@@ -333,6 +333,7 @@ mod tests {
             instructions: "Favor deterministic execution plans.".to_string(),
             enabled: true,
             mutable: true,
+            allowed_canister_calls: vec![],
         });
         stable::upsert_skill(&SkillRecord {
             name: "disabled-skill".to_string(),
@@ -340,6 +341,7 @@ mod tests {
             instructions: "This should not appear.".to_string(),
             enabled: false,
             mutable: true,
+            allowed_canister_calls: vec![],
         });
 
         let prompt = assemble_system_prompt("## Layer 10: Dynamic Context\n- context: yes");
