@@ -41,4 +41,5 @@ canbench-rs = ["dep:canbench-rs"]
 pocket-ic = { version = "9.0.2" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 ureq = "2.12.1"

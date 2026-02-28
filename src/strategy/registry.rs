@@ -21,7 +21,7 @@ use crate::domain::types::{
     StrategyTemplateKey, TemplateActivationState, TemplateRevocationState, TemplateStatus,
     TemplateVersion,
 };
-use crate::storage::stable;
+use crate::storage::{sqlite, stable};
 use crate::strategy::abi;
 use std::collections::BTreeMap;
 
@@ -37,22 +37,28 @@ pub fn get_template(
     key: &StrategyTemplateKey,
     version: &TemplateVersion,
 ) -> Option<StrategyTemplate> {
-    stable::strategy_template(key, version)
+    sqlite::strategy_template(key, version)
+        .ok()
+        .flatten()
+        .or_else(|| stable::strategy_template(key, version))
 }
 
 /// List all stored versions for a given template key.
 pub fn list_template_versions(key: &StrategyTemplateKey) -> Vec<TemplateVersion> {
-    stable::list_strategy_template_versions(key)
+    sqlite::list_strategy_template_versions(key)
+        .unwrap_or_else(|_| stable::list_strategy_template_versions(key))
 }
 
 /// List up to `limit` templates for a given key across all stored versions.
 pub fn list_templates(key: &StrategyTemplateKey, limit: usize) -> Vec<StrategyTemplate> {
-    stable::list_strategy_templates(key, limit)
+    sqlite::list_strategy_templates(key, limit)
+        .unwrap_or_else(|_| stable::list_strategy_templates(key, limit))
 }
 
 /// List up to `limit` templates across all keys and versions.
 pub fn list_all_templates(limit: usize) -> Vec<StrategyTemplate> {
-    stable::list_all_strategy_templates(limit)
+    sqlite::list_all_strategy_templates(limit)
+        .unwrap_or_else(|_| stable::list_all_strategy_templates(limit))
 }
 
 // ── ABI artifacts ────────────────────────────────────────────────────────────
@@ -64,7 +70,10 @@ pub fn upsert_abi_artifact(artifact: AbiArtifact) -> Result<AbiArtifact, String>
 
 /// Retrieve an [`AbiArtifact`] by its key, or `None` if absent.
 pub fn get_abi_artifact(key: &AbiArtifactKey) -> Option<AbiArtifact> {
-    stable::abi_artifact(key)
+    sqlite::abi_artifact(key)
+        .ok()
+        .flatten()
+        .or_else(|| stable::abi_artifact(key))
 }
 
 /// List all stored versions of the ABI artifact for the given protocol/chain/role triple.
@@ -73,7 +82,8 @@ pub fn list_abi_artifact_versions(
     chain_id: u64,
     role: &str,
 ) -> Vec<TemplateVersion> {
-    stable::list_abi_artifact_versions(protocol, chain_id, role)
+    sqlite::list_abi_artifact_versions(protocol, chain_id, role)
+        .unwrap_or_else(|_| stable::list_abi_artifact_versions(protocol, chain_id, role))
 }
 
 // ── Lifecycle state ──────────────────────────────────────────────────────────
