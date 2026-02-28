@@ -180,7 +180,8 @@ A timer-driven scheduler fires every 30 seconds and dispatches up to 4 mutating 
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) with WASM target: `rustup target add wasm32-unknown-unknown`
+- [Rust](https://rustup.rs/) with WASM target: `rustup target add wasm32-wasip1`
+- [wasi2ic](https://github.com/wasm-forge/wasi2ic): `cargo install wasi2ic`
 - [icp-cli](https://docs.icp-cli.dev/) for building and deploying canisters
 - [Foundry](https://book.getfoundry.sh/) (for EVM contract deployment and testing)
 
@@ -190,6 +191,10 @@ A timer-driven scheduler fires every 30 seconds and dispatches up to 4 mutating 
 # Clone the repository
 git clone https://github.com/domwoe/ic-automaton.git
 cd ic-automaton
+
+# Validate the WASI build path used by icp-cli
+cargo check --target wasm32-wasip1 -p backend
+icp build backend
 
 # Start everything with OpenRouter inference (requires OPENROUTER_API_KEY)
 just bootstrap openrouter

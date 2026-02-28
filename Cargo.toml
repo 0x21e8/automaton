@@ -28,6 +28,9 @@ regex = "1"
 sha2 = { version = "0.10", default-features = false }
 sha3 = { version = "0.10", default-features = false }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ic-rusqlite = { git = "https://github.com/0x21e8/ic-rusqlite", rev = "535546ebdf3a860ded4f9d95f5d1091fc819c314", default-features = false, features = ["precompiled"] }
+
 [features]
 default = []
 pocketic_tests = []

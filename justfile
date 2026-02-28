@@ -3,6 +3,16 @@ set dotenv-load := true
 default:
   @just --list
 
+check-backend-wasi:
+  cargo check --target wasm32-wasip1 -p backend
+
+build-backend-wasi:
+  cargo build -p backend --target wasm32-wasip1 --release
+  wasi2ic target/wasm32-wasip1/release/backend.wasm target/wasm32-wasip1/release/backend_nowasi.wasm
+
+check-ic-rusqlite-lock:
+  rg 'source = "git\+https://github.com/0x21e8/ic-rusqlite' Cargo.lock
+
 anvil_host := "127.0.0.1"
 anvil_port := "18545"
 anvil_chain_id := "31337"

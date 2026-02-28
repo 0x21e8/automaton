@@ -28,6 +28,8 @@ fi
 
 wasm_path=""
 for candidate in \
+  "${repo_root}/target/wasm32-wasip1/release/backend_nowasi.wasm" \
+  "${repo_root}/target/wasm32-wasip1/release/backend.wasm" \
   "${repo_root}/target/wasm32-unknown-unknown/release/backend.wasm" \
   "${repo_root}/target/wasm32-unknown-unknown/release/deps/backend.wasm"
 do
@@ -38,7 +40,7 @@ do
 done
 
 if [[ -z "${wasm_path}" ]]; then
-  echo "Could not find backend.wasm in target/wasm32-unknown-unknown/release." >&2
+  echo "Could not find backend wasm artifact in target/wasm32-wasip1 or target/wasm32-unknown-unknown." >&2
   echo "Run 'icp build' first, then run this script again." >&2
   exit 1
 fi
