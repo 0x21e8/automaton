@@ -712,6 +712,9 @@ service : (InitArgs) -> {
   set_evm_rpc_max_response_bytes : (nat64) -> (Result_6);
   // Updates the primary EVM JSON-RPC endpoint (controller only).
   set_evm_rpc_url : (text) -> (Result_2);
+  // Sets a custom welcome message shown in the TUI on boot (controller only).
+  // Pass an empty string to restore the default.
+  set_welcome_message : (text) -> (Result_2);
   // Replaces the HTTP outbound allowlist.  An empty slice disables the allowlist
   // and permits all domains (controller only).
   set_http_allowed_domains : (vec text) -> (Result_4);

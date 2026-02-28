@@ -98,6 +98,10 @@ const TOPUP_STATE_KEY: &str = "cycle_topup.state";
 const CADENCE_MULTIPLIER_KEY: &str = "timing.cadence_multiplier";
 /// Persisted scheduler base tick interval in seconds.
 const SCHEDULER_BASE_TICK_SECS_KEY: &str = "timing.scheduler_base_tick_secs";
+/// Stable key for the optional custom welcome message shown in the TUI on boot.
+const WELCOME_MESSAGE_KEY: &str = "ui.welcome_message";
+/// Maximum character count accepted by `set_welcome_message`.
+pub const MAX_WELCOME_MESSAGE_CHARS: usize = 500;
 
 // ── Capacity constants ───────────────────────────────────────────────────────
 
@@ -3129,6 +3133,32 @@ pub fn wallet_balance_sync_capable(snapshot: &RuntimeSnapshot) -> bool {
 /// Returns the current inference configuration as an `InferenceConfigView`.
 pub fn inference_config_view() -> InferenceConfigView {
     InferenceConfigView::from(&runtime_snapshot())
+}
+
+/// Returns the custom TUI welcome message, or `None` if the default is in use.
+pub fn get_welcome_message() -> Option<String> {
+    RUNTIME_MAP
+        .with(|map| map.borrow().get(&WELCOME_MESSAGE_KEY.to_string()))
+        .and_then(|payload| read_json(Some(payload.as_slice())))
+}
+
+/// Persists a custom TUI welcome message.
+///
+/// The message is trimmed; an empty string clears the custom message (restoring
+/// the default).  Returns an error if the trimmed message exceeds
+/// `MAX_WELCOME_MESSAGE_CHARS`.
+pub fn set_welcome_message(message: String) -> Result<String, String> {
+    let trimmed = message.trim().to_string();
+    if trimmed.chars().count() > MAX_WELCOME_MESSAGE_CHARS {
+        return Err(format!(
+            "welcome message must not exceed {MAX_WELCOME_MESSAGE_CHARS} characters"
+        ));
+    }
+    RUNTIME_MAP.with(|map| {
+        map.borrow_mut()
+            .insert(WELCOME_MESSAGE_KEY.to_string(), encode_json(&trimmed));
+    });
+    Ok(trimmed)
 }
 
 /// Sets the active inference provider (e.g. `OpenRouter`, `LLMCanister`).

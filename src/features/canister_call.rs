@@ -85,8 +85,10 @@ async fn call_canister_raw(
     args_candid: &str,
     canister_id_text: &str,
 ) -> Result<String, String> {
+    let args_candid = resolve_self_canister_placeholder(args_candid);
+
     // 3. Parse Candid text args → binary encoding.
-    let idl_args = candid_parser::parse_idl_args(args_candid)
+    let idl_args = candid_parser::parse_idl_args(&args_candid)
         .map_err(|e| format!("candid parse error in args_candid: {e}"))?;
     let encoded = idl_args
         .to_bytes()
@@ -115,6 +117,25 @@ async fn call_canister_raw(
         &format!("canister:{canister_id_text}.{method}"),
         &truncated,
     ))
+}
+
+/// Replaces `<self-canister-id>` placeholders with this canister's principal text.
+fn resolve_self_canister_placeholder(args_candid: &str) -> String {
+    if !args_candid.contains("<self-canister-id>") {
+        return args_candid.to_string();
+    }
+    args_candid.replace("<self-canister-id>", &current_canister_id_text())
+}
+
+fn current_canister_id_text() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        ic_cdk::api::id().to_text()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Principal::anonymous().to_text()
+    }
 }
 
 // ── Platform implementations ──────────────────────────────────────────────────
@@ -326,5 +347,29 @@ mod tests {
         ));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("candid parse error"));
+    }
+
+    #[test]
+    fn resolves_self_canister_placeholder_before_candid_parse() {
+        stable::init_storage();
+        stable::upsert_skill(&make_skill("aaaaa-aa", "foo", true));
+
+        set_mock_canister_call(|_, _, encoded_args| {
+            let decoded = candid::IDLArgs::from_bytes(encoded_args)
+                .expect("tool should encode valid candid args");
+            let text = decoded.to_string();
+            assert!(
+                text.contains(r#"principal "2vxsx-fae""#),
+                "expected anonymous principal placeholder replacement on host, got {text}"
+            );
+            Ok(candid_parser::parse_idl_args("()").unwrap().to_bytes().unwrap())
+        });
+
+        let result = block_on_with_spin(canister_call_tool(
+            r#"{"canister_id":"aaaaa-aa","method":"foo","args_candid":"(record { owner = principal \"<self-canister-id>\"; subaccount = null })"}"#,
+        ));
+        clear_mock_canister_call();
+
+        assert!(result.is_ok(), "expected success, got {result:?}");
     }
 }

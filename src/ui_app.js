@@ -308,6 +308,11 @@ function sanitizeRpcUrlForDisplay(raw) {
 const BOOT_DELAY_STEP = 90; // ms between each boot line reveal
 const BOOT_LINE_COUNT = 9;  // lines emitted by runBoot (for focus timer)
 
+const DEFAULT_WELCOME_LINES = [
+  "Type 'help' for available commands.",
+  "Type 'connect' to link your EVM wallet.",
+];
+
 async function runBoot() {
   let delay = 80;
   const S = BOOT_DELAY_STEP;
@@ -321,8 +326,6 @@ async function runBoot() {
   printEmpty(delay);                                                           delay += S;
   printLine("READY.", "system bright", delay);                                 delay += S;
   printEmpty(delay);                                                           delay += S;
-  printLine("Type 'help' for available commands.",    "system dim", delay);   delay += S;
-  printLine("Type 'connect' to link your EVM wallet.", "system dim", delay);
 
   // Canister reachability — initial status poll
   await pollStatus();
@@ -338,6 +341,27 @@ async function runBoot() {
     evmConfigLine.textContent = "LOADING EVM CONFIG...        [OK]";
   } catch (_) {
     evmConfigLine.textContent = "LOADING EVM CONFIG...        [—]";
+  }
+
+  // Welcome message — custom or default
+  try {
+    const welcome = await apiFetch("/api/welcome");
+    const msg = welcome && typeof welcome.message === "string" && welcome.message.trim();
+    if (msg) {
+      printSeparator(delay); delay += S;
+      for (const line of msg.split("\n")) {
+        printLine(line, "system", delay); delay += S;
+      }
+      printEmpty(delay);
+    } else {
+      for (const line of DEFAULT_WELCOME_LINES) {
+        printLine(line, "system dim", delay); delay += S;
+      }
+    }
+  } catch (_) {
+    for (const line of DEFAULT_WELCOME_LINES) {
+      printLine(line, "system dim", delay); delay += S;
+    }
   }
 }
 

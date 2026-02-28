@@ -395,6 +395,13 @@ impl ToolManager {
                 allowed_states: vec![AgentState::ExecutingActions],
             },
         );
+        policies.insert(
+            "set_welcome_message".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
 
         Self { policies }
     }
@@ -709,6 +716,7 @@ impl ToolManager {
                     })
                 })
             }
+            "set_welcome_message" => set_welcome_message_tool(&call.args_json),
             "evm_read" => {
                 let now_ns = current_time_ns();
                 if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns) {
@@ -837,6 +845,24 @@ pub fn update_prompt_layer_content(
     };
     stable::save_prompt_layer(&layer)?;
     Ok(layer)
+}
+
+/// Store a custom TUI welcome message and rebuild the HTTP certification tree
+/// so the updated message is immediately served by the certified query path.
+fn set_welcome_message_tool(args_json: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid set_welcome_message args json: {error}"))?;
+    let message = value
+        .get("message")
+        .and_then(|entry| entry.as_str())
+        .ok_or_else(|| "missing required field: message".to_string())?;
+    let stored = stable::set_welcome_message(message.to_string())?;
+    crate::http::init_certification();
+    if stored.is_empty() {
+        Ok("welcome message cleared (default restored)".to_string())
+    } else {
+        Ok(format!("welcome message updated ({} chars)", stored.chars().count()))
+    }
 }
 
 // ── Argument parsers ──────────────────────────────────────────────────────────

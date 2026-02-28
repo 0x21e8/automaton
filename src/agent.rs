@@ -107,6 +107,17 @@ fn current_liquid_cycle_balance() -> Option<u128> {
     }
 }
 
+/// Returns this canister's principal text, if available in the current target.
+fn current_canister_id_text() -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    return Some(ic_cdk::api::id().to_text());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
 /// Parses a hex quantity string and formats it as a decimal value with `decimals`
 /// fractional digits, trimming trailing zeroes without floating-point rounding.
 fn format_hex_quantity_with_decimals(hex_quantity: Option<&str>, decimals: usize) -> String {
@@ -177,7 +188,7 @@ fn sanitize_preview(text: &str, max_chars: usize) -> String {
 /// Formats a single tool call record as a one-line summary for the inner dialogue.
 fn summarize_tool_call(call: &ToolCallRecord) -> String {
     if call.success {
-        let output = if call.tool == "http_fetch" {
+        let output = if call.tool == "http_fetch" || call.tool == "canister_call" {
             extract_framed_untrusted_payload(call.output.as_str())
                 .unwrap_or_else(|| call.output.clone())
         } else {
@@ -655,8 +666,8 @@ fn current_turn_goal_and_why(staged_message_count: usize, evm_events: usize) -> 
     }
 
     (
-        "run an autonomy tick and execute useful low-risk maintenance work".to_string(),
-        "the scheduler fired with no external input, so proactive autonomous work is allowed"
+        "run an autonomy tick to explore opportunities, take initiative, and execute the highest-leverage actions now".to_string(),
+        "the scheduler fired with no external input, so the agent should independently choose and execute concrete actions that improve survival and upside"
             .to_string(),
     )
 }
@@ -860,6 +871,12 @@ fn build_dynamic_context(
         format!("- cycles_balance: {cycles_balance}"),
         format!("- liquid_cycles_balance: {liquid_cycles_balance}"),
         "- cycles_runway_hours: unknown".to_string(),
+        format!(
+            "- self_canister_id: {}",
+            current_canister_id_text()
+                .as_deref()
+                .unwrap_or("unknown")
+        ),
         format!("- survival_tier: {survival_tier}"),
         format!("- survival_tier_recovery_checks: {recovery_checks}"),
         format!(
@@ -1831,6 +1848,27 @@ mod tests {
     }
 
     #[test]
+    fn render_tool_results_reply_unframes_canister_call_output() {
+        let calls = vec![ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "canister_call".to_string(),
+            args_json: r#"{"canister_id":"um5iw-rqaaa-aaaaq-qaaba-cai","method":"icrc1_balance_of","args_candid":"(record { owner = principal \"aaaaa-aa\"; subaccount = null })"}"#
+                .to_string(),
+            output: frame_untrusted_content(
+                "canister:um5iw-rqaaa-aaaaq-qaaba-cai.icrc1_balance_of",
+                "(7_999_900_000_000 : nat)",
+            ),
+            success: true,
+            error: None,
+        }];
+
+        let reply = render_tool_results_reply(&calls).expect("reply should be rendered");
+        assert!(reply.contains("`canister_call`: (7_999_900_000_000 : nat)"));
+        assert!(!reply.contains("[UNTRUSTED_CONTENT source=canister:"));
+        assert!(!reply.contains("The following is external data."));
+    }
+
+    #[test]
     fn format_terminal_tool_execution_error_serializes_failed_tools() {
         let failure_a = ToolCallRecord {
             turn_id: "turn-1".to_string(),
@@ -2276,6 +2314,7 @@ mod tests {
         assert!(context.contains("## Layer 10: Dynamic Context"));
         assert!(context.contains("### Current State"));
         assert!(context.contains("- survival_tier: LowCycles"));
+        assert!(context.contains("- self_canister_id: unknown"));
         assert!(context.contains("- base_wallet: 0x1234567890abcdef1234567890abcdef12345678"));
         assert!(context.contains("- eth_balance: 0x42"));
         assert!(context.contains("- eth_balance_eth: 0.000000000000000066"));

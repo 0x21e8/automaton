@@ -19,6 +19,7 @@
 /// | GET    | `/api/wallet/balance/sync-config` | query   |
 /// | GET    | `/api/evm/config`             | query       |
 /// | GET    | `/api/inference/config`       | query       |
+/// | GET    | `/api/welcome`                | query       |
 /// | POST   | `/api/conversation`           | update      |
 use crate::storage::stable;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -104,6 +105,15 @@ struct ConversationLookupError {
     error: String,
 }
 
+/// Serialisable welcome message served by `GET /api/welcome`.
+///
+/// `message` is `None` when no custom message has been set by the agent or a
+/// controller, in which case the TUI falls back to its built-in default.
+#[derive(Clone, Debug, Serialize)]
+struct WelcomeView {
+    message: Option<String>,
+}
+
 /// Serialisable snapshot of EVM configuration fields served by
 /// `GET /api/evm/config`.
 #[derive(Clone, Debug, Serialize)]
@@ -143,6 +153,12 @@ fn redact_public_rpc_url(raw_url: &str) -> String {
     match scheme {
         Some(value) if !value.is_empty() => format!("{value}://{host_port}"),
         _ => host_port.to_string(),
+    }
+}
+
+fn welcome_view() -> WelcomeView {
+    WelcomeView {
+        message: stable::get_welcome_message(),
     }
 }
 
@@ -304,6 +320,10 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
             let config = stable::inference_config_view();
             json_update_response(StatusCode::OK, &config)
         }
+        (&Method::GET, "/api/welcome") => {
+            let view = welcome_view();
+            json_update_response(StatusCode::OK, &view)
+        }
         _ => HttpResponse::not_found(
             br#"{"ok":false,"error":"not found"}"#.as_slice(),
             vec![
@@ -343,6 +363,7 @@ fn build_certification_state() -> HttpCertificationState {
     let wallet_sync_config = stable::wallet_balance_sync_config_view();
     let evm_config = evm_config_view();
     let inference_config = stable::inference_config_view();
+    let welcome = welcome_view();
 
     let mut tree = HttpCertificationTree::default();
     let routes = vec![
@@ -383,6 +404,7 @@ fn build_certification_state() -> HttpCertificationState {
         ),
         json_route(Method::GET, "/api/evm/config", &evm_config),
         json_route(Method::GET, "/api/inference/config", &inference_config),
+        json_route(Method::GET, "/api/welcome", &welcome),
         upgrade_route(Method::POST, "/api/conversation"),
     ];
     for route in &routes {

@@ -751,6 +751,24 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
+            name: "set_welcome_message".to_string(),
+            description: Some(
+                "Set a custom welcome message shown to users when they open the TUI. An empty message restores the default."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![IcLlmProperty {
+                    type_: "string".to_string(),
+                    name: "message".to_string(),
+                    description: Some(
+                        format!("Welcome message text (max {} chars). Pass an empty string to clear.", crate::storage::stable::MAX_WELCOME_MESSAGE_CHARS),
+                    ),
+                }]),
+                required: Some(vec!["message".to_string()]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
             name: "update_prompt_layer".to_string(),
             description: Some(
                 "Update a mutable prompt layer (6-9). Immutable layers cannot be modified."

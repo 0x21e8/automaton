@@ -293,6 +293,16 @@ fn set_openrouter_api_key(api_key: Option<String>) -> String {
     "openrouter_api_key_updated".to_string()
 }
 
+/// Sets a custom welcome message shown in the TUI on boot (controller only).
+/// An empty string clears the custom message and restores the default.
+#[ic_cdk::update]
+fn set_welcome_message(message: String) -> Result<String, String> {
+    ensure_controller()?;
+    let stored = stable::set_welcome_message(message)?;
+    crate::http::init_certification();
+    Ok(stored)
+}
+
 /// Updates the primary EVM JSON-RPC endpoint (controller only).
 #[ic_cdk::update]
 fn set_evm_rpc_url(url: String) -> Result<String, String> {
