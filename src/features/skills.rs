@@ -22,17 +22,7 @@ pub struct DefaultSkillLoader;
 
 impl DefaultSkillLoader {
     pub fn load_defaults() -> Vec<SkillRecord> {
-        vec![
-            SkillRecord {
-                name: "agent-loop".to_string(),
-                description: "Default loop safety profile".to_string(),
-                instructions: "Stay in FSM order and prefer deterministic behavior.".to_string(),
-                enabled: true,
-                mutable: true,
-                allowed_canister_calls: vec![],
-            },
-            Self::cycles_management_skill(),
-        ]
+        vec![Self::cycles_management_skill()]
     }
 
     pub fn install_defaults() {
@@ -97,5 +87,25 @@ Replace <self-canister-id> with this canister's own principal from context."#
                 },
             ],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DefaultSkillLoader;
+
+    #[test]
+    fn default_skills_exclude_agent_loop_and_include_cycles_management() {
+        let defaults = DefaultSkillLoader::load_defaults();
+        assert!(
+            defaults.iter().all(|skill| skill.name != "agent-loop"),
+            "agent-loop must not be a default skill"
+        );
+        assert!(
+            defaults
+                .iter()
+                .any(|skill| skill.name == "cycles-management"),
+            "cycles-management should remain a default skill"
+        );
     }
 }

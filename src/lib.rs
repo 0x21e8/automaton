@@ -244,6 +244,7 @@ fn apply_init_args(args: InitArgs) {
 fn post_upgrade() {
     stable::init_storage();
     enforce_wallet_sync_response_bytes_floor();
+    let _ = stable::remove_skill("agent-loop");
     crate::features::DefaultSkillLoader::seed_missing_defaults();
     crate::http::init_certification();
     arm_timer();
@@ -865,7 +866,7 @@ fn arm_timer_with_interval(interval_secs: u64) {
 mod tests {
     use super::*;
     use crate::domain::types::{
-        AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, MemoryFact,
+        AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, MemoryFact, SkillRecord,
         StrategyTemplate, StrategyTemplateKey, TemplateStatus, TemplateVersion,
     };
 
@@ -976,6 +977,31 @@ mod tests {
         assert_eq!(
             upgraded.wallet_balance_sync.max_response_bytes,
             WALLET_SYNC_RESPONSE_BYTES_FLOOR
+        );
+    }
+
+    #[test]
+    fn post_upgrade_removes_legacy_agent_loop_skill() {
+        stable::init_storage();
+        stable::upsert_skill(&SkillRecord {
+            name: "agent-loop".to_string(),
+            description: "legacy".to_string(),
+            instructions: "legacy".to_string(),
+            enabled: true,
+            mutable: true,
+            allowed_canister_calls: vec![],
+        });
+
+        post_upgrade();
+
+        let names: Vec<String> = list_skills().into_iter().map(|skill| skill.name).collect();
+        assert!(
+            !names.iter().any(|name| name == "agent-loop"),
+            "post-upgrade migration should remove legacy agent-loop skill"
+        );
+        assert!(
+            names.iter().any(|name| name == "cycles-management"),
+            "cycles-management should remain available after migration"
         );
     }
 

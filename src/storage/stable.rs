@@ -4138,6 +4138,13 @@ pub fn list_skills() -> Vec<SkillRecord> {
     })
 }
 
+/// Removes a skill record by name.
+///
+/// Returns `true` when a record existed and was removed.
+pub fn remove_skill(name: &str) -> bool {
+    SKILL_MAP.with(|map| map.borrow_mut().remove(&name.to_string()).is_some())
+}
+
 pub fn enqueue_job_if_absent(
     kind: TaskKind,
     lane: TaskLane,
