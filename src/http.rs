@@ -961,6 +961,40 @@ mod tests {
     }
 
     #[test]
+    fn get_welcome_route_returns_null_message_by_default() {
+        stable::init_storage();
+        init_certification();
+
+        let request = HttpRequest::get("/api/welcome").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), None);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("welcome body should decode as json");
+        assert_eq!(body.get("message"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn get_welcome_route_returns_custom_message_after_set() {
+        stable::init_storage();
+        stable::set_welcome_message("Hello from the automaton!".to_string())
+            .expect("welcome message should store");
+        init_certification();
+
+        let request = HttpRequest::get("/api/welcome").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("welcome body should decode as json");
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some("Hello from the automaton!")
+        );
+    }
+
+    #[test]
     fn get_inference_config_route_is_certified_query() {
         init_certification();
 

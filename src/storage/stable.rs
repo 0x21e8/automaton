@@ -60,6 +60,7 @@ use crate::domain::types::{
 };
 use crate::features::cycle_topup::TopUpStage;
 use crate::prompt;
+use crate::storage::sqlite;
 use candid::Principal;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use ic_stable_structures::{
@@ -72,6 +73,15 @@ use std::cell::RefCell;
 
 fn now_ns() -> u64 {
     crate::timing::current_time_ns()
+}
+
+fn log_sqlite_dual_write_failure(action: &str, error: &str) {
+    log!(
+        SchedulerStorageLogPriority::Warn,
+        "sqlite_dual_write_failed action={} error={}",
+        action,
+        error
+    );
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -545,6 +555,10 @@ thread_local! {
 /// prompt layers, initialises sequence counters, and calls
 /// `init_scheduler_defaults` / `init_retention_defaults`.
 pub fn init_storage() {
+    if let Err(error) = sqlite::init_storage() {
+        log_sqlite_dual_write_failure("init", &error);
+    }
+
     let mut snapshot = runtime_snapshot();
     let mut snapshot_changed = false;
     if snapshot.evm_cursor.contract_address.is_none() {
@@ -578,6 +592,7 @@ pub fn init_storage() {
     }
     init_scheduler_defaults(now_ns());
     init_retention_defaults(now_ns());
+    backfill_sqlite_historical_collections();
 }
 
 /// Idempotent initialisation of scheduler-runtime and per-task config/runtime
@@ -658,6 +673,108 @@ fn init_retention_defaults(now_ns: u64) {
                 }),
             );
         });
+    }
+}
+
+const SQLITE_HISTORICAL_BACKFILL_MARKER_V1: &str = "phase1_historical_backfill_v1";
+
+fn backfill_sqlite_historical_collections() {
+    let Ok(done) = sqlite::is_backfill_done(SQLITE_HISTORICAL_BACKFILL_MARKER_V1) else {
+        return;
+    };
+    if done {
+        return;
+    }
+
+    for transition in list_recent_transitions(usize::MAX) {
+        if let Err(error) = sqlite::upsert_transition(&transition) {
+            log_sqlite_dual_write_failure("backfill_transition", &error);
+            return;
+        }
+    }
+
+    for turn in list_turns(usize::MAX) {
+        if let Err(error) = sqlite::upsert_turn(&turn) {
+            log_sqlite_dual_write_failure("backfill_turn", &error);
+            return;
+        }
+        let tools = get_tools_for_turn(&turn.id);
+        if let Err(error) = sqlite::replace_tool_calls(&turn.id, &tools) {
+            log_sqlite_dual_write_failure("backfill_tool_calls", &error);
+            return;
+        }
+    }
+
+    for inbox in list_inbox_messages(usize::MAX) {
+        if let Err(error) = sqlite::upsert_inbox(&inbox) {
+            log_sqlite_dual_write_failure("backfill_inbox", &error);
+            return;
+        }
+    }
+    for outbox in list_outbox_messages(usize::MAX) {
+        if let Err(error) = sqlite::upsert_outbox(&outbox) {
+            log_sqlite_dual_write_failure("backfill_outbox", &error);
+            return;
+        }
+    }
+
+    for skill in list_skills() {
+        if let Err(error) = sqlite::upsert_skill(&skill) {
+            log_sqlite_dual_write_failure("backfill_skills", &error);
+            return;
+        }
+    }
+    for job in list_recent_jobs(usize::MAX) {
+        if let Err(error) = sqlite::upsert_job(&job) {
+            log_sqlite_dual_write_failure("backfill_jobs", &error);
+            return;
+        }
+    }
+    for fact in list_all_memory_facts(usize::MAX) {
+        if let Err(error) = sqlite::upsert_memory_fact(&fact) {
+            log_sqlite_dual_write_failure("backfill_memory_facts", &error);
+            return;
+        }
+    }
+    for template in list_all_strategy_templates(usize::MAX) {
+        if let Err(error) = sqlite::upsert_strategy_template(&template) {
+            log_sqlite_dual_write_failure("backfill_strategy_templates", &error);
+            return;
+        }
+    }
+
+    let mut conversations = CONVERSATION_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<ConversationLog>(Some(entry.value().as_slice())))
+            .collect::<Vec<_>>()
+    });
+    conversations.sort_by(|a, b| a.sender.cmp(&b.sender));
+    for log in conversations {
+        for entry in log.entries {
+            if let Err(error) = sqlite::append_conversation(&log.sender, &entry) {
+                log_sqlite_dual_write_failure("backfill_conversations", &error);
+                return;
+            }
+        }
+    }
+
+    let mut artifacts = ABI_ARTIFACT_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<AbiArtifact>(Some(entry.value().as_slice())))
+            .collect::<Vec<_>>()
+    });
+    artifacts.sort_by(|a, b| a.created_at_ns.cmp(&b.created_at_ns));
+    for artifact in artifacts {
+        if let Err(error) = sqlite::upsert_abi_artifact(&artifact) {
+            log_sqlite_dual_write_failure("backfill_abi_artifacts", &error);
+            return;
+        }
+    }
+
+    if let Err(error) = sqlite::mark_backfill_done(SQLITE_HISTORICAL_BACKFILL_MARKER_V1) {
+        log_sqlite_dual_write_failure("mark_backfill_done", &error);
     }
 }
 
@@ -1115,6 +1232,7 @@ pub fn append_conversation_entry(sender: &str, mut entry: ConversationEntry) {
     });
     log.sender = sender_key.clone();
     log.last_activity_ns = entry.timestamp_ns;
+    let sqlite_entry = entry.clone();
     log.entries.push(entry);
     if log.entries.len() > MAX_CONVERSATION_ENTRIES_PER_SENDER {
         let drop_count = log
@@ -1127,6 +1245,9 @@ pub fn append_conversation_entry(sender: &str, mut entry: ConversationEntry) {
     CONVERSATION_MAP.with(|map| {
         map.borrow_mut().insert(sender_key, encode_json(&log));
     });
+    if let Err(error) = sqlite::append_conversation(&log.sender, &sqlite_entry) {
+        log_sqlite_dual_write_failure("append_conversation", &error);
+    }
     evict_oldest_conversation_sender_if_needed();
 }
 
@@ -2075,6 +2196,12 @@ pub fn set_memory_fact(fact: &MemoryFact) -> Result<(), String> {
             key,
             fact.key
         );
+        if let Err(error) = sqlite::delete_memory_fact(&key) {
+            log_sqlite_dual_write_failure("delete_evicted_memory_fact", &error);
+        }
+    }
+    if let Err(error) = sqlite::upsert_memory_fact(fact) {
+        log_sqlite_dual_write_failure("upsert_memory_fact", &error);
     }
     Ok(())
 }
@@ -2089,9 +2216,15 @@ pub fn get_memory_fact(key: &str) -> Option<MemoryFact> {
 /// Removes the memory fact stored under `key`.  Returns `true` if a record
 /// was actually deleted.
 pub fn remove_memory_fact(key: &str) -> bool {
-    MEMORY_FACTS_MAP
+    let removed = MEMORY_FACTS_MAP
         .with(|map| map.borrow_mut().remove(&key.to_string()))
-        .is_some()
+        .is_some();
+    if removed {
+        if let Err(error) = sqlite::delete_memory_fact(key) {
+            log_sqlite_dual_write_failure("remove_memory_fact", &error);
+        }
+    }
+    removed
 }
 
 #[allow(dead_code)]
@@ -2244,6 +2377,9 @@ pub fn upsert_strategy_template(template: StrategyTemplate) -> Result<StrategyTe
     STRATEGY_TEMPLATE_INDEX_MAP.with(|map| {
         map.borrow_mut().insert(index_key, record_key.into_bytes());
     });
+    if let Err(error) = sqlite::upsert_strategy_template(&template) {
+        log_sqlite_dual_write_failure("upsert_strategy_template", &error);
+    }
     Ok(template)
 }
 
@@ -2331,6 +2467,9 @@ pub fn upsert_abi_artifact(artifact: AbiArtifact) -> Result<AbiArtifact, String>
     ABI_ARTIFACT_INDEX_MAP.with(|map| {
         map.borrow_mut().insert(index_key, record_key.into_bytes());
     });
+    if let Err(error) = sqlite::upsert_abi_artifact(&artifact) {
+        log_sqlite_dual_write_failure("upsert_abi_artifact", &error);
+    }
     Ok(artifact)
 }
 
@@ -3265,6 +3404,9 @@ pub fn record_transition(
         map.borrow_mut()
             .insert(record.id.clone(), encode_json(&record));
     });
+    if let Err(error) = sqlite::upsert_transition(&record) {
+        log_sqlite_dual_write_failure("record_transition", &error);
+    }
 
     save_runtime_snapshot(&snapshot);
 }
@@ -3282,6 +3424,9 @@ pub fn append_turn_record(record: &TurnRecord, tool_calls: &[ToolCallRecord]) {
         map.borrow_mut()
             .insert(turn_key, encode_json(&bounded_record));
     });
+    if let Err(error) = sqlite::upsert_turn(&bounded_record) {
+        log_sqlite_dual_write_failure("append_turn_record", &error);
+    }
 
     set_tool_records(&bounded_record.id, tool_calls);
 }
@@ -3389,6 +3534,9 @@ pub fn set_tool_records(turn_id: &str, tool_calls: &[ToolCallRecord]) {
         map.borrow_mut()
             .insert(tool_key, encode_json(&bounded_tool_calls));
     });
+    if let Err(error) = sqlite::replace_tool_calls(turn_id, &bounded_tool_calls) {
+        log_sqlite_dual_write_failure("set_tool_records", &error);
+    }
 }
 
 /// Marks the current turn as complete: clears `turn_in_flight`, sets the new
@@ -3475,6 +3623,9 @@ pub fn post_inbox_message(body: String, caller: String) -> Result<String, String
         map.borrow_mut()
             .insert(inbox_pending_key(seq), id.clone().into_bytes());
     });
+    if let Err(error) = sqlite::upsert_inbox(&message) {
+        log_sqlite_dual_write_failure("post_inbox_message", &error);
+    }
     log!(
         SchedulerStorageLogPriority::Info,
         "inbox_posted id={} seq={}",
@@ -4011,6 +4162,9 @@ pub fn post_outbox_message(
     OUTBOX_MAP.with(|map| {
         map.borrow_mut().insert(id.clone(), encode_json(&message));
     });
+    if let Err(error) = sqlite::upsert_outbox(&message) {
+        log_sqlite_dual_write_failure("post_outbox_message", &error);
+    }
     Ok(id)
 }
 
@@ -4157,6 +4311,9 @@ pub fn upsert_skill(skill: &SkillRecord) {
         map.borrow_mut()
             .insert(skill.name.clone(), encode_json(skill));
     });
+    if let Err(error) = sqlite::upsert_skill(skill) {
+        log_sqlite_dual_write_failure("upsert_skill", &error);
+    }
 }
 
 pub fn list_skills() -> Vec<SkillRecord> {
@@ -4172,7 +4329,13 @@ pub fn list_skills() -> Vec<SkillRecord> {
 ///
 /// Returns `true` when a record existed and was removed.
 pub fn remove_skill(name: &str) -> bool {
-    SKILL_MAP.with(|map| map.borrow_mut().remove(&name.to_string()).is_some())
+    let removed = SKILL_MAP.with(|map| map.borrow_mut().remove(&name.to_string()).is_some());
+    if removed {
+        if let Err(error) = sqlite::delete_skill(name) {
+            log_sqlite_dual_write_failure("remove_skill", &error);
+        }
+    }
+    removed
 }
 
 pub fn enqueue_job_if_absent(
@@ -4237,6 +4400,9 @@ pub fn enqueue_job_if_absent(
         map.borrow_mut()
             .insert(dedupe_index_key(&dedupe_key), job_id.clone().into_bytes());
     });
+    if let Err(error) = sqlite::upsert_job(&job) {
+        log_sqlite_dual_write_failure("enqueue_job_if_absent", &error);
+    }
 
     if let Some(mut task_runtime) = TASK_RUNTIME_MAP
         .with(|map| map.borrow().get(&task_kind_key(&kind)))
@@ -4505,6 +4671,81 @@ pub fn list_recent_jobs(limit: usize) -> Vec<ScheduledJob> {
             .take(keep)
             .filter_map(|entry| read_json::<ScheduledJob>(Some(entry.value().as_slice())))
             .collect()
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SqliteParityCounts {
+    pub transitions: (u64, u64),
+    pub turns: (u64, u64),
+    pub tool_calls: (u64, u64),
+    pub inbox: (u64, u64),
+    pub outbox: (u64, u64),
+    pub conversations: (u64, u64),
+    pub jobs: (u64, u64),
+    pub memory_facts: (u64, u64),
+    pub skills: (u64, u64),
+    pub strategy_templates: (u64, u64),
+    pub abi_artifacts: (u64, u64),
+}
+
+pub fn sqlite_parity_counts() -> Result<SqliteParityCounts, String> {
+    let transitions_stable = TRANSITION_MAP.with(|map| map.borrow().len());
+    let turns_stable = TURN_MAP.with(|map| map.borrow().len());
+    let tool_calls_stable = TOOL_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<Vec<ToolCallRecord>>(Some(entry.value().as_slice())))
+            .fold(0_u64, |acc, calls| {
+                acc.saturating_add(u64::try_from(calls.len()).unwrap_or(u64::MAX))
+            })
+    });
+    let inbox_stable = INBOX_MAP.with(|map| map.borrow().len());
+    let outbox_stable = OUTBOX_MAP.with(|map| map.borrow().len());
+    let conversations_stable = CONVERSATION_MAP.with(|map| {
+        map.borrow()
+            .iter()
+            .filter_map(|entry| read_json::<ConversationLog>(Some(entry.value().as_slice())))
+            .fold(0_u64, |acc, log| {
+                acc.saturating_add(u64::try_from(log.entries.len()).unwrap_or(u64::MAX))
+            })
+    });
+    let jobs_stable = JOB_MAP.with(|map| map.borrow().len());
+    let memory_facts_stable = MEMORY_FACTS_MAP.with(|map| map.borrow().len());
+    let skills_stable = SKILL_MAP.with(|map| map.borrow().len());
+    let strategy_templates_stable = STRATEGY_TEMPLATE_MAP.with(|map| map.borrow().len());
+    let abi_artifacts_stable = ABI_ARTIFACT_MAP.with(|map| map.borrow().len());
+
+    Ok(SqliteParityCounts {
+        transitions: (
+            transitions_stable,
+            sqlite::table_count("transitions").unwrap_or_default(),
+        ),
+        turns: (turns_stable, sqlite::table_count("turns").unwrap_or_default()),
+        tool_calls: (
+            tool_calls_stable,
+            sqlite::table_count("tool_calls").unwrap_or_default(),
+        ),
+        inbox: (inbox_stable, sqlite::table_count("inbox").unwrap_or_default()),
+        outbox: (outbox_stable, sqlite::table_count("outbox").unwrap_or_default()),
+        conversations: (
+            conversations_stable,
+            sqlite::table_count("conversations").unwrap_or_default(),
+        ),
+        jobs: (jobs_stable, sqlite::table_count("jobs").unwrap_or_default()),
+        memory_facts: (
+            memory_facts_stable,
+            sqlite::table_count("memory_facts").unwrap_or_default(),
+        ),
+        skills: (skills_stable, sqlite::table_count("skills").unwrap_or_default()),
+        strategy_templates: (
+            strategy_templates_stable,
+            sqlite::table_count("strategy_templates").unwrap_or_default(),
+        ),
+        abi_artifacts: (
+            abi_artifacts_stable,
+            sqlite::table_count("abi_artifacts").unwrap_or_default(),
+        ),
     })
 }
 
@@ -4801,6 +5042,9 @@ fn save_job(job: &ScheduledJob) {
     JOB_MAP.with(|map| {
         map.borrow_mut().insert(job.id.clone(), encode_json(job));
     });
+    if let Err(error) = sqlite::upsert_job(job) {
+        log_sqlite_dual_write_failure("save_job", &error);
+    }
 }
 
 #[cfg(test)]
@@ -5634,6 +5878,9 @@ fn save_inbox_message(message: &InboxMessage) {
         map.borrow_mut()
             .insert(message.id.clone(), encode_json(message));
     });
+    if let Err(error) = sqlite::upsert_inbox(message) {
+        log_sqlite_dual_write_failure("save_inbox_message", &error);
+    }
 }
 
 fn normalize_conversation_sender(raw: &str) -> String {
@@ -6277,11 +6524,12 @@ mod canbench_pilots {
 mod tests {
     use super::*;
     use crate::domain::types::{
-        AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ConversationEntry,
-        InboxMessageStatus, MemoryFact, PromptLayer, RetentionConfig, RuntimeSnapshot,
-        StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind,
-        StrategyTemplate, StrategyTemplateKey, TaskKind, TaskLane, TemplateActivationState,
-        TemplateRevocationState, TemplateStatus, TemplateVersion, WalletBalanceSnapshot,
+        AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, AgentEvent, AgentState,
+        ContinuationStopReason, ConversationEntry, InboxMessageStatus, MemoryFact, PromptLayer,
+        RetentionConfig, RuntimeSnapshot, SkillRecord, StoragePressureLevel,
+        StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyTemplate,
+        StrategyTemplateKey, TaskKind, TaskLane, TemplateActivationState, TemplateRevocationState,
+        TemplateStatus, TemplateVersion, ToolCallRecord, TurnRecord, WalletBalanceSnapshot,
         WalletBalanceSyncConfig,
     };
 
@@ -9098,6 +9346,86 @@ mod tests {
         assert_eq!(removed, vec!["signal.old"]);
         assert!(get_memory_fact("signal.old").is_none());
         assert!(get_memory_fact("signal.fresh").is_some());
+    }
+
+    #[test]
+    fn sqlite_parity_counts_track_dual_write_collections() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        record_transition(
+            "turn:parity",
+            &AgentState::Idle,
+            &AgentState::LoadingContext,
+            &AgentEvent::TimerTick,
+            None,
+        );
+        append_turn_record(
+            &TurnRecord {
+                id: "turn:parity".to_string(),
+                created_at_ns: 10,
+                finished_at_ns: Some(11),
+                duration_ms: Some(1),
+                state_from: AgentState::Idle,
+                state_to: AgentState::Persisting,
+                source_events: 1,
+                tool_call_count: 1,
+                input_summary: "test".to_string(),
+                inner_dialogue: Some("thinking".to_string()),
+                inference_round_count: 1,
+                continuation_stop_reason: ContinuationStopReason::None,
+                error: None,
+            },
+            &[ToolCallRecord {
+                turn_id: "turn:parity".to_string(),
+                tool: "recall".to_string(),
+                args_json: "{}".to_string(),
+                output: "[]".to_string(),
+                success: true,
+                error: None,
+            }],
+        );
+        post_inbox_message("hello".to_string(), "tester".to_string()).expect("inbox store");
+        post_outbox_message(
+            "turn:parity".to_string(),
+            "reply".to_string(),
+            vec!["inbox:00000000000000000001".to_string()],
+        )
+        .expect("outbox store");
+        upsert_skill(&SkillRecord {
+            name: "sqlite_parity".to_string(),
+            description: "phase-1".to_string(),
+            instructions: "noop".to_string(),
+            enabled: true,
+            mutable: true,
+            allowed_canister_calls: vec![],
+        });
+        enqueue_job_if_absent(
+            TaskKind::PollInbox,
+            TaskLane::Mutating,
+            "parity-job".to_string(),
+            20,
+            1,
+        )
+        .expect("enqueue");
+        set_memory_fact(&MemoryFact {
+            key: "parity.key".to_string(),
+            value: "value".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn:parity".to_string(),
+        })
+        .expect("memory fact");
+
+        let counts = sqlite_parity_counts().expect("parity counts");
+        assert_eq!(counts.transitions.0, counts.transitions.1);
+        assert_eq!(counts.turns.0, counts.turns.1);
+        assert_eq!(counts.tool_calls.0, counts.tool_calls.1);
+        assert_eq!(counts.inbox.0, counts.inbox.1);
+        assert_eq!(counts.outbox.0, counts.outbox.1);
+        assert_eq!(counts.jobs.0, counts.jobs.1);
+        assert_eq!(counts.memory_facts.0, counts.memory_facts.1);
+        assert_eq!(counts.skills.0, counts.skills.1);
     }
 
     #[test]

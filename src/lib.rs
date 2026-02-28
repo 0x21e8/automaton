@@ -42,7 +42,7 @@ use crate::domain::types::{
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
-use crate::storage::stable;
+use crate::storage::{sqlite, stable};
 use crate::timing::current_time_ns;
 use crate::tools::ToolManager;
 use candid::{CandidType, Principal};
@@ -195,6 +195,7 @@ fn init(args: InitArgs) {
 /// validation error.  Separated from `init` so tests can call it directly.
 fn apply_init_args(args: InitArgs) {
     stable::init_storage();
+    let _ = sqlite::init_storage();
     let _ = stable::set_ecdsa_key_name(args.ecdsa_key_name)
         .unwrap_or_else(|error| ic_cdk::trap(&error));
     if let Some(chain_id) = args.evm_chain_id {
@@ -237,12 +238,18 @@ fn apply_init_args(args: InitArgs) {
     }
 }
 
+#[ic_cdk::pre_upgrade]
+fn pre_upgrade() {
+    let _ = sqlite::close_storage();
+}
+
 /// Called after every canister upgrade.
 /// Re-initialises storage (migrating any new stable structures), rebuilds
 /// the HTTP certification tree, and re-arms the timer.
 #[ic_cdk::post_upgrade]
 fn post_upgrade() {
     stable::init_storage();
+    let _ = sqlite::reopen_storage();
     enforce_wallet_sync_response_bytes_floor();
     let _ = stable::remove_skill("agent-loop");
     crate::features::DefaultSkillLoader::seed_missing_defaults();
