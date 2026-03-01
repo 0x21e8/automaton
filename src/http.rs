@@ -25,7 +25,11 @@
 /// | GET    | `/api/welcome`                | query       |
 /// | GET    | `/api/build-info`             | query       |
 /// | POST   | `/api/conversation`           | update      |
+/// | POST   | `/api/steward/direct-message/prepare` | update |
+/// | POST   | `/api/steward/direct-message/execute` | update |
+use crate::domain::types::{EvmStewardProof, StewardCommand};
 use crate::storage::stable;
+use crate::timing::current_time_ns;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 #[cfg(target_arch = "wasm32")]
 use ic_http_certification::utils::add_v2_certificate_header;
@@ -35,6 +39,7 @@ use ic_http_certification::{
     HttpUpdateRequest, HttpUpdateResponse, Method, StatusCode, CERTIFICATE_EXPRESSION_HEADER_NAME,
 };
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
 use std::cell::RefCell;
 
 const HEADER_CONTENT_TYPE: &str = "Content-Type";
@@ -48,6 +53,8 @@ const DEFAULT_SNAPSHOT_LIMIT: usize = 25;
 const UI_INDEX_HTML: &str = include_str!("ui_index.html");
 const UI_STYLES_CSS: &str = include_str!("ui_styles.css");
 const UI_APP_JS: &str = include_str!("ui_app.js");
+const EVM_STEWARD_SIGNING_DOMAIN: &str = "ic-automaton:steward-execute:v1";
+const STEWARD_DIRECT_MESSAGE_PROOF_TTL_NS: u64 = 5 * 60 * 1_000_000_000;
 
 // ── Certification types ──────────────────────────────────────────────────────
 
@@ -107,6 +114,42 @@ struct ConversationLookupRequest {
 struct ConversationLookupError {
     ok: bool,
     error: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct StewardDirectMessagePrepareRequest {
+    sender: String,
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StewardDirectMessagePrepareView {
+    sender: String,
+    message: String,
+    proof_template: EvmStewardProofTemplateView,
+    signing_payload: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EvmStewardProofTemplateView {
+    canister_id: String,
+    chain_id: u64,
+    address: String,
+    command_hash: String,
+    nonce: u64,
+    expires_at_ns: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct StewardDirectMessageExecuteRequest {
+    sender: String,
+    message: String,
+    proof: EvmStewardProof,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StewardDirectMessageExecuteResult {
+    result: String,
 }
 
 /// Serialisable welcome message served by `GET /api/welcome`.
@@ -206,6 +249,114 @@ fn evm_config_view() -> EvmConfigView {
         chain_id: route.chain_id,
         rpc_url: redact_public_rpc_url(&stable::get_evm_rpc_url()),
     }
+}
+
+fn steward_http_expected_canister_id() -> String {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::id().to_text();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    return "rrkah-fqaaa-aaaaa-aaaaq-cai".to_string();
+}
+
+fn normalize_http_evm_address(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().to_ascii_lowercase();
+    let valid = trimmed.len() == 42
+        && trimmed.starts_with("0x")
+        && trimmed
+            .as_bytes()
+            .iter()
+            .skip(2)
+            .all(|byte| byte.is_ascii_hexdigit());
+    if !valid {
+        return Err("address must be a 0x-prefixed 20-byte hex string".to_string());
+    }
+    Ok(trimmed)
+}
+
+fn normalize_steward_direct_message(sender: String, message: String) -> Result<(String, String), String> {
+    let sender = sender.trim().to_string();
+    if sender.is_empty() {
+        return Err("steward sender cannot be empty".to_string());
+    }
+    let message = message.trim().to_string();
+    if message.is_empty() {
+        return Err("steward message cannot be empty".to_string());
+    }
+    Ok((sender, message))
+}
+
+fn steward_send_message_command(sender: String, message: String) -> Result<StewardCommand, String> {
+    let (sender, message) = normalize_steward_direct_message(sender, message)?;
+    Ok(StewardCommand::SendStewardMessage { sender, message })
+}
+
+fn steward_command_hash(command: &StewardCommand) -> Result<String, String> {
+    let encoded = candid::encode_one(command)
+        .map_err(|error| format!("failed to encode steward command: {error}"))?;
+    let digest = Keccak256::digest(&encoded);
+    Ok(format!("0x{}", hex::encode(digest)))
+}
+
+fn canonical_steward_signing_payload(
+    canister_id: &str,
+    chain_id: u64,
+    address: &str,
+    command_hash: &str,
+    nonce: u64,
+    expires_at_ns: u64,
+) -> String {
+    format!(
+        "{EVM_STEWARD_SIGNING_DOMAIN}\ncanister_id:{canister_id}\nchain_id:{chain_id}\naddress:{address}\ncommand_hash:{command_hash}\nnonce:{nonce}\nexpires_at_ns:{expires_at_ns}"
+    )
+}
+
+fn prepare_steward_direct_message_view(
+    payload: StewardDirectMessagePrepareRequest,
+) -> Result<StewardDirectMessagePrepareView, String> {
+    let command = steward_send_message_command(payload.sender, payload.message)?;
+    let (sender, message) = match &command {
+        StewardCommand::SendStewardMessage { sender, message } => (sender.clone(), message.clone()),
+        _ => unreachable!("steward direct message prepare should only build send command"),
+    };
+
+    let status = stable::steward_status_view();
+    let nonce = status.next_nonce;
+    let active = status
+        .active_steward
+        .ok_or_else(|| "no active steward configured".to_string())?;
+    if !active.enabled {
+        return Err("active steward is disabled".to_string());
+    }
+    if active.chain_id == 0 {
+        return Err("active steward chain id must be non-zero".to_string());
+    }
+    let address = normalize_http_evm_address(&active.address)?;
+    let command_hash = steward_command_hash(&command)?;
+    let canister_id = steward_http_expected_canister_id();
+    let expires_at_ns = current_time_ns().saturating_add(STEWARD_DIRECT_MESSAGE_PROOF_TTL_NS);
+    let signing_payload = canonical_steward_signing_payload(
+        &canister_id,
+        active.chain_id,
+        &address,
+        &command_hash,
+        nonce,
+        expires_at_ns,
+    );
+
+    Ok(StewardDirectMessagePrepareView {
+        sender,
+        message,
+        proof_template: EvmStewardProofTemplateView {
+            canister_id,
+            chain_id: active.chain_id,
+            address,
+            command_hash,
+            nonce,
+            expires_at_ns,
+        },
+        signing_payload,
+    })
 }
 
 /// Expands conversation reply previews with full outbox payloads when linked.
@@ -351,6 +502,46 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
                 ),
             }
         }
+        (&Method::POST, "/api/steward/direct-message/prepare") => {
+            match parse_steward_direct_message_prepare_request(request.body()) {
+                Ok(payload) => match prepare_steward_direct_message_view(payload) {
+                    Ok(view) => json_update_response(StatusCode::OK, &view),
+                    Err(error) => json_update_response(
+                        StatusCode::BAD_REQUEST,
+                        &ConversationLookupError { ok: false, error },
+                    ),
+                },
+                Err(error) => json_update_response(
+                    StatusCode::BAD_REQUEST,
+                    &ConversationLookupError { ok: false, error },
+                ),
+            }
+        }
+        (&Method::POST, "/api/steward/direct-message/execute") => {
+            match parse_steward_direct_message_execute_request(request.body()) {
+                Ok(payload) => {
+                    let command = StewardCommand::SendStewardMessage {
+                        sender: payload.sender,
+                        message: payload.message,
+                    };
+                    match futures::executor::block_on(crate::steward_execute(command, payload.proof))
+                    {
+                        Ok(result) => json_update_response(
+                            StatusCode::OK,
+                            &StewardDirectMessageExecuteResult { result },
+                        ),
+                        Err(error) => json_update_response(
+                            StatusCode::BAD_REQUEST,
+                            &ConversationLookupError { ok: false, error },
+                        ),
+                    }
+                }
+                Err(error) => json_update_response(
+                    StatusCode::BAD_REQUEST,
+                    &ConversationLookupError { ok: false, error },
+                ),
+            }
+        }
         (&Method::GET, "/api/evm/config") => {
             let config = evm_config_view();
             json_update_response(StatusCode::OK, &config)
@@ -469,6 +660,8 @@ fn build_certification_state() -> HttpCertificationState {
         json_route(Method::GET, "/api/welcome", &welcome),
         json_route(Method::GET, "/api/build-info", &build_info),
         upgrade_route(Method::POST, "/api/conversation"),
+        upgrade_route(Method::POST, "/api/steward/direct-message/prepare"),
+        upgrade_route(Method::POST, "/api/steward/direct-message/execute"),
     ];
     for route in &routes {
         let entry = HttpCertificationTreeEntry::new(&route.cert_path, route.certification);
@@ -753,6 +946,36 @@ fn parse_conversation_lookup_request(body: &[u8]) -> Result<ConversationLookupRe
     })
 }
 
+fn parse_steward_direct_message_prepare_request(
+    body: &[u8],
+) -> Result<StewardDirectMessagePrepareRequest, String> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err("steward direct message prepare body cannot be empty".to_string());
+    }
+
+    let payload = serde_json::from_slice::<StewardDirectMessagePrepareRequest>(body)
+        .map_err(|error| format!("invalid steward direct message prepare payload: {error}"))?;
+    let (sender, message) = normalize_steward_direct_message(payload.sender, payload.message)?;
+    Ok(StewardDirectMessagePrepareRequest { sender, message })
+}
+
+fn parse_steward_direct_message_execute_request(
+    body: &[u8],
+) -> Result<StewardDirectMessageExecuteRequest, String> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err("steward direct message execute body cannot be empty".to_string());
+    }
+
+    let payload = serde_json::from_slice::<StewardDirectMessageExecuteRequest>(body)
+        .map_err(|error| format!("invalid steward direct message execute payload: {error}"))?;
+    let (sender, message) = normalize_steward_direct_message(payload.sender, payload.message)?;
+    Ok(StewardDirectMessageExecuteRequest {
+        sender,
+        message,
+        proof: payload.proof,
+    })
+}
+
 /// Commits the Merkle root hash of `tree` as the canister's certified data.
 /// No-op in native/test builds where the IC certified data API is unavailable.
 fn set_tree_as_certified_data(tree: &HttpCertificationTree) {
@@ -852,6 +1075,22 @@ mod tests {
         assert!(
             body.contains("STEWARD COMMAND SURFACE"),
             "expanded help palette should include a steward command section"
+        );
+        assert!(
+            body.contains("steward-send -m \"message\""),
+            "expanded help palette should include direct steward messaging action"
+        );
+        assert!(
+            body.contains("personal_sign"),
+            "steward direct message flow should request wallet signature"
+        );
+        assert!(
+            body.contains("/api/steward/direct-message/prepare"),
+            "steward direct message flow should prepare a signed command payload"
+        );
+        assert!(
+            body.contains("/api/steward/direct-message/execute"),
+            "steward direct message flow should submit signed direct message commands"
         );
     }
 
@@ -1278,6 +1517,19 @@ mod tests {
 
         assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(response.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn post_steward_direct_message_routes_are_upgradable() {
+        init_certification();
+
+        let prepare = handle_http_request(HttpRequest::post("/api/steward/direct-message/prepare").build());
+        assert_eq!(prepare.status_code(), StatusCode::OK);
+        assert_eq!(prepare.upgrade(), Some(true));
+
+        let execute = handle_http_request(HttpRequest::post("/api/steward/direct-message/execute").build());
+        assert_eq!(execute.status_code(), StatusCode::OK);
+        assert_eq!(execute.upgrade(), Some(true));
     }
 
     #[test]

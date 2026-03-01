@@ -911,7 +911,7 @@ async fn dispatch_steward_command(
 }
 
 #[ic_cdk::update]
-async fn steward_execute(
+pub(crate) async fn steward_execute(
     command: StewardCommand,
     proof: EvmStewardProof,
 ) -> Result<String, String> {

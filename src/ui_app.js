@@ -910,9 +910,10 @@ function buildHelpLines() {
         cls: "success",
       },
       {
-        text: "  expanded palette     Additional steward actions appear here",
-        cls: "system dim",
-      }
+        text: '  steward-send -m "message"  Direct unpaid steward message (signed command)',
+        cls: "system",
+      },
+      { text: "       personal_sign      Wallet signature required", cls: "system dim" }
     );
   }
 
@@ -1870,6 +1871,134 @@ async function pollPendingReplies() {
   }
 }
 
+async function cmdStewardSend(args) {
+  printEmpty();
+
+  const message = String(args.message ?? "");
+  if (!message.trim()) {
+    printError('Usage: steward-send -m "your message"');
+    printEmpty();
+    return;
+  }
+
+  if (!state.walletConnected || !state.walletAddress) {
+    printError("No wallet connected. Run 'connect' first.");
+    printEmpty();
+    return;
+  }
+
+  if (!state.stewardCapabilities.canExecuteStewardCommands) {
+    printError("Connected wallet is not authorized for steward command execution.");
+    printLine("Tip: wallet address and chain must match the active steward.", "system dim");
+    printEmpty();
+    return;
+  }
+
+  if (!window.ethereum?.request) {
+    printError("Wallet provider is unavailable for personal_sign.");
+    printEmpty();
+    return;
+  }
+
+  const prepareSpinner = createSpinner("PREPARING STEWARD COMMAND...");
+  let prepared;
+  try {
+    prepared = await apiFetch("/api/steward/direct-message/prepare", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sender: state.walletAddress,
+        message,
+      }),
+    });
+    prepareSpinner.stop("PREPARING STEWARD COMMAND...      [OK]");
+  } catch (err) {
+    prepareSpinner.stop(`ERROR: ${err.message ?? err}`, "error");
+    printEmpty();
+    return;
+  }
+
+  const proofTemplate = prepared?.proof_template ?? null;
+  const signingPayload = String(prepared?.signing_payload ?? "");
+  const normalizedSender = String(prepared?.sender ?? state.walletAddress);
+  const normalizedMessage = String(prepared?.message ?? message);
+  if (!proofTemplate || !signingPayload) {
+    printError("Steward command preparation payload is incomplete.");
+    printEmpty();
+    return;
+  }
+
+  printLine("PREPARING SIGNED STEWARD COMMAND...", "system");
+  printLine("  COMMAND: SendStewardMessage", "system dim");
+  printLine(`  SENDER: ${normalizedSender}`, "system dim");
+  printLine(`  NONCE: ${proofTemplate.nonce ?? "?"}`, "system dim");
+  printLine(`  EXPIRES AT (ns): ${proofTemplate.expires_at_ns ?? "?"}`, "system dim");
+
+  const signSpinner = createSpinner("AWAITING WALLET SIGNATURE (personal_sign)...");
+  let signature;
+  try {
+    signature = await window.ethereum.request({
+      method: "personal_sign",
+      params: [signingPayload, state.walletAddress],
+    });
+    signSpinner.stop("SIGNATURE RECEIVED ✓", "success");
+  } catch (err) {
+    signSpinner.stop(
+      isTxRejected(err) ? "SIGNATURE REJECTED BY USER." : `ERROR: ${err.message ?? err}`,
+      "error"
+    );
+    printEmpty();
+    return;
+  }
+
+  const executeSpinner = createSpinner("SUBMITTING SIGNED STEWARD COMMAND...");
+  const sentAfterMs = Date.now();
+  let result;
+  try {
+    result = await apiFetch("/api/steward/direct-message/execute", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sender: normalizedSender,
+        message: normalizedMessage,
+        proof: {
+          ...proofTemplate,
+          signature,
+        },
+      }),
+    });
+    executeSpinner.stop("STEWARD COMMAND APPLIED ✓", "success");
+  } catch (err) {
+    executeSpinner.stop(`ERROR: ${err.message ?? err}`, "error");
+    printEmpty();
+    return;
+  }
+
+  try {
+    await loadStewardStatus();
+  } catch (_) {
+    resolveStewardCapabilities();
+  }
+
+  const pending = queuePendingReply({
+    sender: normalizedSender,
+    senderBody: normalizedMessage,
+    sentAfterMs,
+  });
+  startReplyPolling();
+
+  printEmpty();
+  printSuccess("Direct steward message queued.");
+  if (result?.result) {
+    printLine(`Result: ${result.result}`, "system dim");
+  }
+  printLine(`Request ID: ${pending.id}`, "system dim");
+  printLine("You will be notified when a response from the automaton is received.", "system dim");
+  printLine("Use 'inbox' for unread replies or 'history' for the full conversation.", "system dim");
+  updateStatusBar({ online: true, stateName: state.lastSnapshotData?.runtime?.state });
+  printEmpty();
+}
+
 async function cmdSend(args, flags) {
   printEmpty();
 
@@ -2411,6 +2540,11 @@ async function handleCommand(raw) {
 
       case "donate":
         await cmdDonate(positional, flags);
+        break;
+
+      // Phase 5 — steward command surface
+      case "steward-send":
+        await cmdStewardSend(args);
         break;
 
       default:
