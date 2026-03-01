@@ -36,7 +36,7 @@ use crate::domain::types::{
     InferenceConfigView, InferenceProvider, InferenceProxyStatusView, MemoryFact, MemoryRollup,
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats, PromptLayer,
     PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob,
-    SchedulerRuntime, SessionSummary, SkillRecord, StewardState, StewardStatusView,
+    SchedulerRuntime, SessionSummary, SkillRecord, StewardCommand, StewardState, StewardStatusView,
     StrategyKillSwitchState, StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey,
     SubmitInferenceResultArgs, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
     TemplateActivationState, TemplateRevocationState, TemplateStatus, TemplateVersion,
@@ -151,14 +151,6 @@ enum MemoryFactListSort {
     KeyAsc,
 }
 
-/// Minimal steward command surface used by `steward_execute`.
-/// Additional runtime command variants are added in later phases.
-#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
-enum StewardCommand {
-    /// Executes no runtime mutation beyond auth bookkeeping (nonce + last-used).
-    Noop,
-}
-
 fn memory_fact_sort_to_storage(sort: MemoryFactListSort) -> stable::MemoryFactSort {
     match sort {
         MemoryFactListSort::UpdatedAtDesc => stable::MemoryFactSort::UpdatedAtDesc,
@@ -169,6 +161,7 @@ fn memory_fact_sort_to_storage(sort: MemoryFactListSort) -> stable::MemoryFactSo
 fn steward_command_label(command: &StewardCommand) -> &'static str {
     match command {
         StewardCommand::Noop => "noop",
+        StewardCommand::UpdateSteward { .. } => "update_steward",
     }
 }
 
@@ -300,6 +293,25 @@ fn consume_steward_nonce_and_record_usage(
     active_steward.last_used_at_ns = Some(current_time_ns());
     stable::save_runtime_snapshot(&snapshot);
     Ok(())
+}
+
+fn update_active_steward_and_maybe_reset_nonce(
+    chain_id: u64,
+    address: String,
+    enabled: bool,
+) -> Result<(Option<StewardState>, StewardState, bool), String> {
+    let previous = stable::active_steward();
+    let requested = StewardState {
+        chain_id,
+        address,
+        enabled,
+        last_used_at_ns: None,
+    };
+    let stored = stable::set_active_steward_with_nonce_reset_on_rotation(requested)?;
+    let nonce_reset = previous.as_ref().is_none_or(|current| {
+        current.chain_id != stored.chain_id || current.address != stored.address
+    });
+    Ok((previous, stored, nonce_reset))
 }
 
 /// Looks up a strategy template by key and version, returning a descriptive
@@ -549,17 +561,10 @@ fn set_steward_admin(
 ) -> Result<StewardState, String> {
     ensure_controller()?;
     let caller = caller_for_audit();
-    let previous = stable::active_steward();
-    let requested = StewardState {
-        chain_id,
-        address: address.clone(),
-        enabled,
-        last_used_at_ns: None,
-    };
-
-    let stored = stable::set_active_steward(Some(requested))
-        .map_err(|error| {
-            log!(
+    let (previous, stored, nonce_reset) =
+        update_active_steward_and_maybe_reset_nonce(chain_id, address.clone(), enabled).map_err(
+            |error| {
+                log!(
                 StewardAdminLogPriority::StewardWarn,
                 "set_steward_admin_rejected caller={} chain_id={} address={} enabled={} error={}",
                 caller,
@@ -568,16 +573,17 @@ fn set_steward_admin(
                 enabled,
                 error,
             );
-            error
-        })?
-        .ok_or_else(|| "steward was not persisted".to_string())?;
+                error
+            },
+        )?;
 
     log!(
         StewardAdminLogPriority::StewardInfo,
-        "set_steward_admin_applied caller={} previous_steward={:?} new_steward={:?}",
+        "set_steward_admin_applied caller={} previous_steward={:?} new_steward={:?} nonce_reset={}",
         caller,
         previous,
-        stored
+        stored,
+        nonce_reset,
     );
     Ok(stored)
 }
@@ -602,8 +608,37 @@ fn steward_execute(command: StewardCommand, proof: EvmStewardProof) -> Result<St
     })?;
 
     let result = match command {
-        StewardCommand::Noop => "steward_noop_executed".to_string(),
-    };
+        StewardCommand::Noop => Ok("steward_noop_executed".to_string()),
+        StewardCommand::UpdateSteward {
+            chain_id,
+            address,
+            enabled,
+        } => {
+            let (previous, stored, nonce_reset) =
+                update_active_steward_and_maybe_reset_nonce(chain_id, address, enabled)?;
+            log!(
+                StewardAuthLogPriority::AuthInfo,
+                "steward_update_steward_applied previous_steward={:?} new_steward={:?} nonce_reset={}",
+                previous,
+                stored,
+                nonce_reset,
+            );
+            Ok("steward_update_steward_executed".to_string())
+        }
+    }
+    .map_err(|error: String| {
+        log!(
+            StewardAuthLogPriority::AuthWarn,
+            "steward_execute_rejected command={} chain_id={} address={} nonce={} reason={}",
+            command_label,
+            verified.chain_id,
+            verified.address,
+            verified.nonce,
+            error,
+        );
+        error
+    })?;
+
     log!(
         StewardAuthLogPriority::AuthInfo,
         "steward_execute_applied command={} chain_id={} address={} nonce={} result={}",
@@ -1483,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn set_steward_admin_sets_normalized_state_and_status_view() {
+    fn set_steward_admin_sets_normalized_state_and_resets_nonce_on_rotation() {
         stable::init_storage();
         let _ = stable::set_steward_nonce_state(crate::domain::types::StewardNonceState {
             next_nonce: 42,
@@ -1503,7 +1538,7 @@ mod tests {
 
         let status = get_steward_status();
         assert_eq!(status.active_steward, Some(stored));
-        assert_eq!(status.next_nonce, 42);
+        assert_eq!(status.next_nonce, 0);
     }
 
     #[test]
@@ -1564,6 +1599,47 @@ mod tests {
             steward_execute(command, proof).expect_err("replayed proof nonce should fail");
         assert!(replay_error.contains("proof nonce mismatch"));
         assert_eq!(get_steward_status().next_nonce, 8);
+    }
+
+    #[test]
+    fn steward_execute_update_steward_rotates_identity_and_resets_nonce() {
+        stable::init_storage();
+        let old_key = steward_test_signing_key();
+        let old_address = steward_address_from_key(&old_key);
+        set_steward_admin(8453, old_address, true).expect("active steward should store");
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 9 });
+
+        let new_key =
+            k256::ecdsa::SigningKey::from_slice(&[2u8; 32]).expect("test signing key should build");
+        let new_address = steward_address_from_key(&new_key);
+        let command = StewardCommand::UpdateSteward {
+            chain_id: 8453,
+            address: new_address.clone(),
+            enabled: true,
+        };
+        let proof = build_steward_proof(&command, &old_key, 9, current_time_ns() + 60_000_000_000);
+
+        let result = steward_execute(command, proof).expect("rotation command should execute");
+        assert_eq!(result, "steward_update_steward_executed");
+        let status = get_steward_status();
+        assert_eq!(status.next_nonce, 0);
+        let active = status
+            .active_steward
+            .expect("new steward should be configured");
+        assert_eq!(active.address, new_address);
+        assert!(active.enabled);
+        assert!(active.last_used_at_ns.is_none());
+
+        let new_proof = build_steward_proof(
+            &StewardCommand::Noop,
+            &new_key,
+            0,
+            current_time_ns() + 60_000_000_000,
+        );
+        let new_result =
+            steward_execute(StewardCommand::Noop, new_proof).expect("new steward should execute");
+        assert_eq!(new_result, "steward_noop_executed");
+        assert_eq!(get_steward_status().next_nonce, 1);
     }
 
     #[test]

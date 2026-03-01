@@ -220,6 +220,22 @@ pub struct EvmStewardProof {
     pub signature: String,
 }
 
+/// Runtime command variants executable by the active EVM steward.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum StewardCommand {
+    /// Executes no runtime mutation beyond auth bookkeeping (nonce + last-used).
+    Noop,
+    /// Rotates the single active steward identity.
+    ///
+    /// When `chain_id` or `address` changes, the steward nonce cursor is reset
+    /// atomically with the steward update.
+    UpdateSteward {
+        chain_id: u64,
+        address: String,
+        enabled: bool,
+    },
+}
+
 // ── Wallet types ─────────────────────────────────────────────────────────────
 
 /// Coarse classification of a wallet balance reading.

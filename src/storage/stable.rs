@@ -1480,19 +1480,39 @@ pub fn active_steward() -> Option<StewardState> {
     runtime_snapshot().active_steward
 }
 
+fn normalize_steward_state(mut steward: StewardState) -> Result<StewardState, String> {
+    if steward.chain_id == 0 {
+        return Err("steward chain id must be greater than 0".to_string());
+    }
+    steward.address = normalize_evm_hex_address(&steward.address, "steward address")?;
+    Ok(steward)
+}
+
+fn steward_identity_rotated(previous: Option<&StewardState>, updated: &StewardState) -> bool {
+    previous.is_none_or(|current| {
+        current.chain_id != updated.chain_id || current.address != updated.address
+    })
+}
+
 pub fn set_active_steward(steward: Option<StewardState>) -> Result<Option<StewardState>, String> {
-    let normalized = steward
-        .map(|mut value| {
-            if value.chain_id == 0 {
-                return Err("steward chain id must be greater than 0".to_string());
-            }
-            value.address = normalize_evm_hex_address(&value.address, "steward address")?;
-            Ok(value)
-        })
-        .transpose()?;
+    let normalized = steward.map(normalize_steward_state).transpose()?;
 
     let mut snapshot = runtime_snapshot();
     snapshot.active_steward = normalized.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(normalized)
+}
+
+pub fn set_active_steward_with_nonce_reset_on_rotation(
+    steward: StewardState,
+) -> Result<StewardState, String> {
+    let normalized = normalize_steward_state(steward)?;
+    let mut snapshot = runtime_snapshot();
+    if steward_identity_rotated(snapshot.active_steward.as_ref(), &normalized) {
+        snapshot.steward_nonce = StewardNonceState::default();
+    }
+    snapshot.active_steward = Some(normalized.clone());
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
     Ok(normalized)
@@ -4080,6 +4100,67 @@ mod tests {
 
         let loaded = steward_nonce_state();
         assert_eq!(loaded.next_nonce, 7);
+    }
+
+    #[test]
+    fn set_active_steward_with_nonce_reset_on_rotation_resets_nonce() {
+        init_storage();
+
+        set_active_steward(Some(crate::domain::types::StewardState {
+            chain_id: 8453,
+            address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            enabled: true,
+            last_used_at_ns: Some(10),
+        }))
+        .expect("initial steward should persist");
+        let _ = set_steward_nonce_state(crate::domain::types::StewardNonceState { next_nonce: 9 });
+
+        let updated =
+            set_active_steward_with_nonce_reset_on_rotation(crate::domain::types::StewardState {
+                chain_id: 1,
+                address: "0x1234512345123451234512345123451234512345".to_string(),
+                enabled: false,
+                last_used_at_ns: None,
+            })
+            .expect("rotated steward should persist");
+
+        assert_eq!(updated.chain_id, 1);
+        assert_eq!(
+            updated.address,
+            "0x1234512345123451234512345123451234512345"
+        );
+        assert!(!updated.enabled);
+        assert_eq!(steward_nonce_state().next_nonce, 0);
+    }
+
+    #[test]
+    fn set_active_steward_with_nonce_reset_on_rotation_preserves_nonce_when_identity_unchanged() {
+        init_storage();
+
+        set_active_steward(Some(crate::domain::types::StewardState {
+            chain_id: 8453,
+            address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            enabled: true,
+            last_used_at_ns: Some(10),
+        }))
+        .expect("initial steward should persist");
+        let _ = set_steward_nonce_state(crate::domain::types::StewardNonceState { next_nonce: 33 });
+
+        let updated =
+            set_active_steward_with_nonce_reset_on_rotation(crate::domain::types::StewardState {
+                chain_id: 8453,
+                address: " 0xABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD ".to_string(),
+                enabled: false,
+                last_used_at_ns: None,
+            })
+            .expect("steward update should persist");
+
+        assert!(!updated.enabled);
+        assert_eq!(
+            updated.address,
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        );
+        assert_eq!(steward_nonce_state().next_nonce, 33);
     }
 
     #[test]
