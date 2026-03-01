@@ -78,7 +78,7 @@ Implement a single-steward, EVM-only command plane with full parity for current 
 
 ## Phase 6: Integration, security, and candid validation
 
-- [ ] Add PocketIC integration coverage for:
+- [x] Add PocketIC integration coverage for:
   - valid steward command execution
   - non-steward rejection
   - proof replay rejection
@@ -86,8 +86,8 @@ Implement a single-steward, EVM-only command plane with full parity for current 
   - direct steward message entering conversation flow
   - File refs: `tests/` (new/updated PocketIC tests)
   - Check:
-    - [ ] `icp build`
-    - [ ] `cargo test --features pocketic_tests`
+    - [x] `icp build`
+    - [x] `cargo test --features pocketic_tests --test pocketic_steward_command_plane`
 - [ ] Regenerate candid after API additions.
   - Check:
     - [ ] `icp build`
