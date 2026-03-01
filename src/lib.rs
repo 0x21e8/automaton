@@ -622,26 +622,88 @@ fn set_steward_admin(
 }
 
 /// Executes a signed steward command after EVM-proof verification.
-#[ic_cdk::update]
-fn steward_execute(command: StewardCommand, proof: EvmStewardProof) -> Result<String, String> {
-    let command_label = steward_command_label(&command);
-    let command_hash = steward_command_hash(&command)?;
-    let verified = verify_steward_proof_for_command_hash(&command_hash, &proof)?;
-    consume_steward_nonce_and_record_usage(&verified).map_err(|error| {
-        log!(
-            StewardAuthLogPriority::AuthWarn,
-            "steward_execute_rejected command={} chain_id={} address={} nonce={} reason={}",
-            command_label,
-            verified.chain_id,
-            verified.address,
-            verified.nonce,
-            error,
-        );
-        error
-    })?;
-
-    let result = match command {
+async fn dispatch_steward_command(
+    command: StewardCommand,
+    steward_actor: &str,
+) -> Result<String, String> {
+    match command {
         StewardCommand::Noop => Ok("steward_noop_executed".to_string()),
+        StewardCommand::SetLoopEnabled { enabled } => {
+            stable::set_loop_enabled(enabled);
+            Ok(format!("loop_enabled={enabled}"))
+        }
+        StewardCommand::SetAutonomyToolDedupeEnabled { enabled } => {
+            let config = stable::set_autonomy_tool_dedupe_enabled(enabled);
+            Ok(format!(
+                "autonomy_tool_dedupe_enabled={} dedupe_window_secs={}",
+                config.tool_dedupe_enabled, config.dedupe_window_secs
+            ))
+        }
+        StewardCommand::SetAutonomySuppressionConfig { config } => {
+            let stored = stable::set_autonomy_suppression_config(config)?;
+            Ok(format!(
+                "autonomy_suppression_config_updated dedupe_window_secs={} failure_repeat_window_secs={} failure_repeat_threshold={} failure_cooldown_secs={}",
+                stored.dedupe_window_secs,
+                stored.failure_repeat_window_secs,
+                stored.failure_repeat_threshold,
+                stored.failure_cooldown_secs
+            ))
+        }
+        StewardCommand::SetInferenceProvider { provider } => {
+            stable::set_inference_provider(provider.clone());
+            crate::http::init_certification();
+            Ok(format!("inference_provider={provider:?}"))
+        }
+        StewardCommand::SetInferenceModel { model } => {
+            let stored = stable::set_inference_model(model)?;
+            crate::http::init_certification();
+            Ok(format!("inference_model={stored}"))
+        }
+        StewardCommand::SetOpenrouterBaseUrl { base_url } => {
+            let stored = stable::set_openrouter_base_url(base_url)?;
+            crate::http::init_certification();
+            Ok(format!("openrouter_base_url={stored}"))
+        }
+        StewardCommand::SetOpenrouterApiKey { api_key } => {
+            stable::set_openrouter_api_key(api_key);
+            crate::http::init_certification();
+            Ok("openrouter_api_key_updated".to_string())
+        }
+        StewardCommand::SetInferenceProxyConfig { config } => {
+            let stored = stable::set_openrouter_proxy_config(config)?;
+            crate::http::init_certification();
+            Ok(format!(
+                "inference_proxy_worker_base_url={}",
+                stored.worker_base_url
+            ))
+        }
+        StewardCommand::SetWelcomeMessage { message } => {
+            let stored = stable::set_welcome_message(message)?;
+            crate::http::init_certification();
+            Ok(format!("welcome_message_len={}", stored.len()))
+        }
+        StewardCommand::SetEvmRpcUrl { url } => {
+            let stored = stable::set_evm_rpc_url(url)?;
+            Ok(format!("evm_rpc_url={stored}"))
+        }
+        StewardCommand::SetEvmRpcFallbackUrl { url } => {
+            let stored = stable::set_evm_rpc_fallback_url(url)?;
+            Ok(format!(
+                "evm_rpc_fallback_url={}",
+                stored.unwrap_or_else(|| "none".to_string())
+            ))
+        }
+        StewardCommand::SetEvmRpcMaxResponseBytes { max_response_bytes } => {
+            let stored = stable::set_evm_rpc_max_response_bytes(max_response_bytes)?;
+            Ok(format!("evm_rpc_max_response_bytes={stored}"))
+        }
+        StewardCommand::SetInboxContractAddress { address } => {
+            let stored = stable::set_inbox_contract_address(address)?;
+            Ok(format!(
+                "inbox_contract_address={}",
+                stored.unwrap_or_else(|| "none".to_string())
+            ))
+        }
         StewardCommand::UpdateSteward {
             chain_id,
             address,
@@ -658,11 +720,200 @@ fn steward_execute(command: StewardCommand, proof: EvmStewardProof) -> Result<St
             );
             Ok("steward_update_steward_executed".to_string())
         }
-        _ => Err(format!(
-            "steward command `{command_label}` is not implemented yet"
-        )),
+        StewardCommand::SetEvmChainId { chain_id } => {
+            let stored = stable::set_evm_chain_id(chain_id)?;
+            Ok(format!("evm_chain_id={stored}"))
+        }
+        StewardCommand::SetEvmConfirmationDepth { confirmation_depth } => {
+            let stored = stable::set_evm_confirmation_depth(confirmation_depth)?;
+            Ok(format!("evm_confirmation_depth={stored}"))
+        }
+        StewardCommand::DeriveAutomatonEvmAddress => {
+            crate::features::threshold_signer::derive_and_cache_evm_address(
+                &stable::get_ecdsa_key_name(),
+            )
+            .await
+        }
+        StewardCommand::SetHttpAllowedDomains { domains } => {
+            let stored = stable::set_http_allowed_domains(domains)?;
+            Ok(format!("http_allowed_domains={}", stored.len()))
+        }
+        StewardCommand::UpdatePromptLayer { layer_id, content } => {
+            let stored =
+                crate::tools::update_prompt_layer_content(layer_id, content, steward_actor)?;
+            Ok(format!(
+                "prompt_layer_updated layer_id={} version={}",
+                stored.layer_id, stored.version
+            ))
+        }
+        StewardCommand::PruneMemoryFacts {
+            prefix,
+            updated_before_ns,
+            limit,
+        } => {
+            let normalized_prefix = prefix
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if normalized_prefix.is_none() && updated_before_ns.is_none() {
+                return Err(
+                    "provide at least one prune filter: prefix and/or updated_before_ns"
+                        .to_string(),
+                );
+            }
+            let removed =
+                stable::prune_memory_facts(normalized_prefix, updated_before_ns, limit as usize);
+            Ok(format!("memory_facts_pruned={}", removed.len()))
+        }
+        StewardCommand::SetSchedulerEnabled { enabled } => {
+            Ok(stable::set_scheduler_enabled(enabled))
+        }
+        StewardCommand::SetSchedulerLowCyclesMode { enabled } => {
+            Ok(stable::set_scheduler_low_cycles_mode(enabled))
+        }
+        StewardCommand::SetSchedulerBaseTickSecs { interval_secs } => {
+            let persisted = stable::set_scheduler_base_tick_secs(interval_secs)?;
+            arm_timer_with_interval(persisted);
+            crate::http::init_certification();
+            Ok(format!("scheduler_base_tick_secs={persisted}"))
+        }
+        StewardCommand::SetTaskIntervalSecs {
+            kind,
+            interval_secs,
+        } => {
+            stable::set_task_interval_secs(&kind, interval_secs)?;
+            Ok("task_interval_updated".to_string())
+        }
+        StewardCommand::SetTaskEnabled { kind, enabled } => {
+            stable::set_task_enabled(&kind, enabled);
+            Ok("task_enabled_updated".to_string())
+        }
+        StewardCommand::SetRetentionConfig { config } => {
+            let stored = stable::set_retention_config(config)?;
+            Ok(format!(
+                "retention_config_maintenance_interval_secs={}",
+                stored.maintenance_interval_secs
+            ))
+        }
+        StewardCommand::UpdateSoul { new_soul } => {
+            if new_soul.trim().is_empty() {
+                return Err("soul cannot be empty".to_string());
+            }
+            Ok(stable::set_soul(new_soul))
+        }
+        StewardCommand::UpsertSkill { skill } => {
+            stable::upsert_skill(&skill);
+            Ok(format!("skill_upserted name={}", skill.name))
+        }
+        StewardCommand::IngestStrategyTemplate { template } => {
+            let mut template = template;
+            let now_ns = current_time_ns();
+            if template.created_at_ns == 0 {
+                template.created_at_ns = now_ns;
+            }
+            template.updated_at_ns = now_ns;
+            let _ = crate::strategy::registry::upsert_template(template)?;
+            Ok("strategy_template_ingested".to_string())
+        }
+        StewardCommand::IngestStrategyAbiArtifact {
+            key,
+            abi_json,
+            source_ref,
+            codehash,
+            selector_assertions,
+        } => {
+            let _ = crate::strategy::abi::normalize_and_store_abi_artifact(
+                key,
+                &abi_json,
+                &source_ref,
+                codehash,
+                &selector_assertions,
+                current_time_ns(),
+            )?;
+            Ok("strategy_abi_artifact_ingested".to_string())
+        }
+        StewardCommand::ActivateStrategyTemplate {
+            key,
+            version,
+            reason,
+        } => {
+            let _ = upsert_template_status(key.clone(), version.clone(), TemplateStatus::Active)?;
+            crate::strategy::registry::canary_probe_template(&key, &version)?;
+            let _ = crate::strategy::registry::set_activation(TemplateActivationState {
+                key,
+                version,
+                enabled: true,
+                updated_at_ns: current_time_ns(),
+                reason: reason
+                    .or_else(|| Some("controller activation after canary probe".to_string())),
+            })?;
+            Ok("strategy_template_activated".to_string())
+        }
+        StewardCommand::DeprecateStrategyTemplate {
+            key,
+            version,
+            reason,
+        } => {
+            let _ =
+                upsert_template_status(key.clone(), version.clone(), TemplateStatus::Deprecated)?;
+            let _ = crate::strategy::registry::set_activation(TemplateActivationState {
+                key,
+                version,
+                enabled: false,
+                updated_at_ns: current_time_ns(),
+                reason,
+            });
+            Ok("strategy_template_deprecated".to_string())
+        }
+        StewardCommand::RevokeStrategyTemplate {
+            key,
+            version,
+            reason,
+        } => {
+            let _ = upsert_template_status(key.clone(), version.clone(), TemplateStatus::Revoked)?;
+            let now_ns = current_time_ns();
+            let revocation_reason = reason.clone();
+            let _ = crate::strategy::registry::set_revocation(TemplateRevocationState {
+                key: key.clone(),
+                version: version.clone(),
+                revoked: true,
+                updated_at_ns: now_ns,
+                reason: revocation_reason,
+            })?;
+            let _ = crate::strategy::registry::set_activation(TemplateActivationState {
+                key,
+                version,
+                enabled: false,
+                updated_at_ns: now_ns,
+                reason: reason.or_else(|| Some("revoked".to_string())),
+            });
+            Ok("strategy_template_revoked".to_string())
+        }
+        StewardCommand::SetStrategyKillSwitch {
+            key,
+            enabled,
+            reason,
+        } => {
+            let state = crate::strategy::registry::set_kill_switch(StrategyKillSwitchState {
+                key,
+                enabled,
+                updated_at_ns: current_time_ns(),
+                reason,
+            })?;
+            Ok(format!("strategy_kill_switch_enabled={}", state.enabled))
+        }
     }
-    .map_err(|error: String| {
+}
+
+#[ic_cdk::update]
+async fn steward_execute(
+    command: StewardCommand,
+    proof: EvmStewardProof,
+) -> Result<String, String> {
+    let command_label = steward_command_label(&command);
+    let command_hash = steward_command_hash(&command)?;
+    let verified = verify_steward_proof_for_command_hash(&command_hash, &proof)?;
+    consume_steward_nonce_and_record_usage(&verified).map_err(|error| {
         log!(
             StewardAuthLogPriority::AuthWarn,
             "steward_execute_rejected command={} chain_id={} address={} nonce={} reason={}",
@@ -674,6 +925,22 @@ fn steward_execute(command: StewardCommand, proof: EvmStewardProof) -> Result<St
         );
         error
     })?;
+
+    let steward_actor = format!("steward:{}:{}", verified.chain_id, verified.address);
+    let result = dispatch_steward_command(command, &steward_actor)
+        .await
+        .map_err(|error: String| {
+            log!(
+                StewardAuthLogPriority::AuthWarn,
+                "steward_execute_rejected command={} chain_id={} address={} nonce={} reason={}",
+                command_label,
+                verified.chain_id,
+                verified.address,
+                verified.nonce,
+                error,
+            );
+            error
+        })?;
 
     log!(
         StewardAuthLogPriority::AuthInfo,
@@ -1459,6 +1726,13 @@ mod tests {
         }
     }
 
+    fn execute_steward_command(
+        command: StewardCommand,
+        proof: EvmStewardProof,
+    ) -> Result<String, String> {
+        futures::executor::block_on(steward_execute(command, proof))
+    }
+
     #[test]
     fn get_automaton_evm_address_query_returns_stored_value() {
         stable::init_storage();
@@ -1607,7 +1881,7 @@ mod tests {
         let command = StewardCommand::Noop;
         let proof = build_steward_proof(&command, &key, 7, current_time_ns() + 60_000_000_000);
 
-        let result = steward_execute(command, proof).expect("proof should execute");
+        let result = execute_steward_command(command, proof).expect("proof should execute");
         assert_eq!(result, "steward_noop_executed");
 
         let status = get_steward_status();
@@ -1629,10 +1903,11 @@ mod tests {
 
         let command = StewardCommand::Noop;
         let proof = build_steward_proof(&command, &key, 7, current_time_ns() + 60_000_000_000);
-        steward_execute(command.clone(), proof.clone()).expect("first execution should pass");
+        execute_steward_command(command.clone(), proof.clone())
+            .expect("first execution should pass");
 
         let replay_error =
-            steward_execute(command, proof).expect_err("replayed proof nonce should fail");
+            execute_steward_command(command, proof).expect_err("replayed proof nonce should fail");
         assert!(replay_error.contains("proof nonce mismatch"));
         assert_eq!(get_steward_status().next_nonce, 8);
     }
@@ -1655,7 +1930,8 @@ mod tests {
         };
         let proof = build_steward_proof(&command, &old_key, 9, current_time_ns() + 60_000_000_000);
 
-        let result = steward_execute(command, proof).expect("rotation command should execute");
+        let result =
+            execute_steward_command(command, proof).expect("rotation command should execute");
         assert_eq!(result, "steward_update_steward_executed");
         let status = get_steward_status();
         assert_eq!(status.next_nonce, 0);
@@ -1672,10 +1948,29 @@ mod tests {
             0,
             current_time_ns() + 60_000_000_000,
         );
-        let new_result =
-            steward_execute(StewardCommand::Noop, new_proof).expect("new steward should execute");
+        let new_result = execute_steward_command(StewardCommand::Noop, new_proof)
+            .expect("new steward should execute");
         assert_eq!(new_result, "steward_noop_executed");
         assert_eq!(get_steward_status().next_nonce, 1);
+    }
+
+    #[test]
+    fn steward_execute_set_loop_enabled_dispatches_to_runtime_mutator() {
+        stable::init_storage();
+        let key = steward_test_signing_key();
+        let address = steward_address_from_key(&key);
+        set_steward_admin(8453, address, true).expect("active steward should store");
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 3 });
+        stable::set_loop_enabled(false);
+
+        let command = StewardCommand::SetLoopEnabled { enabled: true };
+        let proof = build_steward_proof(&command, &key, 3, current_time_ns() + 60_000_000_000);
+        let result =
+            execute_steward_command(command, proof).expect("set loop command should execute");
+
+        assert_eq!(result, "loop_enabled=true");
+        assert!(stable::runtime_snapshot().loop_enabled);
+        assert_eq!(get_steward_status().next_nonce, 4);
     }
 
     #[test]
