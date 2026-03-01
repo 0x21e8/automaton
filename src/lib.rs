@@ -31,9 +31,9 @@ mod timing;
 mod tools;
 
 use crate::domain::types::{
-    AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, ConversationLog, ConversationSummary,
-    EvmRouteStateView, InboxMessage, InboxStats, InferenceConfigView, InferenceProvider,
-    InferenceProxyStatusView, MemoryFact, MemoryRollup, ObservabilitySnapshot,
+    AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, AutonomySuppressionConfig, ConversationLog,
+    ConversationSummary, EvmRouteStateView, InboxMessage, InboxStats, InferenceConfigView,
+    InferenceProvider, InferenceProxyStatusView, MemoryFact, MemoryRollup, ObservabilitySnapshot,
     OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats, PromptLayer, PromptLayerView,
     RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob, SchedulerRuntime,
     SessionSummary, SkillRecord, StrategyKillSwitchState, StrategyOutcomeStats, StrategyTemplate,
@@ -76,6 +76,7 @@ impl GetLogFilter for InferenceProxyCallbackLogPriority {
 #[cfg(target_arch = "wasm32")]
 thread_local! {
     static SCHEDULER_TIMER_ID: RefCell<Option<TimerId>> = const { RefCell::new(None) };
+    static SCHEDULER_WAKE_IN_FLIGHT: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// Arguments supplied once at canister creation via `dfx deploy --argument`.
@@ -300,6 +301,28 @@ fn set_loop_enabled(enabled: bool) -> String {
     format!("loop_enabled={enabled}")
 }
 
+/// Enables or disables autonomous tool-call dedupe without changing other
+/// suppression controls (controller only).
+#[ic_cdk::update]
+fn set_autonomy_tool_dedupe_enabled(enabled: bool) -> String {
+    ensure_controller_or_trap();
+    let config = stable::set_autonomy_tool_dedupe_enabled(enabled);
+    format!(
+        "autonomy_tool_dedupe_enabled={} dedupe_window_secs={}",
+        config.tool_dedupe_enabled, config.dedupe_window_secs
+    )
+}
+
+/// Replaces autonomy suppression policy (dedupe window + failure cooldown
+/// thresholds) (controller only).
+#[ic_cdk::update]
+fn set_autonomy_suppression_config(
+    config: AutonomySuppressionConfig,
+) -> Result<AutonomySuppressionConfig, String> {
+    ensure_controller()?;
+    stable::set_autonomy_suppression_config(config)
+}
+
 /// Sets the active inference backend (`IcLlm`, `OpenRouter`, or `OpenRouterProxyWorker`)
 /// (controller only).
 #[ic_cdk::update]
@@ -316,6 +339,15 @@ fn set_inference_provider(provider: InferenceProvider) -> String {
 fn set_inference_model(model: String) -> Result<String, String> {
     ensure_controller()?;
     let stored = stable::set_inference_model(model)?;
+    crate::http::init_certification();
+    Ok(stored)
+}
+
+/// Updates the OpenRouter-compatible base URL used for inference HTTP calls (controller only).
+#[ic_cdk::update]
+fn set_openrouter_base_url(base_url: String) -> Result<String, String> {
+    ensure_controller()?;
+    let stored = stable::set_openrouter_base_url(base_url)?;
     crate::http::init_certification();
     Ok(stored)
 }
@@ -442,6 +474,12 @@ fn get_wallet_balance_telemetry() -> WalletBalanceTelemetryView {
 #[ic_cdk::query]
 fn get_wallet_balance_sync_config() -> WalletBalanceSyncConfigView {
     stable::wallet_balance_sync_config_view()
+}
+
+/// Returns the current autonomy suppression configuration.
+#[ic_cdk::query]
+fn get_autonomy_suppression_config() -> AutonomySuppressionConfig {
+    stable::autonomy_suppression_config()
 }
 
 /// Returns the scheduler's current runtime state (enabled flag, last tick, …).
@@ -698,6 +736,9 @@ fn submit_inference_result(args: SubmitInferenceResultArgs) -> Result<String, St
                 current_time_ns(),
                 agent_turn_priority,
             );
+            if enqueued.is_some() {
+                schedule_immediate_scheduler_tick("inference_proxy_callback_resume");
+            }
             log!(
                 InferenceProxyCallbackLogPriority::Info,
                 "inference_proxy_callback_accepted caller={} job_id={} turn_id={} resume_job_enqueued={} resume_job_id={}",
@@ -719,6 +760,46 @@ fn submit_inference_result(args: SubmitInferenceResultArgs) -> Result<String, St
             );
             Ok("inference_proxy_callback_duplicate".to_string())
         }
+    }
+}
+
+fn schedule_immediate_scheduler_tick(reason: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let should_spawn = SCHEDULER_WAKE_IN_FLIGHT.with(|slot| {
+            let mut in_flight = slot.borrow_mut();
+            if *in_flight {
+                false
+            } else {
+                *in_flight = true;
+                true
+            }
+        });
+        if !should_spawn {
+            log!(
+                InferenceProxyCallbackLogPriority::Info,
+                "scheduler_immediate_wake_skipped reason={} wake_already_in_flight=true",
+                reason,
+            );
+            return;
+        }
+        let reason_owned = reason.to_string();
+        ic_cdk::spawn(async move {
+            scheduler_tick().await;
+            SCHEDULER_WAKE_IN_FLIGHT.with(|slot| {
+                *slot.borrow_mut() = false;
+            });
+            log!(
+                InferenceProxyCallbackLogPriority::Info,
+                "scheduler_immediate_wake_completed reason={}",
+                reason_owned,
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = reason;
     }
 }
 

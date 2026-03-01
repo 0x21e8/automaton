@@ -9,20 +9,21 @@ use super::sqlite::SurvivalOperationRuntimeRecord;
 /// Public function signatures are intentionally identical to the original so
 /// that callers require no changes.
 use crate::domain::types::{
-    AbiArtifact, AbiArtifactKey, AgentEvent, AgentState, ConversationEntry, ConversationLog,
-    ConversationSummary, CycleTelemetry, EvmPollCursor, EvmRouteStateView, InboxMessage,
-    InboxMessageStatus, InboxStats, InferenceConfigView, InferenceProvider,
-    InferenceProxyCallbackApply, InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus,
-    MemoryFact, MemoryRollup, ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OutboxMessage,
-    OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, RetentionConfig,
-    RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease,
-    SchedulerRuntime, SessionSummary, SkillRecord, StorageGrowthMetrics, StoragePressureLevel,
-    StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats,
-    StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass,
-    SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
-    TemplateActivationState, TemplateRevocationState, TemplateVersion, ToolCallRecord,
-    TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
-    WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    AbiArtifact, AbiArtifactKey, AgentEvent, AgentState, AutonomySuppressionConfig,
+    ConversationEntry, ConversationLog, ConversationSummary, CycleTelemetry, EvmPollCursor,
+    EvmRouteStateView, InboxMessage, InboxMessageStatus, InboxStats, InferenceConfigView,
+    InferenceProvider, InferenceProxyCallbackApply, InferenceProxyCallbackRecord,
+    InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup, ObservabilitySnapshot,
+    OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats, PendingInferenceProxyJob, PromptLayer,
+    PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView,
+    ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord,
+    StorageGrowthMetrics, StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent,
+    StrategyOutcomeKind, StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey,
+    SubmitInferenceResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+    TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState,
+    TemplateVersion, ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary,
+    WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
+    WalletBalanceTelemetryView,
 };
 pub use crate::domain::types::{
     AutonomyToolFailureCooldown, MemoryFactSort, MemoryFactStats, RetentionPruneStats,
@@ -179,6 +180,13 @@ const MAX_WALLET_BALANCE_FRESHNESS_WINDOW_SECS: u64 = 24 * 60 * 60;
 const MIN_WALLET_BALANCE_SYNC_RESPONSE_BYTES: u64 = 256;
 #[allow(dead_code)]
 const MAX_WALLET_BALANCE_SYNC_RESPONSE_BYTES: u64 = 4 * 1024;
+const MAX_AUTONOMY_DEDUPE_WINDOW_SECS: u64 = 24 * 60 * 60;
+const MIN_AUTONOMY_FAILURE_REPEAT_WINDOW_SECS: u64 = 1;
+const MAX_AUTONOMY_FAILURE_REPEAT_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+const MIN_AUTONOMY_FAILURE_REPEAT_THRESHOLD: u32 = 1;
+const MAX_AUTONOMY_FAILURE_REPEAT_THRESHOLD: u32 = 100;
+const MIN_AUTONOMY_FAILURE_COOLDOWN_SECS: u64 = 1;
+const MAX_AUTONOMY_FAILURE_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum SchedulerStorageLogPriority {
@@ -1306,6 +1314,30 @@ pub fn set_loop_enabled(enabled: bool) {
     let mut snapshot = runtime_snapshot();
     snapshot.loop_enabled = enabled;
     save_runtime_snapshot(&snapshot);
+}
+
+pub fn autonomy_suppression_config() -> AutonomySuppressionConfig {
+    runtime_snapshot().autonomy_suppression
+}
+
+pub fn set_autonomy_tool_dedupe_enabled(enabled: bool) -> AutonomySuppressionConfig {
+    let mut snapshot = runtime_snapshot();
+    snapshot.autonomy_suppression.tool_dedupe_enabled = enabled;
+    snapshot.last_transition_at_ns = now_ns();
+    let updated = snapshot.autonomy_suppression.clone();
+    save_runtime_snapshot(&snapshot);
+    updated
+}
+
+pub fn set_autonomy_suppression_config(
+    config: AutonomySuppressionConfig,
+) -> Result<AutonomySuppressionConfig, String> {
+    validate_autonomy_suppression_config(&config)?;
+    let mut snapshot = runtime_snapshot();
+    snapshot.autonomy_suppression = config.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(config)
 }
 
 #[allow(dead_code)]
@@ -2615,6 +2647,9 @@ pub fn record_autonomy_tool_failure(
     fingerprint: &str,
     normalized_error: &str,
     failed_at_ns: u64,
+    repeat_window_secs: u64,
+    repeat_threshold: u32,
+    cooldown_secs: u64,
 ) -> Option<AutonomyToolFailureCooldown> {
     let trimmed_error = normalized_error.trim();
     if trimmed_error.is_empty() {
@@ -2626,8 +2661,8 @@ pub fn record_autonomy_tool_failure(
         sqlite::get_autonomy_tool_failure(&key).ok().flatten();
 
     let mut tracker = existing.unwrap_or_default();
-    let within_window = failed_at_ns.saturating_sub(tracker.last_failed_at_ns)
-        <= timing::AUTONOMY_FAILURE_REPEAT_WINDOW_NS;
+    let repeat_window_ns = repeat_window_secs.saturating_mul(1_000_000_000);
+    let within_window = failed_at_ns.saturating_sub(tracker.last_failed_at_ns) <= repeat_window_ns;
     if tracker.normalized_error == trimmed_error && within_window {
         tracker.repeat_count = tracker.repeat_count.saturating_add(1);
     } else {
@@ -2637,9 +2672,9 @@ pub fn record_autonomy_tool_failure(
 
     tracker.normalized_error = trimmed_error.to_string();
     tracker.last_failed_at_ns = failed_at_ns;
-    if tracker.repeat_count >= timing::AUTONOMY_FAILURE_REPEAT_THRESHOLD {
-        tracker.cooldown_until_ns =
-            Some(failed_at_ns.saturating_add(timing::AUTONOMY_FAILURE_COOLDOWN_NS));
+    if tracker.repeat_count >= repeat_threshold {
+        let cooldown_ns = cooldown_secs.saturating_mul(1_000_000_000);
+        tracker.cooldown_until_ns = Some(failed_at_ns.saturating_add(cooldown_ns));
     } else {
         tracker.cooldown_until_ns = None;
     }
@@ -2950,6 +2985,14 @@ pub fn has_pending_inference_proxy_jobs() -> bool {
     pending_inference_proxy_jobs_count() > 0
 }
 
+pub fn inference_proxy_callback_results_count() -> usize {
+    load_inference_proxy_callback_results().len()
+}
+
+pub fn has_buffered_inference_proxy_callback_results() -> bool {
+    inference_proxy_callback_results_count() > 0
+}
+
 pub fn pop_next_inference_proxy_callback_result() -> Option<InferenceProxyCallbackRecord> {
     let mut callback_results = load_inference_proxy_callback_results();
     let next_job_id = callback_results
@@ -3150,6 +3193,36 @@ fn validate_wallet_balance_sync_config(config: &WalletBalanceSyncConfig) -> Resu
     {
         return Err(format!(
             "wallet balance sync max_response_bytes must be in {MIN_WALLET_BALANCE_SYNC_RESPONSE_BYTES}..={MAX_WALLET_BALANCE_SYNC_RESPONSE_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_autonomy_suppression_config(config: &AutonomySuppressionConfig) -> Result<(), String> {
+    if config.dedupe_window_secs > MAX_AUTONOMY_DEDUPE_WINDOW_SECS {
+        return Err(format!(
+            "autonomy suppression dedupe_window_secs must be in 0..={MAX_AUTONOMY_DEDUPE_WINDOW_SECS}"
+        ));
+    }
+    if config.failure_repeat_window_secs < MIN_AUTONOMY_FAILURE_REPEAT_WINDOW_SECS
+        || config.failure_repeat_window_secs > MAX_AUTONOMY_FAILURE_REPEAT_WINDOW_SECS
+    {
+        return Err(format!(
+            "autonomy suppression failure_repeat_window_secs must be in {MIN_AUTONOMY_FAILURE_REPEAT_WINDOW_SECS}..={MAX_AUTONOMY_FAILURE_REPEAT_WINDOW_SECS}"
+        ));
+    }
+    if config.failure_repeat_threshold < MIN_AUTONOMY_FAILURE_REPEAT_THRESHOLD
+        || config.failure_repeat_threshold > MAX_AUTONOMY_FAILURE_REPEAT_THRESHOLD
+    {
+        return Err(format!(
+            "autonomy suppression failure_repeat_threshold must be in {MIN_AUTONOMY_FAILURE_REPEAT_THRESHOLD}..={MAX_AUTONOMY_FAILURE_REPEAT_THRESHOLD}"
+        ));
+    }
+    if config.failure_cooldown_secs < MIN_AUTONOMY_FAILURE_COOLDOWN_SECS
+        || config.failure_cooldown_secs > MAX_AUTONOMY_FAILURE_COOLDOWN_SECS
+    {
+        return Err(format!(
+            "autonomy suppression failure_cooldown_secs must be in {MIN_AUTONOMY_FAILURE_COOLDOWN_SECS}..={MAX_AUTONOMY_FAILURE_COOLDOWN_SECS}"
         ));
     }
     Ok(())

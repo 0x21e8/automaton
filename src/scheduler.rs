@@ -25,7 +25,7 @@
 /// Failed jobs are passed through the recovery policy, which may retry
 /// immediately, apply exponential backoff, tune response-byte limits, or
 /// escalate to a fault.
-use crate::agent::run_scheduled_turn_job;
+use crate::agent::{run_scheduled_turn_job_with_trigger, ScheduledTurnTrigger};
 use crate::domain::cycle_admission::{
     affordability_requirements, can_afford_with_reserve, estimate_operation_cost,
     AffordabilityRequirements, OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES,
@@ -296,7 +296,15 @@ async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
 async fn dispatch_job(job: &ScheduledJob) -> Result<JobDispatchOutcome, String> {
     match job.kind {
         TaskKind::AgentTurn => {
-            run_scheduled_turn_job().await?;
+            let trigger = if job
+                .dedupe_key
+                .starts_with("AgentTurn:inference-proxy-resume:")
+            {
+                ScheduledTurnTrigger::InferenceProxyResume
+            } else {
+                ScheduledTurnTrigger::Periodic
+            };
+            run_scheduled_turn_job_with_trigger(trigger).await?;
             Ok(JobDispatchOutcome::Completed)
         }
         TaskKind::PollInbox => {
