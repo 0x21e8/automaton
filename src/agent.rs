@@ -39,7 +39,7 @@ use crate::features::{
 use crate::sanitize::{
     extract_framed_untrusted_payload, frame_untrusted_content, ToolSequenceValidator,
 };
-use crate::storage::stable;
+use crate::storage::{sqlite, stable};
 use crate::tools::{SignerPort, ToolManager};
 use alloy_primitives::U256;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -717,7 +717,11 @@ fn build_conversation_context(staged_messages: &[InboxMessage], per_sender_limit
     let mut lines = vec!["### Conversation History".to_string()];
     let mut any_entries = false;
     for sender in senders {
-        let Some(log) = stable::get_conversation_log(sender) else {
+        let Some(log) = sqlite::get_conversation_log(sender)
+            .ok()
+            .flatten()
+            .or_else(|| stable::get_conversation_log(sender))
+        else {
             continue;
         };
         let recent = log
@@ -758,14 +762,14 @@ fn build_conversation_context(staged_messages: &[InboxMessage], per_sender_limit
 /// with how many times it has already been called in the current turn.
 fn build_available_tools_section(turn_id: &str) -> String {
     let manager = ToolManager::new();
-    let usage = stable::get_tools_for_turn(turn_id).into_iter().fold(
-        std::collections::BTreeMap::new(),
-        |mut acc, call| {
+    let usage = sqlite::get_tools_for_turn(turn_id)
+        .unwrap_or_else(|_| stable::get_tools_for_turn(turn_id))
+        .into_iter()
+        .fold(std::collections::BTreeMap::new(), |mut acc, call| {
             let entry = acc.entry(call.tool).or_insert(0usize);
             *entry = entry.saturating_add(1);
             acc
-        },
-    );
+        });
 
     let mut lines = vec!["### Available Tools".to_string()];
     for (name, policy) in manager.list_tools() {
@@ -873,9 +877,7 @@ fn build_dynamic_context(
         "- cycles_runway_hours: unknown".to_string(),
         format!(
             "- self_canister_id: {}",
-            current_canister_id_text()
-                .as_deref()
-                .unwrap_or("unknown")
+            current_canister_id_text().as_deref().unwrap_or("unknown")
         ),
         format!("- survival_tier: {survival_tier}"),
         format!("- survival_tier_recovery_checks: {recovery_checks}"),

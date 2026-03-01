@@ -40,6 +40,12 @@ type AgentState = variant {
   Sleeping;
   Persisting;
 };
+type CanisterCallPermission = record {
+  method : text;
+  canister_id : text;
+  call_type : CanisterCallType;
+};
+type CanisterCallType = variant { Update; Query };
 type ContinuationStopReason = variant {
   None;
   MaxDuration;
@@ -240,6 +246,7 @@ type PromptLayerView = record {
 type Result = variant { Ok : TemplateActivationState; Err : text };
 type Result_1 = variant { Ok : StrategyTemplate; Err : text };
 type Result_10 = variant { Ok : PromptLayer; Err : text };
+type Result_11 = variant { Ok; Err : text };
 type Result_2 = variant { Ok : text; Err : text };
 type Result_3 = variant { Ok : AbiArtifact; Err : text };
 type Result_4 = variant { Ok : vec text; Err : text };
@@ -353,12 +360,6 @@ type SessionSummary = record {
   generated_at_ns : nat64;
   window_start_ns : nat64;
   inbox_preview : text;
-};
-type CanisterCallType = variant { Query; Update };
-type CanisterCallPermission = record {
-  canister_id : text;
-  method : text;
-  call_type : CanisterCallType;
 };
 type SkillRecord = record {
   name : text;
@@ -669,8 +670,6 @@ service : (InitArgs) -> {
   list_session_summaries : (nat32) -> (vec SessionSummary) query;
   // Returns all registered skill records.
   list_skills : () -> (vec SkillRecord) query;
-  // Inserts or updates a skill record.  Callable by controllers only.
-  upsert_skill : (SkillRecord) -> (variant { Ok; Err : text });
   // Lists strategy templates.  When `key` is supplied only templates matching
   // that key are returned; otherwise all templates are returned (up to `limit`).
   list_strategy_templates : (opt StrategyTemplateKey, nat32) -> (
@@ -756,4 +755,9 @@ service : (InitArgs) -> {
   update_prompt_layer_admin : (nat8, text) -> (Result_10);
   // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
   update_soul : (text) -> (Result_2);
+  // Inserts or updates a skill record.
+  // 
+  // Only callable by a canister controller.  This is the runtime management
+  // endpoint for adding new inter-canister call skills or modifying existing ones.
+  upsert_skill : (SkillRecord) -> (Result_11);
 }

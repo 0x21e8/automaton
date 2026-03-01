@@ -1,4 +1,4 @@
-use crate::storage::stable;
+use crate::storage::{sqlite, stable};
 
 pub const IMMUTABLE_LAYER_MIN_ID: u8 = 0;
 pub const IMMUTABLE_LAYER_MAX_ID: u8 = 5;
@@ -191,7 +191,8 @@ fn render_layer_3_identity() -> String {
 
 fn render_layer_5_operations() -> String {
     let mut section = LAYER_5_OPERATIONS.to_string();
-    let active_skills = stable::list_skills()
+    let active_skills = sqlite::list_skills()
+        .unwrap_or_else(|_| stable::list_skills())
         .into_iter()
         .filter(|skill| skill.enabled)
         .collect::<Vec<_>>();

@@ -30,7 +30,7 @@ use crate::features::evm::{evm_read_tool, send_eth_tool};
 use crate::features::http_fetch::http_fetch_tool;
 use crate::prompt;
 use crate::sanitize::contains_forbidden_prompt_layer_phrase;
-use crate::storage::stable;
+use crate::storage::{sqlite, stable};
 use crate::strategy::{compiler, learner, registry, validator};
 use crate::timing::current_time_ns;
 use alloy_primitives::U256;
@@ -50,6 +50,8 @@ const MAX_MEMORY_VALUE_BYTES: usize = 4096;
 const MAX_MEMORY_RECALL_RESULTS: usize = 50;
 /// Maximum number of strategy templates returned by `list_strategy_templates`.
 const MAX_STRATEGY_TEMPLATE_RESULTS: usize = 50;
+/// Maximum number of rows returned by the `sql_query` tool.
+const MAX_SQL_QUERY_ROWS: usize = 100;
 /// Maximum character count for content written via `update_prompt_layer`.
 pub const MAX_PROMPT_LAYER_CONTENT_CHARS: usize = 4_000;
 
@@ -128,6 +130,7 @@ fn is_parallel_read_only_tool(tool: &str) -> bool {
         "record_signal"
             | "recall"
             | "memory_stats"
+            | "sql_query"
             | "list_strategy_templates"
             | "get_strategy_outcomes"
             | "evm_read"
@@ -318,6 +321,13 @@ impl ToolManager {
         );
         policies.insert(
             "memory_stats".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+            },
+        );
+        policies.insert(
+            "sql_query".to_string(),
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
@@ -641,6 +651,7 @@ impl ToolManager {
             "remember" => remember_fact_tool(&call.args_json, turn_id),
             "recall" => recall_facts_tool(&call.args_json),
             "memory_stats" => memory_stats_tool(),
+            "sql_query" => sql_query_tool(&call.args_json),
             "forget" => forget_fact_tool(&call.args_json),
             "http_fetch" => http_fetch_tool(&call.args_json).await,
             "top_up_status" => Ok(top_up_status_tool()),
@@ -861,7 +872,10 @@ fn set_welcome_message_tool(args_json: &str) -> Result<String, String> {
     if stored.is_empty() {
         Ok("welcome message cleared (default restored)".to_string())
     } else {
-        Ok(format!("welcome message updated ({} chars)", stored.chars().count()))
+        Ok(format!(
+            "welcome message updated ({} chars)",
+            stored.chars().count()
+        ))
     }
 }
 
@@ -1050,6 +1064,13 @@ struct RecallArgs {
     count_only: bool,
 }
 
+#[derive(Deserialize)]
+struct SqlQueryArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 /// Parse args for the `recall` tool.
 fn parse_recall_args(args_json: &str) -> Result<RecallArgs, String> {
     let mut args: RecallArgs = serde_json::from_str(args_json)
@@ -1068,6 +1089,15 @@ fn parse_forget_args(args_json: &str) -> Result<String, String> {
         .and_then(|entry| entry.as_str())
         .ok_or_else(|| "missing required field: key".to_string())?;
     normalize_memory_key(key_raw)
+}
+
+fn parse_sql_query_args(args_json: &str) -> Result<SqlQueryArgs, String> {
+    let args: SqlQueryArgs = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid sql_query args json: {error}"))?;
+    if args.query.trim().is_empty() {
+        return Err("missing required field: query".to_string());
+    }
+    Ok(args)
 }
 
 /// Extract `layer_id` (u8) and `content` from `update_prompt_layer` args.
@@ -1406,6 +1436,30 @@ fn memory_stats_tool() -> Result<String, String> {
         "storage_bytes": stats.storage_bytes
     }))
     .map_err(|error| format!("failed to serialize memory stats: {error}"))
+}
+
+/// Executes a strictly read-only SQL query over the historical SQLite store.
+///
+/// Guardrails are enforced in the storage adapter:
+/// - SELECT only
+/// - single statement
+/// - enforced row limit
+/// - instruction-budget abort on wasm
+fn sql_query_tool(args_json: &str) -> Result<String, String> {
+    let args = parse_sql_query_args(args_json)?;
+    let limit = args
+        .limit
+        .unwrap_or(MAX_SQL_QUERY_ROWS)
+        .clamp(1, MAX_SQL_QUERY_ROWS);
+    let query = args.query.trim().to_string();
+    let output = sqlite::sql_query_read_only(&query, limit)?;
+    log!(
+        StrategyToolLogPriority::Info,
+        "sql_query_executed limit={} query={}",
+        limit,
+        query
+    );
+    Ok(output)
 }
 
 /// Remove a named fact from stable memory; succeeds even if the key is absent.
@@ -2784,5 +2838,80 @@ mod tests {
         assert!(!records[0].success);
         assert_eq!(records[0].output, "tool blocked by policy");
         assert_eq!(records[0].error.as_deref(), Some("tool blocked"));
+    }
+
+    #[test]
+    fn sql_query_tool_returns_json_rows_for_select() {
+        stable::init_storage();
+        crate::storage::sqlite::upsert_turn(&crate::domain::types::TurnRecord {
+            id: "turn-sql-1".to_string(),
+            created_at_ns: 100,
+            finished_at_ns: Some(101),
+            duration_ms: Some(1),
+            state_from: AgentState::Idle,
+            state_to: AgentState::Persisting,
+            source_events: 1,
+            tool_call_count: 0,
+            input_summary: "sql".to_string(),
+            inner_dialogue: None,
+            inference_round_count: 1,
+            continuation_stop_reason: crate::domain::types::ContinuationStopReason::None,
+            error: None,
+        })
+        .expect("seed turn");
+
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "sql_query".to_string(),
+            args_json: serde_json::json!({
+                "query": "SELECT id FROM turns ORDER BY created_at_ns DESC",
+                "limit": 1
+            })
+            .to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-sql"));
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].success,
+            "sql query should succeed: {:?}",
+            records[0]
+        );
+        assert!(records[0].output.contains("turn-sql-1"));
+    }
+
+    #[test]
+    fn sql_query_tool_rejects_mutating_statement() {
+        stable::init_storage();
+
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "sql_query".to_string(),
+            args_json: serde_json::json!({
+                "query": "UPDATE turns SET id = 'x'"
+            })
+            .to_string(),
+        }];
+
+        let records = block_on_with_spin(manager.execute_actions(
+            &state,
+            &calls,
+            &signer,
+            "turn-sql-blocked",
+        ));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert!(records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("only SELECT"));
     }
 }

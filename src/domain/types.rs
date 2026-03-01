@@ -1460,6 +1460,20 @@ pub enum TaskKind {
     Reconcile,
 }
 
+impl std::str::FromStr for TaskKind {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "AgentTurn" => Ok(Self::AgentTurn),
+            "PollInbox" => Ok(Self::PollInbox),
+            "CheckCycles" => Ok(Self::CheckCycles),
+            "TopUpCycles" => Ok(Self::TopUpCycles),
+            "Reconcile" => Ok(Self::Reconcile),
+            _ => Err(()),
+        }
+    }
+}
+
 impl TaskKind {
     pub const fn as_str(&self) -> &'static str {
         match self {
@@ -1546,6 +1560,18 @@ pub enum SurvivalOperationClass {
     EvmBroadcast,
     ThresholdSign,
     InterCanisterCall,
+}
+
+impl SurvivalOperationClass {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Inference => "inference",
+            Self::EvmPoll => "evm_poll",
+            Self::EvmBroadcast => "evm_broadcast",
+            Self::ThresholdSign => "threshold_sign",
+            Self::InterCanisterCall => "inter_canister_call",
+        }
+    }
 }
 
 /// The class of operation that experienced a recoverable failure.
@@ -2260,4 +2286,52 @@ mod tests {
             serde_json::from_slice(&encoded_rollup).expect("memory rollup should decode");
         assert_eq!(decoded_rollup, rollup);
     }
+}
+
+// ── Storage-layer types ──────────────────────────────────────────────────────
+
+/// Statistics returned by a single retention maintenance pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionPruneStats {
+    pub deleted_jobs: u32,
+    pub deleted_dedupe: u32,
+    pub deleted_inbox: u32,
+    pub deleted_outbox: u32,
+    pub deleted_turns: u32,
+    pub deleted_transitions: u32,
+    pub deleted_tools: u32,
+    pub generated_session_summaries: u32,
+    pub generated_turn_window_summaries: u32,
+    pub generated_memory_rollups: u32,
+    pub deleted_memory_facts: u32,
+}
+
+/// Active cooldown state for a tool fingerprint that has repeatedly failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutonomyToolFailureCooldown {
+    pub normalized_error: String,
+    pub repeat_count: u32,
+    pub cooldown_until_ns: u64,
+}
+
+/// Sort order for memory-fact listing queries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryFactSort {
+    UpdatedAtDesc,
+    KeyAsc,
+}
+
+/// Aggregate statistics about the memory-fact store.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemoryFactStats {
+    pub total_facts: usize,
+    pub storage_bytes: usize,
+    pub config_facts: usize,
+}
+
+/// Distinguishes which outcall telemetry bucket should be updated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeOutcallKind {
+    Inference,
+    HttpFetch,
 }

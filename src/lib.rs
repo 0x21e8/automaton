@@ -430,7 +430,8 @@ fn get_retention_maintenance_runtime() -> RetentionMaintenanceRuntime {
 /// Returns up to `limit` most-recently enqueued scheduler job records.
 #[ic_cdk::query]
 fn list_scheduler_jobs(limit: u32) -> Vec<ScheduledJob> {
-    stable::list_recent_jobs(limit as usize)
+    sqlite::list_recent_jobs(limit as usize)
+        .unwrap_or_else(|_| stable::list_recent_jobs(limit as usize))
 }
 
 /// Returns the configured schedule and live runtime state for every task kind.
@@ -449,7 +450,8 @@ fn get_observability_snapshot(limit: u32) -> ObservabilitySnapshot {
 /// Returns up to `limit` inbox messages ordered by arrival time (newest last).
 #[ic_cdk::query]
 fn list_inbox_messages(limit: u32) -> Vec<InboxMessage> {
-    stable::list_inbox_messages(limit as usize)
+    sqlite::list_inbox_messages(limit as usize)
+        .unwrap_or_else(|_| stable::list_inbox_messages(limit as usize))
 }
 
 /// Returns all prompt layers ordered by layer ID.
@@ -541,7 +543,7 @@ fn prune_memory_facts_admin(
 /// if no conversation exists.
 #[ic_cdk::query]
 fn get_conversation(sender: String) -> Option<ConversationLog> {
-    stable::get_conversation_log(&sender)
+    sqlite::get_conversation_log(&sender).unwrap_or_else(|_| stable::get_conversation_log(&sender))
 }
 
 /// Returns aggregate inbox statistics (total messages, pending count, …).
@@ -553,7 +555,8 @@ fn get_inbox_stats() -> InboxStats {
 /// Returns up to `limit` most-recent outbox messages (agent replies queued for delivery).
 #[ic_cdk::query]
 fn list_outbox_messages(limit: u32) -> Vec<OutboxMessage> {
-    stable::list_outbox_messages(limit as usize)
+    sqlite::list_outbox_messages(limit as usize)
+        .unwrap_or_else(|_| stable::list_outbox_messages(limit as usize))
 }
 
 /// Returns aggregate outbox statistics (total messages, delivered count, …).
@@ -637,7 +640,8 @@ fn update_soul(new_soul: String) -> Result<String, String> {
 /// Returns up to `limit` recent state-transition event records as debug strings.
 #[ic_cdk::query]
 fn list_recent_events(limit: u32) -> Vec<String> {
-    stable::list_recent_transitions(limit as usize)
+    sqlite::list_recent_transitions(limit as usize)
+        .unwrap_or_else(|_| stable::list_recent_transitions(limit as usize))
         .into_iter()
         .map(|record| format!("{record:?}"))
         .collect()
@@ -646,7 +650,8 @@ fn list_recent_events(limit: u32) -> Vec<String> {
 /// Returns up to `limit` recent agent turn records as debug strings.
 #[ic_cdk::query]
 fn list_turns(limit: u32) -> Vec<String> {
-    stable::list_turns(limit as usize)
+    sqlite::list_turns(limit as usize)
+        .unwrap_or_else(|_| stable::list_turns(limit as usize))
         .into_iter()
         .map(|turn| format!("{turn:?}"))
         .collect()
@@ -655,7 +660,7 @@ fn list_turns(limit: u32) -> Vec<String> {
 /// Returns all registered skill records.
 #[ic_cdk::query]
 fn list_skills() -> Vec<SkillRecord> {
-    stable::list_skills()
+    sqlite::list_skills().unwrap_or_else(|_| stable::list_skills())
 }
 
 /// Inserts or updates a skill record.
@@ -684,7 +689,7 @@ fn list_tool_policies() -> Vec<String> {
 /// Returns all tool call records associated with the given turn ID.
 #[ic_cdk::query]
 fn get_tool_calls_for_turn(turn_id: String) -> Vec<ToolCallRecord> {
-    stable::get_tools_for_turn(&turn_id)
+    sqlite::get_tools_for_turn(&turn_id).unwrap_or_else(|_| stable::get_tools_for_turn(&turn_id))
 }
 
 // ── Strategy management ──────────────────────────────────────────────────────

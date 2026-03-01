@@ -18,7 +18,6 @@ futures = "0.3"
 ic-http-certification = "3.1.0"
 ic-cdk = "0.19"
 ic-cdk-timers = "1.0"
-ic-stable-structures = "0.7"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 json5 = "0.4"
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa"] }
@@ -27,6 +26,9 @@ serde_json = "1"
 regex = "1"
 sha2 = { version = "0.10", default-features = false }
 sha3 = { version = "0.10", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ic-rusqlite = { git = "https://github.com/0x21e8/ic-rusqlite", rev = "535546ebdf3a860ded4f9d95f5d1091fc819c314", default-features = false, features = ["precompiled"] }
 
 [features]
 default = []
@@ -38,4 +40,5 @@ canbench-rs = ["dep:canbench-rs"]
 pocket-ic = { version = "9.0.2" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
 ureq = "2.12.1"
