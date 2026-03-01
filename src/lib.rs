@@ -53,6 +53,7 @@ use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use ic_cdk_timers::{clear_timer, set_timer_interval_serial, TimerId};
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
 use serde::Deserialize;
+use sha3::{Digest, Keccak256};
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 
@@ -150,11 +151,32 @@ enum MemoryFactListSort {
     KeyAsc,
 }
 
+/// Minimal steward command surface used by `steward_execute`.
+/// Additional runtime command variants are added in later phases.
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+enum StewardCommand {
+    /// Executes no runtime mutation beyond auth bookkeeping (nonce + last-used).
+    Noop,
+}
+
 fn memory_fact_sort_to_storage(sort: MemoryFactListSort) -> stable::MemoryFactSort {
     match sort {
         MemoryFactListSort::UpdatedAtDesc => stable::MemoryFactSort::UpdatedAtDesc,
         MemoryFactListSort::KeyAsc => stable::MemoryFactSort::KeyAsc,
     }
+}
+
+fn steward_command_label(command: &StewardCommand) -> &'static str {
+    match command {
+        StewardCommand::Noop => "noop",
+    }
+}
+
+fn steward_command_hash(command: &StewardCommand) -> Result<String, String> {
+    let encoded = candid::encode_one(command)
+        .map_err(|error| format!("failed to encode steward command: {error}"))?;
+    let digest = Keccak256::digest(&encoded);
+    Ok(format!("0x{}", hex::encode(digest)))
 }
 
 /// Returns `Err` when the caller is not a canister controller (wasm32 only;
@@ -247,6 +269,37 @@ fn verify_steward_proof_for_command_hash(
             Err(error)
         }
     }
+}
+
+fn consume_steward_nonce_and_record_usage(
+    verified: &crate::features::evm::VerifiedEvmStewardProof,
+) -> Result<(), String> {
+    let mut snapshot = stable::runtime_snapshot();
+    let expected_nonce = snapshot.steward_nonce.next_nonce;
+    if expected_nonce != verified.nonce {
+        return Err(format!(
+            "proof nonce mismatch: expected={} got={}",
+            expected_nonce, verified.nonce
+        ));
+    }
+
+    snapshot.steward_nonce.next_nonce = expected_nonce
+        .checked_add(1)
+        .ok_or_else(|| "steward nonce overflow".to_string())?;
+    let active_steward = snapshot
+        .active_steward
+        .as_mut()
+        .ok_or_else(|| "no active steward configured".to_string())?;
+
+    if !active_steward.enabled {
+        return Err("active steward is disabled".to_string());
+    }
+    if active_steward.chain_id != verified.chain_id || active_steward.address != verified.address {
+        return Err("active steward changed before proof consumption".to_string());
+    }
+    active_steward.last_used_at_ns = Some(current_time_ns());
+    stable::save_runtime_snapshot(&snapshot);
+    Ok(())
 }
 
 /// Looks up a strategy template by key and version, returning a descriptive
@@ -527,6 +580,40 @@ fn set_steward_admin(
         stored
     );
     Ok(stored)
+}
+
+/// Executes a signed steward command after EVM-proof verification.
+#[ic_cdk::update]
+fn steward_execute(command: StewardCommand, proof: EvmStewardProof) -> Result<String, String> {
+    let command_label = steward_command_label(&command);
+    let command_hash = steward_command_hash(&command)?;
+    let verified = verify_steward_proof_for_command_hash(&command_hash, &proof)?;
+    consume_steward_nonce_and_record_usage(&verified).map_err(|error| {
+        log!(
+            StewardAuthLogPriority::AuthWarn,
+            "steward_execute_rejected command={} chain_id={} address={} nonce={} reason={}",
+            command_label,
+            verified.chain_id,
+            verified.address,
+            verified.nonce,
+            error,
+        );
+        error
+    })?;
+
+    let result = match command {
+        StewardCommand::Noop => "steward_noop_executed".to_string(),
+    };
+    log!(
+        StewardAuthLogPriority::AuthInfo,
+        "steward_execute_applied command={} chain_id={} address={} nonce={} result={}",
+        command_label,
+        verified.chain_id,
+        verified.address,
+        verified.nonce,
+        result,
+    );
+    Ok(result)
 }
 
 /// Updates the EVM chain ID used for all on-chain operations (controller only).
@@ -1214,9 +1301,92 @@ mod tests {
     use crate::domain::types::{
         AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, InferenceProxyResultPayload,
         MemoryFact, OpenRouterProxyWorkerConfig, PendingInferenceProxyJob, SkillRecord,
-        StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, TemplateStatus,
-        TemplateVersion,
+        StewardNonceState, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
+        TemplateStatus, TemplateVersion,
     };
+    use sha3::{Digest, Keccak256};
+
+    fn signing_key_from_hex(hex_key: &str) -> k256::ecdsa::SigningKey {
+        let mut secret_key = [0u8; 32];
+        hex::decode_to_slice(hex_key, &mut secret_key).expect("hex private key should decode");
+        k256::ecdsa::SigningKey::from_bytes((&secret_key).into())
+            .expect("test private key should parse")
+    }
+
+    fn steward_test_signing_key() -> k256::ecdsa::SigningKey {
+        signing_key_from_hex("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+    }
+
+    fn steward_address_from_key(signing_key: &k256::ecdsa::SigningKey) -> String {
+        let uncompressed = signing_key.verifying_key().to_encoded_point(false);
+        let digest = Keccak256::digest(&uncompressed.as_bytes()[1..]);
+        format!("0x{}", hex::encode(&digest[12..32]))
+    }
+
+    fn canonical_steward_signing_payload(
+        canister_id: &str,
+        chain_id: u64,
+        address: &str,
+        command_hash: &str,
+        nonce: u64,
+        expires_at_ns: u64,
+    ) -> String {
+        format!(
+            "ic-automaton:steward-execute:v1\ncanister_id:{canister_id}\nchain_id:{chain_id}\naddress:{address}\ncommand_hash:{command_hash}\nnonce:{nonce}\nexpires_at_ns:{expires_at_ns}"
+        )
+    }
+
+    fn ethereum_personal_message_hash(message: &str) -> [u8; 32] {
+        let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+        let mut hasher = Keccak256::new();
+        hasher.update(prefix.as_bytes());
+        hasher.update(message.as_bytes());
+        let digest = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+
+    fn sign_steward_payload(payload: &str, signing_key: &k256::ecdsa::SigningKey) -> String {
+        let prehash = ethereum_personal_message_hash(payload);
+        let (signature, recovery_id) = signing_key
+            .sign_prehash_recoverable(&prehash)
+            .expect("test payload should sign");
+
+        let mut bytes = [0u8; 65];
+        bytes[..64].copy_from_slice(signature.to_bytes().as_slice());
+        bytes[64] = recovery_id.to_byte() + 27;
+        format!("0x{}", hex::encode(bytes))
+    }
+
+    fn build_steward_proof(
+        command: &StewardCommand,
+        signing_key: &k256::ecdsa::SigningKey,
+        nonce: u64,
+        expires_at_ns: u64,
+    ) -> EvmStewardProof {
+        let canister_id = steward_proof_expected_canister_id();
+        let chain_id = 8453;
+        let normalized_address = steward_address_from_key(signing_key);
+        let command_hash = steward_command_hash(command).expect("command hash should encode");
+        let payload = canonical_steward_signing_payload(
+            &canister_id,
+            chain_id,
+            &normalized_address,
+            &command_hash,
+            nonce,
+            expires_at_ns,
+        );
+        EvmStewardProof {
+            canister_id,
+            chain_id,
+            address: normalized_address.to_ascii_uppercase(),
+            command_hash,
+            nonce,
+            expires_at_ns,
+            signature: sign_steward_payload(&payload, signing_key),
+        }
+    }
 
     #[test]
     fn get_automaton_evm_address_query_returns_stored_value() {
@@ -1351,6 +1521,49 @@ mod tests {
         let invalid_address = set_steward_admin(8453, "not-an-address".to_string(), true)
             .expect_err("invalid address must fail");
         assert!(invalid_address.contains("steward address"));
+    }
+
+    #[test]
+    fn steward_execute_accepts_valid_proof_and_advances_nonce() {
+        stable::init_storage();
+        let key = steward_test_signing_key();
+        let address = steward_address_from_key(&key);
+        let stored =
+            set_steward_admin(8453, address.clone(), true).expect("active steward should store");
+        assert_eq!(stored.address, address);
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 7 });
+
+        let command = StewardCommand::Noop;
+        let proof = build_steward_proof(&command, &key, 7, current_time_ns() + 60_000_000_000);
+
+        let result = steward_execute(command, proof).expect("proof should execute");
+        assert_eq!(result, "steward_noop_executed");
+
+        let status = get_steward_status();
+        assert_eq!(status.next_nonce, 8);
+        let steward = status
+            .active_steward
+            .expect("steward state should remain configured");
+        assert_eq!(steward.address, address);
+        assert!(steward.last_used_at_ns.is_some());
+    }
+
+    #[test]
+    fn steward_execute_rejects_replayed_nonce() {
+        stable::init_storage();
+        let key = steward_test_signing_key();
+        let address = steward_address_from_key(&key);
+        set_steward_admin(8453, address, true).expect("active steward should store");
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 7 });
+
+        let command = StewardCommand::Noop;
+        let proof = build_steward_proof(&command, &key, 7, current_time_ns() + 60_000_000_000);
+        steward_execute(command.clone(), proof.clone()).expect("first execution should pass");
+
+        let replay_error =
+            steward_execute(command, proof).expect_err("replayed proof nonce should fail");
+        assert!(replay_error.contains("proof nonce mismatch"));
+        assert_eq!(get_steward_status().next_nonce, 8);
     }
 
     #[test]

@@ -110,6 +110,15 @@ type EvmRouteStateView = record {
   last_poll_at_ns : nat64;
   next_log_index : nat64;
 };
+type EvmStewardProof = record {
+  signature : text;
+  canister_id : text;
+  command_hash : text;
+  chain_id : nat64;
+  address : text;
+  nonce : nat64;
+  expires_at_ns : nat64;
+};
 type HttpRequest = record {
   url : text;
   method : text;
@@ -404,6 +413,7 @@ type SkillRecord = record {
   mutable : bool;
   allowed_canister_calls : vec CanisterCallPermission;
 };
+type StewardCommand = variant { Noop };
 type StewardState = record {
   last_used_at_ns : opt nat64;
   enabled : bool;
@@ -834,6 +844,8 @@ service : (InitArgs) -> {
   // Sets a custom welcome message shown in the TUI on boot (controller only).
   // An empty string clears the custom message and restores the default.
   set_welcome_message : (text) -> (Result_2);
+  // Executes a signed steward command after EVM-proof verification.
+  steward_execute : (StewardCommand, EvmStewardProof) -> (Result_2);
   // Callback endpoint used by the OpenRouter proxy worker to submit async results.
   submit_inference_result : (SubmitInferenceResultArgs) -> (Result_2);
   // Replaces the content of a prompt layer identified by `layer_id` (controller only).
