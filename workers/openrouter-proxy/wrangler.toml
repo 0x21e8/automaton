@@ -1,6 +1,13 @@
 name = "openrouter-proxy"
-main = "build/worker/shim.mjs"
+main = "src/worker.js"
 compatibility_date = "2026-03-01"
 
-[build]
-command = "cargo build --release --target wasm32-unknown-unknown"
+[[queues.producers]]
+binding = "INFERENCE_JOBS"
+queue = "openrouter-proxy-jobs"
+
+[[queues.consumers]]
+queue = "openrouter-proxy-jobs"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 8
