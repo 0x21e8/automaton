@@ -800,9 +800,9 @@ pub fn set_welcome_message(message: String) -> Result<String, String> {
         ));
     }
     if normalized.is_empty() {
-        let _ = sqlite::delete_runtime_scalar(WELCOME_MESSAGE_KEY);
+        sqlite::delete_runtime_scalar(WELCOME_MESSAGE_KEY)?;
     } else {
-        let _ = sqlite::set_runtime_scalar(WELCOME_MESSAGE_KEY, &normalized);
+        sqlite::set_runtime_scalar(WELCOME_MESSAGE_KEY, &normalized)?;
     }
     Ok(normalized)
 }

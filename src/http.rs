@@ -1014,6 +1014,22 @@ mod tests {
     }
 
     #[test]
+    fn get_welcome_route_returns_null_message_after_clear() {
+        stable::init_storage();
+        stable::set_welcome_message("Welcome now".to_string()).expect("welcome message should set");
+        stable::set_welcome_message("   ".to_string()).expect("welcome message should clear");
+        init_certification();
+
+        let request = HttpRequest::get("/api/welcome").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("welcome body should decode as json");
+        assert_eq!(body.get("message"), Some(&Value::Null));
+    }
+
+    #[test]
     fn get_build_info_route_returns_commit_metadata() {
         stable::init_storage();
         init_certification();
