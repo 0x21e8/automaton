@@ -5,15 +5,19 @@
 
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, ConversationEntry, ConversationLog, InboxMessage, MemoryFact,
-    OutboxMessage, ScheduledJob, SkillRecord, StrategyTemplate, StrategyTemplateKey,
-    TemplateVersion, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    OutboxMessage, RuntimeSnapshot, ScheduledJob, SchedulerRuntime, SkillRecord,
+    StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass, TaskKind, TaskScheduleConfig,
+    TaskScheduleRuntime, TemplateVersion, ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
+use crate::features::cycle_topup::TopUpStage;
 #[cfg(target_arch = "wasm32")]
 use ic_rusqlite::rusqlite::types::ValueRef as SqlValueRef;
 #[cfg(not(target_arch = "wasm32"))]
 use rusqlite::types::ValueRef as SqlValueRef;
 use serde_json::Value;
 use serde_json::{Map as JsonMap, Number as JsonNumber};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 const MIGRATION_001_BASE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -87,9 +91,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL,
     priority INTEGER NOT NULL,
     created_at_ns INTEGER NOT NULL,
+    scheduled_for_ns INTEGER NOT NULL DEFAULT 0,
     payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at_ns);
+CREATE INDEX IF NOT EXISTS idx_jobs_pending_lane ON jobs(status, lane, scheduled_for_ns, priority);
 
 CREATE TABLE IF NOT EXISTS memory_facts (
     key TEXT PRIMARY KEY,
@@ -130,9 +136,113 @@ CREATE TABLE IF NOT EXISTS backfill_markers (
 );
 "#;
 
+const MIGRATION_002_HOT_STATE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS hot_runtime_snapshot (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hot_scheduler_runtime (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hot_task_configs (
+    task_kind TEXT PRIMARY KEY,
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hot_task_runtimes (
+    task_kind TEXT PRIMARY KEY,
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hot_topup_state (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hot_survival_operation_runtime (
+    operation_key TEXT PRIMARY KEY,
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+"#;
+
+const MIGRATION_003_REMAINING_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS http_domain_allowlist (
+    domain TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS prompt_layers (
+    layer_id INTEGER PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS retention_runtime (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    date_key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS turn_window_summaries (
+    date_key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_rollups (
+    rollup_key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS strategy_activations (
+    version_key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS strategy_revocations (
+    version_key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS strategy_kill_switches (
+    key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS strategy_outcome_stats (
+    key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS strategy_budgets (
+    key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_tool_failures (
+    tool_name TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runtime_scalars (
+    key TEXT PRIMARY KEY,
+    value_text TEXT NOT NULL
+);
+"#;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
-    use super::MIGRATION_001_BASE_SCHEMA;
+    use super::{MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA};
     use rusqlite::{params, Connection};
     use std::cell::RefCell;
 
@@ -143,10 +253,7 @@ mod backend {
     pub type SqlResult<T> = Result<T, String>;
 
     pub fn init() -> SqlResult<()> {
-        with_connection(|conn| {
-            apply_migrations(conn)?;
-            Ok(())
-        })
+        with_connection(|_conn| Ok(()))
     }
 
     pub fn close() -> SqlResult<()> {
@@ -181,6 +288,10 @@ mod backend {
     fn apply_migrations(conn: &Connection) -> SqlResult<()> {
         conn.execute_batch(MIGRATION_001_BASE_SCHEMA)
             .map_err(|err| err.to_string())?;
+        conn.execute_batch(MIGRATION_002_HOT_STATE_SCHEMA)
+            .map_err(|err| err.to_string())?;
+        conn.execute_batch(MIGRATION_003_REMAINING_SCHEMA)
+            .map_err(|err| err.to_string())?;
         let version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -188,10 +299,11 @@ mod backend {
                 |row| row.get(0),
             )
             .map_err(|err| err.to_string())?;
-        if version < 1 {
+        let now = crate::timing::current_time_ns() as i64;
+        for v in (version + 1)..=3 {
             conn.execute(
-                "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(1, ?1)",
-                params![crate::timing::current_time_ns() as i64],
+                "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
+                params![v, now],
             )
             .map_err(|err| err.to_string())?;
         }
@@ -201,11 +313,17 @@ mod backend {
 
 #[cfg(target_arch = "wasm32")]
 mod backend {
+    use super::{MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA};
+
     pub type SqlResult<T> = Result<T, String>;
 
     pub fn init() -> SqlResult<()> {
         ic_rusqlite::with_connection(|conn| {
-            conn.execute_batch(super::MIGRATION_001_BASE_SCHEMA)
+            conn.execute_batch(MIGRATION_001_BASE_SCHEMA)
+                .map_err(|err| err.to_string())?;
+            conn.execute_batch(MIGRATION_002_HOT_STATE_SCHEMA)
+                .map_err(|err| err.to_string())?;
+            conn.execute_batch(MIGRATION_003_REMAINING_SCHEMA)
                 .map_err(|err| err.to_string())?;
             let version: i64 = conn
                 .query_row(
@@ -214,16 +332,16 @@ mod backend {
                     |row| row.get(0),
                 )
                 .map_err(|err| err.to_string())?;
-            if version < 1 {
+            let now = crate::timing::current_time_ns() as i64;
+            for v in (version + 1)..=3 {
                 conn.execute(
-                    "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(1, ?1)",
-                    [crate::timing::current_time_ns() as i64],
+                    "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
+                    [v, now],
                 )
                 .map_err(|err| err.to_string())?;
             }
             Ok::<(), String>(())
         })
-        .map_err(|err| format!("{err:?}"))?
     }
 
     pub fn close() -> SqlResult<()> {
@@ -234,30 +352,12 @@ mod backend {
     where
         F: FnOnce(&ic_rusqlite::rusqlite::Connection) -> SqlResult<T>,
     {
-        ic_rusqlite::with_connection(|conn| f(conn)).map_err(|err| format!("{err:?}"))?
+        ic_rusqlite::with_connection(|conn| f(&*conn))
     }
 }
 
 fn row_payload<T: serde::Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string(value).map_err(|err| err.to_string())
-}
-
-fn json_path_str(payload_json: &str, path: &str) -> String {
-    serde_json::from_str::<Value>(payload_json)
-        .ok()
-        .and_then(|root| {
-            root.pointer(path)
-                .and_then(|v| v.as_str().map(ToString::to_string))
-        })
-        .unwrap_or_default()
-}
-
-fn json_path_bool(payload_json: &str, path: &str) -> i64 {
-    serde_json::from_str::<Value>(payload_json)
-        .ok()
-        .and_then(|root| root.pointer(path).and_then(|v| v.as_bool()))
-        .map(|v| if v { 1 } else { 0 })
-        .unwrap_or(0)
 }
 
 fn bounded_limit(limit: usize, fallback: usize, hard_cap: usize) -> usize {
@@ -279,6 +379,22 @@ fn canonicalize_version_list(mut versions: Vec<TemplateVersion>) -> Vec<Template
     versions
 }
 
+fn strategy_template_pk(key: &StrategyTemplateKey, version: &TemplateVersion) -> String {
+    format!(
+        "{}:{}:{}:{}@{}.{}.{}",
+        key.protocol, key.primitive, key.chain_id, key.template_id,
+        version.major, version.minor, version.patch
+    )
+}
+
+fn abi_artifact_pk(key: &AbiArtifactKey) -> String {
+    format!(
+        "{}:{}:{}@{}.{}.{}",
+        key.protocol, key.chain_id, key.role,
+        key.version.major, key.version.minor, key.version.patch
+    )
+}
+
 fn normalized_sql_query(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -293,6 +409,7 @@ fn normalized_sql_query(raw: &str) -> Result<String, String> {
     if !lowered.starts_with("select ") && lowered != "select" {
         return Err("only SELECT statements are allowed".to_string());
     }
+    let padded = format!(" {lowered} ");
     for forbidden in [
         " insert ",
         " update ",
@@ -310,7 +427,7 @@ fn normalized_sql_query(raw: &str) -> Result<String, String> {
         " commit ",
         " rollback ",
     ] {
-        if format!(" {lowered} ").contains(forbidden) {
+        if padded.contains(forbidden) {
             return Err("query contains forbidden SQL keyword".to_string());
         }
     }
@@ -339,11 +456,134 @@ fn sql_instruction_budget_exceeded(_start_counter: u64, _max_delta: u64) -> bool
     false
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct SurvivalOperationRuntimeRecord {
+    pub consecutive_failures: u32,
+    pub backoff_until_ns: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HotStateCache {
+    runtime_snapshot: Option<RuntimeSnapshot>,
+    scheduler_runtime: Option<SchedulerRuntime>,
+    task_configs: BTreeMap<String, TaskScheduleConfig>,
+    task_runtimes: BTreeMap<String, TaskScheduleRuntime>,
+    topup_state: Option<TopUpStage>,
+    survival_runtime: BTreeMap<String, SurvivalOperationRuntimeRecord>,
+}
+
+thread_local! {
+    static HOT_STATE_CACHE: RefCell<HotStateCache> = RefCell::new(HotStateCache::default());
+}
+
+fn reset_hot_state_cache() {
+    HOT_STATE_CACHE.with(|cache| {
+        *cache.borrow_mut() = HotStateCache::default();
+    });
+}
+
+fn task_kind_key(kind: &TaskKind) -> String {
+    kind.as_str().to_string()
+}
+
+
+fn hydrate_hot_state_cache() -> Result<(), String> {
+    backend::with_connection(|conn| {
+        let runtime_snapshot = conn
+            .query_row(
+                "SELECT payload_json FROM hot_runtime_snapshot WHERE singleton_id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .map(from_payload_json)
+            .transpose()?;
+
+        let scheduler_runtime = conn
+            .query_row(
+                "SELECT payload_json FROM hot_scheduler_runtime WHERE singleton_id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .map(from_payload_json)
+            .transpose()?;
+
+        let mut task_configs = BTreeMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT task_kind, payload_json FROM hot_task_configs")
+                .map_err(|err| err.to_string())?;
+            let mut rows = stmt.query([]).map_err(|err| err.to_string())?;
+            while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+                let kind = row.get::<_, String>(0).map_err(|err| err.to_string())?;
+                let payload_json = row.get::<_, String>(1).map_err(|err| err.to_string())?;
+                let config: TaskScheduleConfig = from_payload_json(payload_json)?;
+                task_configs.insert(kind, config);
+            }
+        }
+
+        let mut task_runtimes = BTreeMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT task_kind, payload_json FROM hot_task_runtimes")
+                .map_err(|err| err.to_string())?;
+            let mut rows = stmt.query([]).map_err(|err| err.to_string())?;
+            while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+                let kind = row.get::<_, String>(0).map_err(|err| err.to_string())?;
+                let payload_json = row.get::<_, String>(1).map_err(|err| err.to_string())?;
+                let runtime: TaskScheduleRuntime = from_payload_json(payload_json)?;
+                task_runtimes.insert(kind, runtime);
+            }
+        }
+
+        let topup_state = conn
+            .query_row(
+                "SELECT payload_json FROM hot_topup_state WHERE singleton_id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .map(from_payload_json)
+            .transpose()?;
+
+        let mut survival_runtime = BTreeMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT operation_key, payload_json FROM hot_survival_operation_runtime",
+                )
+                .map_err(|err| err.to_string())?;
+            let mut rows = stmt.query([]).map_err(|err| err.to_string())?;
+            while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+                let operation_key = row.get::<_, String>(0).map_err(|err| err.to_string())?;
+                let payload_json = row.get::<_, String>(1).map_err(|err| err.to_string())?;
+                let runtime: SurvivalOperationRuntimeRecord = from_payload_json(payload_json)?;
+                survival_runtime.insert(operation_key, runtime);
+            }
+        }
+
+        HOT_STATE_CACHE.with(|cache| {
+            *cache.borrow_mut() = HotStateCache {
+                runtime_snapshot,
+                scheduler_runtime,
+                task_configs,
+                task_runtimes,
+                topup_state,
+                survival_runtime,
+            };
+        });
+        Ok(())
+    })
+}
+
 pub fn init_storage() -> Result<(), String> {
-    backend::init()
+    backend::init()?;
+    hydrate_hot_state_cache()
 }
 
 pub fn close_storage() -> Result<(), String> {
+    reset_hot_state_cache();
     backend::close()
 }
 
@@ -362,6 +602,191 @@ pub fn schema_version() -> Result<u64, String> {
             )
             .map_err(|err| err.to_string())?;
         Ok(u64::try_from(version).unwrap_or(0))
+    })
+}
+
+pub fn read_runtime_snapshot() -> Result<Option<RuntimeSnapshot>, String> {
+    HOT_STATE_CACHE.with(|cache| Ok(cache.borrow().runtime_snapshot.clone()))
+}
+
+pub fn write_runtime_snapshot(snapshot: &RuntimeSnapshot) -> Result<(), String> {
+    let payload_json = row_payload(snapshot)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO hot_runtime_snapshot(singleton_id, updated_at_ns, payload_json)
+             VALUES(1, ?1, ?2)",
+            (crate::timing::current_time_ns() as i64, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        HOT_STATE_CACHE.with(|cache| {
+            cache.borrow_mut().runtime_snapshot = Some(snapshot.clone());
+        });
+        Ok(())
+    })
+}
+
+pub fn read_scheduler_runtime() -> Result<Option<SchedulerRuntime>, String> {
+    HOT_STATE_CACHE.with(|cache| Ok(cache.borrow().scheduler_runtime.clone()))
+}
+
+pub fn write_scheduler_runtime(runtime: &SchedulerRuntime) -> Result<(), String> {
+    let payload_json = row_payload(runtime)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO hot_scheduler_runtime(singleton_id, updated_at_ns, payload_json)
+             VALUES(1, ?1, ?2)",
+            (crate::timing::current_time_ns() as i64, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        HOT_STATE_CACHE.with(|cache| {
+            cache.borrow_mut().scheduler_runtime = Some(runtime.clone());
+        });
+        Ok(())
+    })
+}
+
+pub fn list_task_configs() -> Result<Vec<(TaskKind, TaskScheduleConfig)>, String> {
+    HOT_STATE_CACHE.with(|cache| {
+        let mut entries = cache
+            .borrow()
+            .task_configs
+            .iter()
+            .filter_map(|(kind_key, config)| {
+                kind_key.parse().ok().map(|kind: TaskKind| (kind, config.clone()))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(kind, cfg)| (cfg.priority, kind.as_str().to_string()));
+        Ok(entries)
+    })
+}
+
+pub fn read_task_config(kind: &TaskKind) -> Result<Option<TaskScheduleConfig>, String> {
+    let key = task_kind_key(kind);
+    HOT_STATE_CACHE.with(|cache| Ok(cache.borrow().task_configs.get(&key).cloned()))
+}
+
+pub fn write_task_config(config: &TaskScheduleConfig) -> Result<(), String> {
+    let task_key = task_kind_key(&config.kind);
+    let payload_json = row_payload(config)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO hot_task_configs(task_kind, updated_at_ns, payload_json)
+             VALUES(?1, ?2, ?3)",
+            (
+                task_key.as_str(),
+                crate::timing::current_time_ns() as i64,
+                payload_json,
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        HOT_STATE_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .task_configs
+                .insert(task_key, config.clone());
+        });
+        Ok(())
+    })
+}
+
+pub fn read_task_runtime(kind: &TaskKind) -> Result<Option<TaskScheduleRuntime>, String> {
+    let key = task_kind_key(kind);
+    HOT_STATE_CACHE.with(|cache| Ok(cache.borrow().task_runtimes.get(&key).cloned()))
+}
+
+pub fn write_task_runtime(kind: &TaskKind, runtime: &TaskScheduleRuntime) -> Result<(), String> {
+    let task_key = task_kind_key(kind);
+    let payload_json = row_payload(runtime)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO hot_task_runtimes(task_kind, updated_at_ns, payload_json)
+             VALUES(?1, ?2, ?3)",
+            (
+                task_key.as_str(),
+                crate::timing::current_time_ns() as i64,
+                payload_json,
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        HOT_STATE_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .task_runtimes
+                .insert(task_key, runtime.clone());
+        });
+        Ok(())
+    })
+}
+
+pub fn read_topup_state() -> Result<Option<TopUpStage>, String> {
+    HOT_STATE_CACHE.with(|cache| Ok(cache.borrow().topup_state.clone()))
+}
+
+pub fn write_topup_state(state: &TopUpStage) -> Result<(), String> {
+    let payload_json = row_payload(state)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO hot_topup_state(singleton_id, updated_at_ns, payload_json)
+             VALUES(1, ?1, ?2)",
+            (crate::timing::current_time_ns() as i64, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        HOT_STATE_CACHE.with(|cache| {
+            cache.borrow_mut().topup_state = Some(state.clone());
+        });
+        Ok(())
+    })
+}
+
+pub fn clear_topup_state() -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM hot_topup_state WHERE singleton_id = 1", [])
+            .map_err(|err| err.to_string())?;
+        HOT_STATE_CACHE.with(|cache| {
+            cache.borrow_mut().topup_state = None;
+        });
+        Ok(())
+    })
+}
+
+pub fn read_survival_operation_runtime(
+    operation: &SurvivalOperationClass,
+) -> Result<SurvivalOperationRuntimeRecord, String> {
+    let key = operation.as_str().to_string();
+    HOT_STATE_CACHE.with(|cache| {
+        Ok(cache
+            .borrow()
+            .survival_runtime
+            .get(&key)
+            .cloned()
+            .unwrap_or_default())
+    })
+}
+
+pub fn write_survival_operation_runtime(
+    operation: &SurvivalOperationClass,
+    runtime: &SurvivalOperationRuntimeRecord,
+) -> Result<(), String> {
+    let operation_key = operation.as_str().to_string();
+    let payload_json = row_payload(runtime)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO hot_survival_operation_runtime(operation_key, updated_at_ns, payload_json)
+             VALUES(?1, ?2, ?3)",
+            (
+                operation_key.as_str(),
+                crate::timing::current_time_ns() as i64,
+                payload_json,
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        HOT_STATE_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .survival_runtime
+                .insert(operation_key, runtime.clone());
+        });
+        Ok(())
     })
 }
 
@@ -441,11 +866,10 @@ pub fn replace_tool_calls(turn_id: &str, tool_calls: &[ToolCallRecord]) -> Resul
             .map_err(|err| err.to_string())?;
         for (index, tool_call) in tool_calls.iter().enumerate() {
             let payload_json = row_payload(tool_call)?;
-            let tool_name = json_path_str(&payload_json, "/tool");
-            let success = json_path_bool(&payload_json, "/success");
+            let success = if tool_call.success { 1_i64 } else { 0_i64 };
             conn.execute(
                 "INSERT INTO tool_calls(turn_id, call_index, tool_name, success, payload_json) VALUES(?1, ?2, ?3, ?4, ?5)",
-                (turn, i64::try_from(index).unwrap_or(i64::MAX), tool_name, success, payload_json),
+                (turn, i64::try_from(index).unwrap_or(i64::MAX), &tool_call.tool, success, payload_json),
             )
             .map_err(|err| err.to_string())?;
         }
@@ -526,15 +950,16 @@ pub fn upsert_job(job: &ScheduledJob) -> Result<(), String> {
     let payload_json = row_payload(job)?;
     backend::with_connection(|conn| {
         conn.execute(
-            "INSERT OR REPLACE INTO jobs(id, kind, lane, status, priority, created_at_ns, payload_json)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO jobs(id, kind, lane, status, priority, created_at_ns, scheduled_for_ns, payload_json)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             (
                 &job.id,
                 format!("{:?}", job.kind),
-                format!("{:?}", job.lane),
+                job.lane.as_str(),
                 format!("{:?}", job.status),
                 i64::from(job.priority),
                 job.created_at_ns as i64,
+                job.scheduled_for_ns as i64,
                 payload_json,
             ),
         )
@@ -597,16 +1022,7 @@ pub fn delete_skill(name: &str) -> Result<(), String> {
 
 pub fn upsert_strategy_template(template: &StrategyTemplate) -> Result<(), String> {
     let payload_json = row_payload(template)?;
-    let template_id = format!(
-        "{}:{}:{}:{}@{}.{}.{}",
-        template.key.protocol,
-        template.key.primitive,
-        template.key.chain_id,
-        template.key.template_id,
-        template.version.major,
-        template.version.minor,
-        template.version.patch
-    );
+    let template_id = strategy_template_pk(&template.key, &template.version);
     backend::with_connection(|conn| {
         conn.execute(
             "INSERT OR REPLACE INTO strategy_templates(template_id, protocol, primitive, chain_id, updated_at_ns, payload_json)
@@ -627,15 +1043,7 @@ pub fn upsert_strategy_template(template: &StrategyTemplate) -> Result<(), Strin
 
 pub fn upsert_abi_artifact(artifact: &AbiArtifact) -> Result<(), String> {
     let payload_json = row_payload(artifact)?;
-    let artifact_id = format!(
-        "{}:{}:{}@{}.{}.{}",
-        artifact.key.protocol,
-        artifact.key.chain_id,
-        artifact.key.role,
-        artifact.key.version.major,
-        artifact.key.version.minor,
-        artifact.key.version.patch
-    );
+    let artifact_id = abi_artifact_pk(&artifact.key);
     backend::with_connection(|conn| {
         conn.execute(
             "INSERT OR REPLACE INTO abi_artifacts(artifact_id, protocol, role, chain_id, created_at_ns, payload_json)
@@ -820,7 +1228,8 @@ pub fn list_skills() -> Result<Vec<SkillRecord>, String> {
         let mut stmt = conn
             .prepare(
                 "SELECT payload_json FROM skills
-                 ORDER BY name ASC",
+                 ORDER BY name ASC
+                 LIMIT 1000",
             )
             .map_err(|err| err.to_string())?;
         let rows = stmt
@@ -838,54 +1247,43 @@ pub fn strategy_template(
     key: &StrategyTemplateKey,
     version: &TemplateVersion,
 ) -> Result<Option<StrategyTemplate>, String> {
+    let pk = strategy_template_pk(key, version);
     backend::with_connection(|conn| {
         let mut stmt = conn
-            .prepare(
-                "SELECT payload_json FROM strategy_templates
-                 WHERE protocol = ?1 AND primitive = ?2 AND chain_id = ?3
-                 ORDER BY updated_at_ns DESC",
-            )
+            .prepare("SELECT payload_json FROM strategy_templates WHERE template_id = ?1")
             .map_err(|err| err.to_string())?;
-        let rows = stmt
-            .query_map(
-                (&key.protocol, &key.primitive, key.chain_id as i64),
-                |row| row.get::<_, String>(0),
-            )
+        let mut rows = stmt
+            .query_map([&pk], |row| row.get::<_, String>(0))
             .map_err(|err| err.to_string())?;
-        for row in rows {
-            let template: StrategyTemplate =
-                from_payload_json(row.map_err(|err| err.to_string())?)?;
-            if template.key.template_id == key.template_id && &template.version == version {
-                return Ok(Some(template));
-            }
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
         }
-        Ok(None)
     })
 }
 
 pub fn list_strategy_template_versions(
     key: &StrategyTemplateKey,
 ) -> Result<Vec<TemplateVersion>, String> {
+    let pattern = format!(
+        "{}:{}:{}:{}@%",
+        key.protocol, key.primitive, key.chain_id, key.template_id
+    );
     backend::with_connection(|conn| {
         let mut stmt = conn
             .prepare(
                 "SELECT payload_json FROM strategy_templates
-                 WHERE protocol = ?1 AND primitive = ?2 AND chain_id = ?3",
+                 WHERE template_id LIKE ?1",
             )
             .map_err(|err| err.to_string())?;
         let rows = stmt
-            .query_map(
-                (&key.protocol, &key.primitive, key.chain_id as i64),
-                |row| row.get::<_, String>(0),
-            )
+            .query_map([pattern.as_str()], |row| row.get::<_, String>(0))
             .map_err(|err| err.to_string())?;
         let mut versions = Vec::new();
         for row in rows {
             let template: StrategyTemplate =
                 from_payload_json(row.map_err(|err| err.to_string())?)?;
-            if template.key.template_id == key.template_id {
-                versions.push(template.version);
-            }
+            versions.push(template.version);
         }
         Ok(canonicalize_version_list(versions))
     })
@@ -898,14 +1296,31 @@ pub fn list_strategy_templates(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let versions = list_strategy_template_versions(key)?;
-    let mut templates = Vec::new();
-    for version in versions.into_iter().take(limit) {
-        if let Some(template) = strategy_template(key, &version)? {
-            templates.push(template);
+    let keep = bounded_limit(limit, 25, 1_000);
+    let pattern = format!(
+        "{}:{}:{}:{}@%",
+        key.protocol, key.primitive, key.chain_id, key.template_id
+    );
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM strategy_templates
+                 WHERE template_id LIKE ?1
+                 ORDER BY updated_at_ns DESC
+                 LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map((pattern.as_str(), keep as i64), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| err.to_string())?;
+        let mut templates = Vec::new();
+        for row in rows {
+            templates.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
         }
-    }
-    Ok(templates)
+        Ok(templates)
+    })
 }
 
 pub fn list_all_strategy_templates(limit: usize) -> Result<Vec<StrategyTemplate>, String> {
@@ -933,26 +1348,18 @@ pub fn list_all_strategy_templates(limit: usize) -> Result<Vec<StrategyTemplate>
 }
 
 pub fn abi_artifact(key: &AbiArtifactKey) -> Result<Option<AbiArtifact>, String> {
+    let pk = abi_artifact_pk(key);
     backend::with_connection(|conn| {
         let mut stmt = conn
-            .prepare(
-                "SELECT payload_json FROM abi_artifacts
-                 WHERE protocol = ?1 AND role = ?2 AND chain_id = ?3
-                 ORDER BY created_at_ns DESC",
-            )
+            .prepare("SELECT payload_json FROM abi_artifacts WHERE artifact_id = ?1")
             .map_err(|err| err.to_string())?;
-        let rows = stmt
-            .query_map((&key.protocol, &key.role, key.chain_id as i64), |row| {
-                row.get::<_, String>(0)
-            })
+        let mut rows = stmt
+            .query_map([&pk], |row| row.get::<_, String>(0))
             .map_err(|err| err.to_string())?;
-        for row in rows {
-            let artifact: AbiArtifact = from_payload_json(row.map_err(|err| err.to_string())?)?;
-            if artifact.key.version == key.version {
-                return Ok(Some(artifact));
-            }
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
         }
-        Ok(None)
     })
 }
 
@@ -1030,7 +1437,1158 @@ pub fn sql_query_read_only(query: &str, row_limit: usize) -> Result<String, Stri
 pub fn table_count(table: &str) -> Result<u64, String> {
     let table_name = match table {
         "transitions" | "turns" | "tool_calls" | "inbox" | "outbox" | "conversations" | "jobs"
-        | "memory_facts" | "skills" | "strategy_templates" | "abi_artifacts" => table,
+        | "memory_facts" | "skills" | "strategy_templates" | "abi_artifacts"
+        | "hot_runtime_snapshot" | "hot_scheduler_runtime" | "hot_task_configs"
+        | "hot_task_runtimes" | "hot_topup_state" | "hot_survival_operation_runtime" => table,
+        _ => return Err(format!("unsupported table: {table}")),
+    };
+    backend::with_connection(|conn| {
+        let query = format!("SELECT COUNT(1) FROM {table_name}");
+        let count: i64 = conn
+            .query_row(&query, [], |row| row.get(0))
+            .map_err(|err| err.to_string())?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    })
+}
+
+// ── New table CRUD (Migration 003) ───────────────────────────────────────────
+
+// -- HTTP domain allowlist --
+
+pub fn list_http_domains() -> Result<Vec<String>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT domain FROM http_domain_allowlist ORDER BY domain ASC")
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut domains = Vec::new();
+        for row in rows {
+            domains.push(row.map_err(|err| err.to_string())?);
+        }
+        Ok(domains)
+    })
+}
+
+pub fn set_http_domains(domains: &[String]) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM http_domain_allowlist", [])
+            .map_err(|err| err.to_string())?;
+        for domain in domains {
+            conn.execute(
+                "INSERT OR REPLACE INTO http_domain_allowlist(domain) VALUES(?1)",
+                [domain.as_str()],
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    })
+}
+
+pub fn add_http_domain(domain: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO http_domain_allowlist(domain) VALUES(?1)",
+            [domain],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn remove_http_domain(domain: &str) -> Result<bool, String> {
+    backend::with_connection(|conn| {
+        let deleted = conn
+            .execute(
+                "DELETE FROM http_domain_allowlist WHERE domain = ?1",
+                [domain],
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(deleted > 0)
+    })
+}
+
+// -- Prompt layers --
+
+pub fn get_prompt_layer(layer_id: u8) -> Result<Option<crate::domain::types::PromptLayer>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM prompt_layers WHERE layer_id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([i64::from(layer_id)], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn save_prompt_layer(layer: &crate::domain::types::PromptLayer) -> Result<(), String> {
+    let payload_json = row_payload(layer)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO prompt_layers(layer_id, payload_json) VALUES(?1, ?2)",
+            (i64::from(layer.layer_id), payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn list_prompt_layers() -> Result<Vec<crate::domain::types::PromptLayer>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM prompt_layers ORDER BY layer_id ASC LIMIT 100")
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+// -- Retention runtime --
+
+pub fn read_retention_runtime<T: serde::de::DeserializeOwned>() -> Result<Option<T>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM retention_runtime WHERE singleton_id = 1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn write_retention_runtime<T: serde::Serialize>(value: &T) -> Result<(), String> {
+    let payload_json = row_payload(value)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO retention_runtime(singleton_id, payload_json) VALUES(1, ?1)",
+            [payload_json],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+// -- Session summaries --
+
+pub fn get_session_summary<T: serde::de::DeserializeOwned>(
+    date_key: &str,
+) -> Result<Option<T>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM session_summaries WHERE date_key = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([date_key], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn upsert_session_summary<T: serde::Serialize>(
+    date_key: &str,
+    value: &T,
+) -> Result<(), String> {
+    let payload_json = row_payload(value)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO session_summaries(date_key, payload_json) VALUES(?1, ?2)",
+            (date_key, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn list_session_summaries<T: serde::de::DeserializeOwned>(
+    limit: usize,
+) -> Result<Vec<T>, String> {
+    let keep = bounded_limit(limit, 25, 100);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM session_summaries ORDER BY date_key DESC LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn count_session_summaries() -> Result<u64, String> {
+    table_count("session_summaries")
+}
+
+pub fn delete_oldest_session_summaries(keep_max: usize) -> Result<u32, String> {
+    backend::with_connection(|conn| {
+        let deleted = conn
+            .execute(
+                "DELETE FROM session_summaries WHERE date_key NOT IN (
+                    SELECT date_key FROM session_summaries ORDER BY date_key DESC LIMIT ?1
+                )",
+                [keep_max as i64],
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(u32::try_from(deleted).unwrap_or(u32::MAX))
+    })
+}
+
+// -- Turn window summaries --
+
+pub fn get_turn_window_summary<T: serde::de::DeserializeOwned>(
+    date_key: &str,
+) -> Result<Option<T>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM turn_window_summaries WHERE date_key = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([date_key], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn upsert_turn_window_summary<T: serde::Serialize>(
+    date_key: &str,
+    value: &T,
+) -> Result<(), String> {
+    let payload_json = row_payload(value)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO turn_window_summaries(date_key, payload_json) VALUES(?1, ?2)",
+            (date_key, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn list_turn_window_summaries<T: serde::de::DeserializeOwned>(
+    limit: usize,
+) -> Result<Vec<T>, String> {
+    let keep = bounded_limit(limit, 25, 100);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM turn_window_summaries ORDER BY date_key DESC LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn delete_oldest_turn_window_summaries(keep_max: usize) -> Result<u32, String> {
+    backend::with_connection(|conn| {
+        let deleted = conn
+            .execute(
+                "DELETE FROM turn_window_summaries WHERE date_key NOT IN (
+                    SELECT date_key FROM turn_window_summaries ORDER BY date_key DESC LIMIT ?1
+                )",
+                [keep_max as i64],
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(u32::try_from(deleted).unwrap_or(u32::MAX))
+    })
+}
+
+// -- Memory rollups --
+
+pub fn upsert_memory_rollup<T: serde::Serialize>(
+    rollup_key: &str,
+    value: &T,
+) -> Result<(), String> {
+    let payload_json = row_payload(value)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_rollups(rollup_key, payload_json) VALUES(?1, ?2)",
+            (rollup_key, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn list_memory_rollups<T: serde::de::DeserializeOwned>(
+    limit: usize,
+) -> Result<Vec<T>, String> {
+    let keep = bounded_limit(limit, 25, 128);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM memory_rollups ORDER BY rollup_key DESC LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn delete_oldest_memory_rollups(keep_max: usize) -> Result<u32, String> {
+    backend::with_connection(|conn| {
+        let deleted = conn
+            .execute(
+                "DELETE FROM memory_rollups WHERE rollup_key NOT IN (
+                    SELECT rollup_key FROM memory_rollups ORDER BY rollup_key DESC LIMIT ?1
+                )",
+                [keep_max as i64],
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(u32::try_from(deleted).unwrap_or(u32::MAX))
+    })
+}
+
+// -- Strategy activations --
+
+pub fn get_strategy_activation<T: serde::de::DeserializeOwned>(
+    version_key: &str,
+) -> Result<Option<T>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM strategy_activations WHERE version_key = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([version_key], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn upsert_strategy_activation<T: serde::Serialize>(
+    version_key: &str,
+    value: &T,
+) -> Result<(), String> {
+    let payload_json = row_payload(value)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO strategy_activations(version_key, payload_json) VALUES(?1, ?2)",
+            (version_key, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+// -- Strategy revocations --
+
+pub fn get_strategy_revocation<T: serde::de::DeserializeOwned>(
+    version_key: &str,
+) -> Result<Option<T>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM strategy_revocations WHERE version_key = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([version_key], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn upsert_strategy_revocation<T: serde::Serialize>(
+    version_key: &str,
+    value: &T,
+) -> Result<(), String> {
+    let payload_json = row_payload(value)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO strategy_revocations(version_key, payload_json) VALUES(?1, ?2)",
+            (version_key, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+// -- Strategy kill switches --
+
+pub fn get_strategy_kill_switch<T: serde::de::DeserializeOwned>(
+    key: &str,
+) -> Result<Option<T>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM strategy_kill_switches WHERE key = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([key], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn upsert_strategy_kill_switch<T: serde::Serialize>(
+    key: &str,
+    value: &T,
+) -> Result<(), String> {
+    let payload_json = row_payload(value)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO strategy_kill_switches(key, payload_json) VALUES(?1, ?2)",
+            (key, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+// -- Strategy outcome stats --
+
+pub fn get_strategy_outcome_stats<T: serde::de::DeserializeOwned>(
+    key: &str,
+) -> Result<Option<T>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM strategy_outcome_stats WHERE key = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([key], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn upsert_strategy_outcome_stats<T: serde::Serialize>(
+    key: &str,
+    value: &T,
+) -> Result<(), String> {
+    let payload_json = row_payload(value)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO strategy_outcome_stats(key, payload_json) VALUES(?1, ?2)",
+            (key, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+// -- Strategy budgets --
+
+pub fn get_strategy_budget(key: &str) -> Result<Option<String>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM strategy_budgets WHERE key = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([key], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => Ok(Some(row.map_err(|err| err.to_string())?)),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn upsert_strategy_budget(key: &str, value: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO strategy_budgets(key, payload_json) VALUES(?1, ?2)",
+            (key, value),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+// -- Autonomy tool failures --
+
+pub fn get_autonomy_tool_failure<T: serde::de::DeserializeOwned>(
+    tool_name: &str,
+) -> Result<Option<T>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM autonomy_tool_failures WHERE tool_name = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([tool_name], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn upsert_autonomy_tool_failure<T: serde::Serialize>(
+    tool_name: &str,
+    value: &T,
+) -> Result<(), String> {
+    let payload_json = row_payload(value)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO autonomy_tool_failures(tool_name, payload_json) VALUES(?1, ?2)",
+            (tool_name, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn delete_autonomy_tool_failure(tool_name: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute(
+            "DELETE FROM autonomy_tool_failures WHERE tool_name = ?1",
+            [tool_name],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn list_autonomy_tool_failures<T: serde::de::DeserializeOwned>(
+) -> Result<Vec<(String, T)>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT tool_name, payload_json FROM autonomy_tool_failures ORDER BY tool_name ASC LIMIT 500")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt.query([]).map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+            let name = row.get::<_, String>(0).map_err(|err| err.to_string())?;
+            let payload_json = row.get::<_, String>(1).map_err(|err| err.to_string())?;
+            let value: T = from_payload_json(payload_json)?;
+            records.push((name, value));
+        }
+        Ok(records)
+    })
+}
+
+// -- Runtime scalars (replaces RUNTIME_MAP scalar keys) --
+
+pub fn get_runtime_scalar(key: &str) -> Result<Option<String>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT value_text FROM runtime_scalars WHERE key = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([key], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => Ok(Some(row.map_err(|err| err.to_string())?)),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn set_runtime_scalar(key: &str, value: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO runtime_scalars(key, value_text) VALUES(?1, ?2)",
+            (key, value),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn delete_runtime_scalar(key: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM runtime_scalars WHERE key = ?1", [key])
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+// -- Extended memory fact queries --
+
+pub fn list_all_memory_facts(limit: usize) -> Result<Vec<MemoryFact>, String> {
+    let keep = bounded_limit(limit, 500, 1_000);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM memory_facts ORDER BY key ASC LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn list_memory_facts_by_prefix(prefix: &str, limit: usize) -> Result<Vec<MemoryFact>, String> {
+    let keep = bounded_limit(limit, 500, 1_000);
+    let pattern = format!("{prefix}%");
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM memory_facts WHERE key LIKE ?1 ORDER BY key ASC LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map((pattern.as_str(), keep as i64), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn get_memory_fact(key: &str) -> Result<Option<MemoryFact>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM memory_facts WHERE key = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([key], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn count_memory_facts() -> Result<usize, String> {
+    table_count("memory_facts").map(|c| c as usize)
+}
+
+pub fn count_memory_facts_by_prefix(prefix: &str) -> Result<usize, String> {
+    let pattern = format!("{prefix}%");
+    backend::with_connection(|conn| {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM memory_facts WHERE key LIKE ?1",
+                [pattern.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(count as usize)
+    })
+}
+
+pub fn prune_memory_facts(
+    prefix: Option<&str>,
+    updated_before_ns: Option<u64>,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    if matches!((prefix, updated_before_ns), (None, None)) {
+        return Ok(Vec::new());
+    }
+    backend::with_connection(|conn| {
+        // Collect the keys to prune, then delete them in a single subquery statement.
+        let keys: Vec<String> = match (prefix, updated_before_ns) {
+            (Some(p), Some(ts)) => {
+                let pattern = format!("{p}%");
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT key FROM memory_facts WHERE key LIKE ?1 AND updated_at_ns < ?2 ORDER BY updated_at_ns ASC LIMIT ?3",
+                    )
+                    .map_err(|err| err.to_string())?;
+                let rows = stmt
+                    .query_map((pattern.as_str(), ts as i64, limit as i64), |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|err| err.to_string())?;
+                rows.map(|r| r.map_err(|err| err.to_string()))
+                    .collect::<Result<_, _>>()?
+            }
+            (Some(p), None) => {
+                let pattern = format!("{p}%");
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT key FROM memory_facts WHERE key LIKE ?1 ORDER BY updated_at_ns ASC LIMIT ?2",
+                    )
+                    .map_err(|err| err.to_string())?;
+                let rows = stmt
+                    .query_map((pattern.as_str(), limit as i64), |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|err| err.to_string())?;
+                rows.map(|r| r.map_err(|err| err.to_string()))
+                    .collect::<Result<_, _>>()?
+            }
+            (None, Some(ts)) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT key FROM memory_facts WHERE updated_at_ns < ?1 ORDER BY updated_at_ns ASC LIMIT ?2",
+                    )
+                    .map_err(|err| err.to_string())?;
+                let rows = stmt
+                    .query_map((ts as i64, limit as i64), |row| row.get::<_, String>(0))
+                    .map_err(|err| err.to_string())?;
+                rows.map(|r| r.map_err(|err| err.to_string()))
+                    .collect::<Result<_, _>>()?
+            }
+            (None, None) => unreachable!(),
+        };
+        if !keys.is_empty() {
+            match (prefix, updated_before_ns) {
+                (Some(p), Some(ts)) => {
+                    let pattern = format!("{p}%");
+                    conn.execute(
+                        "DELETE FROM memory_facts WHERE key IN (SELECT key FROM memory_facts WHERE key LIKE ?1 AND updated_at_ns < ?2 ORDER BY updated_at_ns ASC LIMIT ?3)",
+                        (pattern.as_str(), ts as i64, limit as i64),
+                    ).map_err(|err| err.to_string())?;
+                }
+                (Some(p), None) => {
+                    let pattern = format!("{p}%");
+                    conn.execute(
+                        "DELETE FROM memory_facts WHERE key IN (SELECT key FROM memory_facts WHERE key LIKE ?1 ORDER BY updated_at_ns ASC LIMIT ?2)",
+                        (pattern.as_str(), limit as i64),
+                    ).map_err(|err| err.to_string())?;
+                }
+                (None, Some(ts)) => {
+                    conn.execute(
+                        "DELETE FROM memory_facts WHERE key IN (SELECT key FROM memory_facts WHERE updated_at_ns < ?1 ORDER BY updated_at_ns ASC LIMIT ?2)",
+                        (ts as i64, limit as i64),
+                    ).map_err(|err| err.to_string())?;
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+        Ok(keys)
+    })
+}
+
+// -- Extended inbox queries --
+
+pub fn list_pending_inbox(limit: usize) -> Result<Vec<InboxMessage>, String> {
+    let keep = bounded_limit(limit, 25, 200);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM inbox WHERE status = 'Pending' ORDER BY seq ASC LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn list_staged_inbox(limit: usize) -> Result<Vec<InboxMessage>, String> {
+    let keep = bounded_limit(limit, 25, 200);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM inbox WHERE status = 'Staged' ORDER BY seq ASC LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn count_inbox_by_status(status: &str) -> Result<u64, String> {
+    backend::with_connection(|conn| {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM inbox WHERE status = ?1",
+                [status],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    })
+}
+
+pub fn count_inbox_total() -> Result<u64, String> {
+    table_count("inbox")
+}
+
+pub fn get_inbox_message(id: &str) -> Result<Option<InboxMessage>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM inbox WHERE id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+// -- Extended outbox queries --
+
+pub fn get_outbox_message(id: &str) -> Result<Option<OutboxMessage>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM outbox WHERE id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn count_outbox_total() -> Result<u64, String> {
+    table_count("outbox")
+}
+
+// -- Extended job queries --
+
+pub fn get_job(id: &str) -> Result<Option<ScheduledJob>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM jobs WHERE id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn find_job_by_dedupe_key(dedupe_key: &str) -> Result<Option<ScheduledJob>, String> {
+    backend::with_connection(|conn| {
+        // Only find active (non-terminal) jobs
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM jobs WHERE payload_json LIKE ?1 AND (status = 'Pending' OR status = 'Running') LIMIT 1",
+            )
+            .map_err(|err| err.to_string())?;
+        let pattern = format!("%\"dedupe_key\":\"{dedupe_key}\"%");
+        let mut rows = stmt
+            .query_map([pattern.as_str()], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => {
+                let job: ScheduledJob = from_payload_json(row.map_err(|err| err.to_string())?)?;
+                if job.dedupe_key == dedupe_key {
+                    Ok(Some(job))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn pop_next_pending_job(lane: &str, now_ns: u64) -> Result<Option<ScheduledJob>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM jobs WHERE status = 'Pending' AND lane = ?1 AND scheduled_for_ns <= ?2 ORDER BY priority ASC, created_at_ns ASC LIMIT 1",
+            )
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map((lane, now_ns as i64), |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn delete_job(id: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM jobs WHERE id = ?1", [id])
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn delete_inbox_message(id: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM inbox WHERE id = ?1", [id])
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn delete_outbox_message(id: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM outbox WHERE id = ?1", [id])
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn delete_turn(id: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM turns WHERE id = ?1", [id])
+            .map_err(|err| err.to_string())?;
+        conn.execute("DELETE FROM tool_calls WHERE turn_id = ?1", [id])
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn delete_transition(id: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM transitions WHERE id = ?1", [id])
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+// -- Conversation listing --
+
+pub fn list_conversation_summaries() -> Result<Vec<(String, u64, u32)>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT sender, MAX(timestamp_ns) as last_ns, COUNT(*) as cnt
+                 FROM conversations
+                 GROUP BY sender
+                 ORDER BY last_ns DESC",
+            )
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt.query([]).map_err(|err| err.to_string())?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+            let sender = row.get::<_, String>(0).map_err(|err| err.to_string())?;
+            let last_ns = row.get::<_, i64>(1).map_err(|err| err.to_string())? as u64;
+            let count = row.get::<_, i64>(2).map_err(|err| err.to_string())? as u32;
+            results.push((sender, last_ns, count));
+        }
+        Ok(results)
+    })
+}
+
+// -- Skill retrieval by name --
+
+pub fn get_skill(name: &str) -> Result<Option<SkillRecord>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM skills WHERE name = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([name], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+// -- Retention: bulk delete by age --
+
+pub fn delete_jobs_older_than(cutoff_ns: u64, limit: usize) -> Result<Vec<String>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM jobs WHERE created_at_ns < ?1 AND status IN ('Succeeded', 'Failed', 'TimedOut', 'Skipped') ORDER BY created_at_ns ASC LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map((cutoff_ns as i64, limit as i64), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| err.to_string())?;
+        let ids: Vec<String> = rows
+            .map(|r| r.map_err(|err| err.to_string()))
+            .collect::<Result<_, _>>()?;
+        if !ids.is_empty() {
+            conn.execute(
+                "DELETE FROM jobs WHERE id IN (SELECT id FROM jobs WHERE created_at_ns < ?1 AND status IN ('Succeeded', 'Failed', 'TimedOut', 'Skipped') ORDER BY created_at_ns ASC LIMIT ?2)",
+                (cutoff_ns as i64, limit as i64),
+            ).map_err(|err| err.to_string())?;
+        }
+        Ok(ids)
+    })
+}
+
+pub fn delete_inbox_older_than(cutoff_ns: u64, limit: usize, protected_ids: &[String]) -> Result<Vec<String>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM inbox WHERE posted_at_ns < ?1 AND status = 'Consumed' ORDER BY posted_at_ns ASC LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map((cutoff_ns as i64, limit as i64), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| err.to_string())?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let id = row.map_err(|err| err.to_string())?;
+            if !protected_ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        for id in &ids {
+            conn.execute("DELETE FROM inbox WHERE id = ?1", [id.as_str()])
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(ids)
+    })
+}
+
+pub fn delete_outbox_older_than(cutoff_ns: u64, limit: usize, protected_inbox_ids: &[String]) -> Result<Vec<String>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, payload_json FROM outbox WHERE created_at_ns < ?1 ORDER BY created_at_ns ASC LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query((cutoff_ns as i64, limit as i64))
+            .map_err(|err| err.to_string())?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+            let id = row.get::<_, String>(0).map_err(|err| err.to_string())?;
+            let payload_json = row.get::<_, String>(1).map_err(|err| err.to_string())?;
+            let msg: OutboxMessage = from_payload_json(payload_json)?;
+            let is_protected = msg.source_inbox_ids.iter().any(|iid| protected_inbox_ids.contains(iid));
+            if !is_protected {
+                ids.push(id);
+            }
+        }
+        for id in &ids {
+            conn.execute("DELETE FROM outbox WHERE id = ?1", [id.as_str()])
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(ids)
+    })
+}
+
+pub fn delete_turns_older_than(cutoff_ns: u64, limit: usize) -> Result<Vec<(String, TurnRecord)>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, payload_json FROM turns WHERE created_at_ns < ?1 ORDER BY created_at_ns ASC LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query((cutoff_ns as i64, limit as i64))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+            let id = row.get::<_, String>(0).map_err(|err| err.to_string())?;
+            let payload_json = row.get::<_, String>(1).map_err(|err| err.to_string())?;
+            let turn: TurnRecord = from_payload_json(payload_json)?;
+            records.push((id, turn));
+        }
+        if !records.is_empty() {
+            conn.execute(
+                "DELETE FROM tool_calls WHERE turn_id IN (SELECT id FROM turns WHERE created_at_ns < ?1 ORDER BY created_at_ns ASC LIMIT ?2)",
+                (cutoff_ns as i64, limit as i64),
+            ).map_err(|err| err.to_string())?;
+            conn.execute(
+                "DELETE FROM turns WHERE id IN (SELECT id FROM turns WHERE created_at_ns < ?1 ORDER BY created_at_ns ASC LIMIT ?2)",
+                (cutoff_ns as i64, limit as i64),
+            ).map_err(|err| err.to_string())?;
+        }
+        Ok(records)
+    })
+}
+
+pub fn delete_transitions_older_than(cutoff_ns: u64, limit: usize) -> Result<Vec<(String, TransitionLogRecord)>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, payload_json FROM transitions WHERE occurred_at_ns < ?1 ORDER BY occurred_at_ns ASC LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query((cutoff_ns as i64, limit as i64))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+            let id = row.get::<_, String>(0).map_err(|err| err.to_string())?;
+            let payload_json = row.get::<_, String>(1).map_err(|err| err.to_string())?;
+            let transition: TransitionLogRecord = from_payload_json(payload_json)?;
+            records.push((id, transition));
+        }
+        if !records.is_empty() {
+            conn.execute(
+                "DELETE FROM transitions WHERE id IN (SELECT id FROM transitions WHERE occurred_at_ns < ?1 ORDER BY occurred_at_ns ASC LIMIT ?2)",
+                (cutoff_ns as i64, limit as i64),
+            ).map_err(|err| err.to_string())?;
+        }
+        Ok(records)
+    })
+}
+
+// -- Extend table_count for new tables --
+
+pub fn table_count_extended(table: &str) -> Result<u64, String> {
+    let table_name = match table {
+        "transitions" | "turns" | "tool_calls" | "inbox" | "outbox" | "conversations" | "jobs"
+        | "memory_facts" | "skills" | "strategy_templates" | "abi_artifacts"
+        | "hot_runtime_snapshot" | "hot_scheduler_runtime" | "hot_task_configs"
+        | "hot_task_runtimes" | "hot_topup_state" | "hot_survival_operation_runtime"
+        | "http_domain_allowlist" | "prompt_layers" | "retention_runtime"
+        | "session_summaries" | "turn_window_summaries" | "memory_rollups"
+        | "strategy_activations" | "strategy_revocations" | "strategy_kill_switches"
+        | "strategy_outcome_stats" | "strategy_budgets" | "autonomy_tool_failures"
+        | "runtime_scalars" => table,
         _ => return Err(format!("unsupported table: {table}")),
     };
     backend::with_connection(|conn| {
@@ -1047,8 +2605,10 @@ mod tests {
     use super::*;
     use crate::domain::types::{
         ActionSpec, AgentEvent, AgentState, ContractRoleBinding, InboxMessageStatus, JobStatus,
-        TaskKind, TaskLane, TemplateStatus, TemplateVersion, ToolCallRecord,
+        RuntimeSnapshot, SchedulerRuntime, SurvivalOperationClass, TaskKind, TaskLane,
+        TaskScheduleConfig, TaskScheduleRuntime, TemplateStatus, TemplateVersion, ToolCallRecord,
     };
+    use crate::features::cycle_topup::TopUpStage;
 
     fn sample_turn(id: &str, created_at_ns: u64) -> TurnRecord {
         TurnRecord {
@@ -1080,7 +2640,7 @@ mod tests {
     fn migrations_reach_version_one() {
         close_storage().expect("close before migration test");
         init_storage().expect("init sqlite");
-        assert_eq!(schema_version().expect("schema version"), 1);
+        assert_eq!(schema_version().expect("schema version"), 3);
     }
 
     #[test]
@@ -1098,9 +2658,94 @@ mod tests {
             "skills",
             "strategy_templates",
             "abi_artifacts",
+            "hot_runtime_snapshot",
+            "hot_scheduler_runtime",
+            "hot_task_configs",
+            "hot_task_runtimes",
+            "hot_topup_state",
+            "hot_survival_operation_runtime",
         ] {
             assert_eq!(table_count(table).expect("table count"), 0, "table {table}");
         }
+    }
+
+    #[test]
+    fn hot_state_round_trip_uses_cache() {
+        close_storage().expect("reset sqlite");
+        init_storage().expect("init sqlite");
+
+        let mut snapshot = RuntimeSnapshot::default();
+        snapshot.loop_enabled = false;
+        snapshot.turn_counter = 42;
+        write_runtime_snapshot(&snapshot).expect("runtime snapshot write");
+
+        let mut scheduler_runtime = SchedulerRuntime::default();
+        scheduler_runtime.enabled = false;
+        scheduler_runtime.paused_reason = Some("test".to_string());
+        write_scheduler_runtime(&scheduler_runtime).expect("scheduler runtime write");
+
+        let mut task_config = TaskScheduleConfig::default_for(&TaskKind::CheckCycles);
+        task_config.interval_secs = 77;
+        write_task_config(&task_config).expect("task config write");
+
+        let task_runtime = TaskScheduleRuntime {
+            kind: TaskKind::CheckCycles,
+            next_due_ns: 999,
+            backoff_until_ns: Some(1_111),
+            consecutive_failures: 3,
+            pending_job_id: Some("job-1".to_string()),
+            last_started_ns: Some(1),
+            last_finished_ns: Some(2),
+            last_error: Some("boom".to_string()),
+        };
+        write_task_runtime(&TaskKind::CheckCycles, &task_runtime).expect("task runtime write");
+
+        let topup_state = TopUpStage::Preflight;
+        write_topup_state(&topup_state).expect("topup state write");
+
+        write_survival_operation_runtime(
+            &SurvivalOperationClass::Inference,
+            &SurvivalOperationRuntimeRecord {
+                consecutive_failures: 2,
+                backoff_until_ns: Some(500),
+            },
+        )
+        .expect("survival runtime write");
+
+        let loaded_snapshot = read_runtime_snapshot()
+            .expect("runtime snapshot read")
+            .expect("runtime snapshot should exist");
+        assert_eq!(loaded_snapshot.turn_counter, 42);
+        assert!(!loaded_snapshot.loop_enabled);
+
+        let loaded_scheduler = read_scheduler_runtime()
+            .expect("scheduler runtime read")
+            .expect("scheduler runtime should exist");
+        assert!(!loaded_scheduler.enabled);
+        assert_eq!(loaded_scheduler.paused_reason.as_deref(), Some("test"));
+
+        let loaded_task_config = read_task_config(&TaskKind::CheckCycles)
+            .expect("task config read")
+            .expect("task config should exist");
+        assert_eq!(loaded_task_config.interval_secs, 77);
+
+        let loaded_task_runtime = read_task_runtime(&TaskKind::CheckCycles)
+            .expect("task runtime read")
+            .expect("task runtime should exist");
+        assert_eq!(loaded_task_runtime.pending_job_id.as_deref(), Some("job-1"));
+
+        let loaded_topup_state = read_topup_state()
+            .expect("topup state read")
+            .expect("topup state should exist");
+        assert!(matches!(loaded_topup_state, TopUpStage::Preflight));
+
+        let loaded_survival = read_survival_operation_runtime(&SurvivalOperationClass::Inference)
+            .expect("survival runtime read");
+        assert_eq!(loaded_survival.consecutive_failures, 2);
+        assert_eq!(loaded_survival.backoff_until_ns, Some(500));
+
+        clear_topup_state().expect("topup clear");
+        assert!(read_topup_state().expect("topup read after clear").is_none());
     }
 
     #[test]

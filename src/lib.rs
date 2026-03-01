@@ -42,7 +42,7 @@ use crate::domain::types::{
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
-use crate::storage::stable;
+use crate::storage::{sqlite, stable};
 use crate::timing::current_time_ns;
 use crate::tools::ToolManager;
 use candid::{CandidType, Principal};
