@@ -5,9 +5,9 @@
 
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, ConversationEntry, ConversationLog, InboxMessage, MemoryFact,
-    OutboxMessage, RuntimeSnapshot, ScheduledJob, SchedulerRuntime, SkillRecord,
-    StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass, TaskKind, TaskScheduleConfig,
-    TaskScheduleRuntime, TemplateVersion, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    OutboxMessage, RuntimeSnapshot, ScheduledJob, SchedulerRuntime, SkillRecord, StrategyTemplate,
+    StrategyTemplateKey, SurvivalOperationClass, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
+    TemplateVersion, ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use crate::features::cycle_topup::TopUpStage;
 #[cfg(target_arch = "wasm32")]
@@ -242,7 +242,9 @@ CREATE TABLE IF NOT EXISTS runtime_scalars (
 
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
-    use super::{MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA};
+    use super::{
+        MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
+    };
     use rusqlite::{params, Connection};
     use std::cell::RefCell;
 
@@ -313,7 +315,9 @@ mod backend {
 
 #[cfg(target_arch = "wasm32")]
 mod backend {
-    use super::{MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA};
+    use super::{
+        MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
+    };
 
     pub type SqlResult<T> = Result<T, String>;
 
@@ -382,16 +386,25 @@ fn canonicalize_version_list(mut versions: Vec<TemplateVersion>) -> Vec<Template
 fn strategy_template_pk(key: &StrategyTemplateKey, version: &TemplateVersion) -> String {
     format!(
         "{}:{}:{}:{}@{}.{}.{}",
-        key.protocol, key.primitive, key.chain_id, key.template_id,
-        version.major, version.minor, version.patch
+        key.protocol,
+        key.primitive,
+        key.chain_id,
+        key.template_id,
+        version.major,
+        version.minor,
+        version.patch
     )
 }
 
 fn abi_artifact_pk(key: &AbiArtifactKey) -> String {
     format!(
         "{}:{}:{}@{}.{}.{}",
-        key.protocol, key.chain_id, key.role,
-        key.version.major, key.version.minor, key.version.patch
+        key.protocol,
+        key.chain_id,
+        key.role,
+        key.version.major,
+        key.version.minor,
+        key.version.patch
     )
 }
 
@@ -486,7 +499,6 @@ fn task_kind_key(kind: &TaskKind) -> String {
     kind.as_str().to_string()
 }
 
-
 fn hydrate_hot_state_cache() -> Result<(), String> {
     backend::with_connection(|conn| {
         let runtime_snapshot = conn
@@ -550,9 +562,7 @@ fn hydrate_hot_state_cache() -> Result<(), String> {
         let mut survival_runtime = BTreeMap::new();
         {
             let mut stmt = conn
-                .prepare(
-                    "SELECT operation_key, payload_json FROM hot_survival_operation_runtime",
-                )
+                .prepare("SELECT operation_key, payload_json FROM hot_survival_operation_runtime")
                 .map_err(|err| err.to_string())?;
             let mut rows = stmt.query([]).map_err(|err| err.to_string())?;
             while let Some(row) = rows.next().map_err(|err| err.to_string())? {
@@ -652,7 +662,10 @@ pub fn list_task_configs() -> Result<Vec<(TaskKind, TaskScheduleConfig)>, String
             .task_configs
             .iter()
             .filter_map(|(kind_key, config)| {
-                kind_key.parse().ok().map(|kind: TaskKind| (kind, config.clone()))
+                kind_key
+                    .parse()
+                    .ok()
+                    .map(|kind: TaskKind| (kind, config.clone()))
             })
             .collect::<Vec<_>>();
         entries.sort_by_key(|(kind, cfg)| (cfg.priority, kind.as_str().to_string()));
@@ -1413,7 +1426,7 @@ pub fn sql_query_read_only(query: &str, row_limit: usize) -> Result<String, Stri
         const MAX_SQL_INSTRUCTION_DELTA: u64 = 18_000_000_000;
 
         while let Some(row) = rows.next().map_err(|err| err.to_string())? {
-            if output.len() % 25 == 0
+            if output.len().is_multiple_of(25)
                 && sql_instruction_budget_exceeded(start_counter, MAX_SQL_INSTRUCTION_DELTA)
             {
                 return Err("sql query aborted due to instruction budget".to_string());
@@ -1436,10 +1449,23 @@ pub fn sql_query_read_only(query: &str, row_limit: usize) -> Result<String, Stri
 
 pub fn table_count(table: &str) -> Result<u64, String> {
     let table_name = match table {
-        "transitions" | "turns" | "tool_calls" | "inbox" | "outbox" | "conversations" | "jobs"
-        | "memory_facts" | "skills" | "strategy_templates" | "abi_artifacts"
-        | "hot_runtime_snapshot" | "hot_scheduler_runtime" | "hot_task_configs"
-        | "hot_task_runtimes" | "hot_topup_state" | "hot_survival_operation_runtime" => table,
+        "transitions"
+        | "turns"
+        | "tool_calls"
+        | "inbox"
+        | "outbox"
+        | "conversations"
+        | "jobs"
+        | "memory_facts"
+        | "skills"
+        | "strategy_templates"
+        | "abi_artifacts"
+        | "hot_runtime_snapshot"
+        | "hot_scheduler_runtime"
+        | "hot_task_configs"
+        | "hot_task_runtimes"
+        | "hot_topup_state"
+        | "hot_survival_operation_runtime" => table,
         _ => return Err(format!("unsupported table: {table}")),
     };
     backend::with_connection(|conn| {
@@ -1623,9 +1649,7 @@ pub fn list_session_summaries<T: serde::de::DeserializeOwned>(
     let keep = bounded_limit(limit, 25, 100);
     backend::with_connection(|conn| {
         let mut stmt = conn
-            .prepare(
-                "SELECT payload_json FROM session_summaries ORDER BY date_key DESC LIMIT ?1",
-            )
+            .prepare("SELECT payload_json FROM session_summaries ORDER BY date_key DESC LIMIT ?1")
             .map_err(|err| err.to_string())?;
         let rows = stmt
             .query_map([keep as i64], |row| row.get::<_, String>(0))
@@ -1742,15 +1766,11 @@ pub fn upsert_memory_rollup<T: serde::Serialize>(
     })
 }
 
-pub fn list_memory_rollups<T: serde::de::DeserializeOwned>(
-    limit: usize,
-) -> Result<Vec<T>, String> {
+pub fn list_memory_rollups<T: serde::de::DeserializeOwned>(limit: usize) -> Result<Vec<T>, String> {
     let keep = bounded_limit(limit, 25, 128);
     backend::with_connection(|conn| {
         let mut stmt = conn
-            .prepare(
-                "SELECT payload_json FROM memory_rollups ORDER BY rollup_key DESC LIMIT ?1",
-            )
+            .prepare("SELECT payload_json FROM memory_rollups ORDER BY rollup_key DESC LIMIT ?1")
             .map_err(|err| err.to_string())?;
         let rows = stmt
             .query_map([keep as i64], |row| row.get::<_, String>(0))
@@ -2046,9 +2066,7 @@ pub fn list_all_memory_facts(limit: usize) -> Result<Vec<MemoryFact>, String> {
     let keep = bounded_limit(limit, 500, 1_000);
     backend::with_connection(|conn| {
         let mut stmt = conn
-            .prepare(
-                "SELECT payload_json FROM memory_facts ORDER BY key ASC LIMIT ?1",
-            )
+            .prepare("SELECT payload_json FROM memory_facts ORDER BY key ASC LIMIT ?1")
             .map_err(|err| err.to_string())?;
         let rows = stmt
             .query_map([keep as i64], |row| row.get::<_, String>(0))
@@ -2463,7 +2481,11 @@ pub fn delete_jobs_older_than(cutoff_ns: u64, limit: usize) -> Result<Vec<String
     })
 }
 
-pub fn delete_inbox_older_than(cutoff_ns: u64, limit: usize, protected_ids: &[String]) -> Result<Vec<String>, String> {
+pub fn delete_inbox_older_than(
+    cutoff_ns: u64,
+    limit: usize,
+    protected_ids: &[String],
+) -> Result<Vec<String>, String> {
     backend::with_connection(|conn| {
         let mut stmt = conn
             .prepare(
@@ -2490,7 +2512,11 @@ pub fn delete_inbox_older_than(cutoff_ns: u64, limit: usize, protected_ids: &[St
     })
 }
 
-pub fn delete_outbox_older_than(cutoff_ns: u64, limit: usize, protected_inbox_ids: &[String]) -> Result<Vec<String>, String> {
+pub fn delete_outbox_older_than(
+    cutoff_ns: u64,
+    limit: usize,
+    protected_inbox_ids: &[String],
+) -> Result<Vec<String>, String> {
     backend::with_connection(|conn| {
         let mut stmt = conn
             .prepare(
@@ -2505,7 +2531,10 @@ pub fn delete_outbox_older_than(cutoff_ns: u64, limit: usize, protected_inbox_id
             let id = row.get::<_, String>(0).map_err(|err| err.to_string())?;
             let payload_json = row.get::<_, String>(1).map_err(|err| err.to_string())?;
             let msg: OutboxMessage = from_payload_json(payload_json)?;
-            let is_protected = msg.source_inbox_ids.iter().any(|iid| protected_inbox_ids.contains(iid));
+            let is_protected = msg
+                .source_inbox_ids
+                .iter()
+                .any(|iid| protected_inbox_ids.contains(iid));
             if !is_protected {
                 ids.push(id);
             }
@@ -2518,7 +2547,10 @@ pub fn delete_outbox_older_than(cutoff_ns: u64, limit: usize, protected_inbox_id
     })
 }
 
-pub fn delete_turns_older_than(cutoff_ns: u64, limit: usize) -> Result<Vec<(String, TurnRecord)>, String> {
+pub fn delete_turns_older_than(
+    cutoff_ns: u64,
+    limit: usize,
+) -> Result<Vec<(String, TurnRecord)>, String> {
     backend::with_connection(|conn| {
         let mut stmt = conn
             .prepare(
@@ -2549,7 +2581,10 @@ pub fn delete_turns_older_than(cutoff_ns: u64, limit: usize) -> Result<Vec<(Stri
     })
 }
 
-pub fn delete_transitions_older_than(cutoff_ns: u64, limit: usize) -> Result<Vec<(String, TransitionLogRecord)>, String> {
+pub fn delete_transitions_older_than(
+    cutoff_ns: u64,
+    limit: usize,
+) -> Result<Vec<(String, TransitionLogRecord)>, String> {
     backend::with_connection(|conn| {
         let mut stmt = conn
             .prepare(
@@ -2580,14 +2615,35 @@ pub fn delete_transitions_older_than(cutoff_ns: u64, limit: usize) -> Result<Vec
 
 pub fn table_count_extended(table: &str) -> Result<u64, String> {
     let table_name = match table {
-        "transitions" | "turns" | "tool_calls" | "inbox" | "outbox" | "conversations" | "jobs"
-        | "memory_facts" | "skills" | "strategy_templates" | "abi_artifacts"
-        | "hot_runtime_snapshot" | "hot_scheduler_runtime" | "hot_task_configs"
-        | "hot_task_runtimes" | "hot_topup_state" | "hot_survival_operation_runtime"
-        | "http_domain_allowlist" | "prompt_layers" | "retention_runtime"
-        | "session_summaries" | "turn_window_summaries" | "memory_rollups"
-        | "strategy_activations" | "strategy_revocations" | "strategy_kill_switches"
-        | "strategy_outcome_stats" | "strategy_budgets" | "autonomy_tool_failures"
+        "transitions"
+        | "turns"
+        | "tool_calls"
+        | "inbox"
+        | "outbox"
+        | "conversations"
+        | "jobs"
+        | "memory_facts"
+        | "skills"
+        | "strategy_templates"
+        | "abi_artifacts"
+        | "hot_runtime_snapshot"
+        | "hot_scheduler_runtime"
+        | "hot_task_configs"
+        | "hot_task_runtimes"
+        | "hot_topup_state"
+        | "hot_survival_operation_runtime"
+        | "http_domain_allowlist"
+        | "prompt_layers"
+        | "retention_runtime"
+        | "session_summaries"
+        | "turn_window_summaries"
+        | "memory_rollups"
+        | "strategy_activations"
+        | "strategy_revocations"
+        | "strategy_kill_switches"
+        | "strategy_outcome_stats"
+        | "strategy_budgets"
+        | "autonomy_tool_failures"
         | "runtime_scalars" => table,
         _ => return Err(format!("unsupported table: {table}")),
     };
@@ -2674,14 +2730,18 @@ mod tests {
         close_storage().expect("reset sqlite");
         init_storage().expect("init sqlite");
 
-        let mut snapshot = RuntimeSnapshot::default();
-        snapshot.loop_enabled = false;
-        snapshot.turn_counter = 42;
+        let snapshot = RuntimeSnapshot {
+            loop_enabled: false,
+            turn_counter: 42,
+            ..RuntimeSnapshot::default()
+        };
         write_runtime_snapshot(&snapshot).expect("runtime snapshot write");
 
-        let mut scheduler_runtime = SchedulerRuntime::default();
-        scheduler_runtime.enabled = false;
-        scheduler_runtime.paused_reason = Some("test".to_string());
+        let scheduler_runtime = SchedulerRuntime {
+            enabled: false,
+            paused_reason: Some("test".to_string()),
+            ..SchedulerRuntime::default()
+        };
         write_scheduler_runtime(&scheduler_runtime).expect("scheduler runtime write");
 
         let mut task_config = TaskScheduleConfig::default_for(&TaskKind::CheckCycles);
@@ -2745,7 +2805,9 @@ mod tests {
         assert_eq!(loaded_survival.backoff_until_ns, Some(500));
 
         clear_topup_state().expect("topup clear");
-        assert!(read_topup_state().expect("topup read after clear").is_none());
+        assert!(read_topup_state()
+            .expect("topup read after clear")
+            .is_none());
     }
 
     #[test]

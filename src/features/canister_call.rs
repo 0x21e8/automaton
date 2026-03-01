@@ -362,7 +362,10 @@ mod tests {
                 text.contains(r#"principal "2vxsx-fae""#),
                 "expected anonymous principal placeholder replacement on host, got {text}"
             );
-            Ok(candid_parser::parse_idl_args("()").unwrap().to_bytes().unwrap())
+            Ok(candid_parser::parse_idl_args("()")
+                .unwrap()
+                .to_bytes()
+                .unwrap())
         });
 
         let result = block_on_with_spin(canister_call_tool(

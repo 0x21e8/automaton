@@ -1,3 +1,5 @@
+use super::sqlite;
+use super::sqlite::SurvivalOperationRuntimeRecord;
 /// Stable-memory persistence layer for the ic-automaton canister.
 ///
 /// This is the SQLite-primary rewrite of the storage layer.  All
@@ -30,8 +32,6 @@ use candid::Principal;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use super::sqlite;
-use super::sqlite::SurvivalOperationRuntimeRecord;
 
 fn now_ns() -> u64 {
     crate::timing::current_time_ns()
@@ -204,9 +204,10 @@ struct StorageGrowthSample {
 
 // ── Survival / backoff helpers ────────────────────────────────────────────────
 
-fn get_survival_operation_runtime(operation: &SurvivalOperationClass) -> SurvivalOperationRuntimeRecord {
-    sqlite::read_survival_operation_runtime(operation)
-        .unwrap_or_default()
+fn get_survival_operation_runtime(
+    operation: &SurvivalOperationClass,
+) -> SurvivalOperationRuntimeRecord {
+    sqlite::read_survival_operation_runtime(operation).unwrap_or_default()
 }
 
 fn set_survival_operation_runtime(
@@ -515,7 +516,9 @@ pub fn run_retention_maintenance_once(now_ns: u64) -> RetentionPruneStats {
     let turns_cutoff_ns =
         now_ns.saturating_sub(config.turns_max_age_secs.saturating_mul(1_000_000_000));
     let transitions_cutoff_ns = now_ns.saturating_sub(
-        config.transitions_max_age_secs.saturating_mul(1_000_000_000),
+        config
+            .transitions_max_age_secs
+            .saturating_mul(1_000_000_000),
     );
     let protected_inbox_ids = protected_conversation_inbox_ids();
 
@@ -531,18 +534,20 @@ pub fn run_retention_maintenance_once(now_ns: u64) -> RetentionPruneStats {
     let deleted_dedupe: u32 = 0;
 
     // Delete old consumed inbox messages.
-    let deleted_inbox = sqlite::delete_inbox_older_than(inbox_cutoff_ns, jobs_budget, &protected_inbox_ids)
-        .map(|ids| u32::try_from(ids.len()).unwrap_or(u32::MAX))
-        .unwrap_or(0);
+    let deleted_inbox =
+        sqlite::delete_inbox_older_than(inbox_cutoff_ns, jobs_budget, &protected_inbox_ids)
+            .map(|ids| u32::try_from(ids.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0);
 
     // Delete old outbox messages.
-    let deleted_outbox = sqlite::delete_outbox_older_than(outbox_cutoff_ns, jobs_budget, &protected_inbox_ids)
-        .map(|ids| u32::try_from(ids.len()).unwrap_or(u32::MAX))
-        .unwrap_or(0);
+    let deleted_outbox =
+        sqlite::delete_outbox_older_than(outbox_cutoff_ns, jobs_budget, &protected_inbox_ids)
+            .map(|ids| u32::try_from(ids.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0);
 
     // Delete old turns (and their tool calls).
-    let deleted_turns_records = sqlite::delete_turns_older_than(turns_cutoff_ns, jobs_budget)
-        .unwrap_or_default();
+    let deleted_turns_records =
+        sqlite::delete_turns_older_than(turns_cutoff_ns, jobs_budget).unwrap_or_default();
     let deleted_turns = u32::try_from(deleted_turns_records.len()).unwrap_or(u32::MAX);
 
     // Delete old transitions.
@@ -558,10 +563,8 @@ pub fn run_retention_maintenance_once(now_ns: u64) -> RetentionPruneStats {
     let generated_session_summaries: u32 = 0;
 
     // Generate turn-window summaries from deleted turns/transitions.
-    let generated_turn_window_summaries = generate_turn_window_summaries_from_deleted(
-        &deleted_turns_records,
-        now_ns,
-    );
+    let generated_turn_window_summaries =
+        generate_turn_window_summaries_from_deleted(&deleted_turns_records, now_ns);
 
     // Update memory rollups and prune stale facts.
     let generated_memory_rollups = update_memory_rollups(now_ns);
@@ -641,33 +644,33 @@ fn generate_turn_window_summaries_from_deleted(
     for (window_start_ns, turns) in &by_window {
         let date_key = turn_window_summary_key(*window_start_ns);
         // Read existing summary if any.
-        let mut existing: TurnWindowSummary = sqlite::get_turn_window_summary::<TurnWindowSummary>(&date_key)
-            .ok()
-            .flatten()
-            .unwrap_or(TurnWindowSummary {
-                window_start_ns: *window_start_ns,
-                window_end_ns: window_start_ns.saturating_add(SUMMARY_WINDOW_NS),
-                source_count: 0,
-                turn_count: 0,
-                transition_count: 0,
-                tool_call_count: 0,
-                succeeded_turn_count: 0,
-                failed_turn_count: 0,
-                tool_success_count: 0,
-                tool_failure_count: 0,
-                top_errors: Vec::new(),
-                generated_at_ns: now_ns,
-            });
+        let mut existing: TurnWindowSummary =
+            sqlite::get_turn_window_summary::<TurnWindowSummary>(&date_key)
+                .ok()
+                .flatten()
+                .unwrap_or(TurnWindowSummary {
+                    window_start_ns: *window_start_ns,
+                    window_end_ns: window_start_ns.saturating_add(SUMMARY_WINDOW_NS),
+                    source_count: 0,
+                    turn_count: 0,
+                    transition_count: 0,
+                    tool_call_count: 0,
+                    succeeded_turn_count: 0,
+                    failed_turn_count: 0,
+                    tool_success_count: 0,
+                    tool_failure_count: 0,
+                    top_errors: Vec::new(),
+                    generated_at_ns: now_ns,
+                });
 
         for turn in turns {
             existing.source_count = existing.source_count.saturating_add(1);
             existing.turn_count = existing.turn_count.saturating_add(1);
             existing.tool_call_count = existing
                 .tool_call_count
-                .saturating_add(u32::try_from(turn.tool_call_count).unwrap_or(u32::MAX));
+                .saturating_add(turn.tool_call_count);
             if turn.error.is_none() {
-                existing.succeeded_turn_count =
-                    existing.succeeded_turn_count.saturating_add(1);
+                existing.succeeded_turn_count = existing.succeeded_turn_count.saturating_add(1);
             } else {
                 existing.failed_turn_count = existing.failed_turn_count.saturating_add(1);
                 if let Some(err) = &turn.error {
@@ -839,11 +842,13 @@ pub fn list_conversation_summaries() -> Vec<ConversationSummary> {
     let raw = sqlite::list_conversation_summaries().unwrap_or_default();
     let mut summaries: Vec<ConversationSummary> = raw
         .into_iter()
-        .map(|(sender, last_activity_ns, entry_count)| ConversationSummary {
-            sender,
-            last_activity_ns,
-            entry_count,
-        })
+        .map(
+            |(sender, last_activity_ns, entry_count)| ConversationSummary {
+                sender,
+                last_activity_ns,
+                entry_count,
+            },
+        )
         .collect();
     summaries.sort_by(|left, right| {
         right
@@ -871,8 +876,7 @@ pub fn list_session_summaries(limit: usize) -> Vec<SessionSummary> {
         return Vec::new();
     }
     let keep = limit.min(MAX_OBSERVABILITY_LIMIT);
-    sqlite::list_session_summaries::<SessionSummary>(keep)
-        .unwrap_or_default()
+    sqlite::list_session_summaries::<SessionSummary>(keep).unwrap_or_default()
 }
 
 /// Returns the most-recent `limit` daily turn-window summaries (newest first).
@@ -882,8 +886,7 @@ pub fn list_turn_window_summaries(limit: usize) -> Vec<TurnWindowSummary> {
         return Vec::new();
     }
     let keep = limit.min(MAX_OBSERVABILITY_LIMIT);
-    sqlite::list_turn_window_summaries::<TurnWindowSummary>(keep)
-        .unwrap_or_default()
+    sqlite::list_turn_window_summaries::<TurnWindowSummary>(keep).unwrap_or_default()
 }
 
 /// Returns up to `limit` memory rollups, sorted by generation time descending.
@@ -893,8 +896,8 @@ pub fn list_memory_rollups(limit: usize) -> Vec<MemoryRollup> {
         return Vec::new();
     }
     let keep = limit.min(MAX_MEMORY_ROLLUPS);
-    let mut rollups: Vec<MemoryRollup> = sqlite::list_memory_rollups::<MemoryRollup>(keep)
-        .unwrap_or_default();
+    let mut rollups: Vec<MemoryRollup> =
+        sqlite::list_memory_rollups::<MemoryRollup>(keep).unwrap_or_default();
     rollups.sort_by(|left, right| {
         right
             .generated_at_ns
@@ -1661,11 +1664,7 @@ fn update_memory_rollups(_now_ns: u64) -> u32 {
     0
 }
 
-fn prune_stale_non_critical_memory_facts(
-    now_ns: u64,
-    max_age_secs: u64,
-    limit: usize,
-) -> u32 {
+fn prune_stale_non_critical_memory_facts(now_ns: u64, max_age_secs: u64, limit: usize) -> u32 {
     let cutoff_ns = now_ns.saturating_sub(max_age_secs.saturating_mul(1_000_000_000));
     sqlite::prune_memory_facts(None, Some(cutoff_ns), limit)
         .map(|keys| u32::try_from(keys.len()).unwrap_or(u32::MAX))
@@ -2139,7 +2138,9 @@ pub fn prune_memory_facts(
 
 fn sort_memory_facts(facts: &mut [MemoryFact], sort: MemoryFactSort) {
     match sort {
-        MemoryFactSort::UpdatedAtDesc => facts.sort_by(|a, b| b.updated_at_ns.cmp(&a.updated_at_ns)),
+        MemoryFactSort::UpdatedAtDesc => {
+            facts.sort_by(|a, b| b.updated_at_ns.cmp(&a.updated_at_ns))
+        }
         MemoryFactSort::KeyAsc => facts.sort_by(|a, b| a.key.cmp(&b.key)),
     }
 }
@@ -2476,9 +2477,8 @@ pub fn autonomy_tool_failure_cooldown(
     now_ns: u64,
 ) -> Option<AutonomyToolFailureCooldown> {
     let key = autonomy_tool_failure_key(fingerprint);
-    let tracker: AutonomyToolFailureTracker = sqlite::get_autonomy_tool_failure(&key)
-        .ok()
-        .flatten()?;
+    let tracker: AutonomyToolFailureTracker =
+        sqlite::get_autonomy_tool_failure(&key).ok().flatten()?;
     let cooldown_until_ns = tracker.cooldown_until_ns?;
     if cooldown_until_ns <= now_ns {
         return None;
