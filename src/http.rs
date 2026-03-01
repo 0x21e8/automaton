@@ -15,6 +15,7 @@
 /// | GET    | `/styles.css`                 | query       |
 /// | GET    | `/app.js`                     | query       |
 /// | GET    | `/api/snapshot`               | query       |
+/// | GET    | `/api/steward/status`         | query       |
 /// | GET    | `/api/wallet/balance`         | query       |
 /// | GET    | `/api/wallet/balance/sync-config` | query   |
 /// | GET    | `/api/evm/config`             | query       |
@@ -317,6 +318,10 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
             let snapshot = stable::observability_snapshot(DEFAULT_SNAPSHOT_LIMIT);
             json_update_response(StatusCode::OK, &snapshot)
         }
+        (&Method::GET, "/api/steward/status") => {
+            let status = stable::steward_status_view();
+            json_update_response(StatusCode::OK, &status)
+        }
         (&Method::GET, "/api/wallet/balance") => {
             let telemetry = stable::wallet_balance_telemetry_view();
             json_update_response(StatusCode::OK, &telemetry)
@@ -405,6 +410,7 @@ fn ensure_initialized() {
 /// endpoints.  Inserts each route into a fresh `HttpCertificationTree`.
 fn build_certification_state() -> HttpCertificationState {
     let snapshot = stable::observability_snapshot(DEFAULT_SNAPSHOT_LIMIT);
+    let steward_status = stable::steward_status_view();
     let wallet_balance = stable::wallet_balance_telemetry_view();
     let wallet_sync_config = stable::wallet_balance_sync_config_view();
     let evm_config = evm_config_view();
@@ -445,6 +451,7 @@ fn build_certification_state() -> HttpCertificationState {
             CONTENT_TYPE_JS,
         ),
         json_route(Method::GET, "/api/snapshot", &snapshot),
+        json_route(Method::GET, "/api/steward/status", &steward_status),
         json_route(Method::GET, "/api/wallet/balance", &wallet_balance),
         json_route(
             Method::GET,
@@ -852,6 +859,60 @@ mod tests {
         let body = serde_json::from_slice::<Value>(response.body())
             .expect("wallet balance body should decode as json");
         assert!(body.get("status").is_some());
+    }
+
+    #[test]
+    fn get_steward_status_route_is_certified_query() {
+        init_certification();
+
+        let request = HttpRequest::get("/api/steward/status").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), None);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("steward status body should decode as json");
+        assert!(body.get("active_steward").is_some());
+        assert!(body.get("next_nonce").is_some());
+    }
+
+    #[test]
+    fn get_steward_status_route_returns_active_identity_and_nonce() {
+        stable::init_storage();
+        let stored = stable::set_active_steward(Some(crate::domain::types::StewardState {
+            chain_id: 8453,
+            address: "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa".to_string(),
+            enabled: true,
+            last_used_at_ns: Some(42),
+        }))
+        .expect("active steward should persist")
+        .expect("active steward should be set");
+        let _ = stable::set_steward_nonce_state(crate::domain::types::StewardNonceState {
+            next_nonce: 11,
+        });
+        init_certification();
+
+        let response = handle_http_request_update(HttpRequest::get("/api/steward/status").build_update());
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("steward status update body should decode as json");
+        assert_eq!(
+            body.pointer("/active_steward/chain_id")
+                .and_then(Value::as_u64),
+            Some(stored.chain_id)
+        );
+        assert_eq!(
+            body.pointer("/active_steward/address")
+                .and_then(Value::as_str),
+            Some(stored.address.as_str())
+        );
+        assert_eq!(
+            body.pointer("/active_steward/enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(body.get("next_nonce").and_then(Value::as_u64), Some(11));
     }
 
     #[test]

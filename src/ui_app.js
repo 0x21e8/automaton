@@ -24,6 +24,18 @@ const state = {
   publicClient: null,    // viem public client (initialized in Phase 2 for reads)
   walletClient: null,    // viem wallet client (Phase 3)
 
+  // Steward auth (Phase 5)
+  stewardStatus: null,
+  stewardCapabilities: {
+    hasActiveSteward: false,
+    activeStewardEnabled: false,
+    addressMatches: false,
+    chainMatches: false,
+    walletMatchesActiveSteward: false,
+    canExecuteStewardCommands: false,
+    nextNonce: 0,
+  },
+
   // EVM config from canister (Phase 2+)
   automatonEvmAddress: null,
   inboxContractAddress: null,
@@ -308,7 +320,7 @@ function sanitizeRpcUrlForDisplay(raw) {
 // =============================================================================
 
 const BOOT_DELAY_STEP = 90; // ms between each boot line reveal
-const BOOT_LINE_COUNT = 9;  // lines emitted by runBoot (for focus timer)
+const BOOT_LINE_COUNT = 11; // lines emitted by runBoot (for focus timer)
 
 const DEFAULT_WELCOME_LINES = [
   "Type 'help' for available commands.",
@@ -324,6 +336,8 @@ async function runBoot() {
 
   const connectingLine = printLine("CONNECTING TO CANISTER...", "system dim", delay); delay += S;
   const evmConfigLine  = printLine("LOADING EVM CONFIG...",     "system dim", delay); delay += S;
+  const stewardLine = printLine("RESOLVING STEWARD STATUS...", "system dim", delay); delay += S;
+  const walletLine = printLine("DETECTING WALLET CONNECTION...", "system dim", delay); delay += S;
 
   printEmpty(delay);                                                           delay += S;
   printLine("READY.", "system bright", delay);                                 delay += S;
@@ -344,6 +358,26 @@ async function runBoot() {
     evmConfigLine.textContent = "LOADING EVM CONFIG...        [OK]";
   } catch (_) {
     evmConfigLine.textContent = "LOADING EVM CONFIG...        [—]";
+  }
+
+  // Steward status + capability bootstrap
+  try {
+    await loadStewardStatus();
+    stewardLine.textContent = "RESOLVING STEWARD STATUS...  [OK]";
+  } catch (_) {
+    state.stewardStatus = null;
+    resolveStewardCapabilities();
+    stewardLine.textContent = "RESOLVING STEWARD STATUS...  [—]";
+  }
+
+  // Detect pre-authorized wallet sessions from injected providers.
+  try {
+    const connected = await detectWalletConnection();
+    walletLine.textContent = connected
+      ? "DETECTING WALLET CONNECTION...[CONNECTED]"
+      : "DETECTING WALLET CONNECTION...[NONE]";
+  } catch (_) {
+    walletLine.textContent = "DETECTING WALLET CONNECTION...[FAIL]";
   }
 
   // Welcome message — custom or default
@@ -381,6 +415,104 @@ async function loadEvmConfig() {
   state.rpcUrl               = config.rpc_url                 ?? null;
   // Invalidate any stale public client when config changes
   state.publicClient = null;
+}
+
+function normalizeEvmAddress(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+function resolveStewardCapabilities() {
+  const status = state.stewardStatus ?? {};
+  const activeSteward = status.active_steward ?? null;
+  const stewardAddress = normalizeEvmAddress(activeSteward?.address);
+  const walletAddress = normalizeEvmAddress(state.walletAddress);
+  const stewardChainId = Number(activeSteward?.chain_id ?? 0);
+  const walletChainId = Number(state.chainId ?? 0);
+
+  const hasActiveSteward = Boolean(activeSteward && stewardAddress && stewardChainId > 0);
+  const activeStewardEnabled = Boolean(activeSteward?.enabled);
+  const addressMatches = Boolean(
+    hasActiveSteward && state.walletConnected && walletAddress && walletAddress === stewardAddress
+  );
+  const chainMatches = Boolean(
+    hasActiveSteward && state.walletConnected && walletChainId > 0 && walletChainId === stewardChainId
+  );
+  const walletMatchesActiveSteward = addressMatches && chainMatches;
+  const canExecuteStewardCommands = walletMatchesActiveSteward && activeStewardEnabled;
+  const nextNonce = Number(status.next_nonce ?? 0);
+
+  state.stewardCapabilities = {
+    hasActiveSteward,
+    activeStewardEnabled,
+    addressMatches,
+    chainMatches,
+    walletMatchesActiveSteward,
+    canExecuteStewardCommands,
+    nextNonce: Number.isFinite(nextNonce) && nextNonce >= 0 ? nextNonce : 0,
+  };
+}
+
+async function loadStewardStatus() {
+  const status = await apiFetch("/api/steward/status");
+  state.stewardStatus = status ?? null;
+  resolveStewardCapabilities();
+  return state.stewardStatus;
+}
+
+async function detectWalletConnection() {
+  if (!window.ethereum) {
+    state.walletConnected = false;
+    state.walletAddress = null;
+    state.chainId = null;
+    state.walletClient = null;
+    resolveStewardCapabilities();
+    return false;
+  }
+
+  let accounts = [];
+  let chainIdHex = null;
+  try {
+    [accounts, chainIdHex] = await Promise.all([
+      window.ethereum.request({ method: "eth_accounts" }),
+      window.ethereum.request({ method: "eth_chainId" }),
+    ]);
+  } catch (_) {
+    state.walletConnected = false;
+    state.walletAddress = null;
+    state.chainId = null;
+    state.walletClient = null;
+    resolveStewardCapabilities();
+    return false;
+  }
+
+  const address = Array.isArray(accounts) && accounts.length > 0 ? accounts[0] : null;
+  const chainId = typeof chainIdHex === "string" ? Number.parseInt(chainIdHex, 16) : Number(chainIdHex);
+  state.chainId = Number.isFinite(chainId) ? chainId : null;
+
+  if (!address) {
+    state.walletConnected = false;
+    state.walletAddress = null;
+    state.walletClient = null;
+    resolveStewardCapabilities();
+    registerWalletListeners();
+    updateStatusBar({ online: true, stateName: state.lastSnapshotData?.runtime?.state });
+    return false;
+  }
+
+  state.walletConnected = true;
+  state.walletAddress = address;
+  resolveStewardCapabilities();
+  registerWalletListeners();
+  updateStatusBar({
+    online: true,
+    stateName: state.lastSnapshotData?.runtime?.state,
+    walletAddress: state.walletAddress,
+    chainId: state.chainId,
+  });
+  return true;
 }
 
 // =============================================================================
@@ -1366,6 +1498,7 @@ function registerWalletListeners() {
       state.walletAddress   = null;
       state.chainId         = null;
       state.walletClient    = null;
+      resolveStewardCapabilities();
       if (prev) {
         printEmpty();
         printLine("[wallet disconnected by provider]", "system dim");
@@ -1373,7 +1506,9 @@ function registerWalletListeners() {
       }
       updateStatusBar({ online: true, stateName: state.lastSnapshotData?.runtime?.state });
     } else {
+      state.walletConnected = true;
       state.walletAddress = accounts[0];
+      resolveStewardCapabilities();
       updateStatusBar({
         online: true,
         stateName: state.lastSnapshotData?.runtime?.state,
@@ -1387,6 +1522,7 @@ function registerWalletListeners() {
     const newId = parseInt(chainIdHex, 16);
     state.chainId      = newId;
     state.walletClient = null; // invalidate — chain changed
+    resolveStewardCapabilities();
     updateStatusBar({
       online: true,
       stateName: state.lastSnapshotData?.runtime?.state,
@@ -1454,6 +1590,11 @@ async function cmdConnect() {
   state.walletConnected = true;
   state.walletAddress   = address;
   state.chainId         = chainId;
+  try {
+    await loadStewardStatus();
+  } catch (_) {
+    resolveStewardCapabilities();
+  }
 
   printSuccess(`CONNECTED: ${address}`);
   printLine(`CHAIN: ${chainName(chainId)} (${chainId})`, "system");
@@ -1481,6 +1622,14 @@ async function cmdConnect() {
     }
   }
 
+  if (state.stewardCapabilities.canExecuteStewardCommands) {
+    printLine("STEWARD CAPABILITIES: ACTIVE", "success");
+  } else if (state.stewardCapabilities.hasActiveSteward) {
+    printLine("STEWARD CAPABILITIES: LIMITED (wallet mismatch or steward disabled)", "system dim");
+  } else {
+    printLine("STEWARD CAPABILITIES: NONE CONFIGURED", "system dim");
+  }
+
   printEmpty();
   updateStatusBar({
     online: true,
@@ -1504,6 +1653,7 @@ async function cmdDisconnect() {
   state.walletAddress   = null;
   state.chainId         = null;
   state.walletClient    = null;
+  resolveStewardCapabilities();
 
   printLine(`DISCONNECTED: ${prev}`, "system");
   printEmpty();
@@ -2281,8 +2431,9 @@ function updateStatusBar({ online, stateName, walletAddress, chainId } = {}) {
 
   const addr = walletAddress ?? state.walletAddress;
   if (addr) {
+    const stewardSuffix = state.stewardCapabilities?.canExecuteStewardCommands ? " · steward" : "";
     sbWalletEl.textContent =
-      `${addr.slice(0, 6)}…${addr.slice(-4)}${chainId ? ` · chain ${chainId}` : ""}` + asyncSuffix;
+      `${addr.slice(0, 6)}…${addr.slice(-4)}${chainId ? ` · chain ${chainId}` : ""}${stewardSuffix}${asyncSuffix}`;
   } else {
     sbWalletEl.textContent = `WALLET: not connected${asyncSuffix}`;
   }
@@ -2314,6 +2465,11 @@ async function pollStatus() {
   try {
     const snapshot  = await apiFetch("/api/snapshot");
     const stateName = snapshot?.runtime?.state ?? "ONLINE";
+    try {
+      await loadStewardStatus();
+    } catch (_) {
+      resolveStewardCapabilities();
+    }
     updateStatusBar({ online: true, stateName });
     state.lastSnapshotData = snapshot;
   } catch (_) {
