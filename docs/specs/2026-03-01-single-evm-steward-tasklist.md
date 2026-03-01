@@ -88,10 +88,10 @@ Implement a single-steward, EVM-only command plane with full parity for current 
   - Check:
     - [x] `icp build`
     - [x] `cargo test --features pocketic_tests --test pocketic_steward_command_plane`
-- [ ] Regenerate candid after API additions.
+- [x] Regenerate candid after API additions.
   - Check:
-    - [ ] `icp build`
-    - [ ] `./scripts/generate-candid.sh ic-automaton.did`
+    - [x] `icp build`
+    - [x] `./scripts/generate-candid.sh ic-automaton.did`
 
 ## Final validation gate (must be green)
 

@@ -147,12 +147,14 @@ type InboxMessage = record {
   id : text;
   seq : nat64;
   status : InboxMessageStatus;
+  source : InboxMessageSource;
   body : text;
   consumed_at_ns : opt nat64;
   posted_at_ns : nat64;
   posted_by : text;
   staged_at_ns : opt nat64;
 };
+type InboxMessageSource = variant { StewardDirect; EvmInbox };
 type InboxMessageStatus = variant { Staged; Consumed; Pending };
 type InboxStats = record {
   pending_count : nat64;
@@ -413,7 +415,64 @@ type SkillRecord = record {
   mutable : bool;
   allowed_canister_calls : vec CanisterCallPermission;
 };
-type StewardCommand = variant { Noop };
+type StewardCommand = variant {
+  IngestStrategyAbiArtifact : StrategyAbiIngestArgs;
+  IngestStrategyTemplate : record { template : StrategyTemplate };
+  SetSchedulerLowCyclesMode : record { enabled : bool };
+  SetEvmConfirmationDepth : record { confirmation_depth : nat64 };
+  SetOpenrouterApiKey : record { api_key : opt text };
+  PruneMemoryFacts : record {
+    updated_before_ns : opt nat64;
+    limit : nat32;
+    prefix : opt text;
+  };
+  ActivateStrategyTemplate : record {
+    key : StrategyTemplateKey;
+    version : TemplateVersion;
+    reason : opt text;
+  };
+  Noop;
+  UpsertSkill : record { skill : SkillRecord };
+  SetInferenceProxyConfig : record { config : OpenRouterProxyWorkerConfig };
+  DeprecateStrategyTemplate : record {
+    key : StrategyTemplateKey;
+    version : TemplateVersion;
+    reason : opt text;
+  };
+  SetAutonomyToolDedupeEnabled : record { enabled : bool };
+  UpdatePromptLayer : record { content : text; layer_id : nat8 };
+  SetEvmRpcMaxResponseBytes : record { max_response_bytes : nat64 };
+  SendStewardMessage : record { sender : text; message : text };
+  SetTaskEnabled : record { kind : TaskKind; enabled : bool };
+  SetEvmRpcFallbackUrl : record { url : opt text };
+  SetInferenceProvider : record { provider : InferenceProvider };
+  SetInferenceModel : record { model : text };
+  SetHttpAllowedDomains : record { domains : vec text };
+  UpdateSteward : record { enabled : bool; chain_id : nat64; address : text };
+  SetRetentionConfig : record { config : RetentionConfig };
+  RevokeStrategyTemplate : record {
+    key : StrategyTemplateKey;
+    version : TemplateVersion;
+    reason : opt text;
+  };
+  DeriveAutomatonEvmAddress;
+  SetSchedulerEnabled : record { enabled : bool };
+  SetEvmRpcUrl : record { url : text };
+  SetOpenrouterBaseUrl : record { base_url : text };
+  SetAutonomySuppressionConfig : record { config : AutonomySuppressionConfig };
+  SetStrategyKillSwitch : record {
+    key : StrategyTemplateKey;
+    enabled : bool;
+    reason : opt text;
+  };
+  SetLoopEnabled : record { enabled : bool };
+  SetInboxContractAddress : record { address : opt text };
+  SetSchedulerBaseTickSecs : record { interval_secs : nat64 };
+  SetTaskIntervalSecs : record { kind : TaskKind; interval_secs : nat64 };
+  SetEvmChainId : record { chain_id : nat64 };
+  SetWelcomeMessage : record { message : text };
+  UpdateSoul : record { new_soul : text };
+};
 type StewardState = record {
   last_used_at_ns : opt nat64;
   enabled : bool;
@@ -844,7 +903,6 @@ service : (InitArgs) -> {
   // Sets a custom welcome message shown in the TUI on boot (controller only).
   // An empty string clears the custom message and restores the default.
   set_welcome_message : (text) -> (Result_2);
-  // Executes a signed steward command after EVM-proof verification.
   steward_execute : (StewardCommand, EvmStewardProof) -> (Result_2);
   // Callback endpoint used by the OpenRouter proxy worker to submit async results.
   submit_inference_result : (SubmitInferenceResultArgs) -> (Result_2);
