@@ -69,7 +69,7 @@ Implement a single-steward, EVM-only command plane with full parity for current 
 
 - [x] Detect EVM wallet connection and resolve current steward status/capabilities.
   - File refs: `src/ui_app.js`, HTTP/API handlers in `src/http.rs` and `src/lib.rs`
-- [ ] Show expanded command palette only when connected wallet matches active steward.
+- [x] Show expanded command palette only when connected wallet matches active steward.
   - File refs: `src/ui_app.js`
 - [ ] Add direct steward message UI action and command signing flow.
   - File refs: `src/ui_app.js`

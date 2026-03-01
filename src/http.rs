@@ -834,6 +834,28 @@ mod tests {
     }
 
     #[test]
+    fn serves_app_asset_with_steward_palette_guarded_by_wallet_match() {
+        init_certification();
+
+        let response = handle_http_request(HttpRequest::get("/app.js").build());
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body = std::str::from_utf8(response.body()).expect("app.js body should be utf8");
+        assert!(
+            body.contains("buildHelpLines"),
+            "help rendering should be built dynamically for steward-aware expansion"
+        );
+        assert!(
+            body.contains("walletMatchesActiveSteward"),
+            "steward palette expansion should gate on wallet/steward identity match"
+        );
+        assert!(
+            body.contains("STEWARD COMMAND SURFACE"),
+            "expanded help palette should include a steward command section"
+        );
+    }
+
+    #[test]
     fn api_snapshot_query_path_returns_certified_json() {
         init_certification();
 

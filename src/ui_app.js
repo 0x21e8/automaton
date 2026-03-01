@@ -874,7 +874,7 @@ function parseInput(raw) {
 // COMMANDS — Phase 1 (help, clear)
 // =============================================================================
 
-const HELP_LINES = [
+const BASE_HELP_LINES = [
   { text: "AVAILABLE COMMANDS", cls: "system bright" },
   { text: "────────────────────────────────────", cls: "separator" },
   { text: "  connect              Connect EVM wallet (MetaMask, etc.)", cls: "system" },
@@ -897,9 +897,31 @@ const HELP_LINES = [
   { text: "  Tip: status is live by default; use -f for log/peek; press q or Esc to stop.", cls: "system dim" },
 ];
 
+function buildHelpLines() {
+  const lines = [...BASE_HELP_LINES];
+
+  if (state.stewardCapabilities.walletMatchesActiveSteward) {
+    lines.push(
+      { text: null },
+      { text: "STEWARD COMMAND SURFACE", cls: "system bright" },
+      { text: "────────────────────────────────────", cls: "separator" },
+      {
+        text: "  steward wallet       Connected wallet matches active steward",
+        cls: "success",
+      },
+      {
+        text: "  expanded palette     Additional steward actions appear here",
+        cls: "system dim",
+      }
+    );
+  }
+
+  return lines;
+}
+
 function cmdHelp() {
   printEmpty();
-  HELP_LINES.forEach(({ text, cls }) => {
+  buildHelpLines().forEach(({ text, cls }) => {
     if (text === null) {
       printEmpty();
     } else {
