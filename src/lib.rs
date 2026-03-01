@@ -280,6 +280,7 @@ fn set_loop_enabled(enabled: bool) -> String {
 fn set_inference_provider(provider: InferenceProvider) -> String {
     ensure_controller_or_trap();
     stable::set_inference_provider(provider.clone());
+    crate::http::init_certification();
     format!("inference_provider={provider:?}")
 }
 
@@ -288,7 +289,9 @@ fn set_inference_provider(provider: InferenceProvider) -> String {
 #[ic_cdk::update]
 fn set_inference_model(model: String) -> Result<String, String> {
     ensure_controller()?;
-    stable::set_inference_model(model)
+    let stored = stable::set_inference_model(model)?;
+    crate::http::init_certification();
+    Ok(stored)
 }
 
 /// Stores (or clears) the OpenRouter API key in stable storage.
@@ -297,6 +300,7 @@ fn set_inference_model(model: String) -> Result<String, String> {
 fn set_openrouter_api_key(api_key: Option<String>) -> String {
     ensure_controller_or_trap();
     stable::set_openrouter_api_key(api_key);
+    crate::http::init_certification();
     "openrouter_api_key_updated".to_string()
 }
 
@@ -587,6 +591,7 @@ fn set_scheduler_base_tick_secs(interval_secs: u64) -> Result<u64, String> {
     ensure_controller()?;
     let persisted = stable::set_scheduler_base_tick_secs(interval_secs)?;
     arm_timer_with_interval(persisted);
+    crate::http::init_certification();
     Ok(persisted)
 }
 

@@ -19,6 +19,7 @@
 /// | GET    | `/api/wallet/balance/sync-config` | query   |
 /// | GET    | `/api/evm/config`             | query       |
 /// | GET    | `/api/inference/config`       | query       |
+/// | GET    | `/api/scheduler/config`       | query       |
 /// | GET    | `/api/welcome`                | query       |
 /// | GET    | `/api/build-info`             | query       |
 /// | POST   | `/api/conversation`           | update      |
@@ -121,6 +122,15 @@ struct BuildInfoView {
     commit: &'static str,
 }
 
+/// Serialisable scheduler timing configuration served by
+/// `GET /api/scheduler/config`.
+#[derive(Clone, Debug, Serialize)]
+struct SchedulerConfigView {
+    base_tick_secs: u64,
+    ticks_per_turn_interval: u64,
+    default_turn_interval_secs: u64,
+}
+
 /// Serialisable snapshot of EVM configuration fields served by
 /// `GET /api/evm/config`.
 #[derive(Clone, Debug, Serialize)]
@@ -172,6 +182,16 @@ fn welcome_view() -> WelcomeView {
 fn build_info_view() -> BuildInfoView {
     BuildInfoView {
         commit: option_env!("AUTOMATON_GIT_COMMIT").unwrap_or("unknown"),
+    }
+}
+
+fn scheduler_config_view() -> SchedulerConfigView {
+    let base_tick_secs = stable::get_scheduler_base_tick_secs();
+    let ticks_per_turn_interval = stable::get_cadence_multiplier();
+    SchedulerConfigView {
+        base_tick_secs,
+        ticks_per_turn_interval,
+        default_turn_interval_secs: base_tick_secs.saturating_mul(ticks_per_turn_interval),
     }
 }
 
@@ -333,6 +353,10 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
             let config = stable::inference_config_view();
             json_update_response(StatusCode::OK, &config)
         }
+        (&Method::GET, "/api/scheduler/config") => {
+            let config = scheduler_config_view();
+            json_update_response(StatusCode::OK, &config)
+        }
         (&Method::GET, "/api/welcome") => {
             let view = welcome_view();
             json_update_response(StatusCode::OK, &view)
@@ -380,6 +404,7 @@ fn build_certification_state() -> HttpCertificationState {
     let wallet_sync_config = stable::wallet_balance_sync_config_view();
     let evm_config = evm_config_view();
     let inference_config = stable::inference_config_view();
+    let scheduler_config = scheduler_config_view();
     let welcome = welcome_view();
     let build_info = build_info_view();
 
@@ -422,6 +447,7 @@ fn build_certification_state() -> HttpCertificationState {
         ),
         json_route(Method::GET, "/api/evm/config", &evm_config),
         json_route(Method::GET, "/api/inference/config", &inference_config),
+        json_route(Method::GET, "/api/scheduler/config", &scheduler_config),
         json_route(Method::GET, "/api/welcome", &welcome),
         json_route(Method::GET, "/api/build-info", &build_info),
         upgrade_route(Method::POST, "/api/conversation"),
@@ -1077,6 +1103,27 @@ mod tests {
         let body = serde_json::from_slice::<Value>(response.body())
             .expect("inference config body should decode as json");
         assert!(body.get("provider").is_some());
+    }
+
+    #[test]
+    fn get_scheduler_config_route_is_certified_query() {
+        stable::init_storage();
+        stable::set_scheduler_base_tick_secs(300).expect("base tick should persist");
+        init_certification();
+
+        let request = HttpRequest::get("/api/scheduler/config").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), None);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("scheduler config body should decode as json");
+        assert_eq!(
+            body.get("base_tick_secs").and_then(Value::as_u64),
+            Some(300)
+        );
+        assert!(body.get("ticks_per_turn_interval").is_some());
+        assert!(body.get("default_turn_interval_secs").is_some());
     }
 
     #[test]

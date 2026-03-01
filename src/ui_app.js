@@ -60,8 +60,8 @@ const state = {
 };
 
 const STATUS_VIEW_REFRESH_MS = 2000;
-const UI_BASE_TICK_SECS = 30;
-const UI_TICKS_PER_TURN_INTERVAL = 10;
+const UI_BASE_TICK_SECS_FALLBACK = 30;
+const UI_TICKS_PER_TURN_INTERVAL_FALLBACK = 10;
 const ASYNC_REPLY_POLL_INTERVAL_MS = 10_000;
 const ASYNC_REPLY_TRACK_TTL_MS = 6 * 60 * 60 * 1000;
 
@@ -966,13 +966,14 @@ async function cmdConfig() {
   printEmpty();
   const spinner = createSpinner("FETCHING CONFIG...");
 
-  let snapshot, inferenceConfig, walletSyncConfig, evmConfig;
+  let snapshot, inferenceConfig, walletSyncConfig, evmConfig, schedulerConfig;
   try {
-    [snapshot, inferenceConfig, walletSyncConfig, evmConfig] = await Promise.all([
+    [snapshot, inferenceConfig, walletSyncConfig, evmConfig, schedulerConfig] = await Promise.all([
       apiFetch("/api/snapshot"),
       apiFetch("/api/inference/config"),
       apiFetch("/api/wallet/balance/sync-config"),
       apiFetch("/api/evm/config"),
+      apiFetch("/api/scheduler/config"),
     ]);
   } catch (err) {
     spinner.stop(`ERROR: ${err.message ?? err}`, "error");
@@ -993,7 +994,11 @@ async function cmdConfig() {
   const llmMode = String(inferenceConfig?.provider ?? runtime.inference_provider ?? "unknown")
     .toLowerCase();
   const llmModel = inferenceConfig?.model ?? runtime.inference_model ?? "unknown";
-  const defaultTurnIntervalSecs = UI_BASE_TICK_SECS * UI_TICKS_PER_TURN_INTERVAL;
+  const baseTickSecs = schedulerConfig?.base_tick_secs ?? UI_BASE_TICK_SECS_FALLBACK;
+  const ticksPerTurnInterval =
+    schedulerConfig?.ticks_per_turn_interval ?? UI_TICKS_PER_TURN_INTERVAL_FALLBACK;
+  const defaultTurnIntervalSecs =
+    schedulerConfig?.default_turn_interval_secs ?? (baseTickSecs * ticksPerTurnInterval);
 
   printLine("CONFIG", "system bright");
   printSeparator();
@@ -1002,7 +1007,7 @@ async function cmdConfig() {
   printLine(`  LOOP ENABLED:             ${runtime.loop_enabled ? "yes" : "no"}`, "system");
   printLine(`  SCHEDULER ENABLED:        ${scheduler.enabled ? "yes" : "no"}`, "system");
   printLine(`  LOW CYCLES MODE:          ${scheduler.low_cycles_mode ? "yes" : "no"}`, "system");
-  printLine(`  BASE TICK RATE:           ${UI_BASE_TICK_SECS}s`, "system");
+  printLine(`  BASE TICK RATE:           ${baseTickSecs}s`, "system");
   printLine(`  DEFAULT TURN INTERVAL:    ${defaultTurnIntervalSecs}s`, "system");
   printLine(`  STATUS VIEW REFRESH:      ${STATUS_VIEW_REFRESH_MS / 1000}s`, "system");
   printLine(`  LAST TICK:                ${formatAge(scheduler.last_tick_finished_ns)}`, "system");
