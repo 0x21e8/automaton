@@ -23,7 +23,7 @@ use crate::domain::types::{
     TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState,
     TemplateVersion, ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary,
     WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
-    WalletBalanceTelemetryView,
+    WalletBalanceTelemetryView, StewardNonceState, StewardState,
 };
 pub use crate::domain::types::{
     AutonomyToolFailureCooldown, MemoryFactSort, MemoryFactStats, RetentionPruneStats,
@@ -1474,6 +1474,40 @@ pub fn get_evm_address() -> Option<String> {
 #[allow(dead_code)]
 pub fn get_automaton_evm_address() -> Option<String> {
     get_evm_address()
+}
+
+pub fn active_steward() -> Option<StewardState> {
+    runtime_snapshot().active_steward
+}
+
+pub fn set_active_steward(steward: Option<StewardState>) -> Result<Option<StewardState>, String> {
+    let normalized = steward
+        .map(|mut value| {
+            if value.chain_id == 0 {
+                return Err("steward chain id must be greater than 0".to_string());
+            }
+            value.address = normalize_evm_hex_address(&value.address, "steward address")?;
+            Ok(value)
+        })
+        .transpose()?;
+
+    let mut snapshot = runtime_snapshot();
+    snapshot.active_steward = normalized.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(normalized)
+}
+
+pub fn steward_nonce_state() -> StewardNonceState {
+    runtime_snapshot().steward_nonce
+}
+
+pub fn set_steward_nonce_state(state: StewardNonceState) -> StewardNonceState {
+    let mut snapshot = runtime_snapshot();
+    snapshot.steward_nonce = state.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    state
 }
 
 pub fn get_evm_rpc_url() -> String {
@@ -3980,6 +4014,65 @@ mod tests {
 
     fn trusted_test_principal() -> Principal {
         Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai").expect("test principal should parse")
+    }
+
+    #[test]
+    fn active_steward_round_trip_normalizes_address() {
+        init_storage();
+
+        let stored = set_active_steward(Some(crate::domain::types::StewardState {
+            chain_id: 8453,
+            address: " 0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD ".to_string(),
+            enabled: true,
+            last_used_at_ns: Some(42),
+        }))
+        .expect("active steward should store")
+        .expect("active steward should exist");
+
+        assert_eq!(stored.chain_id, 8453);
+        assert_eq!(stored.address, "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        assert!(stored.enabled);
+        assert_eq!(stored.last_used_at_ns, Some(42));
+
+        let loaded = active_steward().expect("active steward should load");
+        assert_eq!(loaded.address, "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        assert_eq!(loaded.last_used_at_ns, Some(42));
+    }
+
+    #[test]
+    fn set_active_steward_rejects_invalid_identity() {
+        init_storage();
+
+        let invalid_chain = set_active_steward(Some(crate::domain::types::StewardState {
+            chain_id: 0,
+            address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            enabled: true,
+            last_used_at_ns: None,
+        }))
+        .expect_err("chain id 0 must be rejected");
+        assert!(invalid_chain.contains("steward chain id"));
+
+        let invalid_address = set_active_steward(Some(crate::domain::types::StewardState {
+            chain_id: 8453,
+            address: "not-an-address".to_string(),
+            enabled: true,
+            last_used_at_ns: None,
+        }))
+        .expect_err("invalid address must be rejected");
+        assert!(invalid_address.contains("steward address"));
+    }
+
+    #[test]
+    fn steward_nonce_state_round_trip() {
+        init_storage();
+
+        let stored = set_steward_nonce_state(crate::domain::types::StewardNonceState {
+            next_nonce: 7,
+        });
+        assert_eq!(stored.next_nonce, 7);
+
+        let loaded = steward_nonce_state();
+        assert_eq!(loaded.next_nonce, 7);
     }
 
     #[test]

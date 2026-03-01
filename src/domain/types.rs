@@ -177,6 +177,23 @@ pub struct EvmEvent {
     pub payload: String,
 }
 
+/// The single active EVM steward identity authorized for signed commands.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StewardState {
+    pub chain_id: u64,
+    pub address: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub last_used_at_ns: Option<u64>,
+}
+
+/// Monotonic nonce cursor used for replay-safe steward proof verification.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct StewardNonceState {
+    #[serde(default)]
+    pub next_nonce: u64,
+}
+
 // ── Wallet types ─────────────────────────────────────────────────────────────
 
 /// Coarse classification of a wallet balance reading.
@@ -507,6 +524,10 @@ pub struct RuntimeSnapshot {
     pub evm_address: Option<String>,
     #[serde(default)]
     pub inbox_contract_address: Option<String>,
+    #[serde(default)]
+    pub active_steward: Option<StewardState>,
+    #[serde(default)]
+    pub steward_nonce: StewardNonceState,
     #[serde(default = "default_evm_rpc_url")]
     pub evm_rpc_url: String,
     #[serde(default)]
@@ -553,6 +574,8 @@ impl Default for RuntimeSnapshot {
             ecdsa_key_name: String::new(),
             evm_address: None,
             inbox_contract_address: None,
+            active_steward: None,
+            steward_nonce: StewardNonceState::default(),
             evm_rpc_url: default_evm_rpc_url(),
             evm_rpc_fallback_url: None,
             evm_rpc_max_response_bytes: default_evm_rpc_max_response_bytes(),
@@ -2299,6 +2322,8 @@ mod tests {
         assert!(snapshot.wallet_balance_bootstrap_pending);
         assert_eq!(snapshot.evm_bootstrap_lookback_blocks, 1_000);
         assert!(snapshot.cycle_topup.enabled);
+        assert!(snapshot.active_steward.is_none());
+        assert_eq!(snapshot.steward_nonce.next_nonce, 0);
         assert!(snapshot.openrouter_proxy.worker_base_url.is_empty());
         assert!(snapshot
             .openrouter_proxy
