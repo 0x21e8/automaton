@@ -43,6 +43,7 @@ const state = {
   // Background polling for status bar
   pollHandle: null,
   lastSnapshotData: null,
+  buildCommit: "unknown",
 
   // Async send/reply tracking
   pendingReplyRequests: [],
@@ -73,6 +74,7 @@ const inputEl    = document.getElementById("cmd-input");
 const inputRow   = document.getElementById("input-row");
 const sbStateEl  = document.getElementById("sb-state");
 const sbWalletEl = document.getElementById("sb-wallet");
+const sbCommitEl = document.getElementById("sb-commit");
 const sbTimeEl   = document.getElementById("sb-time");
 const sbIndEl    = document.getElementById("sb-indicator");
 
@@ -329,6 +331,7 @@ async function runBoot() {
 
   // Canister reachability — initial status poll
   await pollStatus();
+  await loadBuildInfo();
   if (state.lastSnapshotData) {
     connectingLine.textContent = "CONNECTING TO CANISTER...    [OK]";
   } else {
@@ -2278,6 +2281,9 @@ function updateStatusBar({ online, stateName, walletAddress, chainId } = {}) {
   } else {
     sbWalletEl.textContent = `WALLET: not connected${asyncSuffix}`;
   }
+  if (sbCommitEl) {
+    sbCommitEl.textContent = `commit ${state.buildCommit}`;
+  }
 
   sbTimeEl.textContent = time;
 }
@@ -2307,6 +2313,16 @@ async function pollStatus() {
     state.lastSnapshotData = snapshot;
   } catch (_) {
     updateStatusBar({ online: false });
+  }
+}
+
+async function loadBuildInfo() {
+  try {
+    const buildInfo = await apiFetch("/api/build-info");
+    const commit = typeof buildInfo?.commit === "string" ? buildInfo.commit.trim() : "";
+    state.buildCommit = commit || "unknown";
+  } catch (_) {
+    state.buildCommit = "unknown";
   }
 }
 

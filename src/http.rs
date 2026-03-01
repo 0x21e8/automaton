@@ -20,6 +20,7 @@
 /// | GET    | `/api/evm/config`             | query       |
 /// | GET    | `/api/inference/config`       | query       |
 /// | GET    | `/api/welcome`                | query       |
+/// | GET    | `/api/build-info`             | query       |
 /// | POST   | `/api/conversation`           | update      |
 use crate::storage::stable;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -114,6 +115,12 @@ struct WelcomeView {
     message: Option<String>,
 }
 
+/// Serialisable build metadata served by `GET /api/build-info`.
+#[derive(Clone, Debug, Serialize)]
+struct BuildInfoView {
+    commit: &'static str,
+}
+
 /// Serialisable snapshot of EVM configuration fields served by
 /// `GET /api/evm/config`.
 #[derive(Clone, Debug, Serialize)]
@@ -159,6 +166,12 @@ fn redact_public_rpc_url(raw_url: &str) -> String {
 fn welcome_view() -> WelcomeView {
     WelcomeView {
         message: stable::get_welcome_message(),
+    }
+}
+
+fn build_info_view() -> BuildInfoView {
+    BuildInfoView {
+        commit: option_env!("AUTOMATON_GIT_COMMIT").unwrap_or("unknown"),
     }
 }
 
@@ -324,6 +337,10 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
             let view = welcome_view();
             json_update_response(StatusCode::OK, &view)
         }
+        (&Method::GET, "/api/build-info") => {
+            let view = build_info_view();
+            json_update_response(StatusCode::OK, &view)
+        }
         _ => HttpResponse::not_found(
             br#"{"ok":false,"error":"not found"}"#.as_slice(),
             vec![
@@ -364,6 +381,7 @@ fn build_certification_state() -> HttpCertificationState {
     let evm_config = evm_config_view();
     let inference_config = stable::inference_config_view();
     let welcome = welcome_view();
+    let build_info = build_info_view();
 
     let mut tree = HttpCertificationTree::default();
     let routes = vec![
@@ -405,6 +423,7 @@ fn build_certification_state() -> HttpCertificationState {
         json_route(Method::GET, "/api/evm/config", &evm_config),
         json_route(Method::GET, "/api/inference/config", &inference_config),
         json_route(Method::GET, "/api/welcome", &welcome),
+        json_route(Method::GET, "/api/build-info", &build_info),
         upgrade_route(Method::POST, "/api/conversation"),
     ];
     for route in &routes {
@@ -991,6 +1010,42 @@ mod tests {
         assert_eq!(
             body.get("message").and_then(Value::as_str),
             Some("Hello from the automaton!")
+        );
+    }
+
+    #[test]
+    fn get_build_info_route_returns_commit_metadata() {
+        stable::init_storage();
+        init_certification();
+
+        let request = HttpRequest::get("/api/build-info").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), None);
+
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("build info body should decode as json");
+        assert_eq!(
+            body.get("commit").and_then(Value::as_str),
+            Some(option_env!("AUTOMATON_GIT_COMMIT").unwrap_or("unknown"))
+        );
+    }
+
+    #[test]
+    fn get_build_info_route_returns_commit_metadata_via_update() {
+        stable::init_storage();
+        init_certification();
+
+        let response =
+            handle_http_request_update(HttpRequest::get("/api/build-info").build_update());
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("build info update body should decode as json");
+        assert_eq!(
+            body.get("commit").and_then(Value::as_str),
+            Some(option_env!("AUTOMATON_GIT_COMMIT").unwrap_or("unknown"))
         );
     }
 

@@ -372,6 +372,10 @@ body::after {
   opacity: 0.2;
 }
 
+.sb-spacer {
+  margin-left: auto;
+}
+
 /* --- Animations -------------------------------------------------------------- */
 
 /*
