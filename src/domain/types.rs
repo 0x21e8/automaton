@@ -225,6 +225,45 @@ pub struct EvmStewardProof {
 pub enum StewardCommand {
     /// Executes no runtime mutation beyond auth bookkeeping (nonce + last-used).
     Noop,
+    SetLoopEnabled {
+        enabled: bool,
+    },
+    SetAutonomyToolDedupeEnabled {
+        enabled: bool,
+    },
+    SetAutonomySuppressionConfig {
+        config: AutonomySuppressionConfig,
+    },
+    SetInferenceProvider {
+        provider: InferenceProvider,
+    },
+    SetInferenceModel {
+        model: String,
+    },
+    SetOpenrouterBaseUrl {
+        base_url: String,
+    },
+    SetOpenrouterApiKey {
+        api_key: Option<String>,
+    },
+    SetInferenceProxyConfig {
+        config: OpenRouterProxyWorkerConfig,
+    },
+    SetWelcomeMessage {
+        message: String,
+    },
+    SetEvmRpcUrl {
+        url: String,
+    },
+    SetEvmRpcFallbackUrl {
+        url: Option<String>,
+    },
+    SetEvmRpcMaxResponseBytes {
+        max_response_bytes: u64,
+    },
+    SetInboxContractAddress {
+        address: Option<String>,
+    },
     /// Rotates the single active steward identity.
     ///
     /// When `chain_id` or `address` changes, the steward nonce cursor is reset
@@ -233,6 +272,81 @@ pub enum StewardCommand {
         chain_id: u64,
         address: String,
         enabled: bool,
+    },
+    SetEvmChainId {
+        chain_id: u64,
+    },
+    SetEvmConfirmationDepth {
+        confirmation_depth: u64,
+    },
+    DeriveAutomatonEvmAddress,
+    SetHttpAllowedDomains {
+        domains: Vec<String>,
+    },
+    UpdatePromptLayer {
+        layer_id: u8,
+        content: String,
+    },
+    PruneMemoryFacts {
+        prefix: Option<String>,
+        updated_before_ns: Option<u64>,
+        limit: u32,
+    },
+    SetSchedulerEnabled {
+        enabled: bool,
+    },
+    SetSchedulerLowCyclesMode {
+        enabled: bool,
+    },
+    SetSchedulerBaseTickSecs {
+        interval_secs: u64,
+    },
+    SetTaskIntervalSecs {
+        kind: TaskKind,
+        interval_secs: u64,
+    },
+    SetTaskEnabled {
+        kind: TaskKind,
+        enabled: bool,
+    },
+    SetRetentionConfig {
+        config: RetentionConfig,
+    },
+    UpdateSoul {
+        new_soul: String,
+    },
+    UpsertSkill {
+        skill: SkillRecord,
+    },
+    IngestStrategyTemplate {
+        template: StrategyTemplate,
+    },
+    IngestStrategyAbiArtifact {
+        key: AbiArtifactKey,
+        abi_json: String,
+        source_ref: String,
+        codehash: Option<String>,
+        selector_assertions: Vec<AbiSelectorAssertion>,
+    },
+    ActivateStrategyTemplate {
+        key: StrategyTemplateKey,
+        version: TemplateVersion,
+        reason: Option<String>,
+    },
+    DeprecateStrategyTemplate {
+        key: StrategyTemplateKey,
+        version: TemplateVersion,
+        reason: Option<String>,
+    },
+    RevokeStrategyTemplate {
+        key: StrategyTemplateKey,
+        version: TemplateVersion,
+        reason: Option<String>,
+    },
+    SetStrategyKillSwitch {
+        key: StrategyTemplateKey,
+        enabled: bool,
+        reason: Option<String>,
     },
 }
 
@@ -686,7 +800,7 @@ pub enum CanisterCallType {
 }
 
 /// A single canister method that a skill permits the agent to call.
-#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CanisterCallPermission {
     /// Target canister principal as text (e.g. `"um5iw-rqaaa-aaaaq-qaaba-cai"`).
     pub canister_id: String,
@@ -697,7 +811,7 @@ pub struct CanisterCallPermission {
 }
 
 /// A named, optionally-mutable capability that can be enabled or disabled at runtime.
-#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SkillRecord {
     pub name: String,
     pub description: String,

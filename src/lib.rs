@@ -161,7 +161,40 @@ fn memory_fact_sort_to_storage(sort: MemoryFactListSort) -> stable::MemoryFactSo
 fn steward_command_label(command: &StewardCommand) -> &'static str {
     match command {
         StewardCommand::Noop => "noop",
+        StewardCommand::SetLoopEnabled { .. } => "set_loop_enabled",
+        StewardCommand::SetAutonomyToolDedupeEnabled { .. } => "set_autonomy_tool_dedupe_enabled",
+        StewardCommand::SetAutonomySuppressionConfig { .. } => "set_autonomy_suppression_config",
+        StewardCommand::SetInferenceProvider { .. } => "set_inference_provider",
+        StewardCommand::SetInferenceModel { .. } => "set_inference_model",
+        StewardCommand::SetOpenrouterBaseUrl { .. } => "set_openrouter_base_url",
+        StewardCommand::SetOpenrouterApiKey { .. } => "set_openrouter_api_key",
+        StewardCommand::SetInferenceProxyConfig { .. } => "set_inference_proxy_config",
+        StewardCommand::SetWelcomeMessage { .. } => "set_welcome_message",
+        StewardCommand::SetEvmRpcUrl { .. } => "set_evm_rpc_url",
+        StewardCommand::SetEvmRpcFallbackUrl { .. } => "set_evm_rpc_fallback_url",
+        StewardCommand::SetEvmRpcMaxResponseBytes { .. } => "set_evm_rpc_max_response_bytes",
+        StewardCommand::SetInboxContractAddress { .. } => "set_inbox_contract_address",
         StewardCommand::UpdateSteward { .. } => "update_steward",
+        StewardCommand::SetEvmChainId { .. } => "set_evm_chain_id",
+        StewardCommand::SetEvmConfirmationDepth { .. } => "set_evm_confirmation_depth",
+        StewardCommand::DeriveAutomatonEvmAddress => "derive_automaton_evm_address",
+        StewardCommand::SetHttpAllowedDomains { .. } => "set_http_allowed_domains",
+        StewardCommand::UpdatePromptLayer { .. } => "update_prompt_layer",
+        StewardCommand::PruneMemoryFacts { .. } => "prune_memory_facts",
+        StewardCommand::SetSchedulerEnabled { .. } => "set_scheduler_enabled",
+        StewardCommand::SetSchedulerLowCyclesMode { .. } => "set_scheduler_low_cycles_mode",
+        StewardCommand::SetSchedulerBaseTickSecs { .. } => "set_scheduler_base_tick_secs",
+        StewardCommand::SetTaskIntervalSecs { .. } => "set_task_interval_secs",
+        StewardCommand::SetTaskEnabled { .. } => "set_task_enabled",
+        StewardCommand::SetRetentionConfig { .. } => "set_retention_config",
+        StewardCommand::UpdateSoul { .. } => "update_soul",
+        StewardCommand::UpsertSkill { .. } => "upsert_skill",
+        StewardCommand::IngestStrategyTemplate { .. } => "ingest_strategy_template",
+        StewardCommand::IngestStrategyAbiArtifact { .. } => "ingest_strategy_abi_artifact",
+        StewardCommand::ActivateStrategyTemplate { .. } => "activate_strategy_template",
+        StewardCommand::DeprecateStrategyTemplate { .. } => "deprecate_strategy_template",
+        StewardCommand::RevokeStrategyTemplate { .. } => "revoke_strategy_template",
+        StewardCommand::SetStrategyKillSwitch { .. } => "set_strategy_kill_switch",
     }
 }
 
@@ -625,6 +658,9 @@ fn steward_execute(command: StewardCommand, proof: EvmStewardProof) -> Result<St
             );
             Ok("steward_update_steward_executed".to_string())
         }
+        _ => Err(format!(
+            "steward command `{command_label}` is not implemented yet"
+        )),
     }
     .map_err(|error: String| {
         log!(
