@@ -2660,9 +2660,10 @@ pub fn table_count_extended(table: &str) -> Result<u64, String> {
 mod tests {
     use super::*;
     use crate::domain::types::{
-        ActionSpec, AgentEvent, AgentState, ContractRoleBinding, InboxMessageStatus, JobStatus,
-        RuntimeSnapshot, SchedulerRuntime, SurvivalOperationClass, TaskKind, TaskLane,
-        TaskScheduleConfig, TaskScheduleRuntime, TemplateStatus, TemplateVersion, ToolCallRecord,
+        ActionSpec, AgentEvent, AgentState, ContractRoleBinding, InboxMessageSource,
+        InboxMessageStatus, JobStatus, RuntimeSnapshot, SchedulerRuntime, SurvivalOperationClass,
+        TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, TemplateStatus,
+        TemplateVersion, ToolCallRecord,
     };
     use crate::features::cycle_topup::TopUpStage;
 
@@ -2932,6 +2933,7 @@ mod tests {
             body: "hello".to_string(),
             posted_at_ns: 11,
             posted_by: "alice".to_string(),
+            source: InboxMessageSource::EvmInbox,
             status: InboxMessageStatus::Pending,
             staged_at_ns: None,
             consumed_at_ns: None,
@@ -2943,6 +2945,7 @@ mod tests {
             body: "hello again".to_string(),
             posted_at_ns: 12,
             posted_by: "alice".to_string(),
+            source: InboxMessageSource::EvmInbox,
             status: InboxMessageStatus::Consumed,
             staged_at_ns: Some(13),
             consumed_at_ns: Some(14),

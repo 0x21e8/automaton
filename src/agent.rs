@@ -1816,9 +1816,9 @@ fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> R
 mod tests {
     use super::*;
     use crate::domain::types::{
-        ContinuationStopReason, EvmPollCursor, InboxMessageStatus, InferenceProxyResultPayload,
-        MemoryFact, MemoryRollup, PendingInferenceProxyJob, RuntimeSnapshot,
-        SubmitInferenceResultArgs, SurvivalTier, ToolCall, ToolCallRecord,
+        ContinuationStopReason, EvmPollCursor, InboxMessageSource, InboxMessageStatus,
+        InferenceProxyResultPayload, MemoryFact, MemoryRollup, PendingInferenceProxyJob,
+        RuntimeSnapshot, SubmitInferenceResultArgs, SurvivalTier, ToolCall, ToolCallRecord,
     };
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -1877,6 +1877,7 @@ mod tests {
             body: body.to_string(),
             posted_at_ns: 1,
             posted_by: sender.to_string(),
+            source: InboxMessageSource::EvmInbox,
             status: InboxMessageStatus::Staged,
             staged_at_ns: Some(1),
             consumed_at_ns: None,

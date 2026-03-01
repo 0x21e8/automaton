@@ -174,6 +174,7 @@ fn steward_command_label(command: &StewardCommand) -> &'static str {
         StewardCommand::SetEvmRpcFallbackUrl { .. } => "set_evm_rpc_fallback_url",
         StewardCommand::SetEvmRpcMaxResponseBytes { .. } => "set_evm_rpc_max_response_bytes",
         StewardCommand::SetInboxContractAddress { .. } => "set_inbox_contract_address",
+        StewardCommand::SendStewardMessage { .. } => "send_steward_message",
         StewardCommand::UpdateSteward { .. } => "update_steward",
         StewardCommand::SetEvmChainId { .. } => "set_evm_chain_id",
         StewardCommand::SetEvmConfirmationDepth { .. } => "set_evm_confirmation_depth",
@@ -703,6 +704,10 @@ async fn dispatch_steward_command(
                 "inbox_contract_address={}",
                 stored.unwrap_or_else(|| "none".to_string())
             ))
+        }
+        StewardCommand::SendStewardMessage { sender, message } => {
+            let inbox_id = crate::scheduler::ingest_steward_direct_message(sender, message)?;
+            Ok(format!("steward_direct_message_ingested id={inbox_id}"))
         }
         StewardCommand::UpdateSteward {
             chain_id,
@@ -1637,10 +1642,10 @@ fn arm_timer_with_interval(interval_secs: u64) {
 mod tests {
     use super::*;
     use crate::domain::types::{
-        AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, InferenceProxyResultPayload,
-        MemoryFact, OpenRouterProxyWorkerConfig, PendingInferenceProxyJob, SkillRecord,
-        StewardNonceState, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
-        TemplateStatus, TemplateVersion,
+        AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, InboxMessageSource,
+        InferenceProxyResultPayload, MemoryFact, OpenRouterProxyWorkerConfig,
+        PendingInferenceProxyJob, SkillRecord, StewardNonceState, StrategyTemplate,
+        StrategyTemplateKey, SubmitInferenceResultArgs, TemplateStatus, TemplateVersion,
     };
     use sha3::{Digest, Keccak256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1814,7 +1819,10 @@ mod tests {
                 "set_evm_rpc_max_response_bytes",
                 "set_evm_rpc_max_response_bytes",
             ),
-            ("set_inbox_contract_address_admin", "set_inbox_contract_address"),
+            (
+                "set_inbox_contract_address_admin",
+                "set_inbox_contract_address",
+            ),
             ("set_steward_admin", "update_steward"),
             ("set_evm_chain_id_admin", "set_evm_chain_id"),
             (
@@ -1833,7 +1841,10 @@ mod tests {
                 "set_scheduler_low_cycles_mode",
                 "set_scheduler_low_cycles_mode",
             ),
-            ("set_scheduler_base_tick_secs", "set_scheduler_base_tick_secs"),
+            (
+                "set_scheduler_base_tick_secs",
+                "set_scheduler_base_tick_secs",
+            ),
             ("set_task_interval_secs", "set_task_interval_secs"),
             ("set_task_enabled", "set_task_enabled"),
             ("set_retention_config", "set_retention_config"),
@@ -2144,6 +2155,34 @@ mod tests {
         assert_eq!(result, "loop_enabled=true");
         assert!(stable::runtime_snapshot().loop_enabled);
         assert_eq!(get_steward_status().next_nonce, 4);
+    }
+
+    #[test]
+    fn steward_execute_send_steward_message_ingests_steward_direct_inbox_message() {
+        stable::init_storage();
+        let key = steward_test_signing_key();
+        let address = steward_address_from_key(&key);
+        set_steward_admin(8453, address.clone(), true).expect("active steward should store");
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 2 });
+
+        let command = StewardCommand::SendStewardMessage {
+            sender: address,
+            message: "ship autonomous revenue plan".to_string(),
+        };
+        let proof = build_steward_proof(&command, &key, 2, current_time_ns() + 60_000_000_000);
+        let result = execute_steward_command(command, proof)
+            .expect("send steward message command should execute");
+        assert!(
+            result.starts_with("steward_direct_message_ingested id=inbox:"),
+            "unexpected dispatch result: {result}"
+        );
+
+        let inbox = stable::list_inbox_messages(1);
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].body, "ship autonomous revenue plan");
+        assert_eq!(inbox[0].source, InboxMessageSource::StewardDirect);
+        assert_eq!(stable::inbox_stats().staged_count, 1);
+        assert_eq!(get_steward_status().next_nonce, 3);
     }
 
     #[test]

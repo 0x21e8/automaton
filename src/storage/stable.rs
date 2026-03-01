@@ -11,19 +11,20 @@ use super::sqlite::SurvivalOperationRuntimeRecord;
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AgentEvent, AgentState, AutonomySuppressionConfig,
     ConversationEntry, ConversationLog, ConversationSummary, CycleTelemetry, EvmPollCursor,
-    EvmRouteStateView, InboxMessage, InboxMessageStatus, InboxStats, InferenceConfigView,
-    InferenceProvider, InferenceProxyCallbackApply, InferenceProxyCallbackRecord,
-    InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup, ObservabilitySnapshot,
-    OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats, PendingInferenceProxyJob, PromptLayer,
-    PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView,
-    ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord, StewardNonceState,
-    StewardState, StewardStatusView, StorageGrowthMetrics, StoragePressureLevel,
-    StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats,
-    StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass,
-    SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
-    TemplateActivationState, TemplateRevocationState, TemplateVersion, ToolCallRecord,
-    TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
-    WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    EvmRouteStateView, InboxMessage, InboxMessageSource, InboxMessageStatus, InboxStats,
+    InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
+    InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup,
+    ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats,
+    PendingInferenceProxyJob, PromptLayer, PromptLayerView, RetentionConfig,
+    RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease,
+    SchedulerRuntime, SessionSummary, SkillRecord, StewardNonceState, StewardState,
+    StewardStatusView, StorageGrowthMetrics, StoragePressureLevel, StrategyKillSwitchState,
+    StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats, StrategyTemplate,
+    StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind,
+    TaskLane, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
+    TemplateRevocationState, TemplateVersion, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    TurnWindowSummary, WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
+    WalletBalanceTelemetryView,
 };
 pub use crate::domain::types::{
     AutonomyToolFailureCooldown, MemoryFactSort, MemoryFactStats, RetentionPruneStats,
@@ -2093,6 +2094,15 @@ pub fn normalize_inbox_body(raw_body: &str) -> Result<String, String> {
 
 /// Creates and stores a new inbox message. Returns the new message ID.
 pub fn post_inbox_message(body: String, caller: String) -> Result<String, String> {
+    post_inbox_message_with_source(body, caller, InboxMessageSource::EvmInbox)
+}
+
+/// Creates and stores a new inbox message with an explicit ingestion source.
+pub fn post_inbox_message_with_source(
+    body: String,
+    caller: String,
+    source: InboxMessageSource,
+) -> Result<String, String> {
     let bounded_body = normalize_inbox_body(&body)?;
 
     let seq = next_inbox_seq();
@@ -2103,6 +2113,7 @@ pub fn post_inbox_message(body: String, caller: String) -> Result<String, String
         body: bounded_body,
         posted_at_ns: now_ns(),
         posted_by: caller,
+        source,
         status: InboxMessageStatus::Pending,
         staged_at_ns: None,
         consumed_at_ns: None,
@@ -2110,9 +2121,10 @@ pub fn post_inbox_message(body: String, caller: String) -> Result<String, String
     let _ = sqlite::upsert_inbox(&message);
     log!(
         SchedulerStorageLogPriority::Info,
-        "inbox_posted id={} seq={}",
+        "inbox_posted id={} seq={} source={}",
         id,
-        seq
+        seq,
+        source.as_tag()
     );
     Ok(id)
 }

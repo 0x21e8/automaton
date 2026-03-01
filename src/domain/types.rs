@@ -264,6 +264,10 @@ pub enum StewardCommand {
     SetInboxContractAddress {
         address: Option<String>,
     },
+    SendStewardMessage {
+        sender: String,
+        message: String,
+    },
     /// Rotates the single active steward identity.
     ///
     /// When `chain_id` or `address` changes, the steward nonce cursor is reset
@@ -1730,6 +1734,29 @@ pub enum InboxMessageStatus {
     Consumed,
 }
 
+/// Origin of a message ingested into the canister inbox pipeline.
+#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxMessageSource {
+    EvmInbox,
+    StewardDirect,
+}
+
+impl Default for InboxMessageSource {
+    fn default() -> Self {
+        Self::EvmInbox
+    }
+}
+
+impl InboxMessageSource {
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::EvmInbox => "evm_inbox",
+            Self::StewardDirect => "steward_direct",
+        }
+    }
+}
+
 /// A message posted to the canister inbox, stored in `INBOX_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct InboxMessage {
@@ -1738,6 +1765,8 @@ pub struct InboxMessage {
     pub body: String,
     pub posted_at_ns: u64,
     pub posted_by: String,
+    #[serde(default)]
+    pub source: InboxMessageSource,
     pub status: InboxMessageStatus,
     pub staged_at_ns: Option<u64>,
     pub consumed_at_ns: Option<u64>,

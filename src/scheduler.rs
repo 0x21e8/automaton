@@ -33,10 +33,11 @@ use crate::domain::cycle_admission::{
 };
 use crate::domain::recovery_policy::decide_recovery_action;
 use crate::domain::types::{
-    EvmEvent, JobStatus, OperationFailure, OperationFailureKind, RecoveryContext, RecoveryFailure,
-    RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment, ResponseLimitPolicy,
-    RuntimeSnapshot, ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
-    TemplateActivationState, TemplateStatus,
+    EvmEvent, InboxMessageSource, JobStatus, OperationFailure, OperationFailureKind,
+    RecoveryContext, RecoveryFailure, RecoveryOperation, RecoveryPolicyAction,
+    ResponseLimitAdjustment, ResponseLimitPolicy, RuntimeSnapshot, ScheduledJob,
+    SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane, TemplateActivationState,
+    TemplateStatus,
 };
 use crate::features::cycle_topup::{
     TopUpStage, TOPUP_MIN_OPERATIONAL_CYCLES, TOPUP_MIN_USDC_AVAILABLE_RAW,
@@ -618,6 +619,32 @@ fn evm_event_to_inbox_message(event: &EvmEvent) -> (String, String) {
     }
 }
 
+fn ingest_inbox_message(
+    body: String,
+    sender: String,
+    source: InboxMessageSource,
+) -> Result<String, String> {
+    stable::post_inbox_message_with_source(body, sender, source)
+}
+
+/// Ingests a direct steward message through the same inbox path used by EVM
+/// event delivery, then promotes pending messages into the staged queue.
+pub(crate) fn ingest_steward_direct_message(
+    sender: String,
+    message: String,
+) -> Result<String, String> {
+    let inbox_id = ingest_inbox_message(message, sender, InboxMessageSource::StewardDirect)?;
+    let staged =
+        stable::stage_pending_inbox_messages(POLL_INBOX_STAGE_BATCH_SIZE, current_time_ns());
+    log!(
+        SchedulerLogPriority::Info,
+        "scheduler_steward_direct_ingested id={} staged={}",
+        inbox_id,
+        staged
+    );
+    Ok(inbox_id)
+}
+
 /// Returns the minimum delay in nanoseconds before the next EVM poll, based on
 /// the number of consecutive empty polls and the `EMPTY_POLL_BACKOFF_SCHEDULE_SECS`.
 fn empty_poll_backoff_delay_ns(consecutive_empty_polls: u32) -> u64 {
@@ -932,7 +959,7 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
                 continue;
             }
             let (body, sender) = evm_event_to_inbox_message(event);
-            stable::post_inbox_message(body, sender)?;
+            ingest_inbox_message(body, sender, InboxMessageSource::EvmInbox)?;
             ingested_events = ingested_events.saturating_add(1);
         }
 
@@ -1305,10 +1332,10 @@ mod tests {
     use super::*;
     use crate::domain::types::{
         AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding,
-        EvmEvent, RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment,
-        RetentionConfig, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
-        TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateStatus,
-        TemplateVersion, WalletBalanceSnapshot, WalletBalanceSyncConfig,
+        EvmEvent, InboxMessageSource, InboxMessageStatus, RecoveryOperation, RecoveryPolicyAction,
+        ResponseLimitAdjustment, RetentionConfig, StrategyTemplate, StrategyTemplateKey,
+        SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
+        TemplateStatus, TemplateVersion, WalletBalanceSnapshot, WalletBalanceSyncConfig,
     };
     use crate::storage::stable;
     use std::future::Future;
@@ -1581,6 +1608,34 @@ mod tests {
             body.contains(&event.tx_hash),
             "scheduler fallback body should still include tx hash metadata"
         );
+    }
+
+    #[test]
+    fn ingest_steward_direct_message_routes_through_inbox_pipeline_with_source_tag() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        let sender = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let message = "message from active steward".to_string();
+        let inbox_id = ingest_steward_direct_message(sender.clone(), message.clone())
+            .expect("steward direct message should ingest");
+
+        let inbox = stable::list_inbox_messages(1);
+        assert_eq!(inbox.len(), 1);
+        let stored = &inbox[0];
+        assert_eq!(stored.id, inbox_id);
+        assert_eq!(stored.posted_by, sender);
+        assert_eq!(stored.body, message);
+        assert_eq!(stored.source, InboxMessageSource::StewardDirect);
+        assert_eq!(stored.status, InboxMessageStatus::Staged);
+
+        let stats = stable::inbox_stats();
+        assert_eq!(stats.pending_count, 0);
+        assert_eq!(stats.staged_count, 1);
+        assert_eq!(stats.consumed_count, 0);
     }
 
     #[test]
@@ -2402,6 +2457,14 @@ mod tests {
         assert_eq!(stats.pending_count, 0);
         assert_eq!(stats.staged_count, 2);
         assert_eq!(stats.consumed_count, 0);
+        let staged = stable::list_staged_inbox_messages(10);
+        assert_eq!(staged.len(), 2);
+        assert!(
+            staged
+                .iter()
+                .all(|message| message.source == InboxMessageSource::EvmInbox),
+            "poll path must keep EVM-ingested messages tagged as evm_inbox"
+        );
         assert_eq!(stable::runtime_snapshot().turn_counter, turn_counter_before);
         assert!(
             stable::list_outbox_messages(10).is_empty(),
