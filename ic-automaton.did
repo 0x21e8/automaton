@@ -149,9 +149,30 @@ type InferenceConfigView = record {
   openrouter_max_response_bytes : nat64;
   openrouter_has_api_key : bool;
   provider : InferenceProvider;
+  openrouter_proxy_worker_base_url : opt text;
+  openrouter_proxy_trusted_callback_principal : opt text;
   openrouter_base_url : text;
 };
-type InferenceProvider = variant { OpenRouter; IcLlm };
+type InferenceProvider = variant { OpenRouter; OpenRouterProxyWorker; IcLlm };
+type InferenceProxyResultPayload = record {
+  tool_calls : vec ToolCall;
+  explanation : opt text;
+};
+type InferenceProxyStatusView = record {
+  pending_jobs : nat64;
+  trusted_callback_principal : opt text;
+  completed_jobs : nat64;
+  oldest_pending_age_secs : opt nat64;
+  worker_base_url : opt text;
+  submit_accepted : nat64;
+  submit_failed : nat64;
+  callback_accepted : nat64;
+  callback_rejected : nat64;
+  callback_duplicates : nat64;
+  callback_auth_failures : nat64;
+  resumed_callbacks : nat64;
+  expired_jobs : nat64;
+};
 type InitArgs = record {
   evm_chain_id : opt nat64;
   evm_confirmation_depth : opt nat64;
@@ -208,6 +229,10 @@ type ObservabilitySnapshot = record {
   runtime : RuntimeView;
   session_summaries : vec SessionSummary;
 };
+type OpenRouterProxyWorkerConfig = record {
+  trusted_callback_principal : opt principal;
+  worker_base_url : text;
+};
 type OutboxMessage = record {
   id : text;
   seq : nat64;
@@ -245,16 +270,17 @@ type PromptLayerView = record {
 };
 type Result = variant { Ok : TemplateActivationState; Err : text };
 type Result_1 = variant { Ok : StrategyTemplate; Err : text };
-type Result_10 = variant { Ok : PromptLayer; Err : text };
-type Result_11 = variant { Ok; Err : text };
+type Result_10 = variant { Ok : StrategyKillSwitchState; Err : text };
+type Result_11 = variant { Ok : PromptLayer; Err : text };
+type Result_12 = variant { Ok; Err : text };
 type Result_2 = variant { Ok : text; Err : text };
 type Result_3 = variant { Ok : AbiArtifact; Err : text };
 type Result_4 = variant { Ok : vec text; Err : text };
 type Result_5 = variant { Ok : TemplateRevocationState; Err : text };
 type Result_6 = variant { Ok : nat64; Err : text };
 type Result_7 = variant { Ok : opt text; Err : text };
-type Result_8 = variant { Ok : RetentionConfig; Err : text };
-type Result_9 = variant { Ok : StrategyKillSwitchState; Err : text };
+type Result_8 = variant { Ok : OpenRouterProxyWorkerConfig; Err : text };
+type Result_9 = variant { Ok : RetentionConfig; Err : text };
 type RetentionConfig = record {
   transitions_max_age_secs : nat64;
   memory_facts_max_age_secs : nat64;
@@ -457,6 +483,13 @@ type StrategyTemplateKey = record {
   template_id : text;
   chain_id : nat64;
 };
+type SubmitInferenceResultArgs = record {
+  result : opt InferenceProxyResultPayload;
+  completed_at_ns : nat64;
+  error : opt text;
+  turn_id : text;
+  job_id : text;
+};
 type SurvivalTier = variant { OutOfCycles; Normal; LowCycles; Critical };
 type TaskKind = variant {
   Reconcile;
@@ -500,6 +533,11 @@ type TemplateRevocationState = record {
 };
 type TemplateStatus = variant { Active; Draft; Deprecated; Revoked };
 type TemplateVersion = record { major : nat16; minor : nat16; patch : nat16 };
+type ToolCall = record {
+  args_json : text;
+  tool : text;
+  tool_call_id : opt text;
+};
 type ToolCallRecord = record {
   output : text;
   args_json : text;
@@ -599,6 +637,7 @@ service : (InitArgs) -> {
   get_inbox_stats : () -> (InboxStats) query;
   // Returns the current inference configuration (provider, model, key presence flag).
   get_inference_config : () -> (InferenceConfigView) query;
+  get_inference_proxy_status : () -> (InferenceProxyStatusView) query;
   // Returns an observability snapshot containing up to `limit` recent events,
   // combined with the current runtime and scheduler views.
   get_observability_snapshot : (nat32) -> (ObservabilitySnapshot) query;
@@ -711,9 +750,6 @@ service : (InitArgs) -> {
   set_evm_rpc_max_response_bytes : (nat64) -> (Result_6);
   // Updates the primary EVM JSON-RPC endpoint (controller only).
   set_evm_rpc_url : (text) -> (Result_2);
-  // Sets a custom welcome message shown in the TUI on boot (controller only).
-  // Pass an empty string to restore the default.
-  set_welcome_message : (text) -> (Result_2);
   // Replaces the HTTP outbound allowlist.  An empty slice disables the allowlist
   // and permits all domains (controller only).
   set_http_allowed_domains : (vec text) -> (Result_4);
@@ -722,15 +758,18 @@ service : (InitArgs) -> {
   // Sets the inference model identifier (e.g. `"llama3.1:8b"` or `"openai/gpt-4o-mini"`)
   // (controller only).
   set_inference_model : (text) -> (Result_2);
-  // Sets the active inference backend (`IcLlm` or `OpenRouter`) (controller only).
+  // Sets the active inference backend (`IcLlm`, `OpenRouter`, or `OpenRouterProxyWorker`)
+  // (controller only).
   set_inference_provider : (InferenceProvider) -> (text);
+  // Stores OpenRouter proxy worker config used by async inference callbacks (controller only).
+  set_inference_proxy_config : (OpenRouterProxyWorkerConfig) -> (Result_8);
   // Enables or disables the autonomous agent loop (controller only).
   set_loop_enabled : (bool) -> (text);
   // Stores (or clears) the OpenRouter API key in stable storage.
   // Pass `None` to remove the key (controller only).
   set_openrouter_api_key : (opt text) -> (text);
   // Replaces the conversation-retention policy (controller only).
-  set_retention_config : (RetentionConfig) -> (Result_8);
+  set_retention_config : (RetentionConfig) -> (Result_9);
   // Updates the scheduler timer base tick interval in seconds (controller only).
   set_scheduler_base_tick_secs : (nat64) -> (Result_6);
   // Enables or disables the scheduler (controller only).
@@ -743,7 +782,7 @@ service : (InitArgs) -> {
   // When `enabled` is `true` the agent will refuse to execute any action for
   // that template (controller only).
   set_strategy_kill_switch_admin : (StrategyTemplateKey, bool, opt text) -> (
-      Result_9,
+      Result_10,
     );
   // Enables or disables a specific task kind without affecting the scheduler
   // globally (controller only).
@@ -751,13 +790,18 @@ service : (InitArgs) -> {
   // Overrides the recurrence interval (seconds) for the given task kind
   // (controller only).
   set_task_interval_secs : (TaskKind, nat64) -> (Result_2);
+  // Sets a custom welcome message shown in the TUI on boot (controller only).
+  // An empty string clears the custom message and restores the default.
+  set_welcome_message : (text) -> (Result_2);
+  // Callback endpoint used by the OpenRouter proxy worker to submit async results.
+  submit_inference_result : (SubmitInferenceResultArgs) -> (Result_2);
   // Replaces the content of a prompt layer identified by `layer_id` (controller only).
-  update_prompt_layer_admin : (nat8, text) -> (Result_10);
+  update_prompt_layer_admin : (nat8, text) -> (Result_11);
   // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
   update_soul : (text) -> (Result_2);
   // Inserts or updates a skill record.
   // 
   // Only callable by a canister controller.  This is the runtime management
   // endpoint for adding new inter-canister call skills or modifying existing ones.
-  upsert_skill : (SkillRecord) -> (Result_11);
+  upsert_skill : (SkillRecord) -> (Result_12);
 }

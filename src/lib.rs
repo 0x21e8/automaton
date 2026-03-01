@@ -33,12 +33,14 @@ mod tools;
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, ConversationLog, ConversationSummary,
     EvmRouteStateView, InboxMessage, InboxStats, InferenceConfigView, InferenceProvider,
-    MemoryFact, MemoryRollup, ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer,
-    PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob,
-    SchedulerRuntime, SessionSummary, SkillRecord, StrategyKillSwitchState, StrategyOutcomeStats,
-    StrategyTemplate, StrategyTemplateKey, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
-    TemplateActivationState, TemplateRevocationState, TemplateStatus, TemplateVersion,
-    ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    InferenceProxyStatusView, MemoryFact, MemoryRollup, ObservabilitySnapshot,
+    OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats, PromptLayer, PromptLayerView,
+    RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob, SchedulerRuntime,
+    SessionSummary, SkillRecord, StrategyKillSwitchState, StrategyOutcomeStats, StrategyTemplate,
+    StrategyTemplateKey, SubmitInferenceResultArgs, TaskKind, TaskLane, TaskScheduleConfig,
+    TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState, TemplateStatus,
+    TemplateVersion, ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView,
+    WalletBalanceTelemetryView,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
@@ -46,6 +48,7 @@ use crate::storage::{sqlite, stable};
 use crate::timing::current_time_ns;
 use crate::tools::ToolManager;
 use candid::{CandidType, Principal};
+use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 #[cfg(target_arch = "wasm32")]
 use ic_cdk_timers::{clear_timer, set_timer_interval_serial, TimerId};
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
@@ -55,6 +58,20 @@ use std::cell::RefCell;
 
 // ── Initialization ──────────────────────────────────────────────────────────
 const WALLET_SYNC_RESPONSE_BYTES_FLOOR: u64 = 1_024;
+
+#[derive(Clone, Copy, Debug, LogPriorityLevels)]
+enum InferenceProxyCallbackLogPriority {
+    #[log_level(capacity = 1000, name = "INFERENCE_PROXY_CALLBACK_INFO")]
+    Info,
+    #[log_level(capacity = 500, name = "INFERENCE_PROXY_CALLBACK_ERROR")]
+    Error,
+}
+
+impl GetLogFilter for InferenceProxyCallbackLogPriority {
+    fn get_log_filter() -> LogFilter {
+        LogFilter::ShowAll
+    }
+}
 
 #[cfg(target_arch = "wasm32")]
 thread_local! {
@@ -146,6 +163,14 @@ fn caller_for_audit() -> String {
 
     #[cfg(not(target_arch = "wasm32"))]
     return "native".to_string();
+}
+
+fn inference_proxy_callback_caller_principal() -> String {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::msg_caller().to_text();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    return "2vxsx-fae".to_string();
 }
 
 /// Looks up a strategy template by key and version, returning a descriptive
@@ -275,7 +300,8 @@ fn set_loop_enabled(enabled: bool) -> String {
     format!("loop_enabled={enabled}")
 }
 
-/// Sets the active inference backend (`IcLlm` or `OpenRouter`) (controller only).
+/// Sets the active inference backend (`IcLlm`, `OpenRouter`, or `OpenRouterProxyWorker`)
+/// (controller only).
 #[ic_cdk::update]
 fn set_inference_provider(provider: InferenceProvider) -> String {
     ensure_controller_or_trap();
@@ -302,6 +328,17 @@ fn set_openrouter_api_key(api_key: Option<String>) -> String {
     stable::set_openrouter_api_key(api_key);
     crate::http::init_certification();
     "openrouter_api_key_updated".to_string()
+}
+
+/// Stores OpenRouter proxy worker config used by async inference callbacks (controller only).
+#[ic_cdk::update]
+fn set_inference_proxy_config(
+    config: OpenRouterProxyWorkerConfig,
+) -> Result<OpenRouterProxyWorkerConfig, String> {
+    ensure_controller()?;
+    let stored = stable::set_openrouter_proxy_config(config)?;
+    crate::http::init_certification();
+    Ok(stored)
 }
 
 /// Sets a custom welcome message shown in the TUI on boot (controller only).
@@ -613,6 +650,78 @@ fn set_task_enabled(kind: TaskKind, enabled: bool) -> String {
     "task_enabled_updated".to_string()
 }
 
+/// Callback endpoint used by the OpenRouter proxy worker to submit async results.
+#[ic_cdk::update]
+fn submit_inference_result(args: SubmitInferenceResultArgs) -> Result<String, String> {
+    let caller = inference_proxy_callback_caller_principal();
+    let callback_job_id = args.job_id.clone();
+    let callback_turn_id = args.turn_id.clone();
+    if let Err(error) = stable::assert_inference_proxy_callback_authorized(&caller) {
+        stable::record_inference_proxy_callback_rejected(true);
+        log!(
+            InferenceProxyCallbackLogPriority::Error,
+            "inference_proxy_callback_rejected caller={} job_id={} turn_id={} reason={}",
+            caller,
+            callback_job_id,
+            callback_turn_id,
+            error,
+        );
+        return Err(error);
+    }
+
+    let applied =
+        match stable::apply_inference_proxy_callback(args, caller.clone(), current_time_ns()) {
+            Ok(applied) => applied,
+            Err(error) => {
+                stable::record_inference_proxy_callback_rejected(false);
+                log!(
+                    InferenceProxyCallbackLogPriority::Error,
+                    "inference_proxy_callback_rejected caller={} job_id={} turn_id={} reason={}",
+                    caller,
+                    callback_job_id,
+                    callback_turn_id,
+                    error,
+                );
+                return Err(error);
+            }
+        };
+    crate::http::init_certification();
+    match applied {
+        crate::domain::types::InferenceProxyCallbackApply::Accepted => {
+            let agent_turn_priority = stable::get_task_config(&TaskKind::AgentTurn)
+                .map(|config| config.priority)
+                .unwrap_or(TaskKind::AgentTurn.default_priority());
+            let enqueued = stable::enqueue_job_if_absent(
+                TaskKind::AgentTurn,
+                TaskLane::Mutating,
+                format!("AgentTurn:inference-proxy-resume:{callback_job_id}"),
+                current_time_ns(),
+                agent_turn_priority,
+            );
+            log!(
+                InferenceProxyCallbackLogPriority::Info,
+                "inference_proxy_callback_accepted caller={} job_id={} turn_id={} resume_job_enqueued={} resume_job_id={}",
+                caller,
+                callback_job_id,
+                callback_turn_id,
+                enqueued.is_some(),
+                enqueued.unwrap_or_default(),
+            );
+            Ok("inference_proxy_callback_accepted".to_string())
+        }
+        crate::domain::types::InferenceProxyCallbackApply::Duplicate => {
+            log!(
+                InferenceProxyCallbackLogPriority::Info,
+                "inference_proxy_callback_duplicate caller={} job_id={} turn_id={}",
+                caller,
+                callback_job_id,
+                callback_turn_id,
+            );
+            Ok("inference_proxy_callback_duplicate".to_string())
+        }
+    }
+}
+
 /// Replaces the conversation-retention policy (controller only).
 #[ic_cdk::update]
 fn set_retention_config(config: RetentionConfig) -> Result<RetentionConfig, String> {
@@ -624,6 +733,11 @@ fn set_retention_config(config: RetentionConfig) -> Result<RetentionConfig, Stri
 #[ic_cdk::query]
 fn get_inference_config() -> InferenceConfigView {
     stable::inference_config_view()
+}
+
+#[ic_cdk::query]
+fn get_inference_proxy_status() -> InferenceProxyStatusView {
+    stable::inference_proxy_status_view()
 }
 
 /// Returns the agent's "soul" — the core identity/persona prompt layer.
@@ -893,8 +1007,10 @@ fn arm_timer_with_interval(interval_secs: u64) {
 mod tests {
     use super::*;
     use crate::domain::types::{
-        AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, MemoryFact, SkillRecord,
-        StrategyTemplate, StrategyTemplateKey, TemplateStatus, TemplateVersion,
+        AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, InferenceProxyResultPayload,
+        MemoryFact, OpenRouterProxyWorkerConfig, PendingInferenceProxyJob, SkillRecord,
+        StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, TemplateStatus,
+        TemplateVersion,
     };
 
     #[test]
@@ -1004,6 +1120,91 @@ mod tests {
         assert_eq!(
             upgraded.wallet_balance_sync.max_response_bytes,
             WALLET_SYNC_RESPONSE_BYTES_FLOOR
+        );
+    }
+
+    #[test]
+    fn submit_inference_result_rejects_untrusted_caller() {
+        stable::init_storage();
+        set_inference_proxy_config(OpenRouterProxyWorkerConfig {
+            worker_base_url: "https://proxy.example.workers.dev".to_string(),
+            trusted_callback_principal: Some(
+                Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
+                    .expect("principal should parse"),
+            ),
+        })
+        .expect("proxy config should persist");
+
+        let error = submit_inference_result(SubmitInferenceResultArgs {
+            job_id: "job-auth".to_string(),
+            turn_id: "turn-auth".to_string(),
+            completed_at_ns: 10,
+            result: None,
+            error: Some("failed".to_string()),
+        })
+        .expect_err("non-matching caller principal must be rejected");
+        assert!(error.contains("unauthorized inference proxy callback caller"));
+
+        let status = get_inference_proxy_status();
+        assert_eq!(status.callback_rejected, 1);
+        assert_eq!(status.callback_auth_failures, 1);
+    }
+
+    #[test]
+    fn submit_inference_result_accepts_and_dedupes_for_trusted_caller() {
+        stable::init_storage();
+        set_inference_proxy_config(OpenRouterProxyWorkerConfig {
+            worker_base_url: "https://proxy.example.workers.dev".to_string(),
+            trusted_callback_principal: Some(
+                Principal::from_text("2vxsx-fae").expect("anonymous principal should parse"),
+            ),
+        })
+        .expect("proxy config should persist");
+        stable::upsert_pending_inference_proxy_job(PendingInferenceProxyJob {
+            job_id: "job-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            submitted_at_ns: 1,
+            model: "openai/gpt-4o-mini".to_string(),
+        })
+        .expect("pending job should persist");
+
+        let first = submit_inference_result(SubmitInferenceResultArgs {
+            job_id: "job-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ns: 2,
+            result: Some(InferenceProxyResultPayload {
+                explanation: Some("done".to_string()),
+                tool_calls: Vec::new(),
+            }),
+            error: None,
+        })
+        .expect("first callback should be accepted");
+        assert_eq!(first, "inference_proxy_callback_accepted");
+
+        let duplicate = submit_inference_result(SubmitInferenceResultArgs {
+            job_id: "job-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ns: 3,
+            result: None,
+            error: Some("ignored".to_string()),
+        })
+        .expect("duplicate callback should not error");
+        assert_eq!(duplicate, "inference_proxy_callback_duplicate");
+
+        let status = get_inference_proxy_status();
+        assert_eq!(status.pending_jobs, 0);
+        assert_eq!(status.completed_jobs, 1);
+        assert_eq!(status.callback_accepted, 1);
+        assert_eq!(status.callback_duplicates, 1);
+        assert_eq!(
+            status.trusted_callback_principal.as_deref(),
+            Some("2vxsx-fae")
+        );
+
+        let agent_turn_runtime = stable::get_task_runtime(&TaskKind::AgentTurn);
+        assert!(
+            agent_turn_runtime.pending_job_id.is_some(),
+            "accepted callback should enqueue an agent turn resume job"
         );
     }
 

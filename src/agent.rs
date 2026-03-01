@@ -33,8 +33,8 @@ use crate::domain::types::{
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
 use crate::features::{
-    infer_with_provider, infer_with_provider_transcript, InferenceTranscriptMessage,
-    MockSignerAdapter,
+    infer_with_provider, infer_with_provider_transcript, is_inference_proxy_deferred_output,
+    InferenceTranscriptMessage, MockSignerAdapter,
 };
 use crate::sanitize::{
     extract_framed_untrusted_payload, frame_untrusted_content, ToolSequenceValidator,
@@ -1126,6 +1126,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         }
         let mut transcript = Vec::<InferenceTranscriptMessage>::new();
         let mut inference_completed = false;
+        let mut inference_deferred = false;
         let mut executed_any_tool = false;
 
         loop {
@@ -1225,6 +1226,22 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     break;
                 }
             };
+
+            if is_inference_proxy_deferred_output(&inference) {
+                inference_deferred = true;
+                append_inner_dialogue(
+                    &mut inner_dialogue,
+                    "inference deferred awaiting async proxy callback",
+                );
+                log!(
+                    AgentLogPriority::Info,
+                    "turn={} inference_deferred provider={:?} rounds={}",
+                    turn_id,
+                    snapshot.inference_provider,
+                    inference_round_count,
+                );
+                break;
+            }
 
             let trimmed_reply = inference.explanation.trim().to_string();
             if !trimmed_reply.is_empty() {
@@ -1604,7 +1621,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             if let Err(reason) = advance_state(&mut state, &AgentEvent::PersistCompleted, &turn_id)
             {
                 last_error = Some(reason);
-            } else {
+            } else if !inference_deferred {
                 if staged_message_count > 0 {
                     if let Some(reply) = assistant_reply.clone().or_else(|| inner_dialogue.clone())
                     {

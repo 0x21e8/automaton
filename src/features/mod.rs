@@ -25,7 +25,8 @@ pub mod threshold_signer;
 
 pub use evm::{EvmPoller, HttpEvmPoller};
 pub use inference::{
-    infer_with_provider, infer_with_provider_transcript, InferenceTranscriptMessage,
+    infer_with_provider, infer_with_provider_transcript, is_inference_proxy_deferred_output,
+    InferenceTranscriptMessage,
 };
 pub use signer::MockSignerAdapter;
 pub use skills::DefaultSkillLoader;

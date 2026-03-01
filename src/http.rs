@@ -19,6 +19,7 @@
 /// | GET    | `/api/wallet/balance/sync-config` | query   |
 /// | GET    | `/api/evm/config`             | query       |
 /// | GET    | `/api/inference/config`       | query       |
+/// | GET    | `/api/inference/proxy/status` | query       |
 /// | GET    | `/api/scheduler/config`       | query       |
 /// | GET    | `/api/welcome`                | query       |
 /// | GET    | `/api/build-info`             | query       |
@@ -353,6 +354,10 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
             let config = stable::inference_config_view();
             json_update_response(StatusCode::OK, &config)
         }
+        (&Method::GET, "/api/inference/proxy/status") => {
+            let status = stable::inference_proxy_status_view();
+            json_update_response(StatusCode::OK, &status)
+        }
         (&Method::GET, "/api/scheduler/config") => {
             let config = scheduler_config_view();
             json_update_response(StatusCode::OK, &config)
@@ -404,6 +409,7 @@ fn build_certification_state() -> HttpCertificationState {
     let wallet_sync_config = stable::wallet_balance_sync_config_view();
     let evm_config = evm_config_view();
     let inference_config = stable::inference_config_view();
+    let inference_proxy_status = stable::inference_proxy_status_view();
     let scheduler_config = scheduler_config_view();
     let welcome = welcome_view();
     let build_info = build_info_view();
@@ -447,6 +453,11 @@ fn build_certification_state() -> HttpCertificationState {
         ),
         json_route(Method::GET, "/api/evm/config", &evm_config),
         json_route(Method::GET, "/api/inference/config", &inference_config),
+        json_route(
+            Method::GET,
+            "/api/inference/proxy/status",
+            &inference_proxy_status,
+        ),
         json_route(Method::GET, "/api/scheduler/config", &scheduler_config),
         json_route(Method::GET, "/api/welcome", &welcome),
         json_route(Method::GET, "/api/build-info", &build_info),
@@ -1106,6 +1117,22 @@ mod tests {
     }
 
     #[test]
+    fn get_inference_proxy_status_route_is_certified_query() {
+        stable::init_storage();
+        init_certification();
+
+        let request = HttpRequest::get("/api/inference/proxy/status").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), None);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("inference proxy status body should decode as json");
+        assert!(body.get("pending_jobs").is_some());
+        assert!(body.get("completed_jobs").is_some());
+    }
+
+    #[test]
     fn get_scheduler_config_route_is_certified_query() {
         stable::init_storage();
         stable::set_scheduler_base_tick_secs(300).expect("base tick should persist");
@@ -1131,6 +1158,17 @@ mod tests {
         init_certification();
 
         let request = HttpRequest::post("/api/inference/config").build();
+        let response = handle_http_request(request);
+
+        assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+        assert_eq!(response.upgrade(), None);
+    }
+
+    #[test]
+    fn post_inference_proxy_status_route_is_not_upgradable() {
+        init_certification();
+
+        let request = HttpRequest::post("/api/inference/proxy/status").build();
         let response = handle_http_request(request);
 
         assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
@@ -1315,6 +1353,26 @@ mod tests {
                 CONTENT_TYPE_JSON.to_string(),
             )])
             .with_body(br#"{"provider":"openrouter"}"#.to_vec())
+            .build_update();
+        let response = handle_http_request_update(request);
+
+        assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("response should decode as json");
+        assert_eq!(body.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(body.get("error").and_then(Value::as_str), Some("not found"));
+    }
+
+    #[test]
+    fn post_inference_proxy_status_update_returns_not_found() {
+        init_certification();
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/inference/proxy/status")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(br#"{}"#.to_vec())
             .build_update();
         let response = handle_http_request_update(request);
 

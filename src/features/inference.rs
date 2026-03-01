@@ -44,6 +44,8 @@ const DETERMINISTIC_LAYER_6_UPDATE_CONTENT: &str =
     "## Layer 6: Economic Decision Loop (Mutable Default)\n- phase5-layer6-marker";
 const INFERENCE_OUTCALL_TIMEOUT_MS: u64 = 45_000;
 const INFERENCE_OUTCALL_TIMEOUT_NS: u64 = INFERENCE_OUTCALL_TIMEOUT_MS * 1_000_000;
+const INFERENCE_PROXY_SUBMIT_MAX_RESPONSE_BYTES: u64 = 1_024;
+const INFERENCE_PROXY_DEFERRED_EXPLANATION: &str = "inference deferred awaiting proxy callback";
 
 fn outcall_elapsed_ms(started_at_ns: u64, finished_at_ns: u64) -> u64 {
     finished_at_ns.saturating_sub(started_at_ns) / 1_000_000
@@ -82,6 +84,10 @@ pub struct InferenceOutput {
     pub tool_calls: Vec<ToolCall>,
     #[allow(dead_code)]
     pub explanation: String,
+}
+
+pub fn is_inference_proxy_deferred_output(output: &InferenceOutput) -> bool {
+    output.tool_calls.is_empty() && output.explanation == INFERENCE_PROXY_DEFERRED_EXPLANATION
 }
 
 /// A single entry in the multi-round conversation transcript.
@@ -169,6 +175,11 @@ pub async fn infer_with_provider_transcript(
         }
         InferenceProvider::OpenRouter => {
             OpenRouterInferenceAdapter::from_snapshot(snapshot)
+                .infer_with_transcript(input, transcript)
+                .await
+        }
+        InferenceProvider::OpenRouterProxyWorker => {
+            OpenRouterProxyWorkerInferenceAdapter::from_snapshot(snapshot)
                 .infer_with_transcript(input, transcript)
                 .await
         }
@@ -1464,6 +1475,355 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
     }
 }
 
+pub struct OpenRouterProxyWorkerInferenceAdapter {
+    model: String,
+    worker_base_url: String,
+    api_key: Option<String>,
+    max_response_bytes: u64,
+    evm_tools_enabled: bool,
+}
+
+impl OpenRouterProxyWorkerInferenceAdapter {
+    pub fn from_snapshot(snapshot: &RuntimeSnapshot) -> Self {
+        Self {
+            model: snapshot.inference_model.clone(),
+            worker_base_url: snapshot.openrouter_proxy.worker_base_url.clone(),
+            api_key: snapshot.openrouter_api_key.clone(),
+            max_response_bytes: snapshot.openrouter_max_response_bytes,
+            evm_tools_enabled: !snapshot.evm_rpc_url.trim().is_empty(),
+        }
+    }
+
+    fn validate_config(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("openrouter proxy model cannot be empty".to_string());
+        }
+        if self.worker_base_url.trim().is_empty() {
+            return Err("openrouter proxy worker_base_url cannot be empty".to_string());
+        }
+        if self.max_response_bytes == 0 {
+            return Err("openrouter proxy max_response_bytes must be > 0".to_string());
+        }
+        let api_key = self
+            .api_key
+            .as_deref()
+            .ok_or_else(|| "openrouter api key is not configured".to_string())?;
+        if api_key.trim().is_empty() {
+            return Err("openrouter api key is empty".to_string());
+        }
+        Ok(())
+    }
+
+    fn deferred_output() -> InferenceOutput {
+        InferenceOutput {
+            tool_calls: Vec::new(),
+            explanation: INFERENCE_PROXY_DEFERRED_EXPLANATION.to_string(),
+        }
+    }
+
+    fn submit_ack_max_response_bytes(&self) -> u64 {
+        self.max_response_bytes
+            .clamp(1, INFERENCE_PROXY_SUBMIT_MAX_RESPONSE_BYTES)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterProxySubmitAck {
+    job_id: String,
+    accepted_at_ns: u64,
+    status: String,
+}
+
+fn parse_openrouter_proxy_submit_ack(
+    response: HttpRequestResult,
+    expected_job_id: &str,
+) -> Result<OpenRouterProxySubmitAck, String> {
+    let status = nat_to_status_code(&response.status)?;
+    let body = String::from_utf8(response.body)
+        .map_err(|error| format!("openrouter proxy ack response was not valid utf-8: {error}"))?;
+    if status != 202 {
+        return Err(format!("openrouter proxy returned status {status}: {body}"));
+    }
+
+    let ack: OpenRouterProxySubmitAck = serde_json::from_str(&body)
+        .map_err(|error| format!("failed to parse openrouter proxy ack json: {error}"))?;
+    if ack.job_id.trim().is_empty() {
+        return Err("openrouter proxy ack job_id cannot be empty".to_string());
+    }
+    if !ack.status.eq_ignore_ascii_case("accepted") {
+        return Err(format!(
+            "openrouter proxy ack status must be accepted, got {}",
+            ack.status
+        ));
+    }
+    if ack.job_id != expected_job_id {
+        return Err(format!(
+            "openrouter proxy ack job_id mismatch expected={} received={}",
+            expected_job_id, ack.job_id
+        ));
+    }
+
+    Ok(ack)
+}
+
+fn current_canister_id_text() -> String {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::id().to_text();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    return "2vxsx-fae".to_string();
+}
+
+#[async_trait(?Send)]
+impl InferenceAdapter for OpenRouterProxyWorkerInferenceAdapter {
+    async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String> {
+        self.infer_with_transcript(input, &[]).await
+    }
+
+    async fn infer_with_transcript(
+        &self,
+        input: &InferenceInput,
+        transcript: &[InferenceTranscriptMessage],
+    ) -> Result<InferenceOutput, String> {
+        if let Some(callback) = stable::pop_next_inference_proxy_callback_result() {
+            let callback_error = callback
+                .error
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            if let Some(error) = callback_error {
+                log!(
+                    InferenceLogPriority::Error,
+                    "turn={} provider=openrouter_proxy_worker inference_proxy_callback_error job_id={} callback_turn_id={} error={}",
+                    input.turn_id,
+                    callback.job_id,
+                    callback.turn_id,
+                    error,
+                );
+                return Err(format!(
+                    "openrouter proxy callback reported error for job_id={}: {}",
+                    callback.job_id, error
+                ));
+            }
+
+            let result = callback.result.ok_or_else(|| {
+                format!(
+                    "openrouter proxy callback missing result payload for job_id={}",
+                    callback.job_id
+                )
+            })?;
+            stable::record_inference_proxy_callback_resumed();
+            log!(
+                InferenceLogPriority::Info,
+                "turn={} provider=openrouter_proxy_worker inference_proxy_resume_applied job_id={} callback_turn_id={}",
+                input.turn_id,
+                callback.job_id,
+                callback.turn_id,
+            );
+            return Ok(InferenceOutput {
+                tool_calls: result.tool_calls,
+                explanation: result.explanation.unwrap_or_default(),
+            });
+        }
+
+        self.validate_config()?;
+
+        let pending_jobs_count = stable::pending_inference_proxy_jobs_count();
+        if pending_jobs_count > 0 {
+            log!(
+                InferenceLogPriority::Info,
+                "turn={} provider=openrouter_proxy_worker inference_proxy_deferred reason=pending_callback pending_jobs={}",
+                input.turn_id,
+                pending_jobs_count,
+            );
+            return Ok(Self::deferred_output());
+        }
+
+        let now_ns = current_time_ns();
+        let api_key = self.api_key.clone().unwrap_or_default();
+        let submit_body = build_openrouter_request_body_with_transcript_capabilities(
+            input,
+            &self.model,
+            transcript,
+            self.evm_tools_enabled,
+        );
+        let job_id = format!("proxy-{}-{}", input.turn_id, now_ns);
+        let payload = serde_json::to_vec(&json!({
+            "canister_id": current_canister_id_text(),
+            "turn_id": input.turn_id,
+            "job_id": job_id,
+            "model": self.model,
+            "inference_request": submit_body,
+        }))
+        .map_err(|error| format!("failed to build openrouter proxy submit payload: {error}"))?;
+        let request_size_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        let max_response_bytes = self.submit_ack_max_response_bytes();
+        let requirements = OpenRouterInferenceAdapter::affordability_requirements(
+            request_size_bytes,
+            max_response_bytes,
+        )?;
+        let total_cycles = ic_cdk::api::canister_cycle_balance();
+        let liquid_cycles = ic_cdk::api::canister_liquid_cycle_balance();
+
+        if !can_afford(liquid_cycles, &requirements) {
+            stable::record_survival_operation_failure(
+                &SurvivalOperationClass::Inference,
+                now_ns,
+                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE,
+            );
+            log!(
+                InferenceLogPriority::Error,
+                "turn={} provider=openrouter_proxy_worker inference_proxy_deferred reason=insufficient_liquid_cycles required_cycles={} liquid_cycles={} total_cycles={}",
+                input.turn_id,
+                requirements.required_cycles,
+                liquid_cycles,
+                total_cycles,
+            );
+            return Ok(Self::deferred_output());
+        }
+
+        let request = HttpRequestArgs {
+            url: format!(
+                "{}/v1/inference/jobs",
+                self.worker_base_url.trim_end_matches('/')
+            ),
+            max_response_bytes: Some(max_response_bytes),
+            method: HttpMethod::POST,
+            headers: vec![
+                HttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                },
+                HttpHeader {
+                    name: "authorization".to_string(),
+                    value: format!("Bearer {api_key}"),
+                },
+                HttpHeader {
+                    name: "x-openrouter-api-key".to_string(),
+                    value: api_key,
+                },
+            ],
+            body: Some(payload),
+            transform: None,
+            is_replicated: Some(false),
+        };
+
+        log!(
+            InferenceLogPriority::Info,
+            "turn={} provider=openrouter_proxy_worker inference_proxy_submit_dispatched max_response_bytes={}",
+            input.turn_id,
+            max_response_bytes,
+        );
+
+        let outcall_started_at_ns = current_time_ns();
+        let response = match http_request(&request).await {
+            Ok(response) => response,
+            Err(error) => {
+                let outcall_finished_at_ns = current_time_ns();
+                let elapsed_ms = outcall_elapsed_ms(outcall_started_at_ns, outcall_finished_at_ns);
+                let timed_out = outcall_finished_at_ns.saturating_sub(outcall_started_at_ns)
+                    > INFERENCE_OUTCALL_TIMEOUT_NS;
+                let message = if timed_out {
+                    outcall_timeout_message(
+                        "openrouter proxy submit",
+                        INFERENCE_OUTCALL_TIMEOUT_MS,
+                        elapsed_ms,
+                    )
+                } else {
+                    format!("openrouter proxy submit outcall failed: {error}")
+                };
+                stable::record_outcall_timing(
+                    stable::RuntimeOutcallKind::Inference,
+                    outcall_started_at_ns,
+                    outcall_finished_at_ns,
+                    Some(message.as_str()),
+                    timed_out,
+                );
+                if is_insufficient_cycles_error(&message) {
+                    stable::record_survival_operation_failure(
+                        &SurvivalOperationClass::Inference,
+                        now_ns,
+                        stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE,
+                    );
+                    log!(
+                        InferenceLogPriority::Error,
+                        "turn={} provider=openrouter_proxy_worker inference_proxy_deferred reason=insufficient_cycles_error message={}",
+                        input.turn_id,
+                        message,
+                    );
+                    return Ok(Self::deferred_output());
+                }
+                stable::record_inference_proxy_submit_failed();
+                return Err(message);
+            }
+        };
+
+        let outcall_finished_at_ns = current_time_ns();
+        let elapsed_ms = outcall_elapsed_ms(outcall_started_at_ns, outcall_finished_at_ns);
+        if outcall_finished_at_ns.saturating_sub(outcall_started_at_ns)
+            > INFERENCE_OUTCALL_TIMEOUT_NS
+        {
+            let message = outcall_timeout_message(
+                "openrouter proxy submit",
+                INFERENCE_OUTCALL_TIMEOUT_MS,
+                elapsed_ms,
+            );
+            stable::record_outcall_timing(
+                stable::RuntimeOutcallKind::Inference,
+                outcall_started_at_ns,
+                outcall_finished_at_ns,
+                Some(message.as_str()),
+                true,
+            );
+            stable::record_inference_proxy_submit_failed();
+            return Err(message);
+        }
+
+        let ack = match parse_openrouter_proxy_submit_ack(response, &job_id) {
+            Ok(ack) => {
+                stable::record_outcall_timing(
+                    stable::RuntimeOutcallKind::Inference,
+                    outcall_started_at_ns,
+                    outcall_finished_at_ns,
+                    None,
+                    false,
+                );
+                ack
+            }
+            Err(error) => {
+                stable::record_outcall_timing(
+                    stable::RuntimeOutcallKind::Inference,
+                    outcall_started_at_ns,
+                    outcall_finished_at_ns,
+                    Some(error.as_str()),
+                    false,
+                );
+                stable::record_inference_proxy_submit_failed();
+                return Err(error);
+            }
+        };
+
+        stable::upsert_pending_inference_proxy_job(
+            crate::domain::types::PendingInferenceProxyJob {
+                job_id: ack.job_id.clone(),
+                turn_id: input.turn_id.clone(),
+                submitted_at_ns: now_ns,
+                model: self.model.clone(),
+            },
+        )?;
+        stable::record_inference_proxy_submit_accepted();
+        log!(
+            InferenceLogPriority::Info,
+            "turn={} provider=openrouter_proxy_worker inference_proxy_submit_accepted job_id={} accepted_at_ns={}",
+            input.turn_id,
+            ack.job_id,
+            ack.accepted_at_ns,
+        );
+        Ok(Self::deferred_output())
+    }
+}
+
 fn is_insufficient_cycles_error(error: &str) -> bool {
     let normalized = error.to_lowercase();
     let indicates_insufficient_cycles =
@@ -2681,5 +3041,130 @@ mod tests {
         let error = block_on_with_spin(adapter.infer(&input))
             .expect_err("invalid llm canister id should be rejected");
         assert!(error.contains("invalid ic_llm canister principal"));
+    }
+
+    #[test]
+    fn parse_openrouter_proxy_submit_ack_accepts_compact_202_payload() {
+        let response = HttpRequestResult {
+            status: Nat::from(202u16),
+            headers: vec![],
+            body: br#"{"job_id":"job-1","accepted_at_ns":123,"status":"accepted"}"#.to_vec(),
+        };
+
+        let ack = parse_openrouter_proxy_submit_ack(response, "job-1")
+            .expect("compact ack payload should be accepted");
+        assert_eq!(ack.job_id, "job-1");
+        assert_eq!(ack.accepted_at_ns, 123);
+    }
+
+    #[test]
+    fn parse_openrouter_proxy_submit_ack_rejects_non_202_status() {
+        let response = HttpRequestResult {
+            status: Nat::from(500u16),
+            headers: vec![],
+            body: br#"{"error":"boom"}"#.to_vec(),
+        };
+
+        let error = parse_openrouter_proxy_submit_ack(response, "job-1")
+            .expect_err("non-202 responses must be rejected");
+        assert!(error.contains("openrouter proxy returned status 500"));
+    }
+
+    #[test]
+    fn openrouter_proxy_provider_consumes_completed_callback_before_submit() {
+        stable::init_storage();
+        stable::set_inference_provider(InferenceProvider::OpenRouterProxyWorker);
+        stable::set_openrouter_proxy_config(crate::domain::types::OpenRouterProxyWorkerConfig {
+            worker_base_url: "https://proxy.example.workers.dev".to_string(),
+            trusted_callback_principal: Some(
+                Principal::from_text("2vxsx-fae").expect("principal should parse"),
+            ),
+        })
+        .expect("proxy config should persist");
+        stable::set_openrouter_api_key(Some("sk-or-test".to_string()));
+        stable::upsert_pending_inference_proxy_job(
+            crate::domain::types::PendingInferenceProxyJob {
+                job_id: "job-1".to_string(),
+                turn_id: "turn-original".to_string(),
+                submitted_at_ns: 1,
+                model: "openai/gpt-4o-mini".to_string(),
+            },
+        )
+        .expect("pending proxy job should persist");
+        stable::apply_inference_proxy_callback(
+            crate::domain::types::SubmitInferenceResultArgs {
+                job_id: "job-1".to_string(),
+                turn_id: "turn-original".to_string(),
+                completed_at_ns: 2,
+                result: Some(crate::domain::types::InferenceProxyResultPayload {
+                    explanation: Some("ready".to_string()),
+                    tool_calls: vec![ToolCall {
+                        tool_call_id: None,
+                        tool: "record_signal".to_string(),
+                        args_json: r#"{"signal":"resume"}"#.to_string(),
+                    }],
+                }),
+                error: None,
+            },
+            "2vxsx-fae".to_string(),
+            3,
+        )
+        .expect("callback should be accepted");
+
+        let snapshot = stable::runtime_snapshot();
+        let output = block_on_with_spin(infer_with_provider(
+            &snapshot,
+            &InferenceInput {
+                input: "autonomy_tick".to_string(),
+                context_snippet: "ctx".to_string(),
+                turn_id: "turn-resume".to_string(),
+            },
+        ))
+        .expect("completed callback should be consumed");
+
+        assert_eq!(output.explanation, "ready");
+        assert_eq!(output.tool_calls.len(), 1);
+        let status = stable::inference_proxy_status_view();
+        assert_eq!(status.completed_jobs, 0);
+        assert_eq!(status.resumed_callbacks, 1);
+    }
+
+    #[test]
+    fn openrouter_proxy_provider_defers_when_pending_job_exists() {
+        stable::init_storage();
+        stable::set_inference_provider(InferenceProvider::OpenRouterProxyWorker);
+        stable::set_openrouter_proxy_config(crate::domain::types::OpenRouterProxyWorkerConfig {
+            worker_base_url: "https://proxy.example.workers.dev".to_string(),
+            trusted_callback_principal: Some(
+                Principal::from_text("2vxsx-fae").expect("principal should parse"),
+            ),
+        })
+        .expect("proxy config should persist");
+        stable::set_openrouter_api_key(Some("sk-or-test".to_string()));
+        stable::upsert_pending_inference_proxy_job(
+            crate::domain::types::PendingInferenceProxyJob {
+                job_id: "job-pending".to_string(),
+                turn_id: "turn-original".to_string(),
+                submitted_at_ns: 1,
+                model: "openai/gpt-4o-mini".to_string(),
+            },
+        )
+        .expect("pending proxy job should persist");
+
+        let snapshot = stable::runtime_snapshot();
+        let output = block_on_with_spin(infer_with_provider(
+            &snapshot,
+            &InferenceInput {
+                input: "autonomy_tick".to_string(),
+                context_snippet: "ctx".to_string(),
+                turn_id: "turn-wait".to_string(),
+            },
+        ))
+        .expect("pending callback should defer inference");
+
+        assert!(is_inference_proxy_deferred_output(&output));
+        let status = stable::inference_proxy_status_view();
+        assert_eq!(status.pending_jobs, 1);
+        assert_eq!(status.submit_accepted, 0);
     }
 }

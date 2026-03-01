@@ -10,7 +10,7 @@ Follow the KISS principle. Clarify with the human if you need to introduce compl
 
 ## Delivery workflow
 - Use `icp-cli` as the default toolchain to set up and drive this project (network, build, deploy, and related lifecycle tasks).
-- Follow TDD: write or update tests first, implement incrementally, and keep tests green throughout development.
+- Follow red/green TDD.
 - Do extensive tests. Try to identify edge cases and ICP specifics. Be aware of the ICP security best practices
 - DO NOT edit tests to pass tests later on. If this is necessary communicate with the user.
 - Maintain extensive automated test coverage with both unit tests and integration tests for each implemented feature.

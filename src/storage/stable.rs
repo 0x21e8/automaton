@@ -11,12 +11,14 @@ use super::sqlite::SurvivalOperationRuntimeRecord;
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AgentEvent, AgentState, ConversationEntry, ConversationLog,
     ConversationSummary, CycleTelemetry, EvmPollCursor, EvmRouteStateView, InboxMessage,
-    InboxMessageStatus, InboxStats, InferenceConfigView, InferenceProvider, JobStatus, MemoryFact,
-    MemoryRollup, ObservabilitySnapshot, OutboxMessage, OutboxStats, PromptLayer, PromptLayerView,
-    RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView, ScheduledJob,
-    SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord, StorageGrowthMetrics,
-    StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind,
-    StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
+    InboxMessageStatus, InboxStats, InferenceConfigView, InferenceProvider,
+    InferenceProxyCallbackApply, InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus,
+    MemoryFact, MemoryRollup, ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OutboxMessage,
+    OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, RetentionConfig,
+    RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease,
+    SchedulerRuntime, SessionSummary, SkillRecord, StorageGrowthMetrics, StoragePressureLevel,
+    StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats,
+    StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass,
     SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
     TemplateActivationState, TemplateRevocationState, TemplateVersion, ToolCallRecord,
     TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
@@ -32,6 +34,7 @@ use candid::Principal;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
+use std::collections::BTreeMap;
 
 fn now_ns() -> u64 {
     crate::timing::current_time_ns()
@@ -58,8 +61,12 @@ const CADENCE_MULTIPLIER_KEY: &str = "timing.cadence_multiplier";
 /// Persisted scheduler base tick interval in seconds.
 const SCHEDULER_BASE_TICK_SECS_KEY: &str = "timing.scheduler_base_tick_secs";
 const WELCOME_MESSAGE_KEY: &str = "ui.welcome_message";
+const INFERENCE_PROXY_PENDING_JOBS_KEY: &str = "inference.proxy.pending_jobs";
+const INFERENCE_PROXY_CALLBACK_RESULTS_KEY: &str = "inference.proxy.callback_results";
+const INFERENCE_PROXY_METRICS_KEY: &str = "inference.proxy.metrics";
 /// Maximum character count accepted by `set_welcome_message`.
 pub const MAX_WELCOME_MESSAGE_CHARS: usize = 2_000;
+pub const INFERENCE_PROXY_PENDING_JOB_TTL_SECS: u64 = 15 * 60;
 
 // ── Capacity constants ───────────────────────────────────────────────────────
 
@@ -200,6 +207,18 @@ struct CycleBalanceSample {
 struct StorageGrowthSample {
     captured_at_ns: u64,
     tracked_entries: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct InferenceProxyRuntimeMetrics {
+    submit_accepted: u64,
+    submit_failed: u64,
+    callback_accepted: u64,
+    callback_rejected: u64,
+    callback_duplicates: u64,
+    callback_auth_failures: u64,
+    resumed_callbacks: u64,
+    expired_jobs: u64,
 }
 
 // ── Survival / backoff helpers ────────────────────────────────────────────────
@@ -1608,6 +1627,51 @@ pub fn set_openrouter_api_key(api_key: Option<String>) {
     save_runtime_snapshot(&snapshot);
 }
 
+pub fn set_openrouter_proxy_config(
+    config: OpenRouterProxyWorkerConfig,
+) -> Result<OpenRouterProxyWorkerConfig, String> {
+    let worker_base_url = config
+        .worker_base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if worker_base_url.is_empty() {
+        return Err("openrouter proxy worker_base_url cannot be empty".to_string());
+    }
+    let trusted_callback_principal = config
+        .trusted_callback_principal
+        .ok_or_else(|| "openrouter proxy trusted_callback_principal is required".to_string())?;
+
+    let mut snapshot = runtime_snapshot();
+    snapshot.openrouter_proxy = OpenRouterProxyWorkerConfig {
+        worker_base_url,
+        trusted_callback_principal: Some(trusted_callback_principal),
+    };
+    snapshot.last_transition_at_ns = now_ns();
+    let out = snapshot.openrouter_proxy.clone();
+    save_runtime_snapshot(&snapshot);
+    Ok(out)
+}
+
+pub fn openrouter_proxy_config() -> OpenRouterProxyWorkerConfig {
+    runtime_snapshot().openrouter_proxy
+}
+
+pub fn assert_inference_proxy_callback_authorized(caller_principal: &str) -> Result<(), String> {
+    let expected = runtime_snapshot()
+        .openrouter_proxy
+        .trusted_callback_principal
+        .ok_or_else(|| "inference proxy trusted callback principal is not configured".to_string())?
+        .to_text();
+    if caller_principal != expected {
+        return Err(format!(
+            "unauthorized inference proxy callback caller={} expected={}",
+            caller_principal, expected
+        ));
+    }
+    Ok(())
+}
+
 // ── Private scalar helpers ────────────────────────────────────────────────────
 
 fn runtime_u64(key: &str) -> Option<u64> {
@@ -1630,6 +1694,61 @@ fn runtime_bool(key: &str) -> Option<bool> {
 
 fn save_runtime_bool(key: &str, value: bool) {
     let _ = sqlite::set_runtime_scalar(key, if value { "true" } else { "false" });
+}
+
+fn load_pending_inference_proxy_jobs() -> BTreeMap<String, PendingInferenceProxyJob> {
+    sqlite::get_runtime_scalar(INFERENCE_PROXY_PENDING_JOBS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| {
+            serde_json::from_str::<BTreeMap<String, PendingInferenceProxyJob>>(&raw).ok()
+        })
+        .unwrap_or_default()
+}
+
+fn save_pending_inference_proxy_jobs(jobs: &BTreeMap<String, PendingInferenceProxyJob>) {
+    if let Ok(raw) = serde_json::to_string(jobs) {
+        let _ = sqlite::set_runtime_scalar(INFERENCE_PROXY_PENDING_JOBS_KEY, &raw);
+    }
+}
+
+fn load_inference_proxy_callback_results() -> BTreeMap<String, InferenceProxyCallbackRecord> {
+    sqlite::get_runtime_scalar(INFERENCE_PROXY_CALLBACK_RESULTS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| {
+            serde_json::from_str::<BTreeMap<String, InferenceProxyCallbackRecord>>(&raw).ok()
+        })
+        .unwrap_or_default()
+}
+
+fn save_inference_proxy_callback_results(results: &BTreeMap<String, InferenceProxyCallbackRecord>) {
+    if let Ok(raw) = serde_json::to_string(results) {
+        let _ = sqlite::set_runtime_scalar(INFERENCE_PROXY_CALLBACK_RESULTS_KEY, &raw);
+    }
+}
+
+fn load_inference_proxy_metrics() -> InferenceProxyRuntimeMetrics {
+    sqlite::get_runtime_scalar(INFERENCE_PROXY_METRICS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<InferenceProxyRuntimeMetrics>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_inference_proxy_metrics(metrics: &InferenceProxyRuntimeMetrics) {
+    if let Ok(raw) = serde_json::to_string(metrics) {
+        let _ = sqlite::set_runtime_scalar(INFERENCE_PROXY_METRICS_KEY, &raw);
+    }
+}
+
+fn update_inference_proxy_metrics<F>(mutate: F)
+where
+    F: FnOnce(&mut InferenceProxyRuntimeMetrics),
+{
+    let mut metrics = load_inference_proxy_metrics();
+    mutate(&mut metrics);
+    save_inference_proxy_metrics(&metrics);
 }
 
 fn evm_ingest_dedupe_key(tx_hash: &str, log_index: u64) -> String {
@@ -2794,6 +2913,209 @@ pub fn inference_config_view() -> InferenceConfigView {
     InferenceConfigView::from(&runtime_snapshot())
 }
 
+pub fn upsert_pending_inference_proxy_job(job: PendingInferenceProxyJob) -> Result<(), String> {
+    if job.job_id.trim().is_empty() {
+        return Err("pending inference proxy job_id cannot be empty".to_string());
+    }
+    if job.turn_id.trim().is_empty() {
+        return Err("pending inference proxy turn_id cannot be empty".to_string());
+    }
+    let mut jobs = load_pending_inference_proxy_jobs();
+    jobs.insert(job.job_id.clone(), job);
+    save_pending_inference_proxy_jobs(&jobs);
+    Ok(())
+}
+
+pub fn get_pending_inference_proxy_job(job_id: &str) -> Option<PendingInferenceProxyJob> {
+    let jobs = load_pending_inference_proxy_jobs();
+    jobs.get(job_id).cloned()
+}
+
+pub fn list_pending_inference_proxy_jobs(limit: usize) -> Vec<PendingInferenceProxyJob> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut jobs: Vec<PendingInferenceProxyJob> =
+        load_pending_inference_proxy_jobs().into_values().collect();
+    jobs.sort_by_key(|job| job.submitted_at_ns);
+    jobs.truncate(limit);
+    jobs
+}
+
+pub fn pending_inference_proxy_jobs_count() -> usize {
+    load_pending_inference_proxy_jobs().len()
+}
+
+pub fn has_pending_inference_proxy_jobs() -> bool {
+    pending_inference_proxy_jobs_count() > 0
+}
+
+pub fn pop_next_inference_proxy_callback_result() -> Option<InferenceProxyCallbackRecord> {
+    let mut callback_results = load_inference_proxy_callback_results();
+    let next_job_id = callback_results
+        .iter()
+        .min_by_key(|(_, record)| (record.accepted_at_ns, record.completed_at_ns))
+        .map(|(job_id, _)| job_id.clone())?;
+    let record = callback_results.remove(&next_job_id)?;
+    save_inference_proxy_callback_results(&callback_results);
+    Some(record)
+}
+
+pub fn expire_inference_proxy_pending_jobs(
+    now_ns_param: u64,
+    pending_job_ttl_secs: u64,
+) -> Vec<PendingInferenceProxyJob> {
+    if pending_job_ttl_secs == 0 {
+        return Vec::new();
+    }
+    let ttl_ns = pending_job_ttl_secs.saturating_mul(1_000_000_000);
+    let cutoff_ns = now_ns_param.saturating_sub(ttl_ns);
+
+    let mut pending_jobs = load_pending_inference_proxy_jobs();
+    let mut expired = pending_jobs
+        .values()
+        .filter(|job| job.submitted_at_ns <= cutoff_ns)
+        .cloned()
+        .collect::<Vec<_>>();
+    if expired.is_empty() {
+        return expired;
+    }
+    expired.sort_by_key(|job| job.submitted_at_ns);
+
+    for job in &expired {
+        pending_jobs.remove(&job.job_id);
+    }
+    save_pending_inference_proxy_jobs(&pending_jobs);
+    record_inference_proxy_jobs_expired(u64::try_from(expired.len()).unwrap_or(u64::MAX));
+    expired
+}
+
+pub fn record_inference_proxy_submit_accepted() {
+    update_inference_proxy_metrics(|metrics| {
+        metrics.submit_accepted = metrics.submit_accepted.saturating_add(1);
+    });
+}
+
+pub fn record_inference_proxy_submit_failed() {
+    update_inference_proxy_metrics(|metrics| {
+        metrics.submit_failed = metrics.submit_failed.saturating_add(1);
+    });
+}
+
+pub fn record_inference_proxy_callback_rejected(auth_failure: bool) {
+    update_inference_proxy_metrics(|metrics| {
+        metrics.callback_rejected = metrics.callback_rejected.saturating_add(1);
+        if auth_failure {
+            metrics.callback_auth_failures = metrics.callback_auth_failures.saturating_add(1);
+        }
+    });
+}
+
+pub fn record_inference_proxy_callback_resumed() {
+    update_inference_proxy_metrics(|metrics| {
+        metrics.resumed_callbacks = metrics.resumed_callbacks.saturating_add(1);
+    });
+}
+
+pub fn record_inference_proxy_jobs_expired(expired_count: u64) {
+    if expired_count == 0 {
+        return;
+    }
+    update_inference_proxy_metrics(|metrics| {
+        metrics.expired_jobs = metrics.expired_jobs.saturating_add(expired_count);
+    });
+}
+
+pub fn apply_inference_proxy_callback(
+    args: SubmitInferenceResultArgs,
+    caller_principal: String,
+    accepted_at_ns: u64,
+) -> Result<InferenceProxyCallbackApply, String> {
+    if args.job_id.trim().is_empty() {
+        return Err("inference proxy callback job_id cannot be empty".to_string());
+    }
+    if args.turn_id.trim().is_empty() {
+        return Err("inference proxy callback turn_id cannot be empty".to_string());
+    }
+    if args.result.is_none() && args.error.as_deref().unwrap_or("").trim().is_empty() {
+        return Err("inference proxy callback must include result or error".to_string());
+    }
+
+    let mut callback_results = load_inference_proxy_callback_results();
+    if callback_results.contains_key(&args.job_id) {
+        update_inference_proxy_metrics(|metrics| {
+            metrics.callback_duplicates = metrics.callback_duplicates.saturating_add(1);
+        });
+        return Ok(InferenceProxyCallbackApply::Duplicate);
+    }
+
+    let mut pending_jobs = load_pending_inference_proxy_jobs();
+    let pending = pending_jobs
+        .remove(&args.job_id)
+        .ok_or_else(|| format!("unknown pending inference proxy job_id={}", args.job_id))?;
+    if pending.turn_id != args.turn_id {
+        return Err(format!(
+            "inference proxy callback turn_id mismatch job_id={} expected_turn_id={} received_turn_id={}",
+            args.job_id, pending.turn_id, args.turn_id
+        ));
+    }
+
+    callback_results.insert(
+        args.job_id.clone(),
+        InferenceProxyCallbackRecord {
+            job_id: args.job_id,
+            turn_id: args.turn_id,
+            completed_at_ns: args.completed_at_ns,
+            accepted_at_ns,
+            caller_principal,
+            result: args.result,
+            error: args.error,
+        },
+    );
+    save_pending_inference_proxy_jobs(&pending_jobs);
+    save_inference_proxy_callback_results(&callback_results);
+    update_inference_proxy_metrics(|metrics| {
+        metrics.callback_accepted = metrics.callback_accepted.saturating_add(1);
+    });
+    Ok(InferenceProxyCallbackApply::Accepted)
+}
+
+pub fn inference_proxy_status_view() -> InferenceProxyStatusView {
+    let snapshot = runtime_snapshot();
+    let pending = load_pending_inference_proxy_jobs();
+    let completed = load_inference_proxy_callback_results();
+    let metrics = load_inference_proxy_metrics();
+    let now = now_ns();
+    let oldest_pending_age_secs = pending
+        .values()
+        .min_by_key(|job| job.submitted_at_ns)
+        .map(|job| now.saturating_sub(job.submitted_at_ns) / 1_000_000_000);
+    let worker_base_url = snapshot.openrouter_proxy.worker_base_url.trim().to_string();
+    InferenceProxyStatusView {
+        worker_base_url: if worker_base_url.is_empty() {
+            None
+        } else {
+            Some(worker_base_url)
+        },
+        trusted_callback_principal: snapshot
+            .openrouter_proxy
+            .trusted_callback_principal
+            .as_ref()
+            .map(Principal::to_text),
+        pending_jobs: u64::try_from(pending.len()).unwrap_or(u64::MAX),
+        completed_jobs: u64::try_from(completed.len()).unwrap_or(u64::MAX),
+        oldest_pending_age_secs,
+        submit_accepted: metrics.submit_accepted,
+        submit_failed: metrics.submit_failed,
+        callback_accepted: metrics.callback_accepted,
+        callback_rejected: metrics.callback_rejected,
+        callback_duplicates: metrics.callback_duplicates,
+        callback_auth_failures: metrics.callback_auth_failures,
+        resumed_callbacks: metrics.resumed_callbacks,
+        expired_jobs: metrics.expired_jobs,
+    }
+}
+
 #[allow(dead_code)]
 fn validate_wallet_balance_sync_config(config: &WalletBalanceSyncConfig) -> Result<(), String> {
     if config.normal_interval_secs < MIN_WALLET_BALANCE_SYNC_INTERVAL_SECS
@@ -3577,4 +3899,191 @@ pub fn save_job_for_tests(job: ScheduledJob) {
 pub fn insert_dedupe_for_tests(_dedupe_key: String, _job_id: String) {
     // Dedup is handled inline by the jobs table in SQLite - no separate map needed.
     // This function exists only for test compatibility.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trusted_test_principal() -> Principal {
+        Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai").expect("test principal should parse")
+    }
+
+    #[test]
+    fn set_openrouter_proxy_config_requires_url_and_principal() {
+        init_storage();
+
+        let missing_url = set_openrouter_proxy_config(OpenRouterProxyWorkerConfig {
+            worker_base_url: "   ".to_string(),
+            trusted_callback_principal: Some(trusted_test_principal()),
+        })
+        .expect_err("empty worker url must be rejected");
+        assert!(missing_url.contains("worker_base_url"));
+
+        let missing_principal = set_openrouter_proxy_config(OpenRouterProxyWorkerConfig {
+            worker_base_url: "https://proxy.example.workers.dev".to_string(),
+            trusted_callback_principal: None,
+        })
+        .expect_err("missing principal must be rejected");
+        assert!(missing_principal.contains("trusted_callback_principal"));
+    }
+
+    #[test]
+    fn inference_proxy_callback_auth_uses_single_trusted_principal() {
+        init_storage();
+        let trusted = trusted_test_principal();
+        set_openrouter_proxy_config(OpenRouterProxyWorkerConfig {
+            worker_base_url: "https://proxy.example.workers.dev".to_string(),
+            trusted_callback_principal: Some(trusted),
+        })
+        .expect("proxy config should persist");
+
+        assert!(assert_inference_proxy_callback_authorized("w36hm-eqaaa-aaaal-qr76a-cai").is_ok());
+        let unauthorized = assert_inference_proxy_callback_authorized("2vxsx-fae")
+            .expect_err("unexpected principal must be rejected");
+        assert!(unauthorized.contains("unauthorized inference proxy callback caller"));
+    }
+
+    #[test]
+    fn apply_inference_proxy_callback_is_idempotent_and_consumes_pending_job() {
+        init_storage();
+        upsert_pending_inference_proxy_job(PendingInferenceProxyJob {
+            job_id: "job-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            submitted_at_ns: 100,
+            model: "openai/gpt-4o-mini".to_string(),
+        })
+        .expect("pending job should persist");
+
+        let first = apply_inference_proxy_callback(
+            SubmitInferenceResultArgs {
+                job_id: "job-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                completed_at_ns: 200,
+                result: Some(crate::domain::types::InferenceProxyResultPayload {
+                    explanation: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                }),
+                error: None,
+            },
+            "w36hm-eqaaa-aaaal-qr76a-cai".to_string(),
+            210,
+        )
+        .expect("first callback should be accepted");
+        assert_eq!(first, InferenceProxyCallbackApply::Accepted);
+
+        let duplicate = apply_inference_proxy_callback(
+            SubmitInferenceResultArgs {
+                job_id: "job-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                completed_at_ns: 201,
+                result: None,
+                error: Some("ignored".to_string()),
+            },
+            "w36hm-eqaaa-aaaal-qr76a-cai".to_string(),
+            211,
+        )
+        .expect("duplicate callback should not error");
+        assert_eq!(duplicate, InferenceProxyCallbackApply::Duplicate);
+
+        assert!(
+            list_pending_inference_proxy_jobs(10).is_empty(),
+            "accepted callback should consume pending job"
+        );
+
+        let status = inference_proxy_status_view();
+        assert_eq!(status.pending_jobs, 0);
+        assert_eq!(status.completed_jobs, 1);
+        assert_eq!(status.callback_accepted, 1);
+        assert_eq!(status.callback_duplicates, 1);
+    }
+
+    #[test]
+    fn pop_next_inference_proxy_callback_result_returns_oldest_callback() {
+        init_storage();
+        upsert_pending_inference_proxy_job(PendingInferenceProxyJob {
+            job_id: "job-older".to_string(),
+            turn_id: "turn-older".to_string(),
+            submitted_at_ns: 10,
+            model: "openai/gpt-4o-mini".to_string(),
+        })
+        .expect("first pending job should persist");
+        upsert_pending_inference_proxy_job(PendingInferenceProxyJob {
+            job_id: "job-newer".to_string(),
+            turn_id: "turn-newer".to_string(),
+            submitted_at_ns: 20,
+            model: "openai/gpt-4o-mini".to_string(),
+        })
+        .expect("second pending job should persist");
+
+        apply_inference_proxy_callback(
+            SubmitInferenceResultArgs {
+                job_id: "job-newer".to_string(),
+                turn_id: "turn-newer".to_string(),
+                completed_at_ns: 210,
+                result: Some(crate::domain::types::InferenceProxyResultPayload {
+                    explanation: Some("newer".to_string()),
+                    tool_calls: Vec::new(),
+                }),
+                error: None,
+            },
+            "w36hm-eqaaa-aaaal-qr76a-cai".to_string(),
+            220,
+        )
+        .expect("newer callback should be accepted");
+        apply_inference_proxy_callback(
+            SubmitInferenceResultArgs {
+                job_id: "job-older".to_string(),
+                turn_id: "turn-older".to_string(),
+                completed_at_ns: 110,
+                result: Some(crate::domain::types::InferenceProxyResultPayload {
+                    explanation: Some("older".to_string()),
+                    tool_calls: Vec::new(),
+                }),
+                error: None,
+            },
+            "w36hm-eqaaa-aaaal-qr76a-cai".to_string(),
+            120,
+        )
+        .expect("older callback should be accepted");
+
+        let popped = pop_next_inference_proxy_callback_result()
+            .expect("oldest callback record should be returned first");
+        assert_eq!(popped.job_id, "job-older");
+        assert_eq!(popped.turn_id, "turn-older");
+
+        let status = inference_proxy_status_view();
+        assert_eq!(status.completed_jobs, 1);
+        assert_eq!(status.callback_accepted, 2);
+    }
+
+    #[test]
+    fn expire_inference_proxy_pending_jobs_prunes_stale_entries_and_tracks_metrics() {
+        init_storage();
+        upsert_pending_inference_proxy_job(PendingInferenceProxyJob {
+            job_id: "job-stale".to_string(),
+            turn_id: "turn-stale".to_string(),
+            submitted_at_ns: 10,
+            model: "openai/gpt-4o-mini".to_string(),
+        })
+        .expect("stale pending job should persist");
+        upsert_pending_inference_proxy_job(PendingInferenceProxyJob {
+            job_id: "job-fresh".to_string(),
+            turn_id: "turn-fresh".to_string(),
+            submitted_at_ns: 900_000_000_001,
+            model: "openai/gpt-4o-mini".to_string(),
+        })
+        .expect("fresh pending job should persist");
+
+        let expired = expire_inference_proxy_pending_jobs(1_000_000_000_000, 100);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].job_id, "job-stale");
+
+        let pending = list_pending_inference_proxy_jobs(10);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].job_id, "job-fresh");
+
+        let status = inference_proxy_status_view();
+        assert_eq!(status.expired_jobs, 1);
+    }
 }

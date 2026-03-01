@@ -138,6 +138,23 @@ pub async fn scheduler_tick() {
     );
 
     stable::recover_stale_lease(now_ns);
+    let expired_proxy_jobs = stable::expire_inference_proxy_pending_jobs(
+        now_ns,
+        stable::INFERENCE_PROXY_PENDING_JOB_TTL_SECS,
+    );
+    if !expired_proxy_jobs.is_empty() {
+        let expired_job_ids = expired_proxy_jobs
+            .iter()
+            .map(|job| job.job_id.clone())
+            .collect::<Vec<_>>()
+            .join(",");
+        log!(
+            SchedulerLogPriority::Info,
+            "inference_proxy_job_expired count={} job_ids={}",
+            expired_proxy_jobs.len(),
+            expired_job_ids,
+        );
+    }
 
     if !stable::scheduler_enabled() {
         log!(

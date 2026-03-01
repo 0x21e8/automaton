@@ -1,0 +1,6 @@
+name = "openrouter-proxy"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-03-01"
+
+[build]
+command = "cargo build --release --target wasm32-unknown-unknown"

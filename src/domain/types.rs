@@ -13,7 +13,7 @@
 /// - **Observability** — snapshots, storage metrics, cycle telemetry, and views
 /// - **Scheduler** — jobs, leases, task configs, and survival tiers
 use crate::timing;
-use candid::CandidType;
+use candid::{CandidType, Principal};
 use serde::{Deserialize, Serialize};
 
 // ── Agent FSM types ──────────────────────────────────────────────────────────
@@ -455,6 +455,8 @@ pub struct RuntimeSnapshot {
     #[serde(default = "default_openrouter_max_response_bytes")]
     pub openrouter_max_response_bytes: u64,
     #[serde(default)]
+    pub openrouter_proxy: OpenRouterProxyWorkerConfig,
+    #[serde(default)]
     pub ecdsa_key_name: String,
     #[serde(default)]
     pub evm_address: Option<String>,
@@ -500,6 +502,7 @@ impl Default for RuntimeSnapshot {
             openrouter_api_key: None,
             openrouter_base_url: default_openrouter_base_url(),
             openrouter_max_response_bytes: default_openrouter_max_response_bytes(),
+            openrouter_proxy: OpenRouterProxyWorkerConfig::default(),
             ecdsa_key_name: String::new(),
             evm_address: None,
             inbox_contract_address: None,
@@ -1350,6 +1353,7 @@ pub struct CycleTelemetry {
 ///
 /// - `IcLlm` — on-chain IC LLM canister (no API key required).
 /// - `OpenRouter` — external HTTP gateway; requires `openrouter_api_key`.
+/// - `OpenRouterProxyWorker` — async Cloudflare worker proxy callback path.
 #[derive(
     CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
 )]
@@ -1357,6 +1361,16 @@ pub enum InferenceProvider {
     #[default]
     IcLlm,
     OpenRouter,
+    OpenRouterProxyWorker,
+}
+
+/// Runtime configuration for the OpenRouter async worker proxy inference path.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct OpenRouterProxyWorkerConfig {
+    #[serde(default)]
+    pub worker_base_url: String,
+    #[serde(default)]
+    pub trusted_callback_principal: Option<Principal>,
 }
 
 /// Read-only view of the current inference configuration, returned by queries.
@@ -1367,10 +1381,15 @@ pub struct InferenceConfigView {
     pub openrouter_base_url: String,
     pub openrouter_has_api_key: bool,
     pub openrouter_max_response_bytes: u64,
+    #[serde(default)]
+    pub openrouter_proxy_worker_base_url: Option<String>,
+    #[serde(default)]
+    pub openrouter_proxy_trusted_callback_principal: Option<String>,
 }
 
 impl From<&RuntimeSnapshot> for InferenceConfigView {
     fn from(snapshot: &RuntimeSnapshot) -> Self {
+        let worker_base_url = snapshot.openrouter_proxy.worker_base_url.trim().to_string();
         Self {
             provider: snapshot.inference_provider.clone(),
             model: snapshot.inference_model.clone(),
@@ -1381,8 +1400,87 @@ impl From<&RuntimeSnapshot> for InferenceConfigView {
                 .map(|key| !key.trim().is_empty())
                 .unwrap_or(false),
             openrouter_max_response_bytes: snapshot.openrouter_max_response_bytes,
+            openrouter_proxy_worker_base_url: if worker_base_url.is_empty() {
+                None
+            } else {
+                Some(worker_base_url)
+            },
+            openrouter_proxy_trusted_callback_principal: snapshot
+                .openrouter_proxy
+                .trusted_callback_principal
+                .as_ref()
+                .map(Principal::to_text),
         }
     }
+}
+
+/// Worker callback payload accepted by `submit_inference_result`.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct InferenceProxyResultPayload {
+    #[serde(default)]
+    pub explanation: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// Update-call arguments for the async worker callback endpoint.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct SubmitInferenceResultArgs {
+    pub job_id: String,
+    pub turn_id: String,
+    pub completed_at_ns: u64,
+    #[serde(default)]
+    pub result: Option<InferenceProxyResultPayload>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Durable pending async inference submission tracked until callback arrives.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PendingInferenceProxyJob {
+    pub job_id: String,
+    pub turn_id: String,
+    pub submitted_at_ns: u64,
+    pub model: String,
+}
+
+/// Durable callback record for an async inference job.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
+pub struct InferenceProxyCallbackRecord {
+    pub job_id: String,
+    pub turn_id: String,
+    pub completed_at_ns: u64,
+    pub accepted_at_ns: u64,
+    pub caller_principal: String,
+    #[serde(default)]
+    pub result: Option<InferenceProxyResultPayload>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Result of attempting to apply an async callback payload.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum InferenceProxyCallbackApply {
+    Accepted,
+    Duplicate,
+}
+
+/// Public-safe status of async inference proxy state.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct InferenceProxyStatusView {
+    pub worker_base_url: Option<String>,
+    pub trusted_callback_principal: Option<String>,
+    pub pending_jobs: u64,
+    pub completed_jobs: u64,
+    pub oldest_pending_age_secs: Option<u64>,
+    pub submit_accepted: u64,
+    pub submit_failed: u64,
+    pub callback_accepted: u64,
+    pub callback_rejected: u64,
+    pub callback_duplicates: u64,
+    pub callback_auth_failures: u64,
+    pub resumed_callbacks: u64,
+    pub expired_jobs: u64,
 }
 
 /// The assembled prompt and context passed to the LLM at the start of a turn.
@@ -2063,11 +2161,13 @@ fn default_maintenance_interval_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemoryRollup, RecoveryContext, ResponseLimitPolicy, RetentionConfig,
-        RetentionMaintenanceRuntime, RuntimeSnapshot, SessionSummary, TurnWindowSummary,
-        WalletBalanceSnapshot, WalletBalanceStatus, WalletBalanceSyncConfig,
-        WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+        InferenceConfigView, InferenceProvider, MemoryRollup, OpenRouterProxyWorkerConfig,
+        RecoveryContext, ResponseLimitPolicy, RetentionConfig, RetentionMaintenanceRuntime,
+        RuntimeSnapshot, SessionSummary, TurnWindowSummary, WalletBalanceSnapshot,
+        WalletBalanceStatus, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
+        WalletBalanceTelemetryView,
     };
+    use candid::Principal;
 
     #[test]
     fn wallet_balance_defaults_match_locked_spec() {
@@ -2131,6 +2231,11 @@ mod tests {
         assert!(snapshot.wallet_balance_bootstrap_pending);
         assert_eq!(snapshot.evm_bootstrap_lookback_blocks, 1_000);
         assert!(snapshot.cycle_topup.enabled);
+        assert!(snapshot.openrouter_proxy.worker_base_url.is_empty());
+        assert!(snapshot
+            .openrouter_proxy
+            .trusted_callback_principal
+            .is_none());
         assert_eq!(
             snapshot.cycle_topup.auto_topup_cycle_threshold,
             2_000_000_000_000
@@ -2177,6 +2282,36 @@ mod tests {
         assert!(view.is_stale);
         assert_eq!(view.status, WalletBalanceStatus::Stale);
         assert!(view.bootstrap_pending);
+    }
+
+    #[test]
+    fn inference_config_view_exposes_proxy_config_without_secrets() {
+        let trusted = Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
+            .expect("test principal should parse");
+        let snapshot = RuntimeSnapshot {
+            inference_provider: InferenceProvider::OpenRouterProxyWorker,
+            inference_model: "openai/gpt-4o-mini".to_string(),
+            openrouter_api_key: Some("super-secret-key".to_string()),
+            openrouter_base_url: "https://openrouter.ai/api/v1".to_string(),
+            openrouter_max_response_bytes: 64 * 1024,
+            openrouter_proxy: OpenRouterProxyWorkerConfig {
+                worker_base_url: "https://proxy.example.workers.dev".to_string(),
+                trusted_callback_principal: Some(trusted),
+            },
+            ..RuntimeSnapshot::default()
+        };
+
+        let view = InferenceConfigView::from(&snapshot);
+        assert_eq!(view.provider, InferenceProvider::OpenRouterProxyWorker);
+        assert_eq!(
+            view.openrouter_proxy_worker_base_url.as_deref(),
+            Some("https://proxy.example.workers.dev")
+        );
+        assert_eq!(
+            view.openrouter_proxy_trusted_callback_principal,
+            Some(trusted.to_text())
+        );
+        assert!(view.openrouter_has_api_key);
     }
 
     #[test]
