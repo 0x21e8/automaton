@@ -2847,6 +2847,7 @@ mod tests {
                 args_json: "{\"q\":\"x\"}".to_string(),
                 output: "[]".to_string(),
                 success: true,
+                outcome: crate::domain::types::ToolCallOutcome::Executed,
                 error: None,
             }],
         )
@@ -2920,6 +2921,7 @@ mod tests {
                 args_json: "{}".to_string(),
                 output: "{\"total_facts\":0}".to_string(),
                 success: true,
+                outcome: crate::domain::types::ToolCallOutcome::Executed,
                 error: None,
             }],
         )

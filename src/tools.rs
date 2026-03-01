@@ -22,7 +22,7 @@
 /// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
     AgentState, MemoryFact, PromptLayer, StrategyExecutionIntent, StrategyTemplateKey,
-    SurvivalOperationClass, TemplateVersion, ToolCall, ToolCallRecord,
+    SurvivalOperationClass, TemplateVersion, ToolCall, ToolCallOutcome, ToolCallRecord,
 };
 use crate::features::canister_call::canister_call_tool;
 use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool};
@@ -550,6 +550,7 @@ impl ToolManager {
             args_json: call.args_json.clone(),
             output: "unknown tool".to_string(),
             success: false,
+            outcome: ToolCallOutcome::Executed,
             error: Some("unknown tool".to_string()),
         }
     }
@@ -561,6 +562,7 @@ impl ToolManager {
             args_json: call.args_json.clone(),
             output: "tool blocked by policy".to_string(),
             success: false,
+            outcome: ToolCallOutcome::Executed,
             error: Some("tool blocked".to_string()),
         }
     }
@@ -577,6 +579,7 @@ impl ToolManager {
                 args_json: call.args_json.clone(),
                 output,
                 success: true,
+                outcome: ToolCallOutcome::Executed,
                 error: None,
             },
             Err(error) => ToolCallRecord {
@@ -585,6 +588,7 @@ impl ToolManager {
                 args_json: call.args_json.clone(),
                 output: "tool execution failed".to_string(),
                 success: false,
+                outcome: ToolCallOutcome::Executed,
                 error: Some(error),
             },
         }

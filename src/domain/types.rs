@@ -84,7 +84,25 @@ pub struct ToolCallRecord {
     pub args_json: String,
     pub output: String,
     pub success: bool,
+    #[serde(default)]
+    pub outcome: ToolCallOutcome,
     pub error: Option<String>,
+}
+
+/// Classification of a persisted tool-call record.
+#[derive(
+    CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
+)]
+pub enum ToolCallOutcome {
+    /// Tool implementation actually ran and produced either success or failure.
+    #[default]
+    Executed,
+    /// Call skipped because an identical autonomous call recently succeeded.
+    SuppressedDedupe,
+    /// Call skipped due to repeated-failure cooldown.
+    SuppressedFailureCooldown,
+    /// Call blocked by tool sequence policy.
+    BlockedSequence,
 }
 
 // ── Memory types ─────────────────────────────────────────────────────────────
@@ -357,6 +375,33 @@ impl From<&WalletBalanceSyncConfig> for WalletBalanceSyncConfigView {
     }
 }
 
+/// Runtime policy for autonomous tool-call suppression behavior.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AutonomySuppressionConfig {
+    #[serde(default = "default_autonomy_tool_dedupe_enabled")]
+    pub tool_dedupe_enabled: bool,
+    #[serde(default = "default_autonomy_dedupe_window_secs")]
+    pub dedupe_window_secs: u64,
+    #[serde(default = "default_autonomy_failure_repeat_window_secs")]
+    pub failure_repeat_window_secs: u64,
+    #[serde(default = "default_autonomy_failure_repeat_threshold")]
+    pub failure_repeat_threshold: u32,
+    #[serde(default = "default_autonomy_failure_cooldown_secs")]
+    pub failure_cooldown_secs: u64,
+}
+
+impl Default for AutonomySuppressionConfig {
+    fn default() -> Self {
+        Self {
+            tool_dedupe_enabled: default_autonomy_tool_dedupe_enabled(),
+            dedupe_window_secs: default_autonomy_dedupe_window_secs(),
+            failure_repeat_window_secs: default_autonomy_failure_repeat_window_secs(),
+            failure_repeat_threshold: default_autonomy_failure_repeat_threshold(),
+            failure_cooldown_secs: default_autonomy_failure_cooldown_secs(),
+        }
+    }
+}
+
 /// Configuration for the automatic cycle top-up feature.
 ///
 /// When the canister's cycle balance drops below `auto_topup_cycle_threshold`,
@@ -474,6 +519,8 @@ pub struct RuntimeSnapshot {
     pub wallet_balance: WalletBalanceSnapshot,
     #[serde(default)]
     pub wallet_balance_sync: WalletBalanceSyncConfig,
+    #[serde(default)]
+    pub autonomy_suppression: AutonomySuppressionConfig,
     #[serde(default = "default_wallet_balance_bootstrap_pending")]
     pub wallet_balance_bootstrap_pending: bool,
     #[serde(default)]
@@ -512,6 +559,7 @@ impl Default for RuntimeSnapshot {
             evm_bootstrap_lookback_blocks: default_evm_bootstrap_lookback_blocks(),
             wallet_balance: WalletBalanceSnapshot::default(),
             wallet_balance_sync: WalletBalanceSyncConfig::default(),
+            autonomy_suppression: AutonomySuppressionConfig::default(),
             wallet_balance_bootstrap_pending: default_wallet_balance_bootstrap_pending(),
             cycle_topup: CycleTopUpConfig::default(),
             timing_telemetry: RuntimeTimingTelemetry::default(),
@@ -2041,6 +2089,26 @@ fn default_wallet_balance_sync_discover_usdc_via_inbox() -> bool {
 
 fn default_wallet_balance_bootstrap_pending() -> bool {
     true
+}
+
+fn default_autonomy_tool_dedupe_enabled() -> bool {
+    true
+}
+
+fn default_autonomy_dedupe_window_secs() -> u64 {
+    timing::AUTONOMY_DEDUPE_WINDOW_SECS
+}
+
+fn default_autonomy_failure_repeat_window_secs() -> u64 {
+    timing::AUTONOMY_FAILURE_REPEAT_WINDOW_SECS
+}
+
+fn default_autonomy_failure_repeat_threshold() -> u32 {
+    timing::AUTONOMY_FAILURE_REPEAT_THRESHOLD
+}
+
+fn default_autonomy_failure_cooldown_secs() -> u64 {
+    timing::AUTONOMY_FAILURE_COOLDOWN_SECS
 }
 
 fn default_cycle_topup_enabled() -> bool {

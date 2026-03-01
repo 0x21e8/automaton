@@ -40,6 +40,13 @@ type AgentState = variant {
   Sleeping;
   Persisting;
 };
+type AutonomySuppressionConfig = record {
+  failure_repeat_threshold : nat32;
+  dedupe_window_secs : nat64;
+  tool_dedupe_enabled : bool;
+  failure_repeat_window_secs : nat64;
+  failure_cooldown_secs : nat64;
+};
 type CanisterCallPermission = record {
   method : text;
   canister_id : text;
@@ -159,19 +166,19 @@ type InferenceProxyResultPayload = record {
   explanation : opt text;
 };
 type InferenceProxyStatusView = record {
+  callback_auth_failures : nat64;
   pending_jobs : nat64;
   trusted_callback_principal : opt text;
-  completed_jobs : nat64;
-  oldest_pending_age_secs : opt nat64;
-  worker_base_url : opt text;
-  submit_accepted : nat64;
   submit_failed : nat64;
-  callback_accepted : nat64;
-  callback_rejected : nat64;
+  completed_jobs : nat64;
   callback_duplicates : nat64;
-  callback_auth_failures : nat64;
+  submit_accepted : nat64;
   resumed_callbacks : nat64;
   expired_jobs : nat64;
+  callback_rejected : nat64;
+  callback_accepted : nat64;
+  oldest_pending_age_secs : opt nat64;
+  worker_base_url : opt text;
 };
 type InitArgs = record {
   evm_chain_id : opt nat64;
@@ -270,17 +277,18 @@ type PromptLayerView = record {
 };
 type Result = variant { Ok : TemplateActivationState; Err : text };
 type Result_1 = variant { Ok : StrategyTemplate; Err : text };
-type Result_10 = variant { Ok : StrategyKillSwitchState; Err : text };
-type Result_11 = variant { Ok : PromptLayer; Err : text };
-type Result_12 = variant { Ok; Err : text };
+type Result_10 = variant { Ok : RetentionConfig; Err : text };
+type Result_11 = variant { Ok : StrategyKillSwitchState; Err : text };
+type Result_12 = variant { Ok : PromptLayer; Err : text };
+type Result_13 = variant { Ok; Err : text };
 type Result_2 = variant { Ok : text; Err : text };
 type Result_3 = variant { Ok : AbiArtifact; Err : text };
 type Result_4 = variant { Ok : vec text; Err : text };
 type Result_5 = variant { Ok : TemplateRevocationState; Err : text };
-type Result_6 = variant { Ok : nat64; Err : text };
-type Result_7 = variant { Ok : opt text; Err : text };
-type Result_8 = variant { Ok : OpenRouterProxyWorkerConfig; Err : text };
-type Result_9 = variant { Ok : RetentionConfig; Err : text };
+type Result_6 = variant { Ok : AutonomySuppressionConfig; Err : text };
+type Result_7 = variant { Ok : nat64; Err : text };
+type Result_8 = variant { Ok : opt text; Err : text };
+type Result_9 = variant { Ok : OpenRouterProxyWorkerConfig; Err : text };
 type RetentionConfig = record {
   transitions_max_age_secs : nat64;
   memory_facts_max_age_secs : nat64;
@@ -538,6 +546,12 @@ type ToolCall = record {
   tool : text;
   tool_call_id : opt text;
 };
+type ToolCallOutcome = variant {
+  SuppressedDedupe;
+  BlockedSequence;
+  SuppressedFailureCooldown;
+  Executed;
+};
 type ToolCallRecord = record {
   output : text;
   args_json : text;
@@ -545,6 +559,7 @@ type ToolCallRecord = record {
   error : opt text;
   turn_id : text;
   success : bool;
+  outcome : ToolCallOutcome;
 };
 type TransitionLogRecord = record {
   id : text;
@@ -628,6 +643,8 @@ service : (InitArgs) -> {
   derive_automaton_evm_address : () -> (Result_2);
   // Returns the automaton's derived EVM address, or `None` before first derivation.
   get_automaton_evm_address : () -> (opt text) query;
+  // Returns the current autonomy suppression configuration.
+  get_autonomy_suppression_config : () -> (AutonomySuppressionConfig) query;
   // Returns the full conversation log for the given sender address, or `None`
   // if no conversation exists.
   get_conversation : (text) -> (opt ConversationLog) query;
@@ -739,22 +756,28 @@ service : (InitArgs) -> {
       TemplateVersion,
       opt text,
     ) -> (Result_5);
+  // Replaces autonomy suppression policy (dedupe window + failure cooldown
+  // thresholds) (controller only).
+  set_autonomy_suppression_config : (AutonomySuppressionConfig) -> (Result_6);
+  // Enables or disables autonomous tool-call dedupe without changing other
+  // suppression controls (controller only).
+  set_autonomy_tool_dedupe_enabled : (bool) -> (text);
   // Updates the EVM chain ID used for all on-chain operations (controller only).
-  set_evm_chain_id_admin : (nat64) -> (Result_6);
+  set_evm_chain_id_admin : (nat64) -> (Result_7);
   // Sets how many block confirmations must pass before an EVM event is
   // considered finalised (controller only).
-  set_evm_confirmation_depth_admin : (nat64) -> (Result_6);
+  set_evm_confirmation_depth_admin : (nat64) -> (Result_7);
   // Sets an optional fallback EVM RPC URL used when the primary is unavailable (controller only).
-  set_evm_rpc_fallback_url : (opt text) -> (Result_7);
+  set_evm_rpc_fallback_url : (opt text) -> (Result_8);
   // Caps the maximum response size (bytes) returned by EVM RPC outbound calls (controller only).
-  set_evm_rpc_max_response_bytes : (nat64) -> (Result_6);
+  set_evm_rpc_max_response_bytes : (nat64) -> (Result_7);
   // Updates the primary EVM JSON-RPC endpoint (controller only).
   set_evm_rpc_url : (text) -> (Result_2);
   // Replaces the HTTP outbound allowlist.  An empty slice disables the allowlist
   // and permits all domains (controller only).
   set_http_allowed_domains : (vec text) -> (Result_4);
   // Overrides the EVM inbox contract address (controller only).
-  set_inbox_contract_address_admin : (opt text) -> (Result_7);
+  set_inbox_contract_address_admin : (opt text) -> (Result_8);
   // Sets the inference model identifier (e.g. `"llama3.1:8b"` or `"openai/gpt-4o-mini"`)
   // (controller only).
   set_inference_model : (text) -> (Result_2);
@@ -762,16 +785,18 @@ service : (InitArgs) -> {
   // (controller only).
   set_inference_provider : (InferenceProvider) -> (text);
   // Stores OpenRouter proxy worker config used by async inference callbacks (controller only).
-  set_inference_proxy_config : (OpenRouterProxyWorkerConfig) -> (Result_8);
+  set_inference_proxy_config : (OpenRouterProxyWorkerConfig) -> (Result_9);
   // Enables or disables the autonomous agent loop (controller only).
   set_loop_enabled : (bool) -> (text);
   // Stores (or clears) the OpenRouter API key in stable storage.
   // Pass `None` to remove the key (controller only).
   set_openrouter_api_key : (opt text) -> (text);
+  // Updates the OpenRouter-compatible base URL used for inference HTTP calls (controller only).
+  set_openrouter_base_url : (text) -> (Result_2);
   // Replaces the conversation-retention policy (controller only).
-  set_retention_config : (RetentionConfig) -> (Result_9);
+  set_retention_config : (RetentionConfig) -> (Result_10);
   // Updates the scheduler timer base tick interval in seconds (controller only).
-  set_scheduler_base_tick_secs : (nat64) -> (Result_6);
+  set_scheduler_base_tick_secs : (nat64) -> (Result_7);
   // Enables or disables the scheduler (controller only).
   // Disabling prevents new jobs from being dispatched without stopping the timer.
   set_scheduler_enabled : (bool) -> (text);
@@ -782,7 +807,7 @@ service : (InitArgs) -> {
   // When `enabled` is `true` the agent will refuse to execute any action for
   // that template (controller only).
   set_strategy_kill_switch_admin : (StrategyTemplateKey, bool, opt text) -> (
-      Result_10,
+      Result_11,
     );
   // Enables or disables a specific task kind without affecting the scheduler
   // globally (controller only).
@@ -796,12 +821,12 @@ service : (InitArgs) -> {
   // Callback endpoint used by the OpenRouter proxy worker to submit async results.
   submit_inference_result : (SubmitInferenceResultArgs) -> (Result_2);
   // Replaces the content of a prompt layer identified by `layer_id` (controller only).
-  update_prompt_layer_admin : (nat8, text) -> (Result_11);
+  update_prompt_layer_admin : (nat8, text) -> (Result_12);
   // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
   update_soul : (text) -> (Result_2);
   // Inserts or updates a skill record.
   // 
   // Only callable by a canister controller.  This is the runtime management
   // endpoint for adding new inter-canister call skills or modifying existing ones.
-  upsert_skill : (SkillRecord) -> (Result_12);
+  upsert_skill : (SkillRecord) -> (Result_13);
 }
