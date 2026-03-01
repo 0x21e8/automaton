@@ -203,6 +203,23 @@ pub struct StewardStatusView {
     pub next_nonce: u64,
 }
 
+/// Signed proof attached to steward command execution requests.
+///
+/// The signature authenticates a canonical payload containing:
+/// `canister_id`, `chain_id`, `address`, `command_hash`, `nonce`, and
+/// `expires_at_ns`.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct EvmStewardProof {
+    pub canister_id: String,
+    pub chain_id: u64,
+    pub address: String,
+    pub command_hash: String,
+    pub nonce: u64,
+    pub expires_at_ns: u64,
+    /// 65-byte ECDSA signature encoded as `0x{r}{s}{v}`.
+    pub signature: String,
+}
+
 // ── Wallet types ─────────────────────────────────────────────────────────────
 
 /// Coarse classification of a wallet balance reading.

@@ -32,15 +32,15 @@ mod tools;
 
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, AutonomySuppressionConfig, ConversationLog,
-    ConversationSummary, EvmRouteStateView, InboxMessage, InboxStats, InferenceConfigView,
-    InferenceProvider, InferenceProxyStatusView, MemoryFact, MemoryRollup, ObservabilitySnapshot,
-    OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats, PromptLayer, PromptLayerView,
-    RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob, SchedulerRuntime,
-    SessionSummary, SkillRecord, StewardState, StewardStatusView, StrategyKillSwitchState,
-    StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
-    TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
-    TemplateRevocationState, TemplateStatus, TemplateVersion, ToolCallRecord, TurnWindowSummary,
-    WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    ConversationSummary, EvmRouteStateView, EvmStewardProof, InboxMessage, InboxStats,
+    InferenceConfigView, InferenceProvider, InferenceProxyStatusView, MemoryFact, MemoryRollup,
+    ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats, PromptLayer,
+    PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob,
+    SchedulerRuntime, SessionSummary, SkillRecord, StewardState, StewardStatusView,
+    StrategyKillSwitchState, StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey,
+    SubmitInferenceResultArgs, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
+    TemplateActivationState, TemplateRevocationState, TemplateStatus, TemplateVersion,
+    ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
@@ -82,6 +82,20 @@ enum StewardAdminLogPriority {
 }
 
 impl GetLogFilter for StewardAdminLogPriority {
+    fn get_log_filter() -> LogFilter {
+        LogFilter::ShowAll
+    }
+}
+
+#[derive(Clone, Copy, Debug, LogPriorityLevels)]
+enum StewardAuthLogPriority {
+    #[log_level(capacity = 500, name = "STEWARD_AUTH_INFO")]
+    AuthInfo,
+    #[log_level(capacity = 200, name = "STEWARD_AUTH_WARN")]
+    AuthWarn,
+}
+
+impl GetLogFilter for StewardAuthLogPriority {
     fn get_log_filter() -> LogFilter {
         LogFilter::ShowAll
     }
@@ -186,6 +200,53 @@ fn inference_proxy_callback_caller_principal() -> String {
 
     #[cfg(not(target_arch = "wasm32"))]
     return "2vxsx-fae".to_string();
+}
+
+fn steward_proof_expected_canister_id() -> String {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::id().to_text();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    return "rrkah-fqaaa-aaaaa-aaaaq-cai".to_string();
+}
+
+fn verify_steward_proof_for_command_hash(
+    command_hash: &str,
+    proof: &EvmStewardProof,
+) -> Result<crate::features::evm::VerifiedEvmStewardProof, String> {
+    let context = crate::features::evm::EvmStewardVerificationContext {
+        canister_id: steward_proof_expected_canister_id(),
+        active_steward: stable::active_steward(),
+        expected_nonce: stable::steward_nonce_state().next_nonce,
+        expected_command_hash: command_hash.to_string(),
+        now_ns: current_time_ns(),
+    };
+
+    match crate::features::evm::verify_evm_steward_proof(proof, &context) {
+        Ok(verified) => {
+            log!(
+                StewardAuthLogPriority::AuthInfo,
+                "steward_proof_verified chain_id={} address={} nonce={} expires_at_ns={}",
+                verified.chain_id,
+                verified.address,
+                verified.nonce,
+                verified.expires_at_ns
+            );
+            Ok(verified)
+        }
+        Err(error) => {
+            log!(
+                StewardAuthLogPriority::AuthWarn,
+                "steward_proof_rejected chain_id={} address={} nonce={} expires_at_ns={} reason={}",
+                proof.chain_id,
+                proof.address,
+                proof.nonce,
+                proof.expires_at_ns,
+                error,
+            );
+            Err(error)
+        }
+    }
 }
 
 /// Looks up a strategy template by key and version, returning a descriptive

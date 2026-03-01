@@ -15,9 +15,9 @@ use crate::domain::cycle_admission::{
     DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
-    EvmEvent, EvmPollCursor, ExecutionPlan, OperationFailure, OperationFailureKind, OutcallFailure,
-    OutcallFailureKind, RecoveryFailure, RuntimeSnapshot, StrategyExecutionCall,
-    StrategyOutcomeEvent, StrategyOutcomeKind,
+    EvmEvent, EvmPollCursor, EvmStewardProof, ExecutionPlan, OperationFailure,
+    OperationFailureKind, OutcallFailure, OutcallFailureKind, RecoveryFailure, RuntimeSnapshot,
+    StewardState, StrategyExecutionCall, StrategyOutcomeEvent, StrategyOutcomeKind,
 };
 use crate::storage::stable;
 use crate::timing::current_time_ns;
@@ -36,7 +36,6 @@ use std::str::FromStr;
 use candid::Nat;
 #[cfg(target_arch = "wasm32")]
 use ic_cdk::management_canister::{http_request, HttpHeader, HttpMethod, HttpRequestArgs};
-#[cfg(target_arch = "wasm32")]
 use sha3::{Digest, Keccak256};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -69,6 +68,7 @@ const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str =
     "MessageQueued(address,uint64,address,string,uint256,uint256)";
 const INBOX_USDC_FUNCTION_SIGNATURE: &str = "usdc()";
 const ERC20_BALANCE_OF_FUNCTION_SIGNATURE: &str = "balanceOf(address)";
+const EVM_STEWARD_SIGNING_DOMAIN: &str = "ic-automaton:steward-execute:v1";
 
 // Environment variable that switches the host (non-wasm32) RPC client from stub to real mode.
 #[cfg(not(target_arch = "wasm32"))]
@@ -378,6 +378,27 @@ impl EvmBroadcaster for MockEvmBroadcaster {
             tx_hash: format!("0x{signed_transaction}-mock"),
         })
     }
+}
+
+/// Immutable inputs required to verify one signed steward proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvmStewardVerificationContext {
+    pub canister_id: String,
+    pub active_steward: Option<StewardState>,
+    pub expected_nonce: u64,
+    pub expected_command_hash: String,
+    pub now_ns: u64,
+}
+
+/// Normalized steward proof fields returned after successful verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedEvmStewardProof {
+    pub canister_id: String,
+    pub chain_id: u64,
+    pub address: String,
+    pub command_hash: String,
+    pub nonce: u64,
+    pub expires_at_ns: u64,
 }
 
 // ── RPC client ───────────────────────────────────────────────────────────────
@@ -1114,6 +1135,180 @@ fn normalize_address(raw: &str) -> Result<String, String> {
         return Err("address must be a 0x-prefixed 20-byte hex string".to_string());
     }
     Ok(trimmed)
+}
+
+/// Verifies an EVM steward proof against the active steward identity and nonce cursor.
+///
+/// Verification order:
+/// 1. Normalize proof fields (address, command hash).
+/// 2. Recover signer address from the signature and ensure it matches proof address.
+/// 3. Enforce active steward match (`chain_id`, `address`) and enabled flag.
+/// 4. Enforce nonce and expiry windows.
+pub fn verify_evm_steward_proof(
+    proof: &EvmStewardProof,
+    context: &EvmStewardVerificationContext,
+) -> Result<VerifiedEvmStewardProof, String> {
+    let active_steward = context
+        .active_steward
+        .clone()
+        .ok_or_else(|| "no active steward configured".to_string())?;
+
+    if !active_steward.enabled {
+        return Err("active steward is disabled".to_string());
+    }
+
+    let normalized_address = normalize_address(&proof.address)?;
+    let normalized_command_hash =
+        normalize_command_hash(&proof.command_hash, "proof command hash")?;
+    let expected_command_hash =
+        normalize_command_hash(&context.expected_command_hash, "expected command hash")?;
+    if normalized_command_hash != expected_command_hash {
+        return Err(format!(
+            "proof command hash mismatch: expected={} got={}",
+            expected_command_hash, normalized_command_hash
+        ));
+    }
+
+    let proof_canister_id = proof.canister_id.trim();
+    let expected_canister_id = context.canister_id.trim();
+    if proof_canister_id != expected_canister_id {
+        return Err(format!(
+            "proof canister_id mismatch: expected={} got={}",
+            expected_canister_id, proof_canister_id
+        ));
+    }
+
+    if proof.chain_id != active_steward.chain_id {
+        return Err(format!(
+            "proof chain_id does not match active steward: expected={} got={}",
+            active_steward.chain_id, proof.chain_id
+        ));
+    }
+
+    let active_address = normalize_address(&active_steward.address)?;
+    if normalized_address != active_address {
+        return Err(format!(
+            "proof address does not match active steward: expected={} got={}",
+            active_address, normalized_address
+        ));
+    }
+
+    if proof.nonce != context.expected_nonce {
+        return Err(format!(
+            "proof nonce mismatch: expected={} got={}",
+            context.expected_nonce, proof.nonce
+        ));
+    }
+
+    if context.now_ns > proof.expires_at_ns {
+        return Err(format!(
+            "proof expired: expires_at_ns={} now_ns={}",
+            proof.expires_at_ns, context.now_ns
+        ));
+    }
+
+    let payload = canonical_steward_signing_payload(
+        expected_canister_id,
+        proof.chain_id,
+        &normalized_address,
+        &normalized_command_hash,
+        proof.nonce,
+        proof.expires_at_ns,
+    );
+    let recovered = recover_steward_signer_address(&payload, &proof.signature)?;
+    if recovered != normalized_address {
+        return Err(format!(
+            "recovered signer address does not match proof address: recovered={} proof={}",
+            recovered, normalized_address
+        ));
+    }
+
+    Ok(VerifiedEvmStewardProof {
+        canister_id: expected_canister_id.to_string(),
+        chain_id: proof.chain_id,
+        address: normalized_address,
+        command_hash: normalized_command_hash,
+        nonce: proof.nonce,
+        expires_at_ns: proof.expires_at_ns,
+    })
+}
+
+fn normalize_command_hash(raw: &str, field: &str) -> Result<String, String> {
+    let normalized = normalize_hex_blob(raw, field)?;
+    if normalized.len() != 66 {
+        return Err(format!("{field} must be a 32-byte hex blob"));
+    }
+    Ok(normalized)
+}
+
+fn canonical_steward_signing_payload(
+    canister_id: &str,
+    chain_id: u64,
+    address: &str,
+    command_hash: &str,
+    nonce: u64,
+    expires_at_ns: u64,
+) -> String {
+    format!(
+        "{EVM_STEWARD_SIGNING_DOMAIN}\ncanister_id:{canister_id}\nchain_id:{chain_id}\naddress:{address}\ncommand_hash:{command_hash}\nnonce:{nonce}\nexpires_at_ns:{expires_at_ns}"
+    )
+}
+
+fn ethereum_personal_message_hash(message: &str) -> [u8; 32] {
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+    let mut hasher = Keccak256::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(message.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn parse_steward_signature(raw: &str) -> Result<([u8; 64], u8), String> {
+    let normalized = normalize_hex_blob(raw, "proof signature")?;
+    let without_prefix = normalized.trim_start_matches("0x");
+    if without_prefix.len() != 130 {
+        return Err("proof signature must be 65 bytes (r||s||v)".to_string());
+    }
+    let mut signature_bytes = [0u8; 65];
+    hex::decode_to_slice(without_prefix, &mut signature_bytes)
+        .map_err(|error| format!("failed to decode proof signature: {error}"))?;
+
+    let v = match signature_bytes[64] {
+        0 | 1 => signature_bytes[64],
+        27 | 28 => signature_bytes[64] - 27,
+        other => {
+            return Err(format!(
+                "unsupported proof signature recovery id byte: {other}"
+            ));
+        }
+    };
+
+    let mut compact = [0u8; 64];
+    compact.copy_from_slice(&signature_bytes[..64]);
+    Ok((compact, v))
+}
+
+fn recover_steward_signer_address(payload: &str, signature_hex: &str) -> Result<String, String> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+
+    let message_hash = ethereum_personal_message_hash(payload);
+    let (signature_compact, recovery_id_byte) = parse_steward_signature(signature_hex)?;
+    let signature = Signature::from_slice(&signature_compact)
+        .map_err(|error| format!("invalid proof signature bytes: {error}"))?;
+    let recovery_id = RecoveryId::from_byte(recovery_id_byte)
+        .ok_or_else(|| "failed to parse proof signature recovery id".to_string())?;
+    let recovered = VerifyingKey::recover_from_prehash(&message_hash, &signature, recovery_id)
+        .map_err(|error| format!("failed to recover signer key from proof signature: {error}"))?;
+
+    let uncompressed = recovered.to_encoded_point(false);
+    let bytes = uncompressed.as_bytes();
+    if bytes.len() != 65 || bytes.first().copied() != Some(0x04) {
+        return Err("recovered signer key is not an uncompressed secp256k1 point".to_string());
+    }
+    let digest = Keccak256::digest(&bytes[1..]);
+    Ok(format!("0x{}", hex::encode(&digest[12..32])))
 }
 
 fn inbox_message_queued_topic0() -> String {
@@ -2166,6 +2361,197 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     fn with_host_stub_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
         crate::test_support::with_locked_host_env(vars, f);
+    }
+
+    fn signing_key_from_hex(hex_key: &str) -> k256::ecdsa::SigningKey {
+        let mut secret_key = [0u8; 32];
+        hex::decode_to_slice(hex_key, &mut secret_key).expect("hex private key should decode");
+        k256::ecdsa::SigningKey::from_bytes((&secret_key).into())
+            .expect("test private key should parse")
+    }
+
+    fn steward_test_signing_key() -> k256::ecdsa::SigningKey {
+        signing_key_from_hex("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+    }
+
+    fn steward_address_from_key(signing_key: &k256::ecdsa::SigningKey) -> String {
+        let uncompressed = signing_key.verifying_key().to_encoded_point(false);
+        let digest = Keccak256::digest(&uncompressed.as_bytes()[1..]);
+        format!("0x{}", hex::encode(&digest[12..32]))
+    }
+
+    fn sign_steward_payload(payload: &str, signing_key: &k256::ecdsa::SigningKey) -> String {
+        let prehash = ethereum_personal_message_hash(payload);
+        let (signature, recovery_id) = signing_key
+            .sign_prehash_recoverable(&prehash)
+            .expect("test payload should sign");
+
+        let mut bytes = [0u8; 65];
+        bytes[..64].copy_from_slice(signature.to_bytes().as_slice());
+        bytes[64] = recovery_id.to_byte() + 27;
+        format!("0x{}", hex::encode(bytes))
+    }
+
+    fn build_steward_proof(
+        canister_id: &str,
+        chain_id: u64,
+        address: &str,
+        command_hash: &str,
+        nonce: u64,
+        expires_at_ns: u64,
+        signing_key: &k256::ecdsa::SigningKey,
+    ) -> EvmStewardProof {
+        let normalized_address = normalize_address(address).expect("test address should normalize");
+        let normalized_hash =
+            normalize_command_hash(command_hash, "test command hash").expect("hash should parse");
+        let payload = canonical_steward_signing_payload(
+            canister_id,
+            chain_id,
+            &normalized_address,
+            &normalized_hash,
+            nonce,
+            expires_at_ns,
+        );
+        EvmStewardProof {
+            canister_id: canister_id.to_string(),
+            chain_id,
+            address: address.to_string(),
+            command_hash: command_hash.to_string(),
+            nonce,
+            expires_at_ns,
+            signature: sign_steward_payload(&payload, signing_key),
+        }
+    }
+
+    #[test]
+    fn verify_evm_steward_proof_accepts_valid_signature_and_normalizes_address() {
+        let key = steward_test_signing_key();
+        let signer_address = steward_address_from_key(&key);
+        let command_hash = format!("0x{}", "11".repeat(32));
+        let canister_id = "rrkah-fqaaa-aaaaa-aaaaq-cai";
+        let proof = build_steward_proof(
+            canister_id,
+            8453,
+            &format!("  {}  ", signer_address.to_ascii_uppercase()),
+            &command_hash,
+            7,
+            1_000_000,
+            &key,
+        );
+        let context = EvmStewardVerificationContext {
+            canister_id: canister_id.to_string(),
+            active_steward: Some(StewardState {
+                chain_id: 8453,
+                address: signer_address.to_ascii_uppercase(),
+                enabled: true,
+                last_used_at_ns: None,
+            }),
+            expected_nonce: 7,
+            expected_command_hash: command_hash.clone(),
+            now_ns: 999_999,
+        };
+
+        let verified =
+            verify_evm_steward_proof(&proof, &context).expect("valid proof should verify");
+        assert_eq!(verified.address, signer_address);
+        assert_eq!(verified.chain_id, 8453);
+        assert_eq!(verified.command_hash, command_hash);
+        assert_eq!(verified.nonce, 7);
+    }
+
+    #[test]
+    fn verify_evm_steward_proof_rejects_signature_recovery_mismatch() {
+        let key = steward_test_signing_key();
+        let signer_address = steward_address_from_key(&key);
+        let rogue_key = signing_key_from_hex(
+            "8f2a55949056e6f90b84b5ac3f7f2f4ec4604f0f5f3e59fbb6904fb2497f33a8",
+        );
+        let command_hash = format!("0x{}", "22".repeat(32));
+        let canister_id = "rrkah-fqaaa-aaaaa-aaaaq-cai";
+        let proof = build_steward_proof(
+            canister_id,
+            8453,
+            &signer_address,
+            &command_hash,
+            9,
+            1_000_000,
+            &rogue_key,
+        );
+        let context = EvmStewardVerificationContext {
+            canister_id: canister_id.to_string(),
+            active_steward: Some(StewardState {
+                chain_id: 8453,
+                address: signer_address.clone(),
+                enabled: true,
+                last_used_at_ns: None,
+            }),
+            expected_nonce: 9,
+            expected_command_hash: command_hash,
+            now_ns: 900_000,
+        };
+
+        let error = verify_evm_steward_proof(&proof, &context)
+            .expect_err("mismatched signer should be rejected");
+        assert!(error.contains("recovered signer address does not match proof address"));
+    }
+
+    #[test]
+    fn verify_evm_steward_proof_rejects_chain_nonce_and_expiry_mismatches() {
+        let key = steward_test_signing_key();
+        let signer_address = steward_address_from_key(&key);
+        let command_hash = format!("0x{}", "33".repeat(32));
+        let canister_id = "rrkah-fqaaa-aaaaa-aaaaq-cai";
+        let base_context = EvmStewardVerificationContext {
+            canister_id: canister_id.to_string(),
+            active_steward: Some(StewardState {
+                chain_id: 8453,
+                address: signer_address.clone(),
+                enabled: true,
+                last_used_at_ns: None,
+            }),
+            expected_nonce: 3,
+            expected_command_hash: command_hash.clone(),
+            now_ns: 10_000,
+        };
+
+        let chain_mismatch = build_steward_proof(
+            canister_id,
+            1,
+            &signer_address,
+            &command_hash,
+            3,
+            20_000,
+            &key,
+        );
+        let chain_error = verify_evm_steward_proof(&chain_mismatch, &base_context)
+            .expect_err("chain mismatch should fail");
+        assert!(chain_error.contains("proof chain_id does not match active steward"));
+
+        let nonce_mismatch = build_steward_proof(
+            canister_id,
+            8453,
+            &signer_address,
+            &command_hash,
+            4,
+            20_000,
+            &key,
+        );
+        let nonce_error = verify_evm_steward_proof(&nonce_mismatch, &base_context)
+            .expect_err("nonce mismatch should fail");
+        assert!(nonce_error.contains("proof nonce mismatch"));
+
+        let expired = build_steward_proof(
+            canister_id,
+            8453,
+            &signer_address,
+            &command_hash,
+            3,
+            9_999,
+            &key,
+        );
+        let expiry_error =
+            verify_evm_steward_proof(&expired, &base_context).expect_err("expired proof fails");
+        assert!(expiry_error.contains("proof expired"));
     }
 
     #[test]
