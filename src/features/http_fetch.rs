@@ -39,6 +39,7 @@ const HTTP_FETCH_REGEX_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const HTTP_FETCH_REGEX_DFA_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const HTTP_FETCH_OUTCALL_TIMEOUT_MS: u64 = 20_000;
 const HTTP_FETCH_OUTCALL_TIMEOUT_NS: u64 = HTTP_FETCH_OUTCALL_TIMEOUT_MS * 1_000_000;
+const JSON_PATH_HINT_MAX_KEYS: usize = 8;
 
 fn http_fetch_timeout_message(elapsed_ms: u64) -> String {
     format!(
@@ -160,11 +161,16 @@ fn extract_json_path(body: &str, path: &str) -> Result<String, String> {
 
     let mut current = &root;
     for segment in segments {
-        current = match segment {
-            JsonPathSegment::Field(name) => current.get(name),
-            JsonPathSegment::Index(index) => current.as_array().and_then(|array| array.get(index)),
-        }
-        .ok_or_else(|| format!("json_path extraction failed: path `{trimmed_path}` not found"))?;
+        let next = match &segment {
+            JsonPathSegment::Field(name) => resolve_json_path_field(current, name),
+            JsonPathSegment::Index(index) => current.as_array().and_then(|array| array.get(*index)),
+        };
+        current = next.ok_or_else(|| {
+            format!(
+                "json_path extraction failed: path `{trimmed_path}` not found{}",
+                json_path_missing_hint(current)
+            )
+        })?;
     }
 
     match current {
@@ -172,6 +178,51 @@ fn extract_json_path(body: &str, path: &str) -> Result<String, String> {
         value => serde_json::to_string(value).map_err(|error| {
             format!("json_path extraction failed: could not serialize extracted value: {error}")
         }),
+    }
+}
+
+fn resolve_json_path_field<'a>(current: &'a Value, field_name: &str) -> Option<&'a Value> {
+    current.get(field_name).or_else(|| {
+        let index = field_name.parse::<usize>().ok()?;
+        current.as_array().and_then(|array| array.get(index))
+    })
+}
+
+fn json_path_missing_hint(current: &Value) -> String {
+    match current {
+        Value::Object(fields) => {
+            if fields.is_empty() {
+                return "; current node is empty object".to_string();
+            }
+            let listed = fields
+                .keys()
+                .take(JSON_PATH_HINT_MAX_KEYS)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ellipsis = if fields.len() > JSON_PATH_HINT_MAX_KEYS {
+                ", ..."
+            } else {
+                ""
+            };
+            format!("; current node is object with keys: {listed}{ellipsis}")
+        }
+        Value::Array(items) => format!(
+            "; current node is array (len={}); use [index] syntax for array access",
+            items.len()
+        ),
+        other => format!("; current node is {}", json_value_kind(other)),
+    }
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -612,6 +663,13 @@ mod tests {
     }
 
     #[test]
+    fn http_fetch_tool_json_path_accepts_dot_number_array_alias() {
+        let out = extract_json_path(r#"[{"current_price":"123.45"}]"#, "0.current_price")
+            .expect("dot-number array alias should resolve to index");
+        assert_eq!(out, "123.45");
+    }
+
+    #[test]
     fn http_fetch_tool_json_path_rejects_invalid_array_index_path() {
         let err = extract_json_path(r#"{"pairs":[{"priceUsd":"0.31"}]}"#, "pairs[one].priceUsd")
             .expect_err("non-numeric array index should fail json_path extraction");
@@ -630,6 +688,25 @@ mod tests {
         let out = extract_json_path(r#"{"pairs":[{"priceUsd":"0.31"}]}"#, "$pairs[0].priceUsd")
             .expect("$prefix json_path extraction should succeed");
         assert_eq!(out, "0.31");
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_missing_path_error_lists_object_keys() {
+        let err = extract_json_path(r#"{"data":{"price":42},"pairs":[]}"#, "missing.value")
+            .expect_err("missing path should include object-key hint");
+        assert!(err.contains("path `missing.value` not found"));
+        assert!(err.contains("current node is object with keys:"));
+        assert!(err.contains("data"));
+        assert!(err.contains("pairs"));
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_missing_path_error_hints_array_index_syntax() {
+        let err = extract_json_path(r#"[{"current_price":"123.45"}]"#, "current_price")
+            .expect_err("array root mismatch should include array hint");
+        assert!(err.contains("path `current_price` not found"));
+        assert!(err.contains("current node is array (len=1)"));
+        assert!(err.contains("use [index] syntax"));
     }
 
     #[test]
