@@ -1643,6 +1643,7 @@ mod tests {
         TemplateStatus, TemplateVersion,
     };
     use sha3::{Digest, Keccak256};
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn signing_key_from_hex(hex_key: &str) -> k256::ecdsa::SigningKey {
         let mut secret_key = [0u8; 32];
@@ -1731,6 +1732,178 @@ mod tests {
         proof: EvmStewardProof,
     ) -> Result<String, String> {
         futures::executor::block_on(steward_execute(command, proof))
+    }
+
+    #[test]
+    fn controller_gated_updates_have_steward_command_parity() {
+        let source = include_str!("lib.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut controller_gated_updates = BTreeSet::new();
+
+        for (idx, line) in lines.iter().enumerate() {
+            if line.trim() != "#[ic_cdk::update]" {
+                continue;
+            }
+
+            let mut signature_idx = None;
+            for look_ahead in 1..=8 {
+                let Some(candidate) = lines.get(idx + look_ahead) else {
+                    break;
+                };
+                let candidate = candidate.trim_start();
+                if candidate.starts_with("fn ") || candidate.starts_with("async fn ") {
+                    signature_idx = Some(idx + look_ahead);
+                    break;
+                }
+            }
+
+            let Some(signature_idx) = signature_idx else {
+                continue;
+            };
+            let signature = lines[signature_idx].trim_start();
+            let function_name = signature
+                .strip_prefix("fn ")
+                .or_else(|| signature.strip_prefix("async fn "))
+                .and_then(|rest| rest.split('(').next())
+                .map(str::trim);
+            let Some(function_name) = function_name else {
+                continue;
+            };
+
+            let mut is_controller_gated = false;
+            for look_ahead in 1..=20 {
+                let Some(candidate) = lines.get(signature_idx + look_ahead) else {
+                    break;
+                };
+                let candidate = candidate.trim();
+                if candidate.starts_with("#[ic_cdk::") {
+                    break;
+                }
+                if candidate.contains("ensure_controller_or_trap();")
+                    || candidate.contains("ensure_controller()?;")
+                {
+                    is_controller_gated = true;
+                    break;
+                }
+            }
+
+            if is_controller_gated {
+                controller_gated_updates.insert(function_name.to_string());
+            }
+        }
+
+        let method_to_command_label = BTreeMap::from([
+            ("set_loop_enabled", "set_loop_enabled"),
+            (
+                "set_autonomy_tool_dedupe_enabled",
+                "set_autonomy_tool_dedupe_enabled",
+            ),
+            (
+                "set_autonomy_suppression_config",
+                "set_autonomy_suppression_config",
+            ),
+            ("set_inference_provider", "set_inference_provider"),
+            ("set_inference_model", "set_inference_model"),
+            ("set_openrouter_base_url", "set_openrouter_base_url"),
+            ("set_openrouter_api_key", "set_openrouter_api_key"),
+            ("set_inference_proxy_config", "set_inference_proxy_config"),
+            ("set_welcome_message", "set_welcome_message"),
+            ("set_evm_rpc_url", "set_evm_rpc_url"),
+            ("set_evm_rpc_fallback_url", "set_evm_rpc_fallback_url"),
+            (
+                "set_evm_rpc_max_response_bytes",
+                "set_evm_rpc_max_response_bytes",
+            ),
+            ("set_inbox_contract_address_admin", "set_inbox_contract_address"),
+            ("set_steward_admin", "update_steward"),
+            ("set_evm_chain_id_admin", "set_evm_chain_id"),
+            (
+                "set_evm_confirmation_depth_admin",
+                "set_evm_confirmation_depth",
+            ),
+            (
+                "derive_automaton_evm_address",
+                "derive_automaton_evm_address",
+            ),
+            ("set_http_allowed_domains", "set_http_allowed_domains"),
+            ("update_prompt_layer_admin", "update_prompt_layer"),
+            ("prune_memory_facts_admin", "prune_memory_facts"),
+            ("set_scheduler_enabled", "set_scheduler_enabled"),
+            (
+                "set_scheduler_low_cycles_mode",
+                "set_scheduler_low_cycles_mode",
+            ),
+            ("set_scheduler_base_tick_secs", "set_scheduler_base_tick_secs"),
+            ("set_task_interval_secs", "set_task_interval_secs"),
+            ("set_task_enabled", "set_task_enabled"),
+            ("set_retention_config", "set_retention_config"),
+            ("update_soul", "update_soul"),
+            ("upsert_skill", "upsert_skill"),
+            ("ingest_strategy_template_admin", "ingest_strategy_template"),
+            (
+                "ingest_strategy_abi_artifact_admin",
+                "ingest_strategy_abi_artifact",
+            ),
+            (
+                "activate_strategy_template_admin",
+                "activate_strategy_template",
+            ),
+            (
+                "deprecate_strategy_template_admin",
+                "deprecate_strategy_template",
+            ),
+            ("revoke_strategy_template_admin", "revoke_strategy_template"),
+            ("set_strategy_kill_switch_admin", "set_strategy_kill_switch"),
+        ]);
+        let mapped_methods: BTreeSet<String> = method_to_command_label
+            .keys()
+            .map(|method| (*method).to_string())
+            .collect();
+
+        let missing_mappings: Vec<String> = controller_gated_updates
+            .difference(&mapped_methods)
+            .cloned()
+            .collect();
+        assert!(
+            missing_mappings.is_empty(),
+            "controller-gated update methods missing steward command parity mappings: {missing_mappings:?}"
+        );
+
+        let stale_mappings: Vec<String> = mapped_methods
+            .difference(&controller_gated_updates)
+            .cloned()
+            .collect();
+        assert!(
+            stale_mappings.is_empty(),
+            "stale steward parity mappings without controller-gated update methods: {stale_mappings:?}"
+        );
+
+        let command_labels_from_match: BTreeSet<&str> = lines
+            .iter()
+            .filter_map(|line| {
+                let line = line.trim();
+                if !line.starts_with("StewardCommand::") || !line.contains("=> \"") {
+                    return None;
+                }
+                let (_, rhs) = line.split_once("=> \"")?;
+                let (label, _) = rhs.split_once('"')?;
+                Some(label)
+            })
+            .collect();
+        let unknown_labels: Vec<String> = method_to_command_label
+            .iter()
+            .filter_map(|(method, label)| {
+                if command_labels_from_match.contains(label) {
+                    None
+                } else {
+                    Some(format!("{method} -> {label}"))
+                }
+            })
+            .collect();
+        assert!(
+            unknown_labels.is_empty(),
+            "steward parity mappings reference unknown command labels: {unknown_labels:?}"
+        );
     }
 
     #[test]
