@@ -194,6 +194,15 @@ pub struct StewardNonceState {
     pub next_nonce: u64,
 }
 
+/// Public steward status view used by controller recovery and UI queries.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct StewardStatusView {
+    #[serde(default)]
+    pub active_steward: Option<StewardState>,
+    #[serde(default)]
+    pub next_nonce: u64,
+}
+
 // ── Wallet types ─────────────────────────────────────────────────────────────
 
 /// Coarse classification of a wallet balance reading.

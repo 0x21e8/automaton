@@ -278,9 +278,10 @@ type PromptLayerView = record {
 type Result = variant { Ok : TemplateActivationState; Err : text };
 type Result_1 = variant { Ok : StrategyTemplate; Err : text };
 type Result_10 = variant { Ok : RetentionConfig; Err : text };
-type Result_11 = variant { Ok : StrategyKillSwitchState; Err : text };
-type Result_12 = variant { Ok : PromptLayer; Err : text };
-type Result_13 = variant { Ok; Err : text };
+type Result_11 = variant { Ok : StewardState; Err : text };
+type Result_12 = variant { Ok : StrategyKillSwitchState; Err : text };
+type Result_13 = variant { Ok : PromptLayer; Err : text };
+type Result_14 = variant { Ok; Err : text };
 type Result_2 = variant { Ok : text; Err : text };
 type Result_3 = variant { Ok : AbiArtifact; Err : text };
 type Result_4 = variant { Ok : vec text; Err : text };
@@ -402,6 +403,16 @@ type SkillRecord = record {
   enabled : bool;
   mutable : bool;
   allowed_canister_calls : vec CanisterCallPermission;
+};
+type StewardState = record {
+  last_used_at_ns : opt nat64;
+  enabled : bool;
+  chain_id : nat64;
+  address : text;
+};
+type StewardStatusView = record {
+  next_nonce : nat64;
+  active_steward : opt StewardState;
 };
 type StorageGrowthMetrics = record {
   inbox_staged_queue_entries : nat64;
@@ -675,6 +686,8 @@ service : (InitArgs) -> {
   get_scheduler_view : () -> (SchedulerRuntime) query;
   // Returns the agent's "soul" — the core identity/persona prompt layer.
   get_soul : () -> (text) query;
+  // Returns the currently configured steward identity and next expected nonce.
+  get_steward_status : () -> (StewardStatusView) query;
   // Returns accumulated outcome statistics (success/failure counts, last outcome)
   // for the given template, or `None` if no executions have been recorded yet.
   get_strategy_outcome_stats : (StrategyTemplateKey, TemplateVersion) -> (
@@ -803,11 +816,14 @@ service : (InitArgs) -> {
   // Activates low-cycles mode, which throttles task dispatch to conserve cycles
   // (controller only).
   set_scheduler_low_cycles_mode : (bool) -> (text);
+  // Sets or rotates the active steward identity used for signed command authority
+  // (controller recovery path).
+  set_steward_admin : (nat64, text, bool) -> (Result_11);
   // Arms or disarms the kill switch for all versions of a strategy template.
   // When `enabled` is `true` the agent will refuse to execute any action for
   // that template (controller only).
   set_strategy_kill_switch_admin : (StrategyTemplateKey, bool, opt text) -> (
-      Result_11,
+      Result_12,
     );
   // Enables or disables a specific task kind without affecting the scheduler
   // globally (controller only).
@@ -821,12 +837,12 @@ service : (InitArgs) -> {
   // Callback endpoint used by the OpenRouter proxy worker to submit async results.
   submit_inference_result : (SubmitInferenceResultArgs) -> (Result_2);
   // Replaces the content of a prompt layer identified by `layer_id` (controller only).
-  update_prompt_layer_admin : (nat8, text) -> (Result_12);
+  update_prompt_layer_admin : (nat8, text) -> (Result_13);
   // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
   update_soul : (text) -> (Result_2);
   // Inserts or updates a skill record.
   // 
   // Only callable by a canister controller.  This is the runtime management
   // endpoint for adding new inter-canister call skills or modifying existing ones.
-  upsert_skill : (SkillRecord) -> (Result_13);
+  upsert_skill : (SkillRecord) -> (Result_14);
 }

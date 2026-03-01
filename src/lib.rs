@@ -36,11 +36,11 @@ use crate::domain::types::{
     InferenceProvider, InferenceProxyStatusView, MemoryFact, MemoryRollup, ObservabilitySnapshot,
     OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats, PromptLayer, PromptLayerView,
     RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob, SchedulerRuntime,
-    SessionSummary, SkillRecord, StrategyKillSwitchState, StrategyOutcomeStats, StrategyTemplate,
-    StrategyTemplateKey, SubmitInferenceResultArgs, TaskKind, TaskLane, TaskScheduleConfig,
-    TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState, TemplateStatus,
-    TemplateVersion, ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView,
-    WalletBalanceTelemetryView,
+    SessionSummary, SkillRecord, StewardState, StewardStatusView, StrategyKillSwitchState,
+    StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
+    TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
+    TemplateRevocationState, TemplateStatus, TemplateVersion, ToolCallRecord, TurnWindowSummary,
+    WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
@@ -68,6 +68,20 @@ enum InferenceProxyCallbackLogPriority {
 }
 
 impl GetLogFilter for InferenceProxyCallbackLogPriority {
+    fn get_log_filter() -> LogFilter {
+        LogFilter::ShowAll
+    }
+}
+
+#[derive(Clone, Copy, Debug, LogPriorityLevels)]
+enum StewardAdminLogPriority {
+    #[log_level(capacity = 500, name = "STEWARD_ADMIN_INFO")]
+    StewardInfo,
+    #[log_level(capacity = 200, name = "STEWARD_ADMIN_WARN")]
+    StewardWarn,
+}
+
+impl GetLogFilter for StewardAdminLogPriority {
     fn get_log_filter() -> LogFilter {
         LogFilter::ShowAll
     }
@@ -411,6 +425,49 @@ fn set_inbox_contract_address_admin(address: Option<String>) -> Result<Option<St
     stable::set_inbox_contract_address(address)
 }
 
+/// Sets or rotates the active steward identity used for signed command authority
+/// (controller recovery path).
+#[ic_cdk::update]
+fn set_steward_admin(
+    chain_id: u64,
+    address: String,
+    enabled: bool,
+) -> Result<StewardState, String> {
+    ensure_controller()?;
+    let caller = caller_for_audit();
+    let previous = stable::active_steward();
+    let requested = StewardState {
+        chain_id,
+        address: address.clone(),
+        enabled,
+        last_used_at_ns: None,
+    };
+
+    let stored = stable::set_active_steward(Some(requested))
+        .map_err(|error| {
+            log!(
+                StewardAdminLogPriority::StewardWarn,
+                "set_steward_admin_rejected caller={} chain_id={} address={} enabled={} error={}",
+                caller,
+                chain_id,
+                address,
+                enabled,
+                error,
+            );
+            error
+        })?
+        .ok_or_else(|| "steward was not persisted".to_string())?;
+
+    log!(
+        StewardAdminLogPriority::StewardInfo,
+        "set_steward_admin_applied caller={} previous_steward={:?} new_steward={:?}",
+        caller,
+        previous,
+        stored
+    );
+    Ok(stored)
+}
+
 /// Updates the EVM chain ID used for all on-chain operations (controller only).
 #[ic_cdk::update]
 fn set_evm_chain_id_admin(chain_id: u64) -> Result<u64, String> {
@@ -456,6 +513,12 @@ fn get_runtime_view() -> RuntimeView {
 #[ic_cdk::query]
 fn get_evm_route_state_view() -> EvmRouteStateView {
     stable::evm_route_state_view()
+}
+
+/// Returns the currently configured steward identity and next expected nonce.
+#[ic_cdk::query]
+fn get_steward_status() -> StewardStatusView {
+    stable::steward_status_view()
 }
 
 /// Returns the automaton's derived EVM address, or `None` before first derivation.
@@ -1186,6 +1249,47 @@ mod tests {
 
         let snapshot = stable::runtime_snapshot();
         assert_eq!(snapshot.evm_bootstrap_lookback_blocks, 0);
+    }
+
+    #[test]
+    fn set_steward_admin_sets_normalized_state_and_status_view() {
+        stable::init_storage();
+        let _ = stable::set_steward_nonce_state(crate::domain::types::StewardNonceState {
+            next_nonce: 42,
+        });
+
+        let stored = set_steward_admin(
+            8453,
+            "0xABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD".to_string(),
+            true,
+        )
+        .expect("steward should persist");
+
+        assert_eq!(stored.chain_id, 8453);
+        assert_eq!(stored.address, "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        assert!(stored.enabled);
+        assert!(stored.last_used_at_ns.is_none());
+
+        let status = get_steward_status();
+        assert_eq!(status.active_steward, Some(stored));
+        assert_eq!(status.next_nonce, 42);
+    }
+
+    #[test]
+    fn set_steward_admin_rejects_invalid_identity_inputs() {
+        stable::init_storage();
+
+        let invalid_chain = set_steward_admin(
+            0,
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            true,
+        )
+        .expect_err("chain id 0 must fail");
+        assert!(invalid_chain.contains("steward chain id"));
+
+        let invalid_address = set_steward_admin(8453, "not-an-address".to_string(), true)
+            .expect_err("invalid address must fail");
+        assert!(invalid_address.contains("steward address"));
     }
 
     #[test]

@@ -16,14 +16,14 @@ use crate::domain::types::{
     InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup, ObservabilitySnapshot,
     OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats, PendingInferenceProxyJob, PromptLayer,
     PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView,
-    ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord,
-    StorageGrowthMetrics, StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent,
-    StrategyOutcomeKind, StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey,
-    SubmitInferenceResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
-    TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState,
-    TemplateVersion, ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary,
-    WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
-    WalletBalanceTelemetryView, StewardNonceState, StewardState,
+    ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord, StewardNonceState,
+    StewardState, StewardStatusView, StorageGrowthMetrics, StoragePressureLevel,
+    StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats,
+    StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass,
+    SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
+    TemplateActivationState, TemplateRevocationState, TemplateVersion, ToolCallRecord,
+    TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
+    WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 pub use crate::domain::types::{
     AutonomyToolFailureCooldown, MemoryFactSort, MemoryFactStats, RetentionPruneStats,
@@ -1500,6 +1500,14 @@ pub fn set_active_steward(steward: Option<StewardState>) -> Result<Option<Stewar
 
 pub fn steward_nonce_state() -> StewardNonceState {
     runtime_snapshot().steward_nonce
+}
+
+pub fn steward_status_view() -> StewardStatusView {
+    let snapshot = runtime_snapshot();
+    StewardStatusView {
+        active_steward: snapshot.active_steward,
+        next_nonce: snapshot.steward_nonce.next_nonce,
+    }
 }
 
 pub fn set_steward_nonce_state(state: StewardNonceState) -> StewardNonceState {
@@ -4066,9 +4074,8 @@ mod tests {
     fn steward_nonce_state_round_trip() {
         init_storage();
 
-        let stored = set_steward_nonce_state(crate::domain::types::StewardNonceState {
-            next_nonce: 7,
-        });
+        let stored =
+            set_steward_nonce_state(crate::domain::types::StewardNonceState { next_nonce: 7 });
         assert_eq!(stored.next_nonce, 7);
 
         let loaded = steward_nonce_state();
