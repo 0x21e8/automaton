@@ -11,8 +11,8 @@ use super::sqlite::SurvivalOperationRuntimeRecord;
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AgentEvent, AgentState, AutonomySuppressionConfig,
     ConversationEntry, ConversationLog, ConversationSummary, CycleTelemetry, EvmPollCursor,
-    EvmRouteStateView, InboxMessage, InboxMessageSource, InboxMessageStatus, InboxStats,
-    InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
+    EvmRouteStateView, InboxMessage, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState,
+    InboxStats, InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
     InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup,
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
     OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, RetentionConfig,
@@ -64,6 +64,7 @@ const CADENCE_MULTIPLIER_KEY: &str = "timing.cadence_multiplier";
 const SCHEDULER_BASE_TICK_SECS_KEY: &str = "timing.scheduler_base_tick_secs";
 const WELCOME_MESSAGE_KEY: &str = "ui.welcome_message";
 const INFERENCE_PROXY_PENDING_JOBS_KEY: &str = "inference.proxy.pending_jobs";
+const INBOX_PROXY_WAIT_STATES_KEY: &str = "inference.proxy.inbox_wait_states";
 const INFERENCE_PROXY_CALLBACK_RESULTS_KEY: &str = "inference.proxy.callback_results";
 const INFERENCE_PROXY_COMPLETED_CALLBACK_JOBS_KEY: &str = "inference.proxy.completed_callback_jobs";
 const INFERENCE_PROXY_METRICS_KEY: &str = "inference.proxy.metrics";
@@ -1851,6 +1852,20 @@ fn save_pending_inference_proxy_jobs(jobs: &BTreeMap<String, PendingInferencePro
     }
 }
 
+fn load_inbox_proxy_wait_states() -> BTreeMap<String, InboxProxyWaitState> {
+    sqlite::get_runtime_scalar(INBOX_PROXY_WAIT_STATES_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<BTreeMap<String, InboxProxyWaitState>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_inbox_proxy_wait_states(states: &BTreeMap<String, InboxProxyWaitState>) {
+    if let Ok(raw) = serde_json::to_string(states) {
+        let _ = sqlite::set_runtime_scalar(INBOX_PROXY_WAIT_STATES_KEY, &raw);
+    }
+}
+
 fn load_inference_proxy_callback_results() -> BTreeMap<String, InferenceProxyCallbackRecord> {
     sqlite::get_runtime_scalar(INFERENCE_PROXY_CALLBACK_RESULTS_KEY)
         .ok()
@@ -3121,6 +3136,18 @@ pub fn upsert_pending_inference_proxy_job(job: PendingInferenceProxyJob) -> Resu
     Ok(())
 }
 
+pub fn find_pending_inference_proxy_job_for_turn(
+    turn_id: &str,
+) -> Option<PendingInferenceProxyJob> {
+    if turn_id.trim().is_empty() {
+        return None;
+    }
+    load_pending_inference_proxy_jobs()
+        .into_values()
+        .filter(|job| job.turn_id == turn_id)
+        .max_by_key(|job| job.submitted_at_ns)
+}
+
 pub fn get_pending_inference_proxy_job(job_id: &str) -> Option<PendingInferenceProxyJob> {
     let jobs = load_pending_inference_proxy_jobs();
     jobs.get(job_id).cloned()
@@ -3145,6 +3172,55 @@ pub fn has_pending_inference_proxy_jobs() -> bool {
     pending_inference_proxy_jobs_count() > 0
 }
 
+pub fn has_pending_inference_proxy_job(job_id: &str) -> bool {
+    if job_id.trim().is_empty() {
+        return false;
+    }
+    load_pending_inference_proxy_jobs().contains_key(job_id)
+}
+
+pub fn upsert_inbox_proxy_wait_state(state: InboxProxyWaitState) -> Result<(), String> {
+    if state.inbox_message_id.trim().is_empty() {
+        return Err("inbox proxy wait state inbox_message_id cannot be empty".to_string());
+    }
+    if state.submitted_turn_id.trim().is_empty() {
+        return Err("inbox proxy wait state submitted_turn_id cannot be empty".to_string());
+    }
+    if state
+        .pending_job_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err("inbox proxy wait state pending_job_id cannot be empty".to_string());
+    }
+    let mut states = load_inbox_proxy_wait_states();
+    states.insert(state.inbox_message_id.clone(), state);
+    save_inbox_proxy_wait_states(&states);
+    Ok(())
+}
+
+pub fn get_inbox_proxy_wait_state(inbox_message_id: &str) -> Option<InboxProxyWaitState> {
+    let states = load_inbox_proxy_wait_states();
+    states.get(inbox_message_id).cloned()
+}
+
+pub fn remove_inbox_proxy_wait_states(inbox_message_ids: &[String]) -> usize {
+    if inbox_message_ids.is_empty() {
+        return 0;
+    }
+    let mut states = load_inbox_proxy_wait_states();
+    let mut removed = 0usize;
+    for inbox_message_id in inbox_message_ids {
+        if states.remove(inbox_message_id).is_some() {
+            removed = removed.saturating_add(1);
+        }
+    }
+    if removed > 0 {
+        save_inbox_proxy_wait_states(&states);
+    }
+    removed
+}
+
 pub fn inference_proxy_callback_results_count() -> usize {
     load_inference_proxy_callback_results().len()
 }
@@ -3160,6 +3236,16 @@ pub fn pop_next_inference_proxy_callback_result() -> Option<InferenceProxyCallba
         .min_by_key(|(_, record)| (record.accepted_at_ns, record.completed_at_ns))
         .map(|(job_id, _)| job_id.clone())?;
     let record = callback_results.remove(&next_job_id)?;
+    save_inference_proxy_callback_results(&callback_results);
+    Some(record)
+}
+
+pub fn take_inference_proxy_callback_result(job_id: &str) -> Option<InferenceProxyCallbackRecord> {
+    if job_id.trim().is_empty() {
+        return None;
+    }
+    let mut callback_results = load_inference_proxy_callback_results();
+    let record = callback_results.remove(job_id)?;
     save_inference_proxy_callback_results(&callback_results);
     Some(record)
 }

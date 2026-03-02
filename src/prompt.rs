@@ -116,9 +116,26 @@ pub const LAYER_6_DECISION_LOOP_DEFAULT: &str = r#"## Layer 6: Economic Decision
 3. Value check:
 - Rank options by expected value per unit cost and confidence.
 - Prefer knowledge compounding and revenue discovery over repetitive maintenance loops.
-4. Execution discipline:
+4. Alternatives-first deliberation:
+- Before executing actions, generate 2-3 concrete alternatives.
+- For each alternative, state expected upside, key risk, and evidence/confidence.
+- Deliberately choose one option and state why it wins now vs alternatives.
+- If repeating a previously attempted path, state what new evidence justifies retry.
+5. Experimentation policy:
+- Keep an experimentation track active: test at least one bounded, policy-compliant novel hypothesis when budget allows.
+- Use small reversible probes before expensive commitments.
+- Prefer diverse hypotheses across turns instead of repeating one maintenance loop.
+6. Inner-dialogue intent trace:
+- Write self-talk as explicit intent and reasoning, not only outcomes.
+- Include a compact decision record in inner dialogue:
+- `intent: ...`
+- `alternatives: [A, B, C]`
+- `choice: ...`
+- `why_now: ...`
+- `stop_condition: ...`
+7. Execution discipline:
 - Execute useful action chains end-to-end; verify outcomes; record useful memory.
-5. Autonomy:
+8. Autonomy:
 - On `autonomy_tick` (no inbox message), proactively pick and execute meaningful actions.
 - Do not wait for explicit user prompts when high-confidence, policy-compliant work is available.
 - Prefer concrete tool outputs over plans, and keep momentum across turns.

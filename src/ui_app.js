@@ -69,6 +69,7 @@ const state = {
   knownJobIds: new Set(),
   knownTransitionIds: new Set(),
   knownTurnIds: new Set(),
+  peekActivitySignature: null,
 };
 
 const STATUS_VIEW_REFRESH_MS = 2000;
@@ -913,6 +914,26 @@ function buildHelpLines() {
         text: '  steward-send -m "message"  Direct unpaid steward message (signed command)',
         cls: "system",
       },
+      {
+        text: "  steward-model <variant>    Set inference model variant (signed command)",
+        cls: "system",
+      },
+      {
+        text: "       variants: flash|mini  flash->google/gemini-3-flash-preview",
+        cls: "system dim",
+      },
+      {
+        text: "                              mini->openai/gpt-4o-mini",
+        cls: "system dim",
+      },
+      {
+        text: "  steward-reasoning <variant> Set OpenRouter reasoning effort (signed command)",
+        cls: "system",
+      },
+      {
+        text: "       variants: default|low|medium|high",
+        cls: "system dim",
+      },
       { text: "       personal_sign      Wallet signature required", cls: "system dim" }
     );
   }
@@ -1023,6 +1044,33 @@ function createStatusViewLines() {
   lines.inboxConsumed = printLine("  CONSUMED:        --", "system");
   printEmpty();
   return lines;
+}
+
+function detectRepetitionStatus(turn) {
+  const inner = String(turn?.inner_dialogue ?? "").toLowerCase();
+  if (inner.includes("autonomy dedupe suppressed")) return "dedupe suppressing repeats";
+  if (inner.includes("repeated-failure cooldown suppressed")) return "failure cooldown suppressing repeats";
+  return "not detected";
+}
+
+function summarizePeekLiveActivity(snapshot) {
+  const runtime = snapshot?.runtime ?? {};
+  const scheduler = snapshot?.scheduler ?? {};
+  const latestTurn = Array.isArray(snapshot?.recent_turns) ? snapshot.recent_turns[0] : null;
+  const stateName = String(runtime.state ?? "unknown").toUpperCase();
+  const inFlight = runtime.turn_in_flight === true;
+  const turnId = runtime.last_turn_id ?? "unknown";
+  const leaseJob = scheduler?.active_mutating_lease?.job_id ?? "none";
+  const repetition = detectRepetitionStatus(latestTurn);
+  const phase = inFlight ? `in-flight (${turnId})` : "idle";
+  return `LIVE: ${stateName} · ${phase} · lease:${leaseJob} · repetition:${repetition}`;
+}
+
+function maybeRenderPeekLiveActivity(snapshot, force = false) {
+  const signature = summarizePeekLiveActivity(snapshot);
+  if (!force && signature === state.peekActivitySignature) return;
+  state.peekActivitySignature = signature;
+  printLine(signature, "system dim");
 }
 
 function renderStatusView(lines, snapshot, wallet, errorText = null) {
@@ -1181,6 +1229,10 @@ async function cmdConfig() {
     `  OPENROUTER MAX RESP BYTES: ${inferenceConfig?.openrouter_max_response_bytes ?? "unknown"}`,
     "system",
   );
+  printLine(
+    `  OPENROUTER REASONING:     ${inferenceConfig?.openrouter_reasoning_level ?? "unknown"}`,
+    "system",
+  );
   printEmpty();
 
   printLine("EVM", "system bright");
@@ -1290,6 +1342,9 @@ async function cmdPeek(flags) {
   }
   spinner.stop("");
   printEmpty();
+  state.peekActivitySignature = null;
+  maybeRenderPeekLiveActivity(snapshot, true);
+  printEmpty();
 
   const turns = (snapshot?.recent_turns ?? []).filter((t) => t.inner_dialogue);
 
@@ -1327,6 +1382,10 @@ function renderTurns(turns) {
     if (t.inference_round_count > 0) stats.push(`${t.inference_round_count} inference round${t.inference_round_count !== 1 ? "s" : ""}`);
     if (stats.length > 0) {
       printLine(`  ${stats.join(" · ")}`, "system dim");
+    }
+    const repetition = detectRepetitionStatus(t);
+    if (repetition !== "not detected") {
+      printLine(`  REPETITION: ${repetition}`, "system dim");
     }
 
     if (t.error) {
@@ -1871,6 +1930,145 @@ async function pollPendingReplies() {
   }
 }
 
+function canExecuteStewardCommand() {
+  if (!state.walletConnected || !state.walletAddress) {
+    printError("No wallet connected. Run 'connect' first.");
+    printEmpty();
+    return false;
+  }
+
+  if (!state.stewardCapabilities.canExecuteStewardCommands) {
+    printError("Connected wallet is not authorized for steward command execution.");
+    printLine("Tip: wallet address and chain must match the active steward.", "system dim");
+    printEmpty();
+    return false;
+  }
+
+  if (!window.ethereum?.request) {
+    printError("Wallet provider is unavailable for personal_sign.");
+    printEmpty();
+    return false;
+  }
+
+  return true;
+}
+
+function personalSignHexPayload(payload) {
+  return (
+    "0x" +
+    Array.from(new TextEncoder().encode(payload), (b) => b.toString(16).padStart(2, "0")).join("")
+  );
+}
+
+async function runSignedStewardCommand({
+  preparePath,
+  prepareBody,
+  executePath,
+  commandName,
+  describePrepared,
+  buildExecutePayload,
+}) {
+  const prepareSpinner = createSpinner("PREPARING STEWARD COMMAND...");
+  let prepared;
+  try {
+    prepared = await apiFetchWithRawFallback(preparePath, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(prepareBody),
+    });
+    prepareSpinner.stop("PREPARING STEWARD COMMAND...      [OK]");
+  } catch (err) {
+    prepareSpinner.stop(`ERROR: ${err.message ?? err}`, "error");
+    printEmpty();
+    return null;
+  }
+
+  const proofTemplate = prepared?.proof_template ?? null;
+  const signingPayload = String(prepared?.signing_payload ?? "");
+  if (!proofTemplate || !signingPayload) {
+    printError("Steward command preparation payload is incomplete.");
+    printEmpty();
+    return null;
+  }
+
+  printLine("PREPARING SIGNED STEWARD COMMAND...", "system");
+  printLine(`  COMMAND: ${commandName}`, "system dim");
+  const details = typeof describePrepared === "function" ? describePrepared(prepared, proofTemplate) : [];
+  for (const line of details) {
+    printLine(`  ${line}`, "system dim");
+  }
+
+  const signSpinner = createSpinner("AWAITING WALLET SIGNATURE (personal_sign)...");
+  let signature;
+  try {
+    signature = await window.ethereum.request({
+      method: "personal_sign",
+      params: [personalSignHexPayload(signingPayload), state.walletAddress],
+    });
+    signSpinner.stop("SIGNATURE RECEIVED ✓", "success");
+  } catch (err) {
+    signSpinner.stop(
+      isTxRejected(err) ? "SIGNATURE REJECTED BY USER." : `ERROR: ${err.message ?? err}`,
+      "error"
+    );
+    printEmpty();
+    return null;
+  }
+
+  const executeSpinner = createSpinner("SUBMITTING SIGNED STEWARD COMMAND...");
+  const expectedNonce = Number(proofTemplate?.nonce ?? NaN);
+  let result;
+  let executeError = null;
+  const executePayload = buildExecutePayload(prepared, proofTemplate, signature);
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      result = await apiFetchWithRawFallback(executePath, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(executePayload),
+      });
+      break;
+    } catch (err) {
+      executeError = err;
+      if (attempt === 1 && isTransientHttpFailure(err)) {
+        executeSpinner.update("SUBMITTING SIGNED STEWARD COMMAND... (transient failure, retrying)");
+        await delay(900);
+        continue;
+      }
+      break;
+    }
+  }
+
+  if (!result && executeError && isTransientHttpFailure(executeError) && Number.isFinite(expectedNonce)) {
+    // If the first submission succeeded but the boundary dropped the response,
+    // nonce advancement signals the signed command was consumed.
+    try {
+      await loadStewardStatus();
+      const latestNonce = Number(state.stewardStatus?.next_nonce ?? NaN);
+      if (Number.isFinite(latestNonce) && latestNonce >= expectedNonce + 1) {
+        result = { result: "steward command likely applied (response lost; nonce advanced)" };
+      }
+    } catch (_) {
+      // Keep the original transient error if status reconciliation is unavailable.
+    }
+  }
+
+  if (!result) {
+    executeSpinner.stop(`ERROR: ${executeError?.message ?? executeError}`, "error");
+    printEmpty();
+    return null;
+  }
+  executeSpinner.stop("STEWARD COMMAND APPLIED ✓", "success");
+
+  try {
+    await loadStewardStatus();
+  } catch (_) {
+    resolveStewardCapabilities();
+  }
+
+  return { prepared, proofTemplate, result };
+}
+
 async function cmdStewardSend(args) {
   printEmpty();
 
@@ -1881,120 +2079,150 @@ async function cmdStewardSend(args) {
     return;
   }
 
-  if (!state.walletConnected || !state.walletAddress) {
-    printError("No wallet connected. Run 'connect' first.");
-    printEmpty();
+  if (!canExecuteStewardCommand()) {
     return;
   }
 
-  if (!state.stewardCapabilities.canExecuteStewardCommands) {
-    printError("Connected wallet is not authorized for steward command execution.");
-    printLine("Tip: wallet address and chain must match the active steward.", "system dim");
-    printEmpty();
+  const signed = await runSignedStewardCommand({
+    preparePath: "/api/steward/direct-message/prepare",
+    prepareBody: {
+      sender: state.walletAddress,
+      message,
+    },
+    executePath: "/api/steward/direct-message/execute",
+    commandName: "SendStewardMessage",
+    describePrepared: (prepared, proofTemplate) => [
+      `SENDER: ${String(prepared?.sender ?? state.walletAddress)}`,
+      `NONCE: ${proofTemplate.nonce ?? "?"}`,
+      `EXPIRES AT (ns): ${proofTemplate.expires_at_ns ?? "?"}`,
+    ],
+    buildExecutePayload: (prepared, proofTemplate, signature) => ({
+      sender: String(prepared?.sender ?? state.walletAddress),
+      message: String(prepared?.message ?? message),
+      proof: {
+        ...proofTemplate,
+        signature,
+      },
+    }),
+  });
+  if (!signed) {
     return;
   }
 
-  if (!window.ethereum?.request) {
-    printError("Wallet provider is unavailable for personal_sign.");
-    printEmpty();
-    return;
-  }
-
-  const prepareSpinner = createSpinner("PREPARING STEWARD COMMAND...");
-  let prepared;
-  try {
-    prepared = await apiFetch("/api/steward/direct-message/prepare", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        sender: state.walletAddress,
-        message,
-      }),
-    });
-    prepareSpinner.stop("PREPARING STEWARD COMMAND...      [OK]");
-  } catch (err) {
-    prepareSpinner.stop(`ERROR: ${err.message ?? err}`, "error");
-    printEmpty();
-    return;
-  }
-
-  const proofTemplate = prepared?.proof_template ?? null;
-  const signingPayload = String(prepared?.signing_payload ?? "");
-  const normalizedSender = String(prepared?.sender ?? state.walletAddress);
-  const normalizedMessage = String(prepared?.message ?? message);
-  if (!proofTemplate || !signingPayload) {
-    printError("Steward command preparation payload is incomplete.");
-    printEmpty();
-    return;
-  }
-
-  printLine("PREPARING SIGNED STEWARD COMMAND...", "system");
-  printLine("  COMMAND: SendStewardMessage", "system dim");
-  printLine(`  SENDER: ${normalizedSender}`, "system dim");
-  printLine(`  NONCE: ${proofTemplate.nonce ?? "?"}`, "system dim");
-  printLine(`  EXPIRES AT (ns): ${proofTemplate.expires_at_ns ?? "?"}`, "system dim");
-
-  const signSpinner = createSpinner("AWAITING WALLET SIGNATURE (personal_sign)...");
-  let signature;
-  try {
-    signature = await window.ethereum.request({
-      method: "personal_sign",
-      params: [signingPayload, state.walletAddress],
-    });
-    signSpinner.stop("SIGNATURE RECEIVED ✓", "success");
-  } catch (err) {
-    signSpinner.stop(
-      isTxRejected(err) ? "SIGNATURE REJECTED BY USER." : `ERROR: ${err.message ?? err}`,
-      "error"
-    );
-    printEmpty();
-    return;
-  }
-
-  const executeSpinner = createSpinner("SUBMITTING SIGNED STEWARD COMMAND...");
-  const sentAfterMs = Date.now();
-  let result;
-  try {
-    result = await apiFetch("/api/steward/direct-message/execute", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        sender: normalizedSender,
-        message: normalizedMessage,
-        proof: {
-          ...proofTemplate,
-          signature,
-        },
-      }),
-    });
-    executeSpinner.stop("STEWARD COMMAND APPLIED ✓", "success");
-  } catch (err) {
-    executeSpinner.stop(`ERROR: ${err.message ?? err}`, "error");
-    printEmpty();
-    return;
-  }
-
-  try {
-    await loadStewardStatus();
-  } catch (_) {
-    resolveStewardCapabilities();
-  }
-
+  const normalizedSender = String(signed.prepared?.sender ?? state.walletAddress);
+  const normalizedMessage = String(signed.prepared?.message ?? message);
   const pending = queuePendingReply({
     sender: normalizedSender,
     senderBody: normalizedMessage,
-    sentAfterMs,
+    sentAfterMs: Date.now(),
   });
   startReplyPolling();
 
   printEmpty();
   printSuccess("Direct steward message queued.");
-  if (result?.result) {
-    printLine(`Result: ${result.result}`, "system dim");
+  if (signed.result?.result) {
+    printLine(`Result: ${signed.result.result}`, "system dim");
   }
   printLine(`Request ID: ${pending.id}`, "system dim");
   printLine("You will be notified when a response from the automaton is received.", "system dim");
   printLine("Use 'inbox' for unread replies or 'history' for the full conversation.", "system dim");
+  updateStatusBar({ online: true, stateName: state.lastSnapshotData?.runtime?.state });
+  printEmpty();
+}
+
+async function cmdStewardModel(positional) {
+  printEmpty();
+
+  const variant = String(positional?.[0] ?? "").trim().toLowerCase();
+  if (!variant) {
+    printError("Usage: steward-model <variant>");
+    printLine("Variants: flash | mini", "system dim");
+    printEmpty();
+    return;
+  }
+
+  if (!canExecuteStewardCommand()) {
+    return;
+  }
+
+  const signed = await runSignedStewardCommand({
+    preparePath: "/api/steward/model/prepare",
+    prepareBody: { variant },
+    executePath: "/api/steward/model/execute",
+    commandName: "SetInferenceModel",
+    describePrepared: (prepared, proofTemplate) => [
+      `VARIANT: ${String(prepared?.variant ?? variant)}`,
+      `MODEL: ${String(prepared?.model ?? "")}`,
+      `NONCE: ${proofTemplate.nonce ?? "?"}`,
+      `EXPIRES AT (ns): ${proofTemplate.expires_at_ns ?? "?"}`,
+    ],
+    buildExecutePayload: (_prepared, proofTemplate, signature) => ({
+      variant,
+      proof: {
+        ...proofTemplate,
+        signature,
+      },
+    }),
+  });
+  if (!signed) {
+    return;
+  }
+
+  printEmpty();
+  printSuccess("Steward model command applied.");
+  const model = String(signed.prepared?.model ?? "").trim();
+  if (model) {
+    printLine(`Model: ${model}`, "system dim");
+  }
+  if (signed.result?.result) {
+    printLine(`Result: ${signed.result.result}`, "system dim");
+  }
+  updateStatusBar({ online: true, stateName: state.lastSnapshotData?.runtime?.state });
+  printEmpty();
+}
+
+async function cmdStewardReasoning(positional) {
+  printEmpty();
+
+  const variant = String(positional?.[0] ?? "").trim().toLowerCase();
+  if (!variant) {
+    printError("Usage: steward-reasoning <variant>");
+    printLine("Variants: default | low | medium | high", "system dim");
+    printEmpty();
+    return;
+  }
+
+  if (!canExecuteStewardCommand()) {
+    return;
+  }
+
+  const signed = await runSignedStewardCommand({
+    preparePath: "/api/steward/reasoning/prepare",
+    prepareBody: { variant },
+    executePath: "/api/steward/reasoning/execute",
+    commandName: "SetOpenrouterReasoningLevel",
+    describePrepared: (prepared, proofTemplate) => [
+      `VARIANT: ${String(prepared?.variant ?? variant)}`,
+      `NONCE: ${proofTemplate.nonce ?? "?"}`,
+      `EXPIRES AT (ns): ${proofTemplate.expires_at_ns ?? "?"}`,
+    ],
+    buildExecutePayload: (_prepared, proofTemplate, signature) => ({
+      variant,
+      proof: {
+        ...proofTemplate,
+        signature,
+      },
+    }),
+  });
+  if (!signed) {
+    return;
+  }
+
+  printEmpty();
+  printSuccess("Steward reasoning command applied.");
+  if (signed.result?.result) {
+    printLine(`Result: ${signed.result.result}`, "system dim");
+  }
   updateStatusBar({ online: true, stateName: state.lastSnapshotData?.runtime?.state });
   printEmpty();
 }
@@ -2442,6 +2670,7 @@ function appendNewLogEntries(snapshot) {
 }
 
 function appendNewPeekEntries(snapshot) {
+  maybeRenderPeekLiveActivity(snapshot);
   const newTurns = (snapshot?.recent_turns ?? [])
     .filter((t) => t.inner_dialogue && !state.knownTurnIds.has(t.id))
     .sort((a, b) => Number(a.created_at_ns ?? 0) - Number(b.created_at_ns ?? 0));
@@ -2458,6 +2687,10 @@ function appendNewPeekEntries(snapshot) {
     if (t.tool_call_count > 0)       stats.push(`${t.tool_call_count} tool call${t.tool_call_count !== 1 ? "s" : ""}`);
     if (t.inference_round_count > 0) stats.push(`${t.inference_round_count} inference round${t.inference_round_count !== 1 ? "s" : ""}`);
     if (stats.length > 0) printLine(`  ${stats.join(" · ")}`, "system dim");
+    const repetition = detectRepetitionStatus(t);
+    if (repetition !== "not detected") {
+      printLine(`  REPETITION: ${repetition}`, "system dim");
+    }
     if (t.error) printLine(`  ↳ ERROR: ${t.error}`, "error");
     const lines = String(t.inner_dialogue).split("\n");
     for (const l of lines) printLine(`  ${l}`, "system");
@@ -2547,6 +2780,14 @@ async function handleCommand(raw) {
         await cmdStewardSend(args);
         break;
 
+      case "steward-model":
+        await cmdStewardModel(positional);
+        break;
+
+      case "steward-reasoning":
+        await cmdStewardReasoning(positional);
+        break;
+
       default:
         printEmpty();
         printError(`Unknown command: '${cmd}'. Type 'help' for assistance.`);
@@ -2612,9 +2853,62 @@ async function apiFetch(path, init) {
     data = text ? JSON.parse(text) : null;
   } catch (_) {}
   if (!res.ok) {
-    throw new Error((data && data.error) || `HTTP ${res.status}`);
+    const fallbackText = text ? text.trim().slice(0, 180) : "";
+    throw new Error((data && data.error) || (fallbackText ? `HTTP ${res.status}: ${fallbackText}` : `HTTP ${res.status}`));
   }
   return data;
+}
+
+function isTransientHttpFailure(error) {
+  const message = String(error?.message ?? error ?? "");
+  return (
+    /HTTP (502|503|504)\b/.test(message) ||
+    /Failed to fetch/i.test(message) ||
+    /NetworkError/i.test(message)
+  );
+}
+
+function currentRawOrigin() {
+  try {
+    const { protocol, host } = window.location;
+    if (!host) return null;
+    if (host.includes(".raw.icp0.io") || host.includes(".raw.ic0.app")) {
+      return `${protocol}//${host}`;
+    }
+    if (host.endsWith(".icp0.io")) {
+      return `${protocol}//${host.replace(/\.icp0\.io$/, ".raw.icp0.io")}`;
+    }
+    if (host.endsWith(".ic0.app")) {
+      return `${protocol}//${host.replace(/\.ic0\.app$/, ".raw.ic0.app")}`;
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function shouldFallbackToRawDomain(error) {
+  const message = String(error?.message ?? error ?? "");
+  return (
+    /Response Verification Error/i.test(message) ||
+    /failed verification/i.test(message) ||
+    /HTTP (500|502|503|504)\b/.test(message)
+  );
+}
+
+async function apiFetchWithRawFallback(path, init) {
+  try {
+    return await apiFetch(path, init);
+  } catch (primaryError) {
+    if (!shouldFallbackToRawDomain(primaryError)) {
+      throw primaryError;
+    }
+    const rawOrigin = currentRawOrigin();
+    if (!rawOrigin) {
+      throw primaryError;
+    }
+    return apiFetch(`${rawOrigin}${path}`, init);
+  }
 }
 
 async function pollStatus() {

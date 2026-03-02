@@ -18,8 +18,9 @@ use crate::domain::cycle_admission::{
     OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
-    InferenceInput, InferenceProvider, OperationFailure, OperationFailureKind, OutcallFailure,
-    OutcallFailureKind, RecoveryFailure, RuntimeSnapshot, SurvivalOperationClass, ToolCall,
+    InferenceInput, InferenceProvider, OpenRouterReasoningLevel, OperationFailure,
+    OperationFailureKind, OutcallFailure, OutcallFailureKind, RecoveryFailure, RuntimeSnapshot,
+    SurvivalOperationClass, ToolCall,
 };
 use crate::prompt;
 use crate::storage::stable;
@@ -44,7 +45,7 @@ const DETERMINISTIC_LAYER_6_UPDATE_CONTENT: &str =
     "## Layer 6: Economic Decision Loop (Mutable Default)\n- phase5-layer6-marker";
 const INFERENCE_OUTCALL_TIMEOUT_MS: u64 = 45_000;
 const INFERENCE_OUTCALL_TIMEOUT_NS: u64 = INFERENCE_OUTCALL_TIMEOUT_MS * 1_000_000;
-const INFERENCE_PROXY_SUBMIT_MAX_RESPONSE_BYTES: u64 = 1_024;
+const INFERENCE_PROXY_SUBMIT_MAX_RESPONSE_BYTES: u64 = 2_048;
 const INFERENCE_PROXY_DEFERRED_EXPLANATION: &str = "inference deferred awaiting proxy callback";
 
 fn outcall_elapsed_ms(started_at_ns: u64, finished_at_ns: u64) -> u64 {
@@ -1219,6 +1220,7 @@ pub struct OpenRouterInferenceAdapter {
     api_key: Option<String>,
     max_response_bytes: u64,
     evm_tools_enabled: bool,
+    reasoning_level: OpenRouterReasoningLevel,
 }
 
 impl OpenRouterInferenceAdapter {
@@ -1249,6 +1251,7 @@ impl OpenRouterInferenceAdapter {
             api_key: snapshot.openrouter_api_key.clone(),
             max_response_bytes: snapshot.openrouter_max_response_bytes,
             evm_tools_enabled: !snapshot.evm_rpc_url.trim().is_empty(),
+            reasoning_level: snapshot.openrouter_reasoning_level,
         }
     }
 
@@ -1294,6 +1297,7 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
                 &self.model,
                 transcript,
                 self.evm_tools_enabled,
+                self.reasoning_level,
             ))
             .map_err(|error| format!("failed to build openrouter request payload: {error}"))?;
         let request_size_bytes = Self::estimate_request_size_bytes(&payload);
@@ -1481,6 +1485,7 @@ pub struct OpenRouterProxyWorkerInferenceAdapter {
     api_key: Option<String>,
     max_response_bytes: u64,
     evm_tools_enabled: bool,
+    reasoning_level: OpenRouterReasoningLevel,
 }
 
 impl OpenRouterProxyWorkerInferenceAdapter {
@@ -1491,6 +1496,7 @@ impl OpenRouterProxyWorkerInferenceAdapter {
             api_key: snapshot.openrouter_api_key.clone(),
             max_response_bytes: snapshot.openrouter_max_response_bytes,
             evm_tools_enabled: !snapshot.evm_rpc_url.trim().is_empty(),
+            reasoning_level: snapshot.openrouter_reasoning_level,
         }
     }
 
@@ -1574,6 +1580,51 @@ fn current_canister_id_text() -> String {
     return "2vxsx-fae".to_string();
 }
 
+fn inference_output_from_proxy_callback(
+    input_turn_id: &str,
+    callback: crate::domain::types::InferenceProxyCallbackRecord,
+) -> Result<InferenceOutput, String> {
+    let callback_error = callback
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(error) = callback_error {
+        log!(
+            InferenceLogPriority::Error,
+            "turn={} provider=openrouter_proxy_worker inference_proxy_callback_error job_id={} callback_turn_id={} error={}",
+            input_turn_id,
+            callback.job_id,
+            callback.turn_id,
+            error,
+        );
+        return Err(format!(
+            "openrouter proxy callback reported error for job_id={}: {}",
+            callback.job_id, error
+        ));
+    }
+
+    let result = callback.result.ok_or_else(|| {
+        format!(
+            "openrouter proxy callback missing result payload for job_id={}",
+            callback.job_id
+        )
+    })?;
+    stable::record_inference_proxy_callback_resumed();
+    log!(
+        InferenceLogPriority::Info,
+        "turn={} provider=openrouter_proxy_worker inference_proxy_resume_applied job_id={} callback_turn_id={}",
+        input_turn_id,
+        callback.job_id,
+        callback.turn_id,
+    );
+    Ok(InferenceOutput {
+        tool_calls: result.tool_calls,
+        explanation: result.explanation.unwrap_or_default(),
+    })
+}
+
 #[async_trait(?Send)]
 impl InferenceAdapter for OpenRouterProxyWorkerInferenceAdapter {
     async fn infer(&self, input: &InferenceInput) -> Result<InferenceOutput, String> {
@@ -1585,60 +1636,40 @@ impl InferenceAdapter for OpenRouterProxyWorkerInferenceAdapter {
         input: &InferenceInput,
         transcript: &[InferenceTranscriptMessage],
     ) -> Result<InferenceOutput, String> {
-        if let Some(callback) = stable::pop_next_inference_proxy_callback_result() {
-            let callback_error = callback
-                .error
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            if let Some(error) = callback_error {
-                log!(
-                    InferenceLogPriority::Error,
-                    "turn={} provider=openrouter_proxy_worker inference_proxy_callback_error job_id={} callback_turn_id={} error={}",
-                    input.turn_id,
-                    callback.job_id,
-                    callback.turn_id,
-                    error,
-                );
-                return Err(format!(
-                    "openrouter proxy callback reported error for job_id={}: {}",
-                    callback.job_id, error
-                ));
+        if let Some(job_id) = input
+            .proxy_resume_job_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(callback) = stable::take_inference_proxy_callback_result(job_id) {
+                return inference_output_from_proxy_callback(&input.turn_id, callback);
             }
-
-            let result = callback.result.ok_or_else(|| {
-                format!(
-                    "openrouter proxy callback missing result payload for job_id={}",
-                    callback.job_id
-                )
-            })?;
-            stable::record_inference_proxy_callback_resumed();
+            if stable::has_pending_inference_proxy_job(job_id) {
+                log!(
+                    InferenceLogPriority::Info,
+                    "turn={} provider=openrouter_proxy_worker inference_proxy_deferred reason=pending_targeted_callback job_id={}",
+                    input.turn_id,
+                    job_id,
+                );
+                return Ok(Self::deferred_output());
+            }
             log!(
                 InferenceLogPriority::Info,
-                "turn={} provider=openrouter_proxy_worker inference_proxy_resume_applied job_id={} callback_turn_id={}",
+                "turn={} provider=openrouter_proxy_worker inference_proxy_deferred reason=targeted_callback_missing job_id={}",
                 input.turn_id,
-                callback.job_id,
-                callback.turn_id,
-            );
-            return Ok(InferenceOutput {
-                tool_calls: result.tool_calls,
-                explanation: result.explanation.unwrap_or_default(),
-            });
-        }
-
-        self.validate_config()?;
-
-        let pending_jobs_count = stable::pending_inference_proxy_jobs_count();
-        if pending_jobs_count > 0 {
-            log!(
-                InferenceLogPriority::Info,
-                "turn={} provider=openrouter_proxy_worker inference_proxy_deferred reason=pending_callback pending_jobs={}",
-                input.turn_id,
-                pending_jobs_count,
+                job_id,
             );
             return Ok(Self::deferred_output());
         }
+
+        if input.allow_global_proxy_callback_resume {
+            if let Some(callback) = stable::pop_next_inference_proxy_callback_result() {
+                return inference_output_from_proxy_callback(&input.turn_id, callback);
+            }
+        }
+
+        self.validate_config()?;
 
         let now_ns = current_time_ns();
         let api_key = self.api_key.clone().unwrap_or_default();
@@ -1647,6 +1678,7 @@ impl InferenceAdapter for OpenRouterProxyWorkerInferenceAdapter {
             &self.model,
             transcript,
             self.evm_tools_enabled,
+            self.reasoning_level,
         );
         let job_id = format!("proxy-{}-{}", input.turn_id, now_ns);
         let payload = serde_json::to_vec(&json!({
@@ -1962,8 +1994,10 @@ fn build_openrouter_request_body_with_transcript_capabilities(
     model: &str,
     transcript: &[InferenceTranscriptMessage],
     evm_tools_enabled: bool,
+    reasoning_level: OpenRouterReasoningLevel,
 ) -> Value {
     let mut body = build_openrouter_request_body_with_transcript(input, model, transcript);
+    apply_openrouter_reasoning_level(&mut body, reasoning_level);
     if evm_tools_enabled {
         return body;
     }
@@ -1982,6 +2016,28 @@ fn build_openrouter_request_body_with_transcript_capabilities(
     }
 
     body
+}
+
+fn apply_openrouter_reasoning_level(body: &mut Value, reasoning_level: OpenRouterReasoningLevel) {
+    let effort = match reasoning_level {
+        OpenRouterReasoningLevel::Default => None,
+        OpenRouterReasoningLevel::Low => Some("low"),
+        OpenRouterReasoningLevel::Medium => Some("medium"),
+        OpenRouterReasoningLevel::High => Some("high"),
+    };
+    let Some(effort) = effort else {
+        return;
+    };
+
+    let Some(map) = body.as_object_mut() else {
+        return;
+    };
+
+    map.insert("reasoning".to_string(), json!({ "effort": effort }));
+    map.insert(
+        "ignore_unsupported_parameters".to_string(),
+        Value::Bool(true),
+    );
 }
 
 fn build_openrouter_request_body_with_transcript(
@@ -2388,6 +2444,7 @@ mod tests {
             api_key: None,
             max_response_bytes: 1_024,
             evm_tools_enabled: true,
+            reasoning_level: OpenRouterReasoningLevel::Default,
         };
 
         let error = adapter
@@ -2522,6 +2579,8 @@ mod tests {
             input: "hello".to_string(),
             context_snippet: "## Layer 10: Dynamic Context\n### Conversation with 0xabc\n  [0xabc]: hi\n  [you]: hello".to_string(),
             turn_id: "turn-compact".to_string(),
+            proxy_resume_job_id: None,
+            allow_global_proxy_callback_resume: false,
         };
 
         let request = build_ic_llm_request(&input, IcLlmModel::Llama3_1_8B);
@@ -2549,6 +2608,8 @@ mod tests {
             input: "hello".to_string(),
             context_snippet: "## Layer 10: Dynamic Context\n### Conversation with 0xdef\n  [0xdef]: ping\n  [you]: pong".to_string(),
             turn_id: "turn-openrouter".to_string(),
+            proxy_resume_job_id: None,
+            allow_global_proxy_callback_resume: false,
         };
         let body = build_openrouter_request_body(&input, "openai/gpt-4o-mini");
 
@@ -2578,6 +2639,8 @@ mod tests {
             input: "inbox:ping".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-continue-ic-llm".to_string(),
+            proxy_resume_job_id: None,
+            allow_global_proxy_callback_resume: false,
         };
         let transcript = vec![
             InferenceTranscriptMessage::Assistant {
@@ -2639,6 +2702,8 @@ mod tests {
             input: "inbox:ping".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-continue-openrouter".to_string(),
+            proxy_resume_job_id: None,
+            allow_global_proxy_callback_resume: false,
         };
         let transcript = vec![
             InferenceTranscriptMessage::Assistant {
@@ -2792,6 +2857,8 @@ mod tests {
                 input: "hello".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-1".to_string(),
+                proxy_resume_job_id: None,
+                allow_global_proxy_callback_resume: false,
             },
             "openai/gpt-4o-mini",
         );
@@ -2958,10 +3025,13 @@ mod tests {
                 input: "hello".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-1".to_string(),
+                proxy_resume_job_id: None,
+                allow_global_proxy_callback_resume: false,
             },
             "openai/gpt-4o-mini",
             &[],
             false,
+            OpenRouterReasoningLevel::Default,
         );
 
         let tools = body
@@ -2987,6 +3057,35 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_request_body_includes_reasoning_effort_when_configured() {
+        let body = build_openrouter_request_body_with_transcript_capabilities(
+            &InferenceInput {
+                input: "hello".to_string(),
+                context_snippet: "ctx".to_string(),
+                turn_id: "turn-reasoning".to_string(),
+                proxy_resume_job_id: None,
+                allow_global_proxy_callback_resume: false,
+            },
+            "openai/gpt-4o-mini",
+            &[],
+            true,
+            OpenRouterReasoningLevel::High,
+        );
+
+        assert_eq!(
+            body.get("reasoning")
+                .and_then(|value| value.get("effort"))
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            body.get("ignore_unsupported_parameters")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn deterministic_ic_llm_model_layer_6_probe_reflects_prompt_layer_updates() {
         stable::init_storage();
         let adapter = IcLlmInferenceAdapter {
@@ -2999,6 +3098,8 @@ mod tests {
             input: "request_layer_6_probe:true".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-probe-1".to_string(),
+            proxy_resume_job_id: None,
+            allow_global_proxy_callback_resume: false,
         };
 
         let first = block_on_with_spin(adapter.infer(&no_marker))
@@ -3018,6 +3119,8 @@ mod tests {
             input: "request_layer_6_probe:true".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-probe-2".to_string(),
+            proxy_resume_job_id: None,
+            allow_global_proxy_callback_resume: false,
         };
         let second = block_on_with_spin(adapter.infer(&with_marker))
             .expect("deterministic inference should succeed");
@@ -3036,6 +3139,8 @@ mod tests {
             input: "hello".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-invalid-llm-id".to_string(),
+            proxy_resume_job_id: None,
+            allow_global_proxy_callback_resume: false,
         };
 
         let error = block_on_with_spin(adapter.infer(&input))
@@ -3118,6 +3223,8 @@ mod tests {
                 input: "autonomy_tick".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-resume".to_string(),
+                proxy_resume_job_id: Some("job-1".to_string()),
+                allow_global_proxy_callback_resume: false,
             },
         ))
         .expect("completed callback should be consumed");
@@ -3158,6 +3265,8 @@ mod tests {
                 input: "autonomy_tick".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-wait".to_string(),
+                proxy_resume_job_id: Some("job-pending".to_string()),
+                allow_global_proxy_callback_resume: false,
             },
         ))
         .expect("pending callback should defer inference");
@@ -3166,5 +3275,71 @@ mod tests {
         let status = stable::inference_proxy_status_view();
         assert_eq!(status.pending_jobs, 1);
         assert_eq!(status.submit_accepted, 0);
+    }
+
+    #[test]
+    fn openrouter_proxy_provider_targeted_resume_keeps_unrelated_callback_buffered() {
+        stable::init_storage();
+        stable::set_inference_provider(InferenceProvider::OpenRouterProxyWorker);
+        stable::set_openrouter_proxy_config(crate::domain::types::OpenRouterProxyWorkerConfig {
+            worker_base_url: "https://proxy.example.workers.dev".to_string(),
+            trusted_callback_principal: Some(
+                Principal::from_text("2vxsx-fae").expect("principal should parse"),
+            ),
+        })
+        .expect("proxy config should persist");
+        stable::set_openrouter_api_key(Some("sk-or-test".to_string()));
+        for (job_id, turn_id, accepted_at_ns, explanation) in [
+            ("job-other", "turn-other", 6u64, "other-result"),
+            ("job-target", "turn-target", 8u64, "target-result"),
+        ] {
+            stable::upsert_pending_inference_proxy_job(
+                crate::domain::types::PendingInferenceProxyJob {
+                    job_id: job_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    submitted_at_ns: accepted_at_ns.saturating_sub(1),
+                    model: "openai/gpt-4o-mini".to_string(),
+                },
+            )
+            .expect("pending proxy job should persist");
+            stable::apply_inference_proxy_callback(
+                crate::domain::types::SubmitInferenceResultArgs {
+                    job_id: job_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    completed_at_ns: accepted_at_ns.saturating_add(1),
+                    result: Some(crate::domain::types::InferenceProxyResultPayload {
+                        explanation: Some(explanation.to_string()),
+                        tool_calls: Vec::new(),
+                    }),
+                    error: None,
+                },
+                "2vxsx-fae".to_string(),
+                accepted_at_ns,
+            )
+            .expect("callback payload should be accepted");
+        }
+
+        let snapshot = stable::runtime_snapshot();
+        let output = block_on_with_spin(infer_with_provider(
+            &snapshot,
+            &InferenceInput {
+                input: "inbox:target".to_string(),
+                context_snippet: "ctx".to_string(),
+                turn_id: "turn-resume-target".to_string(),
+                proxy_resume_job_id: Some("job-target".to_string()),
+                allow_global_proxy_callback_resume: false,
+            },
+        ))
+        .expect("targeted callback should be consumed");
+
+        assert_eq!(output.explanation, "target-result");
+        let status = stable::inference_proxy_status_view();
+        assert_eq!(
+            status.completed_jobs, 1,
+            "other callback should remain buffered"
+        );
+        let leftover = stable::take_inference_proxy_callback_result("job-other")
+            .expect("unrelated callback should still be buffered");
+        assert_eq!(leftover.turn_id, "turn-other");
     }
 }

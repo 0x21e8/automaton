@@ -262,6 +262,11 @@ fn respond_with_submit_ack(pic: &PocketIc, request: CanisterHttpRequest) -> Prox
         !api_key.trim().is_empty(),
         "proxy submit API key header should be non-empty"
     );
+    assert_eq!(
+        request.max_response_bytes,
+        Some(2_048),
+        "proxy submit ack response budget should stay tightly bounded"
+    );
 
     let body: Value = serde_json::from_slice(&request.body)
         .unwrap_or_else(|error| panic!("failed to decode proxy submit request body: {error}"));

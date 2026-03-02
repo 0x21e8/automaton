@@ -59,6 +59,7 @@ oc3hk-viaaa-aaaak-qxcuq-cai
 ```bash
 icp canister call backend set_inference_provider '(variant { OpenRouterProxyWorker })' -e ic
 icp canister call backend set_inference_model '("google/gemini-3-flash-preview")' -e ic
+icp canister call backend set_openrouter_reasoning_level '(variant { Medium })' -e ic
 icp canister call backend set_openrouter_base_url '("https://openrouter.ai/api/v1")' -e ic
 
 set -a

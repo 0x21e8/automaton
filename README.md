@@ -94,7 +94,7 @@ This is an experiment in **machine autonomy** or artificial *sovereignty*.
 ## Features
 
 ### Autonomous Reasoning
-The agent calls LLMs (via [OpenRouter](https://openrouter.ai) or IC's native LLM canister) and decides which tools to invoke based on its constitution, conversation history, and on-chain context. Multi-round continuation allows the agent to reason iteratively -- execute tools, observe results, then decide what to do next.
+The agent calls LLMs (via [OpenRouter](https://openrouter.ai) or IC's native LLM canister) and decides which tools to invoke based on its constitution, conversation history, and on-chain context. Multi-round continuation allows the agent to reason iteratively -- execute tools, observe results, then decide what to do next. For OpenRouter models, reasoning effort is runtime-configurable (`Default`, `Low`, `Medium`, `High`) via `set_openrouter_reasoning_level`.
 
 ### Threshold ECDSA Wallet
 The canister derives its own Ethereum address via ICP's [threshold ECDSA](https://internetcomputer.org/docs/current/developer-docs/smart-contracts/signatures/t-ecdsa) signing. No human ever holds the private key. The agent can sign messages, construct EIP-1559 transactions, and broadcast them to Base.
@@ -106,6 +106,9 @@ The canister derives its own Ethereum address via ICP's [threshold ECDSA](https:
 
 ### On-Chain Inbox
 An [Inbox.sol](evm/src/Inbox.sol) contract on Base allows anyone to send messages to the agent with attached ETH or USDC payments. The canister polls for `MessageQueued` events and ingests them as input for reasoning turns.
+
+### Signed Steward Command Plane
+The canister supports a single active EVM steward identity for privileged runtime changes (including direct steward messages) through signed commands.
 
 ### Survival Tiers
 The agent monitors its own cycle balance and adapts behavior under resource pressure:
@@ -161,6 +164,9 @@ The agent maintains a fresh snapshot of its ETH and USDC balances via periodic b
 - Freshness window: 10 minutes (stale if older)
 - USDC contract address is auto-discovered from the Inbox contract if not explicitly configured
 - Balance data is injected into each turn's dynamic context (Layer 10)
+
+### Inference Proxy Callback Reliability
+When OpenRouter proxy-worker mode is enabled, callback ingestion is idempotent by `job_id` and tracks recently completed callback jobs so duplicate deliveries are safely ignored even after result consumption.
 
 ### Storage Retention & Summarization
 To prevent unbounded stable memory growth, a periodic maintenance job:
@@ -260,6 +266,7 @@ Runtime configuration (updatable via canister calls):
 | `set_inference_provider` | Switch between `OpenRouter` and `IcLlm` |
 | `set_inference_model` | Set model name (e.g. `google/gemini-3-flash-preview`, `llama3.1:8b`) |
 | `set_openrouter_api_key` | Configure OpenRouter API key |
+| `set_openrouter_reasoning_level` | Set OpenRouter reasoning effort (`Default`, `Low`, `Medium`, `High`) |
 | `set_task_interval_secs` | Adjust per-task scheduling frequency |
 | `set_loop_enabled` | Enable/disable the agent turn loop |
 

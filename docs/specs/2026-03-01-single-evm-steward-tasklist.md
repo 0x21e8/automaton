@@ -95,7 +95,7 @@ Implement a single-steward, EVM-only command plane with full parity for current 
 
 ## Final validation gate (must be green)
 
-- [ ] `bash .githooks/pre-commit`
+- [x] `bash .githooks/pre-commit`
 - [ ] `icp build`
 - [ ] `cargo test --all-targets --all-features`
 - [ ] `cargo test --features pocketic_tests`

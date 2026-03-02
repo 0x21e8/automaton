@@ -28,8 +28,8 @@
 use crate::domain::state_machine;
 use crate::domain::types::{
     AgentEvent, AgentState, AutonomySuppressionConfig, ContinuationStopReason, ConversationEntry,
-    InboxMessage, InferenceInput, InferenceProvider, MemoryFact, MemoryRollup, RuntimeSnapshot,
-    ToolCall, ToolCallOutcome, ToolCallRecord, TurnRecord, WalletBalanceStatus,
+    InboxMessage, InboxProxyWaitState, InferenceInput, InferenceProvider, MemoryFact, MemoryRollup,
+    RuntimeSnapshot, ToolCall, ToolCallOutcome, ToolCallRecord, TurnRecord, WalletBalanceStatus,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
@@ -67,6 +67,8 @@ const MAX_STAGED_INBOX_MESSAGES_PER_TURN: usize = 1;
 const AUTONOMY_DEDUPE_SKIP_REASON: &str = "skipped due to freshness dedupe";
 const AUTONOMY_FAILURE_COOLDOWN_SKIP_REASON: &str = "suppressed due to repeated failure cooldown";
 const TOOL_SEQUENCE_VALIDATOR_BLOCK_PREFIX: &str = "tool sequence validator blocked";
+const PROXY_WAIT_MAX_ATTEMPTS_FOR_STAGED_INBOX: u32 = 8;
+const PROXY_WAIT_FAIL_CLOSE_GRACE_SECS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScheduledTurnTrigger {
@@ -328,12 +330,21 @@ fn extract_signal_payload(args_json: &str) -> Option<String> {
 
 /// Normalises a tool-call args string to canonical JSON so that fingerprints
 /// are stable regardless of key ordering or whitespace in the original payload.
-fn canonical_tool_args_json(args_json: &str) -> String {
+fn canonical_tool_args_json_for_fingerprint(tool: &str, args_json: &str) -> String {
     let trimmed = args_json.trim();
     if trimmed.is_empty() {
         return "{}".to_string();
     }
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let tool_name = tool.trim();
+        if tool_name == "remember" || tool_name == "forget" {
+            if let Some(raw_key) = value.get("key").and_then(|entry| entry.as_str()) {
+                if let Ok(canonical_key) = crate::tools::canonicalize_memory_key_for_dedupe(raw_key)
+                {
+                    value["key"] = serde_json::Value::String(canonical_key);
+                }
+            }
+        }
         if let Ok(serialized) = serde_json::to_string(&value) {
             return serialized;
         }
@@ -343,7 +354,7 @@ fn canonical_tool_args_json(args_json: &str) -> String {
 
 /// Computes a Keccak-256 fingerprint of `tool:canonical_args` for deduplication.
 fn tool_call_fingerprint(tool: &str, args_json: &str) -> String {
-    let canonical_args = canonical_tool_args_json(args_json);
+    let canonical_args = canonical_tool_args_json_for_fingerprint(tool, args_json);
     let mut hasher = Keccak256::new();
     hasher.update(tool.trim().as_bytes());
     hasher.update(b":");
@@ -746,6 +757,42 @@ fn should_apply_autonomy_suppression(
     trigger == ScheduledTurnTrigger::Periodic && !has_external_input && inference_round_count == 1
 }
 
+fn load_staged_inbox_proxy_wait_state(
+    staged_message_ids: &[String],
+) -> Option<InboxProxyWaitState> {
+    staged_message_ids
+        .iter()
+        .find_map(|id| stable::get_inbox_proxy_wait_state(id))
+}
+
+fn persist_inbox_proxy_wait_state_for_staged_messages(
+    staged_message_ids: &[String],
+    state: &InboxProxyWaitState,
+) {
+    for inbox_message_id in staged_message_ids {
+        let mut entry = state.clone();
+        entry.inbox_message_id = inbox_message_id.clone();
+        let _ = stable::upsert_inbox_proxy_wait_state(entry);
+    }
+}
+
+fn should_fail_close_proxy_wait(state: &InboxProxyWaitState, now_ns: u64) -> bool {
+    let max_wait_age_secs = stable::INFERENCE_PROXY_PENDING_JOB_TTL_SECS
+        .saturating_add(PROXY_WAIT_FAIL_CLOSE_GRACE_SECS);
+    let max_wait_age_ns = max_wait_age_secs.saturating_mul(1_000_000_000);
+    let wait_age_ns = now_ns.saturating_sub(state.started_at_ns);
+    state.wait_attempts >= PROXY_WAIT_MAX_ATTEMPTS_FOR_STAGED_INBOX
+        || wait_age_ns >= max_wait_age_ns
+}
+
+fn proxy_wait_fail_close_reply(state: &InboxProxyWaitState) -> String {
+    let job = state
+        .pending_job_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("Unable to complete async inference in time (job_id={job}). Please retry your request.")
+}
+
 // ── Context builders ─────────────────────────────────────────────────────────
 
 /// Renders the `### Pending Obligations` section for the dynamic context block.
@@ -1144,7 +1191,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             },
             &turn_id,
         );
-        stable::complete_turn(AgentState::Faulted, Some(error.clone()));
+        stable::complete_turn(&turn_id, AgentState::Faulted, Some(error.clone()));
         return Err(error);
     }
 
@@ -1155,6 +1202,13 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
 
     let evm_events = 0usize;
     let has_external_input = staged_message_count > 0;
+    let staged_proxy_wait_state = if has_external_input
+        && snapshot.inference_provider == InferenceProvider::OpenRouterProxyWorker
+    {
+        load_staged_inbox_proxy_wait_state(&staged_message_ids)
+    } else {
+        None
+    };
     let should_infer = true;
 
     if let Err(reason) = advance_state(
@@ -1166,7 +1220,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         &turn_id,
     ) {
         stable::set_last_error(Some(reason.clone()));
-        stable::complete_turn(AgentState::Faulted, Some(reason.clone()));
+        stable::complete_turn(&turn_id, AgentState::Faulted, Some(reason.clone()));
         return Err(reason);
     }
 
@@ -1203,6 +1257,10 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             },
             context_snippet: context_summary,
             turn_id: turn_id.clone(),
+            proxy_resume_job_id: staged_proxy_wait_state
+                .as_ref()
+                .and_then(|state| state.pending_job_id.clone()),
+            allow_global_proxy_callback_resume: !has_external_input,
         };
 
         #[cfg(target_arch = "wasm32")]
@@ -1223,6 +1281,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         let mut transcript = Vec::<InferenceTranscriptMessage>::new();
         let mut inference_completed = false;
         let mut inference_deferred = false;
+        let mut staged_external_input_handled = false;
         let mut executed_any_tool = false;
 
         loop {
@@ -1325,7 +1384,74 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
 
             if is_inference_proxy_deferred_output(&inference) {
                 inference_deferred = true;
+                let now_ns = current_time_ns();
                 let pending_jobs = stable::pending_inference_proxy_jobs_count();
+                if has_external_input
+                    && snapshot.inference_provider == InferenceProvider::OpenRouterProxyWorker
+                {
+                    let mut wait_state =
+                        staged_proxy_wait_state
+                            .clone()
+                            .unwrap_or_else(|| InboxProxyWaitState {
+                                inbox_message_id: staged_message_ids
+                                    .first()
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                pending_job_id: None,
+                                submitted_turn_id: turn_id.clone(),
+                                started_at_ns: now_ns,
+                                wait_attempts: 0,
+                            });
+                    if wait_state.started_at_ns == 0 {
+                        wait_state.started_at_ns = now_ns;
+                    }
+                    wait_state.wait_attempts = wait_state.wait_attempts.saturating_add(1);
+                    if wait_state.pending_job_id.is_none() {
+                        wait_state.pending_job_id =
+                            stable::find_pending_inference_proxy_job_for_turn(&turn_id)
+                                .map(|job| job.job_id);
+                    }
+                    persist_inbox_proxy_wait_state_for_staged_messages(
+                        &staged_message_ids,
+                        &wait_state,
+                    );
+                    if should_fail_close_proxy_wait(&wait_state, now_ns) {
+                        let fallback_reply = proxy_wait_fail_close_reply(&wait_state);
+                        match stable::post_outbox_message(
+                            turn_id.clone(),
+                            fallback_reply.clone(),
+                            staged_message_ids.clone(),
+                        ) {
+                            Ok(outbox_message_id) => {
+                                record_conversation_entries(
+                                    &turn_id,
+                                    &staged_messages,
+                                    &staged_message_ids,
+                                    &outbox_message_id,
+                                    &fallback_reply,
+                                    now_ns,
+                                );
+                                let _ = stable::consume_staged_inbox_messages(
+                                    &staged_message_ids,
+                                    now_ns,
+                                );
+                                let _ = stable::remove_inbox_proxy_wait_states(&staged_message_ids);
+                                staged_external_input_handled = true;
+                                inference_deferred = false;
+                                append_inner_dialogue(
+                                    &mut inner_dialogue,
+                                    &format!(
+                                        "fallback: async inference timed out after {} attempt(s)",
+                                        wait_state.wait_attempts
+                                    ),
+                                );
+                            }
+                            Err(error) => {
+                                last_error = Some(error);
+                            }
+                        }
+                    }
+                }
                 append_inner_dialogue(
                     &mut inner_dialogue,
                     &format!(
@@ -1715,7 +1841,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             {
                 last_error = Some(reason);
             } else if !inference_deferred {
-                if staged_message_count > 0 {
+                if staged_message_count > 0 && !staged_external_input_handled {
                     if let Some(reply) = assistant_reply.clone().or_else(|| inner_dialogue.clone())
                     {
                         match stable::post_outbox_message(
@@ -1740,11 +1866,12 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     }
                 }
                 if last_error.is_none() {
-                    if !staged_message_ids.is_empty() {
+                    if !staged_external_input_handled && !staged_message_ids.is_empty() {
                         let _ = stable::consume_staged_inbox_messages(
                             &staged_message_ids,
                             current_time_ns(),
                         );
+                        let _ = stable::remove_inbox_proxy_wait_states(&staged_message_ids);
                     }
                     let _ = advance_state(&mut state, &AgentEvent::SleepRequested, &turn_id);
                 }
@@ -1788,7 +1915,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     stable::append_turn_record(&turn_record, &all_tool_calls);
     stable::record_turn_duration(started_at_ns, finished_at_ns, max_turn_duration_ns);
 
-    stable::complete_turn(state, last_error.clone());
+    stable::complete_turn(&turn_id, state, last_error.clone());
     log!(
         AgentLogPriority::Info,
         "turn={} completed state={:?} error_present={} inference_round_count={} continuation_stop_reason={:?} tool_calls={} duration_ms={}",
@@ -1828,8 +1955,9 @@ mod tests {
     use super::*;
     use crate::domain::types::{
         ContinuationStopReason, EvmPollCursor, InboxMessageSource, InboxMessageStatus,
-        InferenceProxyResultPayload, MemoryFact, MemoryRollup, PendingInferenceProxyJob,
-        RuntimeSnapshot, SubmitInferenceResultArgs, SurvivalTier, ToolCall, ToolCallRecord,
+        InboxProxyWaitState, InferenceProxyResultPayload, MemoryFact, MemoryRollup,
+        PendingInferenceProxyJob, RuntimeSnapshot, SubmitInferenceResultArgs, SurvivalTier,
+        ToolCall, ToolCallRecord,
     };
     use std::future::Future;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -2307,6 +2435,22 @@ mod tests {
             &config,
         );
         assert!(suppressed_late.is_empty());
+    }
+
+    #[test]
+    fn remember_fingerprint_canonicalizes_timestamp_suffixed_keys() {
+        let first = tool_call_fingerprint(
+            "remember",
+            r#"{"key":"signal.eth.1730000000","value":"same"}"#,
+        );
+        let second = tool_call_fingerprint(
+            "remember",
+            r#"{"key":"signal.eth.1730000001","value":"same"}"#,
+        );
+        assert_eq!(
+            first, second,
+            "timestamp-suffixed remember keys should collapse to a stable dedupe fingerprint"
+        );
     }
 
     #[test]
@@ -2930,6 +3074,62 @@ mod tests {
         );
         let turns = stable::list_turns(1);
         assert_eq!(turns.len(), 1, "executed turn should be recorded");
+    }
+
+    #[test]
+    fn staged_proxy_wait_timeout_fail_closes_and_consumes_inbox() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_inference_provider(InferenceProvider::OpenRouterProxyWorker);
+        stable::set_openrouter_proxy_config(crate::domain::types::OpenRouterProxyWorkerConfig {
+            worker_base_url: "https://proxy.example.workers.dev".to_string(),
+            trusted_callback_principal: Some(
+                candid::Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
+                    .expect("principal should parse"),
+            ),
+        })
+        .expect("proxy config should persist");
+        stable::post_inbox_message(
+            "stuck async inference request".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox message should be accepted");
+        assert_eq!(stable::stage_pending_inbox_messages(10, 100), 1);
+        let staged = stable::list_staged_inbox_messages(1);
+        assert_eq!(staged.len(), 1, "staged inbox message should exist");
+        let staged_id = staged[0].id.clone();
+        let overdue_ns = (stable::INFERENCE_PROXY_PENDING_JOB_TTL_SECS
+            .saturating_add(PROXY_WAIT_FAIL_CLOSE_GRACE_SECS)
+            .saturating_add(1))
+        .saturating_mul(1_000_000_000);
+        let started_at_ns = current_time_ns().saturating_sub(overdue_ns);
+        stable::upsert_inbox_proxy_wait_state(InboxProxyWaitState {
+            inbox_message_id: staged_id.clone(),
+            pending_job_id: Some("job-missing".to_string()),
+            submitted_turn_id: "turn-old".to_string(),
+            started_at_ns,
+            wait_attempts: PROXY_WAIT_MAX_ATTEMPTS_FOR_STAGED_INBOX,
+        })
+        .expect("proxy wait state should persist");
+
+        let result = block_on_with_spin(run_scheduled_turn_job_with_trigger(
+            ScheduledTurnTrigger::InferenceProxyResume,
+        ));
+        assert!(result.is_ok(), "turn should fail-close without hard error");
+
+        let outbox = stable::list_outbox_messages(10);
+        assert_eq!(outbox.len(), 1, "fail-close should post a reply");
+        assert!(
+            outbox[0]
+                .body
+                .contains("Unable to complete async inference in time"),
+            "fail-close reply should explain async timeout"
+        );
+        assert_eq!(stable::inbox_stats().staged_count, 0);
+        assert_eq!(stable::inbox_stats().consumed_count, 1);
+        assert!(
+            stable::get_inbox_proxy_wait_state(&staged_id).is_none(),
+            "fail-close should clear persisted wait state"
+        );
     }
 
     #[test]

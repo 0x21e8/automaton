@@ -45,10 +45,19 @@ pub const DEFAULT_TASK_INTERVAL_SECS: u64 = BASE_TICK_SECS * TICKS_PER_TURN_INTE
 
 // ── Lease TTLs ──────────────────────────────────────────────────────────────
 
-/// Lease TTL for an agent turn — must comfortably exceed `AGENT_TURN_BUDGET_SECS`
-/// to allow for context loading, tool execution, and persistence.
-/// Ratio: ~2.67× the turn budget.
-pub const AGENT_TURN_LEASE_TTL_SECS: u64 = AGENT_TURN_BUDGET_SECS * 8 / 3;
+/// Conservative upper bound for bounded inter-canister waits used by autonomous
+/// tool execution paths (for example `canister_call`).
+///
+/// This stays derived from scheduler cadence constants so we avoid hard-coded
+/// timeout literals while keeping lease sizing resilient to cadence changes.
+pub const INTER_CANISTER_BOUNDED_WAIT_SECS: u64 = DEFAULT_TASK_INTERVAL_SECS;
+/// Additional grace window after budget + bounded waits to absorb scheduler-tick
+/// skew and callback scheduling jitter.
+pub const AGENT_TURN_LEASE_GRACE_SECS: u64 = SCHEDULER_TICK_INTERVAL_SECS;
+/// Lease TTL for an agent turn. Must exceed the max turn budget and the
+/// longest bounded inter-canister wait window used within a turn.
+pub const AGENT_TURN_LEASE_TTL_SECS: u64 =
+    AGENT_TURN_BUDGET_SECS + INTER_CANISTER_BOUNDED_WAIT_SECS + AGENT_TURN_LEASE_GRACE_SECS;
 pub const AGENT_TURN_LEASE_TTL_NS: u64 = AGENT_TURN_LEASE_TTL_SECS * NANOS_PER_SEC;
 
 /// Lease TTL for lightweight jobs (poll inbox, check cycles, …).
@@ -201,6 +210,12 @@ mod tests {
         assert_eq!(
             MAX_AGENT_TURN_DURATION_NS,
             AGENT_TURN_BUDGET_SECS * NANOS_PER_SEC
+        );
+        assert_eq!(INTER_CANISTER_BOUNDED_WAIT_SECS, DEFAULT_TASK_INTERVAL_SECS);
+        assert_eq!(AGENT_TURN_LEASE_GRACE_SECS, SCHEDULER_TICK_INTERVAL_SECS);
+        assert_eq!(
+            AGENT_TURN_LEASE_TTL_SECS,
+            AGENT_TURN_BUDGET_SECS + INTER_CANISTER_BOUNDED_WAIT_SECS + AGENT_TURN_LEASE_GRACE_SECS
         );
     }
 

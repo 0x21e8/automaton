@@ -1773,6 +1773,17 @@ pub struct PendingInferenceProxyJob {
     pub model: String,
 }
 
+/// Durable async-wait state for a staged inbox message awaiting proxy completion.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct InboxProxyWaitState {
+    pub inbox_message_id: String,
+    #[serde(default)]
+    pub pending_job_id: Option<String>,
+    pub submitted_turn_id: String,
+    pub started_at_ns: u64,
+    pub wait_attempts: u32,
+}
+
 /// Durable callback record for an async inference job.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct InferenceProxyCallbackRecord {
@@ -1818,6 +1829,10 @@ pub struct InferenceInput {
     pub input: String,
     pub context_snippet: String,
     pub turn_id: String,
+    #[serde(default)]
+    pub proxy_resume_job_id: Option<String>,
+    #[serde(default)]
+    pub allow_global_proxy_callback_resume: bool,
 }
 
 /// Lifecycle state of an inbox message.

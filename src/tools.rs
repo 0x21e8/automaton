@@ -912,6 +912,10 @@ fn normalize_memory_key(raw: &str) -> Result<String, String> {
     Ok(canonical)
 }
 
+pub(crate) fn canonicalize_memory_key_for_dedupe(raw: &str) -> Result<String, String> {
+    normalize_memory_key(raw)
+}
+
 fn canonicalize_memory_key(normalized: &str) -> String {
     let mut segments = normalized
         .split('.')

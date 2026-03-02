@@ -139,6 +139,7 @@ pub async fn scheduler_tick() {
     );
 
     stable::recover_stale_lease(now_ns);
+    let _ = stable::recover_orphaned_turn_lock(now_ns);
     let expired_proxy_jobs = stable::expire_inference_proxy_pending_jobs(
         now_ns,
         stable::INFERENCE_PROXY_PENDING_JOB_TTL_SECS,
@@ -643,6 +644,18 @@ pub(crate) fn ingest_steward_direct_message(
         staged
     );
     Ok(inbox_id)
+}
+
+/// Enqueues an immediate `AgentTurn` job if no non-terminal job already exists
+/// for the provided dedupe key.
+pub(crate) fn enqueue_immediate_agent_turn_job_if_absent(dedupe_key: String) -> Option<String> {
+    stable::enqueue_job_if_absent(
+        TaskKind::AgentTurn,
+        TaskLane::Mutating,
+        dedupe_key,
+        current_time_ns(),
+        stable::agent_turn_priority(),
+    )
 }
 
 /// Returns the minimum delay in nanoseconds before the next EVM poll, based on
@@ -2065,6 +2078,50 @@ mod tests {
         assert_eq!(
             lease_ttl_ns(&TaskKind::Reconcile),
             timing::LIGHTWEIGHT_LEASE_TTL_NS
+        );
+    }
+
+    #[test]
+    fn scheduler_tick_recovers_orphaned_turn_lock_after_stale_agent_turn_lease_timeout() {
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        let _ = stable::increment_turn_counter();
+        let dedupe_key = "AgentTurn:stale-lease-recovery".to_string();
+        let job_id = stable::enqueue_job_if_absent(
+            TaskKind::AgentTurn,
+            TaskLane::Mutating,
+            dedupe_key.clone(),
+            0,
+            0,
+        )
+        .expect("agent turn job should enqueue");
+        let popped = stable::pop_next_pending_job(TaskLane::Mutating, 0).expect("job should pop");
+        assert_eq!(popped.id, job_id);
+        stable::acquire_mutating_lease(&job_id, 0, 1).expect("lease should acquire");
+
+        block_on_with_spin(scheduler_tick());
+
+        assert!(
+            !stable::runtime_snapshot().turn_in_flight,
+            "scheduler tick should clear orphaned turn lock after stale lease timeout"
+        );
+        let jobs = stable::list_recent_jobs(20);
+        let timed_out = jobs
+            .iter()
+            .find(|job| job.dedupe_key == dedupe_key)
+            .expect("timed-out job should be retained in recent jobs");
+        assert_eq!(timed_out.status, JobStatus::TimedOut);
+        assert!(
+            timed_out
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("mutating lease expired"),
+            "stale lease timeout should preserve diagnostic reason"
         );
     }
 

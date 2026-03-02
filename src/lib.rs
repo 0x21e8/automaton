@@ -808,15 +808,10 @@ async fn dispatch_steward_command(
         }
         StewardCommand::SendStewardMessage { sender, message } => {
             let inbox_id = crate::scheduler::ingest_steward_direct_message(sender, message)?;
-            let pending_proxy_jobs = stable::has_pending_inference_proxy_jobs();
-            let immediate_job_id = if pending_proxy_jobs {
-                None
-            } else {
-                enqueue_immediate_agent_turn_if_absent(
-                    STEWARD_DIRECT_IMMEDIATE_TURN_DEDUPE_KEY.to_string(),
-                    "steward_direct_message_resume",
-                )
-            };
+            let immediate_job_id = enqueue_immediate_agent_turn_if_absent(
+                STEWARD_DIRECT_IMMEDIATE_TURN_DEDUPE_KEY.to_string(),
+                "steward_direct_message_resume",
+            );
             Ok(format!(
                 "steward_direct_message_ingested id={inbox_id} immediate_turn_enqueued={} immediate_job_id={}",
                 immediate_job_id.is_some(),
@@ -2538,7 +2533,7 @@ mod tests {
     }
 
     #[test]
-    fn steward_send_does_not_enqueue_immediate_turn_when_proxy_callback_is_pending() {
+    fn steward_send_enqueues_immediate_turn_even_when_proxy_callback_is_pending() {
         stable::init_storage();
         let key = steward_test_signing_key();
         let address = steward_address_from_key(&key);
@@ -2561,8 +2556,8 @@ mod tests {
 
         let agent_turn_runtime = stable::get_task_runtime(&TaskKind::AgentTurn);
         assert!(
-            agent_turn_runtime.pending_job_id.is_none(),
-            "steward send should not enqueue an immediate turn while proxy callback jobs are pending"
+            agent_turn_runtime.pending_job_id.is_some(),
+            "steward send should enqueue an immediate turn while proxy callback jobs are pending"
         );
     }
 
