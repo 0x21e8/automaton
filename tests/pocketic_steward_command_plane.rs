@@ -38,6 +38,7 @@ struct StewardState {
     address: String,
     enabled: bool,
     last_used_at_ns: Option<u64>,
+    principal: Option<Principal>,
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -63,9 +64,18 @@ enum StewardCommand {
     SetLoopEnabled {
         enabled: bool,
     },
+    SetInferenceModel {
+        model: String,
+    },
+    SetOpenrouterReasoningLevel {
+        level: OpenRouterReasoningLevel,
+    },
     SendStewardMessage {
         sender: String,
         message: String,
+    },
+    SetPrincipal {
+        principal: Option<Principal>,
     },
     UpdateSteward {
         chain_id: u64,
@@ -74,9 +84,31 @@ enum StewardCommand {
     },
 }
 
-#[derive(CandidType, Clone, Copy, Debug)]
+#[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum InferenceProvider {
     IcLlm,
+    OpenRouter,
+    OpenRouterProxyWorker,
+}
+
+#[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum OpenRouterReasoningLevel {
+    Default,
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct InferenceConfigView {
+    provider: InferenceProvider,
+    model: String,
+    openrouter_base_url: String,
+    openrouter_has_api_key: bool,
+    openrouter_max_response_bytes: u64,
+    openrouter_reasoning_level: OpenRouterReasoningLevel,
+    openrouter_proxy_worker_base_url: Option<String>,
+    openrouter_proxy_trusted_callback_principal: Option<String>,
 }
 
 #[derive(CandidType, Clone, Copy, Debug)]
@@ -165,8 +197,21 @@ fn call_update<T>(pic: &PocketIc, canister_id: Principal, method: &str, payload:
 where
     T: for<'de> Deserialize<'de> + CandidType,
 {
+    call_update_as(pic, canister_id, Principal::anonymous(), method, payload)
+}
+
+fn call_update_as<T>(
+    pic: &PocketIc,
+    canister_id: Principal,
+    caller: Principal,
+    method: &str,
+    payload: Vec<u8>,
+) -> T
+where
+    T: for<'de> Deserialize<'de> + CandidType,
+{
     let response = pic
-        .update_call(canister_id, Principal::anonymous(), method, payload)
+        .update_call(canister_id, caller, method, payload)
         .unwrap_or_else(|error| panic!("update call {method} failed: {error:?}"));
     decode_one(&response)
         .unwrap_or_else(|error| panic!("failed decoding {method} response: {error:?}"))
@@ -194,6 +239,15 @@ fn get_steward_status(pic: &PocketIc, canister_id: Principal) -> StewardStatusVi
     )
 }
 
+fn get_inference_config(pic: &PocketIc, canister_id: Principal) -> InferenceConfigView {
+    call_query(
+        pic,
+        canister_id,
+        "get_inference_config",
+        encode_args(()).expect("failed to encode get_inference_config"),
+    )
+}
+
 fn steward_execute(
     pic: &PocketIc,
     canister_id: Principal,
@@ -203,6 +257,17 @@ fn steward_execute(
     let payload =
         encode_args((command, proof)).expect("failed to encode steward_execute payload args");
     call_update(pic, canister_id, "steward_execute", payload)
+}
+
+fn steward_execute_ingress(
+    pic: &PocketIc,
+    canister_id: Principal,
+    caller: Principal,
+    command: StewardCommand,
+) -> Result<String, String> {
+    let payload =
+        encode_args((command,)).expect("failed to encode steward_execute_ingress payload args");
+    call_update_as(pic, canister_id, caller, "steward_execute_ingress", payload)
 }
 
 fn set_inference_provider(pic: &PocketIc, canister_id: Principal, provider: InferenceProvider) {
@@ -470,6 +535,95 @@ fn steward_pocketic_enforces_valid_execution_replay_nonce_and_rotation() {
             .expect("rotated-in steward key should execute");
     assert_eq!(new_wallet_result, "steward_noop_executed");
     assert_eq!(get_steward_status(&pic, canister_id).next_nonce, 1);
+}
+
+#[test]
+fn steward_signed_model_and_reasoning_commands_apply_in_pocketic() {
+    let (pic, canister_id) = with_backend_canister();
+    let steward_key = steward_test_signing_key();
+    let steward_address = steward_address_from_key(&steward_key);
+    set_steward_admin(&pic, canister_id, STEWARD_CHAIN_ID, steward_address, true);
+
+    let model_command = StewardCommand::SetInferenceModel {
+        model: "google/gemini-3-flash-preview".to_string(),
+    };
+    let model_proof = build_steward_proof(&pic, canister_id, &model_command, &steward_key, 0);
+    let model_result = steward_execute(&pic, canister_id, model_command, model_proof)
+        .expect("signed model command should execute");
+    assert_eq!(
+        model_result,
+        "inference_model=google/gemini-3-flash-preview"
+    );
+
+    let reasoning_command = StewardCommand::SetOpenrouterReasoningLevel {
+        level: OpenRouterReasoningLevel::High,
+    };
+    let reasoning_proof =
+        build_steward_proof(&pic, canister_id, &reasoning_command, &steward_key, 1);
+    let reasoning_result = steward_execute(&pic, canister_id, reasoning_command, reasoning_proof)
+        .expect("signed reasoning command should execute");
+    assert_eq!(reasoning_result, "openrouter_reasoning_level=High");
+
+    let config = get_inference_config(&pic, canister_id);
+    assert_eq!(config.model, "google/gemini-3-flash-preview");
+    assert_eq!(
+        config.openrouter_reasoning_level,
+        OpenRouterReasoningLevel::High
+    );
+    assert_eq!(get_steward_status(&pic, canister_id).next_nonce, 2);
+}
+
+#[test]
+fn steward_ingress_principal_can_execute_without_signature_and_unauthorized_is_rejected() {
+    let (pic, canister_id) = with_backend_canister();
+    let steward_key = steward_test_signing_key();
+    let steward_address = steward_address_from_key(&steward_key);
+    set_steward_admin(
+        &pic,
+        canister_id,
+        STEWARD_CHAIN_ID,
+        steward_address.clone(),
+        true,
+    );
+
+    let principal = Principal::self_authenticating(b"ii-steward");
+    let link_command = StewardCommand::SetPrincipal {
+        principal: Some(principal),
+    };
+    let link_proof = build_steward_proof(&pic, canister_id, &link_command, &steward_key, 0);
+    let link_result = steward_execute(&pic, canister_id, link_command, link_proof)
+        .expect("signed principal link command should execute");
+    assert_eq!(
+        link_result,
+        format!("steward_principal={}", principal.to_text())
+    );
+    assert_eq!(get_steward_status(&pic, canister_id).next_nonce, 1);
+
+    let ingress_result = steward_execute_ingress(
+        &pic,
+        canister_id,
+        principal,
+        StewardCommand::SetLoopEnabled { enabled: true },
+    )
+    .expect("authorized ingress principal should execute");
+    assert_eq!(ingress_result, "loop_enabled=true");
+    assert_eq!(
+        get_steward_status(&pic, canister_id)
+            .active_steward
+            .as_ref()
+            .and_then(|steward| steward.principal),
+        Some(principal)
+    );
+    assert_eq!(
+        get_steward_status(&pic, canister_id).next_nonce,
+        1,
+        "ingress execution must not consume EVM nonce"
+    );
+
+    let attacker = Principal::self_authenticating(b"ii-attacker");
+    let rejected = steward_execute_ingress(&pic, canister_id, attacker, StewardCommand::Noop)
+        .expect_err("unauthorized ingress principal must be rejected");
+    assert!(rejected.contains("caller principal does not match active steward principal"));
 }
 
 #[test]

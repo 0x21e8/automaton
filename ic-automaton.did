@@ -168,6 +168,7 @@ type InferenceConfigView = record {
   openrouter_has_api_key : bool;
   provider : InferenceProvider;
   openrouter_proxy_worker_base_url : opt text;
+  openrouter_reasoning_level : OpenRouterReasoningLevel;
   openrouter_proxy_trusted_callback_principal : opt text;
   openrouter_base_url : text;
 };
@@ -251,6 +252,7 @@ type OpenRouterProxyWorkerConfig = record {
   trusted_callback_principal : opt principal;
   worker_base_url : text;
 };
+type OpenRouterReasoningLevel = variant { Low; High; Medium; Default };
 type OutboxMessage = record {
   id : text;
   seq : nat64;
@@ -456,6 +458,7 @@ type StewardCommand = variant {
     reason : opt text;
   };
   DeriveAutomatonEvmAddress;
+  SetOpenrouterReasoningLevel : record { level : OpenRouterReasoningLevel };
   SetSchedulerEnabled : record { enabled : bool };
   SetEvmRpcUrl : record { url : text };
   SetOpenrouterBaseUrl : record { base_url : text };
@@ -472,8 +475,10 @@ type StewardCommand = variant {
   SetEvmChainId : record { chain_id : nat64 };
   SetWelcomeMessage : record { message : text };
   UpdateSoul : record { new_soul : text };
+  SetPrincipal : record { "principal" : opt principal };
 };
 type StewardState = record {
+  "principal" : opt principal;
   last_used_at_ns : opt nat64;
   enabled : bool;
   chain_id : nat64;
@@ -875,6 +880,8 @@ service : (InitArgs) -> {
   set_openrouter_api_key : (opt text) -> (text);
   // Updates the OpenRouter-compatible base URL used for inference HTTP calls (controller only).
   set_openrouter_base_url : (text) -> (Result_2);
+  // Sets the OpenRouter reasoning effort level for models that support it (controller only).
+  set_openrouter_reasoning_level : (OpenRouterReasoningLevel) -> (text);
   // Replaces the conversation-retention policy (controller only).
   set_retention_config : (RetentionConfig) -> (Result_10);
   // Updates the scheduler timer base tick interval in seconds (controller only).
@@ -904,6 +911,7 @@ service : (InitArgs) -> {
   // An empty string clears the custom message and restores the default.
   set_welcome_message : (text) -> (Result_2);
   steward_execute : (StewardCommand, EvmStewardProof) -> (Result_2);
+  steward_execute_ingress : (StewardCommand) -> (Result_2);
   // Callback endpoint used by the OpenRouter proxy worker to submit async results.
   submit_inference_result : (SubmitInferenceResultArgs) -> (Result_2);
   // Replaces the content of a prompt layer identified by `layer_id` (controller only).

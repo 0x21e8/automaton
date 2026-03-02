@@ -14,8 +14,8 @@ use crate::domain::types::{
     EvmRouteStateView, InboxMessage, InboxMessageSource, InboxMessageStatus, InboxStats,
     InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
     InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup,
-    ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats,
-    PendingInferenceProxyJob, PromptLayer, PromptLayerView, RetentionConfig,
+    ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
+    OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, RetentionConfig,
     RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease,
     SchedulerRuntime, SessionSummary, SkillRecord, StewardNonceState, StewardState,
     StewardStatusView, StorageGrowthMetrics, StoragePressureLevel, StrategyKillSwitchState,
@@ -65,10 +65,12 @@ const SCHEDULER_BASE_TICK_SECS_KEY: &str = "timing.scheduler_base_tick_secs";
 const WELCOME_MESSAGE_KEY: &str = "ui.welcome_message";
 const INFERENCE_PROXY_PENDING_JOBS_KEY: &str = "inference.proxy.pending_jobs";
 const INFERENCE_PROXY_CALLBACK_RESULTS_KEY: &str = "inference.proxy.callback_results";
+const INFERENCE_PROXY_COMPLETED_CALLBACK_JOBS_KEY: &str = "inference.proxy.completed_callback_jobs";
 const INFERENCE_PROXY_METRICS_KEY: &str = "inference.proxy.metrics";
 /// Maximum character count accepted by `set_welcome_message`.
 pub const MAX_WELCOME_MESSAGE_CHARS: usize = 2_000;
 pub const INFERENCE_PROXY_PENDING_JOB_TTL_SECS: u64 = 15 * 60;
+const MAX_COMPLETED_INFERENCE_PROXY_CALLBACK_JOBS: usize = 2_048;
 
 // ── Capacity constants ───────────────────────────────────────────────────────
 
@@ -1039,6 +1041,12 @@ pub fn get_task_config(kind: &TaskKind) -> Option<TaskScheduleConfig> {
     sqlite::read_task_config(kind).ok().flatten()
 }
 
+pub fn agent_turn_priority() -> u8 {
+    get_task_config(&TaskKind::AgentTurn)
+        .map(|config| config.priority)
+        .unwrap_or(TaskKind::AgentTurn.default_priority())
+}
+
 /// Updates the recurrence interval for `kind` and advances `next_due_ns`
 /// by the new interval from `now`.  Returns an error if `interval_secs` is 0.
 pub fn set_task_interval_secs(kind: &TaskKind, interval_secs: u64) -> Result<(), String> {
@@ -1486,6 +1494,9 @@ fn normalize_steward_state(mut steward: StewardState) -> Result<StewardState, St
         return Err("steward chain id must be greater than 0".to_string());
     }
     steward.address = normalize_evm_hex_address(&steward.address, "steward address")?;
+    if steward.principal == Some(Principal::anonymous()) {
+        return Err("steward principal cannot be anonymous".to_string());
+    }
     Ok(steward)
 }
 
@@ -1508,15 +1519,39 @@ pub fn set_active_steward(steward: Option<StewardState>) -> Result<Option<Stewar
 pub fn set_active_steward_with_nonce_reset_on_rotation(
     steward: StewardState,
 ) -> Result<StewardState, String> {
-    let normalized = normalize_steward_state(steward)?;
+    let mut normalized = normalize_steward_state(steward)?;
     let mut snapshot = runtime_snapshot();
     if steward_identity_rotated(snapshot.active_steward.as_ref(), &normalized) {
         snapshot.steward_nonce = StewardNonceState::default();
+        normalized.principal = None;
+    } else if normalized.principal.is_none() {
+        normalized.principal = snapshot
+            .active_steward
+            .as_ref()
+            .and_then(|steward| steward.principal);
     }
     snapshot.active_steward = Some(normalized.clone());
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
     Ok(normalized)
+}
+
+pub fn set_active_steward_principal(
+    principal: Option<Principal>,
+) -> Result<Option<Principal>, String> {
+    if principal == Some(Principal::anonymous()) {
+        return Err("steward principal cannot be anonymous".to_string());
+    }
+    let mut snapshot = runtime_snapshot();
+    let active = snapshot
+        .active_steward
+        .as_mut()
+        .ok_or_else(|| "no active steward configured".to_string())?;
+    active.principal = principal;
+    snapshot.last_transition_at_ns = now_ns();
+    let out = active.principal;
+    save_runtime_snapshot(&snapshot);
+    Ok(out)
 }
 
 pub fn steward_nonce_state() -> StewardNonceState {
@@ -1722,6 +1757,15 @@ pub fn set_openrouter_api_key(api_key: Option<String>) {
     save_runtime_snapshot(&snapshot);
 }
 
+pub fn set_openrouter_reasoning_level(level: OpenRouterReasoningLevel) -> OpenRouterReasoningLevel {
+    let mut snapshot = runtime_snapshot();
+    snapshot.openrouter_reasoning_level = level;
+    snapshot.last_transition_at_ns = now_ns();
+    let out = snapshot.openrouter_reasoning_level;
+    save_runtime_snapshot(&snapshot);
+    out
+}
+
 pub fn set_openrouter_proxy_config(
     config: OpenRouterProxyWorkerConfig,
 ) -> Result<OpenRouterProxyWorkerConfig, String> {
@@ -1821,6 +1865,36 @@ fn save_inference_proxy_callback_results(results: &BTreeMap<String, InferencePro
     if let Ok(raw) = serde_json::to_string(results) {
         let _ = sqlite::set_runtime_scalar(INFERENCE_PROXY_CALLBACK_RESULTS_KEY, &raw);
     }
+}
+
+fn load_completed_inference_proxy_callback_jobs() -> BTreeMap<String, u64> {
+    sqlite::get_runtime_scalar(INFERENCE_PROXY_COMPLETED_CALLBACK_JOBS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<BTreeMap<String, u64>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_completed_inference_proxy_callback_jobs(completed_jobs: &BTreeMap<String, u64>) {
+    if let Ok(raw) = serde_json::to_string(completed_jobs) {
+        let _ = sqlite::set_runtime_scalar(INFERENCE_PROXY_COMPLETED_CALLBACK_JOBS_KEY, &raw);
+    }
+}
+
+fn remember_completed_inference_proxy_callback_job(job_id: &str, accepted_at_ns: u64) {
+    let mut completed_jobs = load_completed_inference_proxy_callback_jobs();
+    completed_jobs.insert(job_id.to_string(), accepted_at_ns);
+    while completed_jobs.len() > MAX_COMPLETED_INFERENCE_PROXY_CALLBACK_JOBS {
+        let Some(oldest_job_id) = completed_jobs
+            .iter()
+            .min_by_key(|(_, at_ns)| *at_ns)
+            .map(|(job_id, _)| job_id.clone())
+        else {
+            break;
+        };
+        completed_jobs.remove(&oldest_job_id);
+    }
+    save_completed_inference_proxy_callback_jobs(&completed_jobs);
 }
 
 fn load_inference_proxy_metrics() -> InferenceProxyRuntimeMetrics {
@@ -2041,9 +2115,21 @@ pub fn set_tool_records(turn_id: &str, tool_calls: &[ToolCallRecord]) {
     let _ = sqlite::replace_tool_calls(turn_id, &bounded_tool_calls);
 }
 
-/// Marks the current turn as complete.
-pub fn complete_turn(state: AgentState, error: Option<String>) {
+/// Marks `turn_id` as complete if it is still the active runtime turn.
+///
+/// This id guard prevents stale late-resume completions from overwriting a
+/// newer in-flight turn after recovery paths clear abandoned locks.
+pub fn complete_turn(turn_id: &str, state: AgentState, error: Option<String>) {
     let mut snapshot = runtime_snapshot();
+    if snapshot.last_turn_id.as_deref() != Some(turn_id) {
+        log!(
+            SchedulerStorageLogPriority::Warn,
+            "turn_complete_ignored turn_id={} last_turn_id={:?}",
+            turn_id,
+            snapshot.last_turn_id
+        );
+        return;
+    }
     snapshot.turn_in_flight = false;
     snapshot.state = state;
     snapshot.last_error = error;
@@ -3159,7 +3245,8 @@ pub fn apply_inference_proxy_callback(
     }
 
     let mut callback_results = load_inference_proxy_callback_results();
-    if callback_results.contains_key(&args.job_id) {
+    let completed_jobs = load_completed_inference_proxy_callback_jobs();
+    if callback_results.contains_key(&args.job_id) || completed_jobs.contains_key(&args.job_id) {
         update_inference_proxy_metrics(|metrics| {
             metrics.callback_duplicates = metrics.callback_duplicates.saturating_add(1);
         });
@@ -3167,9 +3254,12 @@ pub fn apply_inference_proxy_callback(
     }
 
     let mut pending_jobs = load_pending_inference_proxy_jobs();
-    let pending = pending_jobs
-        .remove(&args.job_id)
-        .ok_or_else(|| format!("unknown pending inference proxy job_id={}", args.job_id))?;
+    let Some(pending) = pending_jobs.remove(&args.job_id) else {
+        update_inference_proxy_metrics(|metrics| {
+            metrics.callback_duplicates = metrics.callback_duplicates.saturating_add(1);
+        });
+        return Ok(InferenceProxyCallbackApply::Duplicate);
+    };
     if pending.turn_id != args.turn_id {
         return Err(format!(
             "inference proxy callback turn_id mismatch job_id={} expected_turn_id={} received_turn_id={}",
@@ -3191,6 +3281,7 @@ pub fn apply_inference_proxy_callback(
     );
     save_pending_inference_proxy_jobs(&pending_jobs);
     save_inference_proxy_callback_results(&callback_results);
+    remember_completed_inference_proxy_callback_job(&pending.job_id, accepted_at_ns);
     update_inference_proxy_metrics(|metrics| {
         metrics.callback_accepted = metrics.callback_accepted.saturating_add(1);
     });
@@ -3556,6 +3647,45 @@ pub fn recover_stale_lease(now_ns: u64) {
             None,
         );
     }
+}
+
+/// Clears a stuck `turn_in_flight` lock when there is no active mutating lease.
+///
+/// Returns `true` when recovery was applied.
+pub fn recover_orphaned_turn_lock(now_ns: u64) -> bool {
+    let runtime = scheduler_runtime();
+    if runtime
+        .active_mutating_lease
+        .as_ref()
+        .is_some_and(|lease| lease.expires_at_ns > now_ns)
+    {
+        return false;
+    }
+
+    let mut snapshot = runtime_snapshot();
+    if !snapshot.turn_in_flight {
+        return false;
+    }
+
+    let turn_id = snapshot
+        .last_turn_id
+        .clone()
+        .unwrap_or_else(|| "turn-unknown".to_string());
+    let had_stale_lease = runtime.active_mutating_lease.is_some();
+
+    snapshot.turn_in_flight = false;
+    snapshot.last_error = Some(format!(
+        "recovered orphaned turn lock for {turn_id}: no active mutating lease"
+    ));
+    snapshot.last_transition_at_ns = now_ns;
+    save_runtime_snapshot(&snapshot);
+    log!(
+        SchedulerStorageLogPriority::Warn,
+        "scheduler_recover_orphan_turn_lock turn_id={} stale_lease_record_present={}",
+        turn_id,
+        had_stale_lease
+    );
+    true
 }
 
 pub fn list_recent_jobs(limit: usize) -> Vec<ScheduledJob> {
@@ -4065,6 +4195,7 @@ mod tests {
             address: " 0xABCDEFabcdefABCDEFabcdefABCDEFabcdefABCD ".to_string(),
             enabled: true,
             last_used_at_ns: Some(42),
+            principal: None,
         }))
         .expect("active steward should store")
         .expect("active steward should exist");
@@ -4088,6 +4219,7 @@ mod tests {
             address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
             enabled: true,
             last_used_at_ns: None,
+            principal: None,
         }))
         .expect_err("chain id 0 must be rejected");
         assert!(invalid_chain.contains("steward chain id"));
@@ -4097,6 +4229,7 @@ mod tests {
             address: "not-an-address".to_string(),
             enabled: true,
             last_used_at_ns: None,
+            principal: None,
         }))
         .expect_err("invalid address must be rejected");
         assert!(invalid_address.contains("steward address"));
@@ -4123,6 +4256,7 @@ mod tests {
             address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
             enabled: true,
             last_used_at_ns: Some(10),
+            principal: None,
         }))
         .expect("initial steward should persist");
         let _ = set_steward_nonce_state(crate::domain::types::StewardNonceState { next_nonce: 9 });
@@ -4133,6 +4267,7 @@ mod tests {
                 address: "0x1234512345123451234512345123451234512345".to_string(),
                 enabled: false,
                 last_used_at_ns: None,
+                principal: None,
             })
             .expect("rotated steward should persist");
 
@@ -4154,6 +4289,7 @@ mod tests {
             address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
             enabled: true,
             last_used_at_ns: Some(10),
+            principal: None,
         }))
         .expect("initial steward should persist");
         let _ = set_steward_nonce_state(crate::domain::types::StewardNonceState { next_nonce: 33 });
@@ -4164,6 +4300,7 @@ mod tests {
                 address: " 0xABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCD ".to_string(),
                 enabled: false,
                 last_used_at_ns: None,
+                principal: None,
             })
             .expect("steward update should persist");
 
@@ -4192,6 +4329,18 @@ mod tests {
         })
         .expect_err("missing principal must be rejected");
         assert!(missing_principal.contains("trusted_callback_principal"));
+    }
+
+    #[test]
+    fn set_openrouter_reasoning_level_persists_in_runtime_snapshot() {
+        init_storage();
+        let stored = set_openrouter_reasoning_level(OpenRouterReasoningLevel::Medium);
+        assert_eq!(stored, OpenRouterReasoningLevel::Medium);
+        let snapshot = runtime_snapshot();
+        assert_eq!(
+            snapshot.openrouter_reasoning_level,
+            OpenRouterReasoningLevel::Medium
+        );
     }
 
     #[test]
@@ -4260,6 +4409,59 @@ mod tests {
         let status = inference_proxy_status_view();
         assert_eq!(status.pending_jobs, 0);
         assert_eq!(status.completed_jobs, 1);
+        assert_eq!(status.callback_accepted, 1);
+        assert_eq!(status.callback_duplicates, 1);
+    }
+
+    #[test]
+    fn apply_inference_proxy_callback_is_idempotent_after_result_is_consumed() {
+        init_storage();
+        upsert_pending_inference_proxy_job(PendingInferenceProxyJob {
+            job_id: "job-consumed".to_string(),
+            turn_id: "turn-consumed".to_string(),
+            submitted_at_ns: 10,
+            model: "openai/gpt-4o-mini".to_string(),
+        })
+        .expect("pending job should persist");
+
+        let accepted = apply_inference_proxy_callback(
+            SubmitInferenceResultArgs {
+                job_id: "job-consumed".to_string(),
+                turn_id: "turn-consumed".to_string(),
+                completed_at_ns: 20,
+                result: Some(crate::domain::types::InferenceProxyResultPayload {
+                    explanation: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                }),
+                error: None,
+            },
+            "w36hm-eqaaa-aaaal-qr76a-cai".to_string(),
+            30,
+        )
+        .expect("first callback should be accepted");
+        assert_eq!(accepted, InferenceProxyCallbackApply::Accepted);
+
+        let popped = pop_next_inference_proxy_callback_result()
+            .expect("accepted callback should be available for resume");
+        assert_eq!(popped.job_id, "job-consumed");
+
+        let duplicate_after_pop = apply_inference_proxy_callback(
+            SubmitInferenceResultArgs {
+                job_id: "job-consumed".to_string(),
+                turn_id: "turn-consumed".to_string(),
+                completed_at_ns: 21,
+                result: None,
+                error: Some("ignored".to_string()),
+            },
+            "w36hm-eqaaa-aaaal-qr76a-cai".to_string(),
+            31,
+        )
+        .expect("duplicate callback should still be idempotent after pop");
+        assert_eq!(duplicate_after_pop, InferenceProxyCallbackApply::Duplicate);
+
+        let status = inference_proxy_status_view();
+        assert_eq!(status.pending_jobs, 0);
+        assert_eq!(status.completed_jobs, 0);
         assert_eq!(status.callback_accepted, 1);
         assert_eq!(status.callback_duplicates, 1);
     }
@@ -4351,5 +4553,81 @@ mod tests {
 
         let status = inference_proxy_status_view();
         assert_eq!(status.expired_jobs, 1);
+    }
+
+    #[test]
+    fn complete_turn_ignores_stale_turn_completion_attempts() {
+        init_storage();
+        let current = increment_turn_counter();
+        let current_turn_id = current
+            .last_turn_id
+            .clone()
+            .expect("turn id should be assigned after increment");
+
+        complete_turn(
+            "turn-stale",
+            AgentState::Sleeping,
+            Some("stale completion".to_string()),
+        );
+        let snapshot_after_stale = runtime_snapshot();
+        assert!(
+            snapshot_after_stale.turn_in_flight,
+            "stale completion must not clear active turn lock"
+        );
+        assert_eq!(
+            snapshot_after_stale.last_turn_id.as_deref(),
+            Some(current_turn_id.as_str())
+        );
+
+        complete_turn(&current_turn_id, AgentState::Sleeping, None);
+        assert!(
+            !runtime_snapshot().turn_in_flight,
+            "active completion should still clear turn lock"
+        );
+    }
+
+    #[test]
+    fn recover_orphaned_turn_lock_clears_when_no_active_mutating_lease_exists() {
+        init_storage();
+        let turn = increment_turn_counter();
+        let now_ns = turn.last_transition_at_ns.saturating_add(1);
+
+        let recovered = recover_orphaned_turn_lock(now_ns);
+        assert!(recovered, "orphaned turn lock should be recovered");
+
+        let snapshot = runtime_snapshot();
+        assert!(!snapshot.turn_in_flight);
+        assert!(
+            snapshot
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("recovered orphaned turn lock"),
+            "recovery reason should be persisted for diagnostics"
+        );
+    }
+
+    #[test]
+    fn recover_orphaned_turn_lock_skips_while_active_mutating_lease_is_held() {
+        init_storage();
+        let _ = increment_turn_counter();
+        let job_id = enqueue_job_if_absent(
+            TaskKind::AgentTurn,
+            TaskLane::Mutating,
+            "AgentTurn:recover-orphan-lock-test".to_string(),
+            0,
+            0,
+        )
+        .expect("agent turn job should enqueue");
+        let popped = pop_next_pending_job(TaskLane::Mutating, 0).expect("job should pop");
+        assert_eq!(popped.id, job_id);
+        acquire_mutating_lease(&job_id, 100, 10_000).expect("lease should acquire");
+
+        let recovered = recover_orphaned_turn_lock(200);
+        assert!(!recovered, "active lease should block orphan-lock recovery");
+        assert!(
+            runtime_snapshot().turn_in_flight,
+            "turn lock must remain while lease is active"
+        );
     }
 }

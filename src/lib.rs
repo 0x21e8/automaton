@@ -34,13 +34,14 @@ use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, AutonomySuppressionConfig, ConversationLog,
     ConversationSummary, EvmRouteStateView, EvmStewardProof, InboxMessage, InboxStats,
     InferenceConfigView, InferenceProvider, InferenceProxyStatusView, MemoryFact, MemoryRollup,
-    ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OutboxMessage, OutboxStats, PromptLayer,
-    PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime, RuntimeView, ScheduledJob,
-    SchedulerRuntime, SessionSummary, SkillRecord, StewardCommand, StewardState, StewardStatusView,
-    StrategyKillSwitchState, StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey,
-    SubmitInferenceResultArgs, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
-    TemplateActivationState, TemplateRevocationState, TemplateStatus, TemplateVersion,
-    ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
+    OutboxStats, PromptLayer, PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime,
+    RuntimeView, ScheduledJob, SchedulerRuntime, SessionSummary, SkillRecord, StewardCommand,
+    StewardState, StewardStatusView, StrategyKillSwitchState, StrategyOutcomeStats,
+    StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, TaskKind, TaskScheduleConfig,
+    TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState, TemplateStatus,
+    TemplateVersion, ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView,
+    WalletBalanceTelemetryView,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
@@ -54,11 +55,14 @@ use ic_cdk_timers::{clear_timer, set_timer_interval_serial, TimerId};
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
 use serde::Deserialize;
 use sha3::{Digest, Keccak256};
+#[cfg(all(not(target_arch = "wasm32"), test))]
+use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 
 // ── Initialization ──────────────────────────────────────────────────────────
 const WALLET_SYNC_RESPONSE_BYTES_FLOOR: u64 = 1_024;
+const STEWARD_DIRECT_IMMEDIATE_TURN_DEDUPE_KEY: &str = "AgentTurn:steward-direct-immediate";
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum InferenceProxyCallbackLogPriority {
@@ -106,6 +110,11 @@ impl GetLogFilter for StewardAuthLogPriority {
 thread_local! {
     static SCHEDULER_TIMER_ID: RefCell<Option<TimerId>> = const { RefCell::new(None) };
     static SCHEDULER_WAKE_IN_FLIGHT: RefCell<bool> = const { RefCell::new(false) };
+}
+
+#[cfg(all(not(target_arch = "wasm32"), test))]
+thread_local! {
+    static TEST_STEWARD_INGRESS_CALLER: RefCell<Option<Principal>> = const { RefCell::new(None) };
 }
 
 /// Arguments supplied once at canister creation via `dfx deploy --argument`.
@@ -168,6 +177,7 @@ fn steward_command_label(command: &StewardCommand) -> &'static str {
         StewardCommand::SetInferenceModel { .. } => "set_inference_model",
         StewardCommand::SetOpenrouterBaseUrl { .. } => "set_openrouter_base_url",
         StewardCommand::SetOpenrouterApiKey { .. } => "set_openrouter_api_key",
+        StewardCommand::SetOpenrouterReasoningLevel { .. } => "set_openrouter_reasoning_level",
         StewardCommand::SetInferenceProxyConfig { .. } => "set_inference_proxy_config",
         StewardCommand::SetWelcomeMessage { .. } => "set_welcome_message",
         StewardCommand::SetEvmRpcUrl { .. } => "set_evm_rpc_url",
@@ -175,6 +185,7 @@ fn steward_command_label(command: &StewardCommand) -> &'static str {
         StewardCommand::SetEvmRpcMaxResponseBytes { .. } => "set_evm_rpc_max_response_bytes",
         StewardCommand::SetInboxContractAddress { .. } => "set_inbox_contract_address",
         StewardCommand::SendStewardMessage { .. } => "send_steward_message",
+        StewardCommand::SetPrincipal { .. } => "set_principal",
         StewardCommand::UpdateSteward { .. } => "update_steward",
         StewardCommand::SetEvmChainId { .. } => "set_evm_chain_id",
         StewardCommand::SetEvmConfirmationDepth { .. } => "set_evm_confirmation_depth",
@@ -251,6 +262,35 @@ fn inference_proxy_callback_caller_principal() -> String {
     return "2vxsx-fae".to_string();
 }
 
+fn steward_ingress_caller() -> Principal {
+    #[cfg(target_arch = "wasm32")]
+    return ic_cdk::api::msg_caller();
+
+    #[cfg(all(not(target_arch = "wasm32"), test))]
+    return TEST_STEWARD_INGRESS_CALLER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .copied()
+            .unwrap_or_else(Principal::anonymous)
+    });
+
+    #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+    return Principal::anonymous();
+}
+
+#[cfg(test)]
+fn set_steward_ingress_caller_for_tests(caller: Option<Principal>) {
+    #[cfg(all(not(target_arch = "wasm32"), test))]
+    TEST_STEWARD_INGRESS_CALLER.with(|slot| {
+        *slot.borrow_mut() = caller;
+    });
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = caller;
+    }
+}
+
 fn steward_proof_expected_canister_id() -> String {
     #[cfg(target_arch = "wasm32")]
     return ic_cdk::api::id().to_text();
@@ -259,7 +299,7 @@ fn steward_proof_expected_canister_id() -> String {
     return "rrkah-fqaaa-aaaaa-aaaaq-cai".to_string();
 }
 
-fn verify_steward_proof_for_command_hash(
+async fn verify_steward_proof_for_command_hash(
     command_hash: &str,
     proof: &EvmStewardProof,
 ) -> Result<crate::features::evm::VerifiedEvmStewardProof, String> {
@@ -270,8 +310,24 @@ fn verify_steward_proof_for_command_hash(
         expected_command_hash: command_hash.to_string(),
         now_ns: current_time_ns(),
     };
+    let rpc_result =
+        crate::features::evm::HttpEvmRpcClient::from_snapshot(&stable::runtime_snapshot());
+    let rpc_client = match &rpc_result {
+        Ok(client) => Some(client),
+        Err(reason) => {
+            log!(
+                StewardAuthLogPriority::AuthWarn,
+                "steward_proof_eip1271_unavailable reason={reason}"
+            );
+            None
+        }
+    };
 
-    match crate::features::evm::verify_evm_steward_proof(proof, &context) {
+    match crate::features::evm::verify_evm_steward_proof_with_eip1271_fallback(
+        proof, &context, rpc_client,
+    )
+    .await
+    {
         Ok(verified) => {
             log!(
                 StewardAuthLogPriority::AuthInfo,
@@ -329,6 +385,36 @@ fn consume_steward_nonce_and_record_usage(
     Ok(())
 }
 
+fn authorize_and_record_steward_ingress_usage(caller: Principal) -> Result<StewardState, String> {
+    if caller == Principal::anonymous() {
+        return Err("anonymous caller cannot execute steward ingress command".to_string());
+    }
+    let mut snapshot = stable::runtime_snapshot();
+    let active_steward = snapshot
+        .active_steward
+        .as_mut()
+        .ok_or_else(|| "no active steward configured".to_string())?;
+    if !active_steward.enabled {
+        return Err("active steward is disabled".to_string());
+    }
+    let expected_principal = active_steward
+        .principal
+        .as_ref()
+        .copied()
+        .ok_or_else(|| "active steward principal is not configured".to_string())?;
+    if caller != expected_principal {
+        return Err(format!(
+            "caller principal does not match active steward principal: caller={} expected={}",
+            caller.to_text(),
+            expected_principal.to_text(),
+        ));
+    }
+    active_steward.last_used_at_ns = Some(current_time_ns());
+    let out = active_steward.clone();
+    stable::save_runtime_snapshot(&snapshot);
+    Ok(out)
+}
+
 fn update_active_steward_and_maybe_reset_nonce(
     chain_id: u64,
     address: String,
@@ -340,6 +426,7 @@ fn update_active_steward_and_maybe_reset_nonce(
         address,
         enabled,
         last_used_at_ns: None,
+        principal: None,
     };
     let stored = stable::set_active_steward_with_nonce_reset_on_rotation(requested)?;
     let nonce_reset = previous.as_ref().is_none_or(|current| {
@@ -536,6 +623,15 @@ fn set_openrouter_api_key(api_key: Option<String>) -> String {
     "openrouter_api_key_updated".to_string()
 }
 
+/// Sets the OpenRouter reasoning effort level for models that support it (controller only).
+#[ic_cdk::update]
+fn set_openrouter_reasoning_level(level: OpenRouterReasoningLevel) -> String {
+    ensure_controller_or_trap();
+    let stored = stable::set_openrouter_reasoning_level(level);
+    crate::http::init_certification();
+    format!("openrouter_reasoning_level={stored:?}")
+}
+
 /// Stores OpenRouter proxy worker config used by async inference callbacks (controller only).
 #[ic_cdk::update]
 fn set_inference_proxy_config(
@@ -670,6 +766,11 @@ async fn dispatch_steward_command(
             crate::http::init_certification();
             Ok("openrouter_api_key_updated".to_string())
         }
+        StewardCommand::SetOpenrouterReasoningLevel { level } => {
+            let stored = stable::set_openrouter_reasoning_level(level);
+            crate::http::init_certification();
+            Ok(format!("openrouter_reasoning_level={stored:?}"))
+        }
         StewardCommand::SetInferenceProxyConfig { config } => {
             let stored = stable::set_openrouter_proxy_config(config)?;
             crate::http::init_certification();
@@ -707,7 +808,29 @@ async fn dispatch_steward_command(
         }
         StewardCommand::SendStewardMessage { sender, message } => {
             let inbox_id = crate::scheduler::ingest_steward_direct_message(sender, message)?;
-            Ok(format!("steward_direct_message_ingested id={inbox_id}"))
+            let pending_proxy_jobs = stable::has_pending_inference_proxy_jobs();
+            let immediate_job_id = if pending_proxy_jobs {
+                None
+            } else {
+                enqueue_immediate_agent_turn_if_absent(
+                    STEWARD_DIRECT_IMMEDIATE_TURN_DEDUPE_KEY.to_string(),
+                    "steward_direct_message_resume",
+                )
+            };
+            Ok(format!(
+                "steward_direct_message_ingested id={inbox_id} immediate_turn_enqueued={} immediate_job_id={}",
+                immediate_job_id.is_some(),
+                immediate_job_id.unwrap_or_default()
+            ))
+        }
+        StewardCommand::SetPrincipal { principal } => {
+            let stored = stable::set_active_steward_principal(principal)?;
+            Ok(format!(
+                "steward_principal={}",
+                stored
+                    .map(|entry| entry.to_text())
+                    .unwrap_or_else(|| "none".to_string())
+            ))
         }
         StewardCommand::UpdateSteward {
             chain_id,
@@ -917,7 +1040,7 @@ pub(crate) async fn steward_execute(
 ) -> Result<String, String> {
     let command_label = steward_command_label(&command);
     let command_hash = steward_command_hash(&command)?;
-    let verified = verify_steward_proof_for_command_hash(&command_hash, &proof)?;
+    let verified = verify_steward_proof_for_command_hash(&command_hash, &proof).await?;
     consume_steward_nonce_and_record_usage(&verified).map_err(|error| {
         log!(
             StewardAuthLogPriority::AuthWarn,
@@ -954,6 +1077,51 @@ pub(crate) async fn steward_execute(
         verified.chain_id,
         verified.address,
         verified.nonce,
+        result,
+    );
+    Ok(result)
+}
+
+#[ic_cdk::update]
+pub(crate) async fn steward_execute_ingress(command: StewardCommand) -> Result<String, String> {
+    let command_label = steward_command_label(&command);
+    let caller = steward_ingress_caller();
+    let caller_text = caller.to_text();
+    let active_steward = authorize_and_record_steward_ingress_usage(caller).map_err(|error| {
+        log!(
+            StewardAuthLogPriority::AuthWarn,
+            "steward_execute_ingress_rejected command={} caller={} reason={}",
+            command_label,
+            caller_text,
+            error,
+        );
+        error
+    })?;
+    let steward_actor = format!(
+        "steward:{}:{}:principal:{}",
+        active_steward.chain_id, active_steward.address, caller_text
+    );
+    let result = dispatch_steward_command(command, &steward_actor)
+        .await
+        .map_err(|error: String| {
+            log!(
+                StewardAuthLogPriority::AuthWarn,
+                "steward_execute_ingress_rejected command={} caller={} chain_id={} address={} reason={}",
+                command_label,
+                caller_text,
+                active_steward.chain_id,
+                active_steward.address,
+                error,
+            );
+            error
+        })?;
+    log!(
+        StewardAuthLogPriority::AuthInfo,
+        "steward_execute_ingress_applied command={} caller={} chain_id={} address={} result={}",
+        command_label,
+        caller_text,
+        active_steward.chain_id,
+        active_steward.address,
         result,
     );
     Ok(result)
@@ -1280,19 +1448,10 @@ fn submit_inference_result(args: SubmitInferenceResultArgs) -> Result<String, St
     crate::http::init_certification();
     match applied {
         crate::domain::types::InferenceProxyCallbackApply::Accepted => {
-            let agent_turn_priority = stable::get_task_config(&TaskKind::AgentTurn)
-                .map(|config| config.priority)
-                .unwrap_or(TaskKind::AgentTurn.default_priority());
-            let enqueued = stable::enqueue_job_if_absent(
-                TaskKind::AgentTurn,
-                TaskLane::Mutating,
+            let enqueued = enqueue_immediate_agent_turn_if_absent(
                 format!("AgentTurn:inference-proxy-resume:{callback_job_id}"),
-                current_time_ns(),
-                agent_turn_priority,
+                "inference_proxy_callback_resume",
             );
-            if enqueued.is_some() {
-                schedule_immediate_scheduler_tick("inference_proxy_callback_resume");
-            }
             log!(
                 InferenceProxyCallbackLogPriority::Info,
                 "inference_proxy_callback_accepted caller={} job_id={} turn_id={} resume_job_enqueued={} resume_job_id={}",
@@ -1315,6 +1474,14 @@ fn submit_inference_result(args: SubmitInferenceResultArgs) -> Result<String, St
             Ok("inference_proxy_callback_duplicate".to_string())
         }
     }
+}
+
+fn enqueue_immediate_agent_turn_if_absent(dedupe_key: String, wake_reason: &str) -> Option<String> {
+    let enqueued = crate::scheduler::enqueue_immediate_agent_turn_job_if_absent(dedupe_key);
+    if enqueued.is_some() {
+        schedule_immediate_scheduler_tick(wake_reason);
+    }
+    enqueued
 }
 
 fn schedule_immediate_scheduler_tick(reason: &str) {
@@ -1609,8 +1776,8 @@ fn http_request(request: HttpRequest) -> HttpResponse {
 /// Called automatically by the IC boundary nodes when `http_request` signals
 /// an upgrade.
 #[ic_cdk::update]
-fn http_request_update(request: HttpUpdateRequest) -> HttpUpdateResponse {
-    crate::http::handle_http_request_update(request)
+async fn http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateResponse<'static> {
+    crate::http::handle_http_request_update(request).await
 }
 
 /// Registers the recurring scheduler timer.  Called from both `init` and
@@ -1712,9 +1879,30 @@ mod tests {
         let canister_id = steward_proof_expected_canister_id();
         let chain_id = 8453;
         let normalized_address = steward_address_from_key(signing_key);
+        build_steward_proof_for_address(
+            command,
+            &normalized_address,
+            signing_key,
+            nonce,
+            expires_at_ns,
+            &canister_id,
+            chain_id,
+        )
+    }
+
+    fn build_steward_proof_for_address(
+        command: &StewardCommand,
+        address: &str,
+        signing_key: &k256::ecdsa::SigningKey,
+        nonce: u64,
+        expires_at_ns: u64,
+        canister_id: &str,
+        chain_id: u64,
+    ) -> EvmStewardProof {
+        let normalized_address = address.trim().to_ascii_lowercase();
         let command_hash = steward_command_hash(command).expect("command hash should encode");
         let payload = canonical_steward_signing_payload(
-            &canister_id,
+            canister_id,
             chain_id,
             &normalized_address,
             &command_hash,
@@ -1722,7 +1910,7 @@ mod tests {
             expires_at_ns,
         );
         EvmStewardProof {
-            canister_id,
+            canister_id: canister_id.to_string(),
             chain_id,
             address: normalized_address.to_ascii_uppercase(),
             command_hash,
@@ -1737,6 +1925,16 @@ mod tests {
         proof: EvmStewardProof,
     ) -> Result<String, String> {
         futures::executor::block_on(steward_execute(command, proof))
+    }
+
+    fn execute_steward_ingress_command(
+        caller: Option<Principal>,
+        command: StewardCommand,
+    ) -> Result<String, String> {
+        set_steward_ingress_caller_for_tests(caller);
+        let result = futures::executor::block_on(steward_execute_ingress(command));
+        set_steward_ingress_caller_for_tests(None);
+        result
     }
 
     #[test]
@@ -1811,6 +2009,10 @@ mod tests {
             ("set_inference_model", "set_inference_model"),
             ("set_openrouter_base_url", "set_openrouter_base_url"),
             ("set_openrouter_api_key", "set_openrouter_api_key"),
+            (
+                "set_openrouter_reasoning_level",
+                "set_openrouter_reasoning_level",
+            ),
             ("set_inference_proxy_config", "set_inference_proxy_config"),
             ("set_welcome_message", "set_welcome_message"),
             ("set_evm_rpc_url", "set_evm_rpc_url"),
@@ -2158,6 +2360,134 @@ mod tests {
     }
 
     #[test]
+    fn steward_execute_ingress_accepts_authorized_principal_without_nonce_progress() {
+        stable::init_storage();
+        let key = steward_test_signing_key();
+        let address = steward_address_from_key(&key);
+        set_steward_admin(8453, address, true).expect("active steward should store");
+        let linked_principal =
+            Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai").expect("principal should parse");
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 11 });
+
+        let link_command = StewardCommand::SetPrincipal {
+            principal: Some(linked_principal),
+        };
+        let link_proof =
+            build_steward_proof(&link_command, &key, 11, current_time_ns() + 60_000_000_000);
+        let link_result = execute_steward_command(link_command, link_proof)
+            .expect("set principal should execute");
+        assert_eq!(link_result, "steward_principal=w36hm-eqaaa-aaaal-qr76a-cai");
+        assert_eq!(get_steward_status().next_nonce, 12);
+
+        stable::set_loop_enabled(false);
+        let ingress_result = execute_steward_ingress_command(
+            Some(linked_principal),
+            StewardCommand::SetLoopEnabled { enabled: true },
+        )
+        .expect("authorized ingress principal should execute");
+        assert_eq!(ingress_result, "loop_enabled=true");
+        assert_eq!(get_steward_status().next_nonce, 12);
+        assert!(stable::runtime_snapshot().loop_enabled);
+    }
+
+    #[test]
+    fn steward_execute_ingress_rejects_non_matching_principal() {
+        stable::init_storage();
+        let key = steward_test_signing_key();
+        let address = steward_address_from_key(&key);
+        set_steward_admin(8453, address, true).expect("active steward should store");
+        let linked_principal =
+            Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai").expect("principal should parse");
+        let attacker_principal = Principal::self_authenticating(b"attacker-principal");
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 0 });
+        let link_command = StewardCommand::SetPrincipal {
+            principal: Some(linked_principal),
+        };
+        let link_proof =
+            build_steward_proof(&link_command, &key, 0, current_time_ns() + 60_000_000_000);
+        execute_steward_command(link_command, link_proof).expect("set principal should execute");
+
+        let error = execute_steward_ingress_command(Some(attacker_principal), StewardCommand::Noop)
+            .expect_err("non-matching principal must be rejected");
+        assert!(error.contains("caller principal does not match active steward principal"));
+    }
+
+    #[test]
+    fn steward_execute_ingress_update_steward_clears_principal_on_rotation() {
+        stable::init_storage();
+        let old_key = steward_test_signing_key();
+        let old_address = steward_address_from_key(&old_key);
+        set_steward_admin(8453, old_address, true).expect("active steward should store");
+        let linked_principal =
+            Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai").expect("principal should parse");
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 0 });
+        let link_command = StewardCommand::SetPrincipal {
+            principal: Some(linked_principal),
+        };
+        let link_proof = build_steward_proof(
+            &link_command,
+            &old_key,
+            0,
+            current_time_ns() + 60_000_000_000,
+        );
+        execute_steward_command(link_command, link_proof).expect("set principal should execute");
+
+        let new_key =
+            k256::ecdsa::SigningKey::from_slice(&[2u8; 32]).expect("test signing key should build");
+        let new_address = steward_address_from_key(&new_key);
+        let rotate_result = execute_steward_ingress_command(
+            Some(linked_principal),
+            StewardCommand::UpdateSteward {
+                chain_id: 8453,
+                address: new_address.clone(),
+                enabled: true,
+            },
+        )
+        .expect("authorized ingress principal should rotate steward");
+        assert_eq!(rotate_result, "steward_update_steward_executed");
+
+        let status = get_steward_status();
+        assert_eq!(status.next_nonce, 0);
+        let active = status
+            .active_steward
+            .expect("rotated steward should remain configured");
+        assert_eq!(active.address, new_address);
+        assert_eq!(active.principal, None);
+
+        let rejected =
+            execute_steward_ingress_command(Some(linked_principal), StewardCommand::Noop)
+                .expect_err("principal must be relinked after steward rotation");
+        assert!(rejected.contains("active steward principal is not configured"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn steward_execute_accepts_eip1271_contract_wallet_signature() {
+        stable::init_storage();
+        let key = steward_test_signing_key();
+        let contract_address = "0x8f61f9a23b6bad39a85623fff41cbee5b4dbee2c".to_string();
+        set_steward_admin(8453, contract_address.clone(), true)
+            .expect("active steward should store");
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 1 });
+
+        let command = StewardCommand::Noop;
+        let canister_id = steward_proof_expected_canister_id();
+        let proof = build_steward_proof_for_address(
+            &command,
+            &contract_address,
+            &key,
+            1,
+            current_time_ns() + 60_000_000_000,
+            &canister_id,
+            8453,
+        );
+        let result =
+            execute_steward_command(command, proof).expect("eip1271 fallback proof should execute");
+        assert_eq!(result, "steward_noop_executed");
+        assert_eq!(get_steward_status().next_nonce, 2);
+    }
+
+    #[test]
     fn steward_execute_send_steward_message_ingests_steward_direct_inbox_message() {
         stable::init_storage();
         let key = steward_test_signing_key();
@@ -2183,6 +2513,57 @@ mod tests {
         assert_eq!(inbox[0].source, InboxMessageSource::StewardDirect);
         assert_eq!(stable::inbox_stats().staged_count, 1);
         assert_eq!(get_steward_status().next_nonce, 3);
+    }
+
+    #[test]
+    fn steward_send_enqueues_immediate_agent_turn_when_proxy_callback_not_pending() {
+        stable::init_storage();
+        let key = steward_test_signing_key();
+        let address = steward_address_from_key(&key);
+        set_steward_admin(8453, address.clone(), true).expect("active steward should store");
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 0 });
+
+        let command = StewardCommand::SendStewardMessage {
+            sender: address,
+            message: "kick next turn now".to_string(),
+        };
+        let proof = build_steward_proof(&command, &key, 0, current_time_ns() + 60_000_000_000);
+        execute_steward_command(command, proof).expect("steward send should execute");
+
+        let agent_turn_runtime = stable::get_task_runtime(&TaskKind::AgentTurn);
+        assert!(
+            agent_turn_runtime.pending_job_id.is_some(),
+            "steward send should enqueue an immediate agent turn when no proxy callback is pending"
+        );
+    }
+
+    #[test]
+    fn steward_send_does_not_enqueue_immediate_turn_when_proxy_callback_is_pending() {
+        stable::init_storage();
+        let key = steward_test_signing_key();
+        let address = steward_address_from_key(&key);
+        set_steward_admin(8453, address.clone(), true).expect("active steward should store");
+        let _ = stable::set_steward_nonce_state(StewardNonceState { next_nonce: 0 });
+        stable::upsert_pending_inference_proxy_job(PendingInferenceProxyJob {
+            job_id: "pending-proxy-job".to_string(),
+            turn_id: "turn-pending".to_string(),
+            submitted_at_ns: current_time_ns(),
+            model: "openai/gpt-4o-mini".to_string(),
+        })
+        .expect("pending proxy job should persist");
+
+        let command = StewardCommand::SendStewardMessage {
+            sender: address,
+            message: "do not kick while callback pending".to_string(),
+        };
+        let proof = build_steward_proof(&command, &key, 0, current_time_ns() + 60_000_000_000);
+        execute_steward_command(command, proof).expect("steward send should execute");
+
+        let agent_turn_runtime = stable::get_task_runtime(&TaskKind::AgentTurn);
+        assert!(
+            agent_turn_runtime.pending_job_id.is_none(),
+            "steward send should not enqueue an immediate turn while proxy callback jobs are pending"
+        );
     }
 
     #[test]

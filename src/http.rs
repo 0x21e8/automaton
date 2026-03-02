@@ -27,7 +27,13 @@
 /// | POST   | `/api/conversation`           | update      |
 /// | POST   | `/api/steward/direct-message/prepare` | update |
 /// | POST   | `/api/steward/direct-message/execute` | update |
-use crate::domain::types::{EvmStewardProof, StewardCommand};
+/// | POST   | `/api/steward/model/prepare`  | update      |
+/// | POST   | `/api/steward/model/execute`  | update      |
+/// | POST   | `/api/steward/reasoning/prepare` | update   |
+/// | POST   | `/api/steward/reasoning/execute` | update   |
+use crate::domain::types::{
+    EvmStewardProof, StewardCommand, StewardModelVariant, StewardReasoningVariant,
+};
 use crate::storage::stable;
 use crate::timing::current_time_ns;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -122,10 +128,35 @@ struct StewardDirectMessagePrepareRequest {
     message: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct StewardModelPrepareRequest {
+    variant: StewardModelVariant,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct StewardReasoningPrepareRequest {
+    variant: StewardReasoningVariant,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct StewardDirectMessagePrepareView {
     sender: String,
     message: String,
+    proof_template: EvmStewardProofTemplateView,
+    signing_payload: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StewardModelPrepareView {
+    variant: StewardModelVariant,
+    model: String,
+    proof_template: EvmStewardProofTemplateView,
+    signing_payload: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StewardReasoningPrepareView {
+    variant: StewardReasoningVariant,
     proof_template: EvmStewardProofTemplateView,
     signing_payload: String,
 }
@@ -137,7 +168,17 @@ struct EvmStewardProofTemplateView {
     address: String,
     command_hash: String,
     nonce: u64,
+    /// Serialized as a string to avoid JavaScript `Number` precision loss
+    /// (nanosecond timestamps exceed `Number.MAX_SAFE_INTEGER`).
+    #[serde(serialize_with = "serialize_u64_as_string")]
     expires_at_ns: u64,
+}
+
+fn serialize_u64_as_string<S: serde::Serializer>(
+    value: &u64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&value.to_string())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -147,9 +188,27 @@ struct StewardDirectMessageExecuteRequest {
     proof: EvmStewardProof,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct StewardModelExecuteRequest {
+    variant: StewardModelVariant,
+    proof: EvmStewardProof,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct StewardReasoningExecuteRequest {
+    variant: StewardReasoningVariant,
+    proof: EvmStewardProof,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct StewardDirectMessageExecuteResult {
     result: String,
+}
+
+#[derive(Clone, Debug)]
+struct SignedStewardCommandPrepareView {
+    proof_template: EvmStewardProofTemplateView,
+    signing_payload: String,
 }
 
 /// Serialisable welcome message served by `GET /api/welcome`.
@@ -274,7 +333,10 @@ fn normalize_http_evm_address(value: &str) -> Result<String, String> {
     Ok(trimmed)
 }
 
-fn normalize_steward_direct_message(sender: String, message: String) -> Result<(String, String), String> {
+fn normalize_steward_direct_message(
+    sender: String,
+    message: String,
+) -> Result<(String, String), String> {
     let sender = sender.trim().to_string();
     if sender.is_empty() {
         return Err("steward sender cannot be empty".to_string());
@@ -289,6 +351,18 @@ fn normalize_steward_direct_message(sender: String, message: String) -> Result<(
 fn steward_send_message_command(sender: String, message: String) -> Result<StewardCommand, String> {
     let (sender, message) = normalize_steward_direct_message(sender, message)?;
     Ok(StewardCommand::SendStewardMessage { sender, message })
+}
+
+fn steward_set_model_command(variant: StewardModelVariant) -> StewardCommand {
+    StewardCommand::SetInferenceModel {
+        model: variant.inference_model().to_string(),
+    }
+}
+
+fn steward_set_reasoning_command(variant: StewardReasoningVariant) -> StewardCommand {
+    StewardCommand::SetOpenrouterReasoningLevel {
+        level: variant.reasoning_level(),
+    }
 }
 
 fn steward_command_hash(command: &StewardCommand) -> Result<String, String> {
@@ -311,15 +385,9 @@ fn canonical_steward_signing_payload(
     )
 }
 
-fn prepare_steward_direct_message_view(
-    payload: StewardDirectMessagePrepareRequest,
-) -> Result<StewardDirectMessagePrepareView, String> {
-    let command = steward_send_message_command(payload.sender, payload.message)?;
-    let (sender, message) = match &command {
-        StewardCommand::SendStewardMessage { sender, message } => (sender.clone(), message.clone()),
-        _ => unreachable!("steward direct message prepare should only build send command"),
-    };
-
+fn prepare_signed_steward_command(
+    command: StewardCommand,
+) -> Result<SignedStewardCommandPrepareView, String> {
     let status = stable::steward_status_view();
     let nonce = status.next_nonce;
     let active = status
@@ -344,9 +412,7 @@ fn prepare_steward_direct_message_view(
         expires_at_ns,
     );
 
-    Ok(StewardDirectMessagePrepareView {
-        sender,
-        message,
+    Ok(SignedStewardCommandPrepareView {
         proof_template: EvmStewardProofTemplateView {
             canister_id,
             chain_id: active.chain_id,
@@ -356,6 +422,56 @@ fn prepare_steward_direct_message_view(
             expires_at_ns,
         },
         signing_payload,
+    })
+}
+
+async fn execute_signed_steward_command(
+    command: StewardCommand,
+    proof: EvmStewardProof,
+) -> Result<StewardDirectMessageExecuteResult, String> {
+    let result = crate::steward_execute(command, proof).await?;
+    Ok(StewardDirectMessageExecuteResult { result })
+}
+
+fn prepare_steward_direct_message_view(
+    payload: StewardDirectMessagePrepareRequest,
+) -> Result<StewardDirectMessagePrepareView, String> {
+    let command = steward_send_message_command(payload.sender, payload.message)?;
+    let (sender, message) = match &command {
+        StewardCommand::SendStewardMessage { sender, message } => (sender.clone(), message.clone()),
+        _ => unreachable!("steward direct message prepare should only build send command"),
+    };
+    let shared = prepare_signed_steward_command(command)?;
+    Ok(StewardDirectMessagePrepareView {
+        sender,
+        message,
+        proof_template: shared.proof_template,
+        signing_payload: shared.signing_payload,
+    })
+}
+
+fn prepare_steward_model_view(
+    payload: StewardModelPrepareRequest,
+) -> Result<StewardModelPrepareView, String> {
+    let command = steward_set_model_command(payload.variant);
+    let shared = prepare_signed_steward_command(command)?;
+    Ok(StewardModelPrepareView {
+        variant: payload.variant,
+        model: payload.variant.inference_model().to_string(),
+        proof_template: shared.proof_template,
+        signing_payload: shared.signing_payload,
+    })
+}
+
+fn prepare_steward_reasoning_view(
+    payload: StewardReasoningPrepareRequest,
+) -> Result<StewardReasoningPrepareView, String> {
+    let command = steward_set_reasoning_command(payload.variant);
+    let shared = prepare_signed_steward_command(command)?;
+    Ok(StewardReasoningPrepareView {
+        variant: payload.variant,
+        proof_template: shared.proof_template,
+        signing_payload: shared.signing_payload,
     })
 }
 
@@ -446,7 +562,9 @@ pub fn handle_http_request(request: HttpRequest<'_>) -> HttpResponse<'static> {
 /// Handles `http_request_update` calls — the mutable side of the HTTP
 /// interface.  Each arm dispatches to the appropriate storage operation and
 /// calls `init_certification` when a state change affects a GET-served route.
-pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateResponse<'static> {
+pub async fn handle_http_request_update(
+    request: HttpUpdateRequest<'_>,
+) -> HttpUpdateResponse<'static> {
     let path = match request.get_path() {
         Ok(path) => path,
         Err(_) => {
@@ -524,12 +642,74 @@ pub fn handle_http_request_update(request: HttpUpdateRequest<'_>) -> HttpUpdateR
                         sender: payload.sender,
                         message: payload.message,
                     };
-                    match futures::executor::block_on(crate::steward_execute(command, payload.proof))
-                    {
-                        Ok(result) => json_update_response(
-                            StatusCode::OK,
-                            &StewardDirectMessageExecuteResult { result },
+                    match execute_signed_steward_command(command, payload.proof).await {
+                        Ok(result) => json_update_response(StatusCode::OK, &result),
+                        Err(error) => json_update_response(
+                            StatusCode::BAD_REQUEST,
+                            &ConversationLookupError { ok: false, error },
                         ),
+                    }
+                }
+                Err(error) => json_update_response(
+                    StatusCode::BAD_REQUEST,
+                    &ConversationLookupError { ok: false, error },
+                ),
+            }
+        }
+        (&Method::POST, "/api/steward/model/prepare") => {
+            match parse_steward_model_prepare_request(request.body()) {
+                Ok(payload) => match prepare_steward_model_view(payload) {
+                    Ok(view) => json_update_response(StatusCode::OK, &view),
+                    Err(error) => json_update_response(
+                        StatusCode::BAD_REQUEST,
+                        &ConversationLookupError { ok: false, error },
+                    ),
+                },
+                Err(error) => json_update_response(
+                    StatusCode::BAD_REQUEST,
+                    &ConversationLookupError { ok: false, error },
+                ),
+            }
+        }
+        (&Method::POST, "/api/steward/model/execute") => {
+            match parse_steward_model_execute_request(request.body()) {
+                Ok(payload) => {
+                    let command = steward_set_model_command(payload.variant);
+                    match execute_signed_steward_command(command, payload.proof).await {
+                        Ok(result) => json_update_response(StatusCode::OK, &result),
+                        Err(error) => json_update_response(
+                            StatusCode::BAD_REQUEST,
+                            &ConversationLookupError { ok: false, error },
+                        ),
+                    }
+                }
+                Err(error) => json_update_response(
+                    StatusCode::BAD_REQUEST,
+                    &ConversationLookupError { ok: false, error },
+                ),
+            }
+        }
+        (&Method::POST, "/api/steward/reasoning/prepare") => {
+            match parse_steward_reasoning_prepare_request(request.body()) {
+                Ok(payload) => match prepare_steward_reasoning_view(payload) {
+                    Ok(view) => json_update_response(StatusCode::OK, &view),
+                    Err(error) => json_update_response(
+                        StatusCode::BAD_REQUEST,
+                        &ConversationLookupError { ok: false, error },
+                    ),
+                },
+                Err(error) => json_update_response(
+                    StatusCode::BAD_REQUEST,
+                    &ConversationLookupError { ok: false, error },
+                ),
+            }
+        }
+        (&Method::POST, "/api/steward/reasoning/execute") => {
+            match parse_steward_reasoning_execute_request(request.body()) {
+                Ok(payload) => {
+                    let command = steward_set_reasoning_command(payload.variant);
+                    match execute_signed_steward_command(command, payload.proof).await {
+                        Ok(result) => json_update_response(StatusCode::OK, &result),
                         Err(error) => json_update_response(
                             StatusCode::BAD_REQUEST,
                             &ConversationLookupError { ok: false, error },
@@ -662,6 +842,10 @@ fn build_certification_state() -> HttpCertificationState {
         upgrade_route(Method::POST, "/api/conversation"),
         upgrade_route(Method::POST, "/api/steward/direct-message/prepare"),
         upgrade_route(Method::POST, "/api/steward/direct-message/execute"),
+        upgrade_route(Method::POST, "/api/steward/model/prepare"),
+        upgrade_route(Method::POST, "/api/steward/model/execute"),
+        upgrade_route(Method::POST, "/api/steward/reasoning/prepare"),
+        upgrade_route(Method::POST, "/api/steward/reasoning/execute"),
     ];
     for route in &routes {
         let entry = HttpCertificationTreeEntry::new(&route.cert_path, route.certification);
@@ -976,6 +1160,46 @@ fn parse_steward_direct_message_execute_request(
     })
 }
 
+fn parse_steward_model_prepare_request(body: &[u8]) -> Result<StewardModelPrepareRequest, String> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err("steward model prepare body cannot be empty".to_string());
+    }
+
+    serde_json::from_slice::<StewardModelPrepareRequest>(body)
+        .map_err(|error| format!("invalid steward model prepare payload: {error}"))
+}
+
+fn parse_steward_model_execute_request(body: &[u8]) -> Result<StewardModelExecuteRequest, String> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err("steward model execute body cannot be empty".to_string());
+    }
+
+    serde_json::from_slice::<StewardModelExecuteRequest>(body)
+        .map_err(|error| format!("invalid steward model execute payload: {error}"))
+}
+
+fn parse_steward_reasoning_prepare_request(
+    body: &[u8],
+) -> Result<StewardReasoningPrepareRequest, String> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err("steward reasoning prepare body cannot be empty".to_string());
+    }
+
+    serde_json::from_slice::<StewardReasoningPrepareRequest>(body)
+        .map_err(|error| format!("invalid steward reasoning prepare payload: {error}"))
+}
+
+fn parse_steward_reasoning_execute_request(
+    body: &[u8],
+) -> Result<StewardReasoningExecuteRequest, String> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err("steward reasoning execute body cannot be empty".to_string());
+    }
+
+    serde_json::from_slice::<StewardReasoningExecuteRequest>(body)
+        .map_err(|error| format!("invalid steward reasoning execute payload: {error}"))
+}
+
 /// Commits the Merkle root hash of `tree` as the canister's certified data.
 /// No-op in native/test builds where the IC certified data API is unavailable.
 fn set_tree_as_certified_data(tree: &HttpCertificationTree) {
@@ -1081,6 +1305,22 @@ mod tests {
             "expanded help palette should include direct steward messaging action"
         );
         assert!(
+            body.contains("steward-model <variant>"),
+            "expanded help palette should include steward model command variants"
+        );
+        assert!(
+            body.contains("steward-reasoning <variant>"),
+            "expanded help palette should include steward reasoning command variants"
+        );
+        assert!(
+            body.contains("flash|mini"),
+            "expanded help palette should show model variant hints"
+        );
+        assert!(
+            body.contains("default|low|medium|high"),
+            "expanded help palette should show reasoning variant hints"
+        );
+        assert!(
             body.contains("personal_sign"),
             "steward direct message flow should request wallet signature"
         );
@@ -1091,6 +1331,22 @@ mod tests {
         assert!(
             body.contains("/api/steward/direct-message/execute"),
             "steward direct message flow should submit signed direct message commands"
+        );
+        assert!(
+            body.contains("/api/steward/model/prepare"),
+            "steward model flow should prepare signed model commands"
+        );
+        assert!(
+            body.contains("/api/steward/model/execute"),
+            "steward model flow should execute signed model commands"
+        );
+        assert!(
+            body.contains("/api/steward/reasoning/prepare"),
+            "steward reasoning flow should prepare signed reasoning commands"
+        );
+        assert!(
+            body.contains("/api/steward/reasoning/execute"),
+            "steward reasoning flow should execute signed reasoning commands"
         );
     }
 
@@ -1145,6 +1401,7 @@ mod tests {
             address: "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa".to_string(),
             enabled: true,
             last_used_at_ns: Some(42),
+            principal: None,
         }))
         .expect("active steward should persist")
         .expect("active steward should be set");
@@ -1153,7 +1410,9 @@ mod tests {
         });
         init_certification();
 
-        let response = handle_http_request_update(HttpRequest::get("/api/steward/status").build_update());
+        let response = futures::executor::block_on(handle_http_request_update(
+            HttpRequest::get("/api/steward/status").build_update(),
+        ));
 
         assert_eq!(response.status_code(), StatusCode::OK);
         let body = serde_json::from_slice::<Value>(response.body())
@@ -1276,8 +1535,9 @@ mod tests {
         })
         .expect("wallet sync config should persist");
 
-        let telemetry_response =
-            handle_http_request_update(HttpRequest::get("/api/wallet/balance").build_update());
+        let telemetry_response = futures::executor::block_on(handle_http_request_update(
+            HttpRequest::get("/api/wallet/balance").build_update(),
+        ));
         assert_eq!(telemetry_response.status_code(), StatusCode::OK);
         let telemetry = serde_json::from_slice::<Value>(telemetry_response.body())
             .expect("telemetry body should decode as json");
@@ -1303,9 +1563,9 @@ mod tests {
         assert!(telemetry.get("evm_rpc_url").is_none());
         assert!(telemetry.get("openrouter_api_key").is_none());
 
-        let config_response = handle_http_request_update(
+        let config_response = futures::executor::block_on(handle_http_request_update(
             HttpRequest::get("/api/wallet/balance/sync-config").build_update(),
-        );
+        ));
         assert_eq!(config_response.status_code(), StatusCode::OK);
         let config = serde_json::from_slice::<Value>(config_response.body())
             .expect("config body should decode as json");
@@ -1412,8 +1672,9 @@ mod tests {
         stable::init_storage();
         init_certification();
 
-        let response =
-            handle_http_request_update(HttpRequest::get("/api/build-info").build_update());
+        let response = futures::executor::block_on(handle_http_request_update(
+            HttpRequest::get("/api/build-info").build_update(),
+        ));
 
         assert_eq!(response.status_code(), StatusCode::OK);
         let body = serde_json::from_slice::<Value>(response.body())
@@ -1523,13 +1784,132 @@ mod tests {
     fn post_steward_direct_message_routes_are_upgradable() {
         init_certification();
 
-        let prepare = handle_http_request(HttpRequest::post("/api/steward/direct-message/prepare").build());
+        let prepare =
+            handle_http_request(HttpRequest::post("/api/steward/direct-message/prepare").build());
         assert_eq!(prepare.status_code(), StatusCode::OK);
         assert_eq!(prepare.upgrade(), Some(true));
 
-        let execute = handle_http_request(HttpRequest::post("/api/steward/direct-message/execute").build());
+        let execute =
+            handle_http_request(HttpRequest::post("/api/steward/direct-message/execute").build());
         assert_eq!(execute.status_code(), StatusCode::OK);
         assert_eq!(execute.upgrade(), Some(true));
+
+        let model_prepare =
+            handle_http_request(HttpRequest::post("/api/steward/model/prepare").build());
+        assert_eq!(model_prepare.status_code(), StatusCode::OK);
+        assert_eq!(model_prepare.upgrade(), Some(true));
+
+        let model_execute =
+            handle_http_request(HttpRequest::post("/api/steward/model/execute").build());
+        assert_eq!(model_execute.status_code(), StatusCode::OK);
+        assert_eq!(model_execute.upgrade(), Some(true));
+
+        let reasoning_prepare =
+            handle_http_request(HttpRequest::post("/api/steward/reasoning/prepare").build());
+        assert_eq!(reasoning_prepare.status_code(), StatusCode::OK);
+        assert_eq!(reasoning_prepare.upgrade(), Some(true));
+
+        let reasoning_execute =
+            handle_http_request(HttpRequest::post("/api/steward/reasoning/execute").build());
+        assert_eq!(reasoning_execute.status_code(), StatusCode::OK);
+        assert_eq!(reasoning_execute.upgrade(), Some(true));
+    }
+
+    #[test]
+    fn steward_model_prepare_route_maps_variant_to_set_inference_model_command() {
+        stable::init_storage();
+        stable::set_active_steward(Some(crate::domain::types::StewardState {
+            chain_id: 8453,
+            address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            enabled: true,
+            last_used_at_ns: None,
+            principal: None,
+        }))
+        .expect("active steward should persist");
+        let _ = stable::set_steward_nonce_state(crate::domain::types::StewardNonceState {
+            next_nonce: 19,
+        });
+        init_certification();
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/steward/model/prepare")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(br#"{"variant":"flash"}"#.to_vec())
+            .build_update();
+        let response = futures::executor::block_on(handle_http_request_update(request));
+        assert_eq!(response.status_code(), StatusCode::OK);
+
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("model prepare response should decode");
+        assert_eq!(
+            body.get("variant").and_then(Value::as_str),
+            Some("flash"),
+            "response should preserve canonical model variant"
+        );
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("google/gemini-3-flash-preview")
+        );
+        assert_eq!(
+            body.pointer("/proof_template/nonce")
+                .and_then(Value::as_u64),
+            Some(19)
+        );
+        let expected_hash = steward_command_hash(&StewardCommand::SetInferenceModel {
+            model: "google/gemini-3-flash-preview".to_string(),
+        })
+        .expect("model command hash should encode");
+        assert_eq!(
+            body.pointer("/proof_template/command_hash")
+                .and_then(Value::as_str),
+            Some(expected_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn steward_reasoning_prepare_route_maps_variant_to_reasoning_command() {
+        stable::init_storage();
+        stable::set_active_steward(Some(crate::domain::types::StewardState {
+            chain_id: 8453,
+            address: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            enabled: true,
+            last_used_at_ns: None,
+            principal: None,
+        }))
+        .expect("active steward should persist");
+        let _ = stable::set_steward_nonce_state(crate::domain::types::StewardNonceState {
+            next_nonce: 7,
+        });
+        init_certification();
+
+        let request: HttpUpdateRequest = HttpRequest::post("/api/steward/reasoning/prepare")
+            .with_headers(vec![(
+                "content-type".to_string(),
+                CONTENT_TYPE_JSON.to_string(),
+            )])
+            .with_body(br#"{"variant":"high"}"#.to_vec())
+            .build_update();
+        let response = futures::executor::block_on(handle_http_request_update(request));
+        assert_eq!(response.status_code(), StatusCode::OK);
+
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("reasoning prepare response should decode");
+        assert_eq!(
+            body.get("variant").and_then(Value::as_str),
+            Some("high"),
+            "response should preserve canonical reasoning variant"
+        );
+        let expected_hash = steward_command_hash(&StewardCommand::SetOpenrouterReasoningLevel {
+            level: crate::domain::types::OpenRouterReasoningLevel::High,
+        })
+        .expect("reasoning command hash should encode");
+        assert_eq!(
+            body.pointer("/proof_template/command_hash")
+                .and_then(Value::as_str),
+            Some(expected_hash.as_str())
+        );
     }
 
     #[test]
@@ -1555,7 +1935,7 @@ mod tests {
             )])
             .with_body(br#"{"sender":"0xabcd00000000000000000000000000000000ef12"}"#.to_vec())
             .build_update();
-        let response = handle_http_request_update(request);
+        let response = futures::executor::block_on(handle_http_request_update(request));
 
         assert_eq!(response.status_code(), StatusCode::OK);
         let body = serde_json::from_slice::<Value>(response.body())
@@ -1604,7 +1984,7 @@ mod tests {
             )])
             .with_body(br#"{"sender":"0xabcd00000000000000000000000000000000ef12"}"#.to_vec())
             .build_update();
-        let response = handle_http_request_update(request);
+        let response = futures::executor::block_on(handle_http_request_update(request));
 
         assert_eq!(response.status_code(), StatusCode::OK);
         let body = serde_json::from_slice::<Value>(response.body())
@@ -1644,7 +2024,7 @@ mod tests {
             )])
             .with_body(br#"{"sender":"0xabcd00000000000000000000000000000000ef12"}"#.to_vec())
             .build_update();
-        let response = handle_http_request_update(request);
+        let response = futures::executor::block_on(handle_http_request_update(request));
 
         assert_eq!(response.status_code(), StatusCode::OK);
         let body = serde_json::from_slice::<Value>(response.body())
@@ -1669,7 +2049,7 @@ mod tests {
             )])
             .with_body(br#"{"message":"legacy path"}"#.to_vec())
             .build_update();
-        let response = handle_http_request_update(request);
+        let response = futures::executor::block_on(handle_http_request_update(request));
 
         assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
         let body = serde_json::from_slice::<Value>(response.body())
@@ -1689,7 +2069,7 @@ mod tests {
             )])
             .with_body(br#"{"provider":"openrouter"}"#.to_vec())
             .build_update();
-        let response = handle_http_request_update(request);
+        let response = futures::executor::block_on(handle_http_request_update(request));
 
         assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
         let body = serde_json::from_slice::<Value>(response.body())
@@ -1709,7 +2089,7 @@ mod tests {
             )])
             .with_body(br#"{}"#.to_vec())
             .build_update();
-        let response = handle_http_request_update(request);
+        let response = futures::executor::block_on(handle_http_request_update(request));
 
         assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
         let body = serde_json::from_slice::<Value>(response.body())

@@ -16,6 +16,35 @@ use crate::timing;
 use candid::{CandidType, Principal};
 use serde::{Deserialize, Serialize};
 
+/// Deserializes a `u64` from either a JSON number or a JSON string.
+///
+/// Nanosecond timestamps exceed JavaScript's `Number.MAX_SAFE_INTEGER`, so the
+/// browser may send them as strings to preserve precision.  Candid and other
+/// callers still send plain numbers, so both forms must be accepted.
+fn deserialize_u64_from_string_or_number<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    struct U64OrStringVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for U64OrStringVisitor {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a u64 or a string containing a u64")
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<u64, E> {
+            v.parse::<u64>().map_err(serde::de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(U64OrStringVisitor)
+}
+
 // ── Agent FSM types ──────────────────────────────────────────────────────────
 
 /// All stable states of the agent finite-state machine.
@@ -185,6 +214,8 @@ pub struct StewardState {
     pub enabled: bool,
     #[serde(default)]
     pub last_used_at_ns: Option<u64>,
+    #[serde(default)]
+    pub principal: Option<Principal>,
 }
 
 /// Monotonic nonce cursor used for replay-safe steward proof verification.
@@ -215,6 +246,9 @@ pub struct EvmStewardProof {
     pub address: String,
     pub command_hash: String,
     pub nonce: u64,
+    /// Accepts both JSON numbers and strings to avoid JavaScript `Number`
+    /// precision loss (nanosecond timestamps exceed `Number.MAX_SAFE_INTEGER`).
+    #[serde(deserialize_with = "deserialize_u64_from_string_or_number")]
     pub expires_at_ns: u64,
     /// 65-byte ECDSA signature encoded as `0x{r}{s}{v}`.
     pub signature: String,
@@ -246,6 +280,9 @@ pub enum StewardCommand {
     SetOpenrouterApiKey {
         api_key: Option<String>,
     },
+    SetOpenrouterReasoningLevel {
+        level: OpenRouterReasoningLevel,
+    },
     SetInferenceProxyConfig {
         config: OpenRouterProxyWorkerConfig,
     },
@@ -267,6 +304,11 @@ pub enum StewardCommand {
     SendStewardMessage {
         sender: String,
         message: String,
+    },
+    /// Links or clears the ingress principal allowed to execute steward
+    /// commands without EVM signatures.
+    SetPrincipal {
+        principal: Option<Principal>,
     },
     /// Rotates the single active steward identity.
     ///
@@ -677,6 +719,8 @@ pub struct RuntimeSnapshot {
     #[serde(default = "default_openrouter_max_response_bytes")]
     pub openrouter_max_response_bytes: u64,
     #[serde(default)]
+    pub openrouter_reasoning_level: OpenRouterReasoningLevel,
+    #[serde(default)]
     pub openrouter_proxy: OpenRouterProxyWorkerConfig,
     #[serde(default)]
     pub ecdsa_key_name: String,
@@ -730,6 +774,7 @@ impl Default for RuntimeSnapshot {
             openrouter_api_key: None,
             openrouter_base_url: default_openrouter_base_url(),
             openrouter_max_response_bytes: default_openrouter_max_response_bytes(),
+            openrouter_reasoning_level: OpenRouterReasoningLevel::default(),
             openrouter_proxy: OpenRouterProxyWorkerConfig::default(),
             ecdsa_key_name: String::new(),
             evm_address: None,
@@ -1595,6 +1640,56 @@ pub enum InferenceProvider {
     OpenRouterProxyWorker,
 }
 
+/// Runtime reasoning-effort level used for OpenRouter requests.
+#[derive(
+    CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
+)]
+pub enum OpenRouterReasoningLevel {
+    #[default]
+    Default,
+    Low,
+    Medium,
+    High,
+}
+
+/// User-facing steward model variants used by the signed HTTP command plane.
+#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StewardModelVariant {
+    Flash,
+    Mini,
+}
+
+impl StewardModelVariant {
+    pub fn inference_model(self) -> &'static str {
+        match self {
+            Self::Flash => "google/gemini-3-flash-preview",
+            Self::Mini => "openai/gpt-4o-mini",
+        }
+    }
+}
+
+/// User-facing steward reasoning variants used by the signed HTTP command plane.
+#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StewardReasoningVariant {
+    Default,
+    Low,
+    Medium,
+    High,
+}
+
+impl StewardReasoningVariant {
+    pub fn reasoning_level(self) -> OpenRouterReasoningLevel {
+        match self {
+            Self::Default => OpenRouterReasoningLevel::Default,
+            Self::Low => OpenRouterReasoningLevel::Low,
+            Self::Medium => OpenRouterReasoningLevel::Medium,
+            Self::High => OpenRouterReasoningLevel::High,
+        }
+    }
+}
+
 /// Runtime configuration for the OpenRouter async worker proxy inference path.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct OpenRouterProxyWorkerConfig {
@@ -1612,6 +1707,8 @@ pub struct InferenceConfigView {
     pub openrouter_base_url: String,
     pub openrouter_has_api_key: bool,
     pub openrouter_max_response_bytes: u64,
+    #[serde(default)]
+    pub openrouter_reasoning_level: OpenRouterReasoningLevel,
     #[serde(default)]
     pub openrouter_proxy_worker_base_url: Option<String>,
     #[serde(default)]
@@ -1631,6 +1728,7 @@ impl From<&RuntimeSnapshot> for InferenceConfigView {
                 .map(|key| !key.trim().is_empty())
                 .unwrap_or(false),
             openrouter_max_response_bytes: snapshot.openrouter_max_response_bytes,
+            openrouter_reasoning_level: snapshot.openrouter_reasoning_level,
             openrouter_proxy_worker_base_url: if worker_base_url.is_empty() {
                 None
             } else {
@@ -1735,17 +1833,12 @@ pub enum InboxMessageStatus {
 }
 
 /// Origin of a message ingested into the canister inbox pipeline.
-#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxMessageSource {
+    #[default]
     EvmInbox,
     StewardDirect,
-}
-
-impl Default for InboxMessageSource {
-    fn default() -> Self {
-        Self::EvmInbox
-    }
 }
 
 impl InboxMessageSource {
@@ -2438,10 +2531,10 @@ fn default_maintenance_interval_secs() -> u64 {
 mod tests {
     use super::{
         InferenceConfigView, InferenceProvider, MemoryRollup, OpenRouterProxyWorkerConfig,
-        RecoveryContext, ResponseLimitPolicy, RetentionConfig, RetentionMaintenanceRuntime,
-        RuntimeSnapshot, SessionSummary, TurnWindowSummary, WalletBalanceSnapshot,
-        WalletBalanceStatus, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
-        WalletBalanceTelemetryView,
+        OpenRouterReasoningLevel, RecoveryContext, ResponseLimitPolicy, RetentionConfig,
+        RetentionMaintenanceRuntime, RuntimeSnapshot, SessionSummary, TurnWindowSummary,
+        WalletBalanceSnapshot, WalletBalanceStatus, WalletBalanceSyncConfig,
+        WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
     };
     use candid::Principal;
 
@@ -2522,6 +2615,10 @@ mod tests {
             snapshot.cycle_topup.onesec_locker_address,
             "0xae2351b15cff68b5863c6690dca58dce383bf45a"
         );
+        assert_eq!(
+            snapshot.openrouter_reasoning_level,
+            OpenRouterReasoningLevel::Default
+        );
     }
 
     #[test]
@@ -2572,6 +2669,7 @@ mod tests {
             openrouter_api_key: Some("super-secret-key".to_string()),
             openrouter_base_url: "https://openrouter.ai/api/v1".to_string(),
             openrouter_max_response_bytes: 64 * 1024,
+            openrouter_reasoning_level: OpenRouterReasoningLevel::High,
             openrouter_proxy: OpenRouterProxyWorkerConfig {
                 worker_base_url: "https://proxy.example.workers.dev".to_string(),
                 trusted_callback_principal: Some(trusted),
@@ -2590,6 +2688,10 @@ mod tests {
             Some(trusted.to_text())
         );
         assert!(view.openrouter_has_api_key);
+        assert_eq!(
+            view.openrouter_reasoning_level,
+            OpenRouterReasoningLevel::High
+        );
     }
 
     #[test]

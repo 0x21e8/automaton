@@ -68,6 +68,8 @@ const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str =
     "MessageQueued(address,uint64,address,string,uint256,uint256)";
 const INBOX_USDC_FUNCTION_SIGNATURE: &str = "usdc()";
 const ERC20_BALANCE_OF_FUNCTION_SIGNATURE: &str = "balanceOf(address)";
+const EIP1271_IS_VALID_SIGNATURE_FUNCTION_SIGNATURE: &str = "isValidSignature(bytes32,bytes)";
+const EIP1271_IS_VALID_SIGNATURE_MAGIC_VALUE: &str = "1626ba7e";
 const EVM_STEWARD_SIGNING_DOMAIN: &str = "ic-automaton:steward-execute:v1";
 
 // Environment variable that switches the host (non-wasm32) RPC client from stub to real mode.
@@ -80,6 +82,10 @@ const HOST_EVM_RPC_STUB_FORCE_BODY_ENV: &str = "IC_AUTOMATON_EVM_RPC_STUB_FORCE_
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN_ENV: &str =
     "IC_AUTOMATON_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN";
+#[cfg(not(target_arch = "wasm32"))]
+const HOST_EIP1271_STUB_CONTRACT_ADDRESS: &str = "0x8f61f9a23b6bad39a85623fff41cbee5b4dbee2c";
+#[cfg(not(target_arch = "wasm32"))]
+const HOST_EIP1271_STUB_DELEGATED_CODE: &str = "0xef010063c0c19a282a1b52b07dd5a65b58948a07dae32b";
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum StrategyExecutionLogPriority {
@@ -504,6 +510,24 @@ impl HttpEvmRpcClient {
             .and_then(Value::as_str)
             .ok_or_else(|| "eth_getBalance result was missing".to_string())?;
         normalize_hex_quantity(raw, "eth_getBalance result")
+    }
+
+    /// Fetch deployed runtime bytecode for `address` at the latest block.
+    /// Returns a 0x-prefixed hex blob; EOAs typically return `0x`.
+    pub async fn eth_get_code(&self, address: &str) -> Result<String, String> {
+        let response = self
+            .rpc_call(
+                "eth_getCode",
+                json!([address, "latest"]),
+                self.control_plane_max_response_bytes(),
+            )
+            .await
+            .map_err(|error| format!("eth_getCode failed: {error}"))?;
+        let raw = response
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "eth_getCode result was missing".to_string())?;
+        normalize_hex_blob(raw, "eth_getCode result")
     }
 
     /// Read-only contract call (`eth_call`) at the latest block.
@@ -1019,6 +1043,7 @@ fn host_rpc_stub_response(body: &[u8]) -> Result<Vec<u8>, String> {
         "eth_getLogs" => host_rpc_stub_eth_get_logs_result(&request)?,
         "eth_getBalance" => json!({"jsonrpc":"2.0","id":1,"result":"0x1"}),
         "eth_call" => host_rpc_stub_eth_call_result(&request),
+        "eth_getCode" => host_rpc_stub_eth_get_code_result(&request)?,
         "eth_getTransactionCount" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
         "eth_gasPrice" => json!({"jsonrpc":"2.0","id":1,"result":"0x3b9aca00"}),
         "eth_estimateGas" => json!({"jsonrpc":"2.0","id":1,"result":"0x5208"}),
@@ -1082,6 +1107,12 @@ fn host_rpc_stub_eth_get_logs_result(request: &Value) -> Result<Value, String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn host_rpc_stub_eth_call_result(request: &Value) -> Value {
+    let to = request
+        .pointer("/params/0/to")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     let data = request
         .pointer("/params/0/data")
         .and_then(Value::as_str)
@@ -1093,6 +1124,18 @@ fn host_rpc_stub_eth_call_result(request: &Value) -> Value {
         "0x{}",
         function_selector_hex(ERC20_BALANCE_OF_FUNCTION_SIGNATURE)
     );
+    let eip1271_selector = format!(
+        "0x{}",
+        function_selector_hex(EIP1271_IS_VALID_SIGNATURE_FUNCTION_SIGNATURE)
+    );
+
+    if to == HOST_EIP1271_STUB_CONTRACT_ADDRESS && data.starts_with(&eip1271_selector) {
+        return json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":"0x1626ba7e00000000000000000000000000000000000000000000000000000000"
+        });
+    }
 
     if data == usdc_selector {
         return json!({
@@ -1110,6 +1153,21 @@ fn host_rpc_stub_eth_call_result(request: &Value) -> Value {
     }
 
     json!({"jsonrpc":"2.0","id":1,"result":"0x"})
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn host_rpc_stub_eth_get_code_result(request: &Value) -> Result<Value, String> {
+    let address = request
+        .pointer("/params/0")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "host rpc stub eth_getCode missing address".to_string())?;
+    let normalized = normalize_address(address)?;
+    let result = if normalized == HOST_EIP1271_STUB_CONTRACT_ADDRESS {
+        HOST_EIP1271_STUB_DELEGATED_CODE
+    } else {
+        "0x"
+    };
+    Ok(json!({"jsonrpc":"2.0","id":1,"result":result}))
 }
 
 fn parse_hex_u64(raw: &str, field: &str) -> Result<u64, String> {
@@ -1148,24 +1206,101 @@ pub fn verify_evm_steward_proof(
     proof: &EvmStewardProof,
     context: &EvmStewardVerificationContext,
 ) -> Result<VerifiedEvmStewardProof, String> {
+    let prepared = prepare_steward_verification(proof, context)?;
+    let recovered = recover_steward_signer_address(&prepared.payload, &proof.signature)?;
+    if recovered != prepared.normalized_address {
+        return Err(format!(
+            "recovered signer address does not match proof address: recovered={} proof={}",
+            recovered, prepared.normalized_address
+        ));
+    }
+
+    Ok(prepared.into_verified())
+}
+
+/// Like `verify_evm_steward_proof`, but when direct ECDSA recovery fails it
+/// attempts EIP-1271 contract-wallet verification through EVM RPC.
+pub async fn verify_evm_steward_proof_with_eip1271_fallback(
+    proof: &EvmStewardProof,
+    context: &EvmStewardVerificationContext,
+    rpc: Option<&HttpEvmRpcClient>,
+) -> Result<VerifiedEvmStewardProof, String> {
+    let prepared = prepare_steward_verification(proof, context)?;
+    let signature_error = match recover_steward_signer_address(&prepared.payload, &proof.signature)
+    {
+        Ok(recovered) if recovered == prepared.normalized_address => {
+            return Ok(prepared.into_verified());
+        }
+        Ok(recovered) => format!(
+            "recovered signer address does not match proof address: recovered={} proof={}",
+            recovered, prepared.normalized_address
+        ),
+        Err(error) => error,
+    };
+
+    let Some(rpc) = rpc else {
+        return Err(signature_error);
+    };
+    match verify_eip1271_signature(
+        rpc,
+        &prepared.normalized_address,
+        &prepared.payload,
+        &proof.signature,
+    )
+    .await
+    {
+        Ok(true) => Ok(prepared.into_verified()),
+        Ok(false) => Err(signature_error),
+        Err(error) => Err(format!(
+            "{signature_error}; eip1271 fallback error: {error}"
+        )),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedStewardVerification {
+    canister_id: String,
+    chain_id: u64,
+    normalized_address: String,
+    command_hash: String,
+    nonce: u64,
+    expires_at_ns: u64,
+    payload: String,
+}
+
+impl PreparedStewardVerification {
+    fn into_verified(self) -> VerifiedEvmStewardProof {
+        VerifiedEvmStewardProof {
+            canister_id: self.canister_id,
+            chain_id: self.chain_id,
+            address: self.normalized_address,
+            command_hash: self.command_hash,
+            nonce: self.nonce,
+            expires_at_ns: self.expires_at_ns,
+        }
+    }
+}
+
+fn prepare_steward_verification(
+    proof: &EvmStewardProof,
+    context: &EvmStewardVerificationContext,
+) -> Result<PreparedStewardVerification, String> {
     let active_steward = context
         .active_steward
         .clone()
         .ok_or_else(|| "no active steward configured".to_string())?;
-
     if !active_steward.enabled {
         return Err("active steward is disabled".to_string());
     }
 
     let normalized_address = normalize_address(&proof.address)?;
-    let normalized_command_hash =
-        normalize_command_hash(&proof.command_hash, "proof command hash")?;
+    let command_hash = normalize_command_hash(&proof.command_hash, "proof command hash")?;
     let expected_command_hash =
         normalize_command_hash(&context.expected_command_hash, "expected command hash")?;
-    if normalized_command_hash != expected_command_hash {
+    if command_hash != expected_command_hash {
         return Err(format!(
             "proof command hash mismatch: expected={} got={}",
-            expected_command_hash, normalized_command_hash
+            expected_command_hash, command_hash
         ));
     }
 
@@ -1199,7 +1334,6 @@ pub fn verify_evm_steward_proof(
             context.expected_nonce, proof.nonce
         ));
     }
-
     if context.now_ns > proof.expires_at_ns {
         return Err(format!(
             "proof expired: expires_at_ns={} now_ns={}",
@@ -1211,25 +1345,18 @@ pub fn verify_evm_steward_proof(
         expected_canister_id,
         proof.chain_id,
         &normalized_address,
-        &normalized_command_hash,
+        &command_hash,
         proof.nonce,
         proof.expires_at_ns,
     );
-    let recovered = recover_steward_signer_address(&payload, &proof.signature)?;
-    if recovered != normalized_address {
-        return Err(format!(
-            "recovered signer address does not match proof address: recovered={} proof={}",
-            recovered, normalized_address
-        ));
-    }
-
-    Ok(VerifiedEvmStewardProof {
+    Ok(PreparedStewardVerification {
         canister_id: expected_canister_id.to_string(),
         chain_id: proof.chain_id,
-        address: normalized_address,
-        command_hash: normalized_command_hash,
+        normalized_address,
+        command_hash,
         nonce: proof.nonce,
         expires_at_ns: proof.expires_at_ns,
+        payload,
     })
 }
 
@@ -1288,6 +1415,64 @@ fn parse_steward_signature(raw: &str) -> Result<([u8; 64], u8), String> {
     let mut compact = [0u8; 64];
     compact.copy_from_slice(&signature_bytes[..64]);
     Ok((compact, v))
+}
+
+fn decode_hex_blob_bytes(raw: &str, field: &str) -> Result<Vec<u8>, String> {
+    let normalized = normalize_hex_blob(raw, field)?;
+    let without_prefix = normalized.trim_start_matches("0x");
+    hex::decode(without_prefix).map_err(|error| format!("failed to decode {field}: {error}"))
+}
+
+fn encode_eip1271_is_valid_signature_call(message_hash: &[u8; 32], signature: &[u8]) -> String {
+    let selector = function_selector_hex(EIP1271_IS_VALID_SIGNATURE_FUNCTION_SIGNATURE);
+    let mut encoded = format!(
+        "0x{}{}{:064x}{:064x}",
+        selector,
+        hex::encode(message_hash),
+        64u64,
+        signature.len()
+    );
+    encoded.push_str(&hex::encode(signature));
+    let padding = (32 - (signature.len() % 32)) % 32;
+    if padding > 0 {
+        encoded.push_str(&"00".repeat(padding));
+    }
+    encoded
+}
+
+fn is_empty_contract_code(raw_code: &str) -> bool {
+    let payload = raw_code.trim().trim_start_matches("0x");
+    payload.is_empty() || payload.as_bytes().iter().all(|byte| *byte == b'0')
+}
+
+fn is_eip1271_magic_result(raw: &str) -> Result<bool, String> {
+    let normalized = normalize_hex_blob(raw, "eip1271 isValidSignature result")?;
+    let payload = normalized.trim_start_matches("0x");
+    Ok(payload.len() >= 8 && payload.starts_with(EIP1271_IS_VALID_SIGNATURE_MAGIC_VALUE))
+}
+
+async fn verify_eip1271_signature(
+    rpc: &HttpEvmRpcClient,
+    address: &str,
+    payload: &str,
+    signature_hex: &str,
+) -> Result<bool, String> {
+    let deployed_code = rpc
+        .eth_get_code(address)
+        .await
+        .map_err(|error| format!("eth_getCode failed: {error}"))?;
+    if is_empty_contract_code(&deployed_code) {
+        return Ok(false);
+    }
+
+    let signature = decode_hex_blob_bytes(signature_hex, "proof signature")?;
+    let message_hash = ethereum_personal_message_hash(payload);
+    let calldata = encode_eip1271_is_valid_signature_call(&message_hash, &signature);
+    let raw = rpc
+        .eth_call(address, &calldata)
+        .await
+        .map_err(|error| format!("eth_call isValidSignature failed: {error}"))?;
+    is_eip1271_magic_result(&raw)
 }
 
 fn recover_steward_signer_address(payload: &str, signature_hex: &str) -> Result<String, String> {
@@ -2445,6 +2630,7 @@ mod tests {
                 address: signer_address.to_ascii_uppercase(),
                 enabled: true,
                 last_used_at_ns: None,
+                principal: None,
             }),
             expected_nonce: 7,
             expected_command_hash: command_hash.clone(),
@@ -2484,6 +2670,7 @@ mod tests {
                 address: signer_address.clone(),
                 enabled: true,
                 last_used_at_ns: None,
+                principal: None,
             }),
             expected_nonce: 9,
             expected_command_hash: command_hash,
@@ -2493,6 +2680,226 @@ mod tests {
         let error = verify_evm_steward_proof(&proof, &context)
             .expect_err("mismatched signer should be rejected");
         assert!(error.contains("recovered signer address does not match proof address"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn verify_evm_steward_proof_with_eip1271_fallback_accepts_contract_wallet_signature() {
+        let key = steward_test_signing_key();
+        let signer_address = steward_address_from_key(&key);
+        let contract_address = HOST_EIP1271_STUB_CONTRACT_ADDRESS.to_string();
+        assert_ne!(signer_address, contract_address);
+
+        let command_hash = format!("0x{}", "44".repeat(32));
+        let canister_id = "rrkah-fqaaa-aaaaa-aaaaq-cai";
+        let proof = build_steward_proof(
+            canister_id,
+            8453,
+            &contract_address,
+            &command_hash,
+            3,
+            1_000_000,
+            &key,
+        );
+        let context = EvmStewardVerificationContext {
+            canister_id: canister_id.to_string(),
+            active_steward: Some(StewardState {
+                chain_id: 8453,
+                address: contract_address.clone(),
+                enabled: true,
+                last_used_at_ns: None,
+                principal: None,
+            }),
+            expected_nonce: 3,
+            expected_command_hash: command_hash,
+            now_ns: 999_999,
+        };
+        let rpc =
+            HttpEvmRpcClient::from_snapshot(&RuntimeSnapshot::default()).expect("rpc should build");
+
+        let verified = block_on_with_spin(verify_evm_steward_proof_with_eip1271_fallback(
+            &proof,
+            &context,
+            Some(&rpc),
+        ))
+        .expect("eip1271 fallback should accept valid contract wallet signature");
+        assert_eq!(verified.address, contract_address);
+        assert_eq!(verified.nonce, 3);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn verify_evm_steward_proof_with_eip1271_fallback_rejects_eoa_mismatch() {
+        let key = steward_test_signing_key();
+        let signer_address = steward_address_from_key(&key);
+        let rogue_key = signing_key_from_hex(
+            "8f2a55949056e6f90b84b5ac3f7f2f4ec4604f0f5f3e59fbb6904fb2497f33a8",
+        );
+        let command_hash = format!("0x{}", "55".repeat(32));
+        let canister_id = "rrkah-fqaaa-aaaaa-aaaaq-cai";
+        let proof = build_steward_proof(
+            canister_id,
+            8453,
+            &signer_address,
+            &command_hash,
+            4,
+            1_000_000,
+            &rogue_key,
+        );
+        let context = EvmStewardVerificationContext {
+            canister_id: canister_id.to_string(),
+            active_steward: Some(StewardState {
+                chain_id: 8453,
+                address: signer_address,
+                enabled: true,
+                last_used_at_ns: None,
+                principal: None,
+            }),
+            expected_nonce: 4,
+            expected_command_hash: command_hash,
+            now_ns: 999_999,
+        };
+        let rpc =
+            HttpEvmRpcClient::from_snapshot(&RuntimeSnapshot::default()).expect("rpc should build");
+
+        let error = block_on_with_spin(verify_evm_steward_proof_with_eip1271_fallback(
+            &proof,
+            &context,
+            Some(&rpc),
+        ))
+        .expect_err("eoa mismatch should stay rejected");
+        assert!(error.contains("recovered signer address does not match proof address"));
+    }
+
+    /// End-to-end test that signs a steward payload with Foundry's `cast wallet sign`
+    /// and verifies it with the Rust recovery path.  Uses a nanosecond timestamp
+    /// that exceeds `Number.MAX_SAFE_INTEGER` to exercise the precision-loss fix.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn verify_evm_steward_proof_with_cast_signed_payload() {
+        // Skip if `cast` is not installed.
+        let cast_check = std::process::Command::new("cast").arg("--version").output();
+        if cast_check.is_err() || !cast_check.unwrap().status.success() {
+            eprintln!("skipping cast e2e test: `cast` not found in PATH");
+            return;
+        }
+
+        let private_key = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let key = steward_test_signing_key();
+        let signer_address = steward_address_from_key(&key);
+
+        let canister_id = "rrkah-fqaaa-aaaaa-aaaaq-cai";
+        let chain_id: u64 = 8453;
+        let command_hash = format!("0x{}", "ab".repeat(32));
+        let nonce: u64 = 42;
+        // Nanosecond timestamp exceeding Number.MAX_SAFE_INTEGER (9007199254740991).
+        let expires_at_ns: u64 = 1_772_447_162_556_949_500;
+
+        let normalized_address =
+            normalize_address(&signer_address).expect("test address should normalize");
+        let normalized_hash =
+            normalize_command_hash(&command_hash, "test command hash").expect("hash should parse");
+        let payload = canonical_steward_signing_payload(
+            canister_id,
+            chain_id,
+            &normalized_address,
+            &normalized_hash,
+            nonce,
+            expires_at_ns,
+        );
+
+        // Sign with `cast wallet sign --private-key` (uses personal_sign / EIP-191).
+        let cast_output = std::process::Command::new("cast")
+            .arg("wallet")
+            .arg("sign")
+            .arg("--private-key")
+            .arg(private_key)
+            .arg(&payload)
+            .output()
+            .expect("cast wallet sign should execute");
+        assert!(
+            cast_output.status.success(),
+            "cast wallet sign failed: {}",
+            String::from_utf8_lossy(&cast_output.stderr)
+        );
+        let cast_signature = String::from_utf8(cast_output.stdout)
+            .expect("cast output should be utf8")
+            .trim()
+            .to_string();
+
+        // Build proof with the cast-produced signature.
+        let proof = EvmStewardProof {
+            canister_id: canister_id.to_string(),
+            chain_id,
+            address: signer_address.clone(),
+            command_hash: command_hash.clone(),
+            nonce,
+            expires_at_ns,
+            signature: cast_signature,
+        };
+        let context = EvmStewardVerificationContext {
+            canister_id: canister_id.to_string(),
+            active_steward: Some(StewardState {
+                chain_id,
+                address: signer_address.clone(),
+                enabled: true,
+                last_used_at_ns: None,
+                principal: None,
+            }),
+            expected_nonce: nonce,
+            expected_command_hash: command_hash.clone(),
+            now_ns: expires_at_ns - 1,
+        };
+
+        let verified =
+            verify_evm_steward_proof(&proof, &context).expect("cast-signed proof should verify");
+        assert_eq!(verified.address, normalized_address);
+        assert_eq!(verified.nonce, nonce);
+        assert_eq!(verified.expires_at_ns, expires_at_ns);
+    }
+
+    /// Verifies the full JSON round-trip: prepare view serializes `expires_at_ns`
+    /// as a string, and `EvmStewardProof` deserializes it back without precision loss.
+    #[test]
+    fn steward_proof_expires_at_ns_survives_json_round_trip() {
+        // A nanosecond value that exceeds Number.MAX_SAFE_INTEGER.
+        let large_ns: u64 = 1_772_447_162_556_949_500;
+
+        // Simulate the JSON that the browser would send back (string-valued expires_at_ns).
+        let json = format!(
+            r#"{{
+                "canister_id": "rrkah-fqaaa-aaaaa-aaaaq-cai",
+                "chain_id": 8453,
+                "address": "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+                "command_hash": "0x{hash}",
+                "nonce": 0,
+                "expires_at_ns": "{large_ns}",
+                "signature": "0x{sig}"
+            }}"#,
+            hash = "aa".repeat(32),
+            sig = "bb".repeat(65),
+        );
+        let proof: EvmStewardProof =
+            serde_json::from_str(&json).expect("string expires_at_ns should deserialize");
+        assert_eq!(proof.expires_at_ns, large_ns);
+
+        // Also verify plain numeric form still works (Candid / non-browser callers).
+        let json_numeric = format!(
+            r#"{{
+                "canister_id": "rrkah-fqaaa-aaaaa-aaaaq-cai",
+                "chain_id": 8453,
+                "address": "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+                "command_hash": "0x{hash}",
+                "nonce": 0,
+                "expires_at_ns": 1000000,
+                "signature": "0x{sig}"
+            }}"#,
+            hash = "aa".repeat(32),
+            sig = "bb".repeat(65),
+        );
+        let proof_numeric: EvmStewardProof =
+            serde_json::from_str(&json_numeric).expect("numeric expires_at_ns should deserialize");
+        assert_eq!(proof_numeric.expires_at_ns, 1_000_000);
     }
 
     #[test]
@@ -2508,6 +2915,7 @@ mod tests {
                 address: signer_address.clone(),
                 enabled: true,
                 last_used_at_ns: None,
+                principal: None,
             }),
             expected_nonce: 3,
             expected_command_hash: command_hash.clone(),
