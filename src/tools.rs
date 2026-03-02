@@ -1077,8 +1077,13 @@ struct SqlQueryArgs {
 
 /// Parse args for the `recall` tool.
 fn parse_recall_args(args_json: &str) -> Result<RecallArgs, String> {
-    let mut args: RecallArgs = serde_json::from_str(args_json)
-        .map_err(|error| format!("invalid recall args json: {error}"))?;
+    let trimmed = args_json.trim();
+    let mut args: RecallArgs = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        RecallArgs::default()
+    } else {
+        serde_json::from_str(trimmed)
+            .map_err(|error| format!("invalid recall args json: {error}"))?
+    };
     let normalized_prefix = normalize_memory_prefix(args.prefix.as_deref().unwrap_or_default())?;
     args.prefix = Some(normalized_prefix);
     Ok(args)
@@ -2414,6 +2419,21 @@ mod tests {
         let error = parse_recall_args(r#"{"sort_by":"unsupported"}"#)
             .expect_err("unsupported sort_by must fail");
         assert!(error.contains("unsupported"));
+    }
+
+    #[test]
+    fn parse_recall_args_accepts_empty_args_json() {
+        let args = parse_recall_args("").expect("empty recall args should default optional fields");
+        assert_eq!(args.prefix.as_deref(), Some(""));
+        assert!(!args.count_only);
+    }
+
+    #[test]
+    fn parse_recall_args_accepts_null_args_json() {
+        let args =
+            parse_recall_args("null").expect("null recall args should default optional fields");
+        assert_eq!(args.prefix.as_deref(), Some(""));
+        assert!(!args.count_only);
     }
 
     #[test]
