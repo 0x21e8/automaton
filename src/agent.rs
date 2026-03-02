@@ -543,6 +543,8 @@ fn is_http_fetch_recoverable_failure(record: &ToolCallRecord) -> bool {
     normalized.starts_with("json_path extraction failed:")
         || normalized.starts_with("regex extraction failed:")
         || normalized.starts_with("http 4")
+        || normalized.contains("http body exceeds size limit")
+        || normalized.contains("response exceeded max_response_bytes")
 }
 
 fn is_remember_capacity_failure(record: &ToolCallRecord) -> bool {
@@ -2176,6 +2178,42 @@ mod tests {
         };
         let failures = vec![&failed];
         assert!(should_degrade_tool_failures_for_autonomy(&failures, false));
+    }
+
+    #[test]
+    fn autonomy_degrades_http_fetch_response_too_large_without_external_input() {
+        let failed = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://www.coingecko.com/en/coins/ethereum"}"#.to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            outcome: ToolCallOutcome::Executed,
+            error: Some(
+                "HTTP fetch failed: call rejected: 1 - Http body exceeds size limit of 65536 bytes."
+                    .to_string(),
+            ),
+        };
+        let failures = vec![&failed];
+        assert!(should_degrade_tool_failures_for_autonomy(&failures, false));
+    }
+
+    #[test]
+    fn external_input_keeps_http_fetch_response_too_large_terminal() {
+        let failed = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://www.coingecko.com/en/coins/ethereum"}"#.to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            outcome: ToolCallOutcome::Executed,
+            error: Some(
+                "HTTP fetch failed: call rejected: 1 - Http body exceeds size limit of 65536 bytes."
+                    .to_string(),
+            ),
+        };
+        let failures = vec![&failed];
+        assert!(!should_degrade_tool_failures_for_autonomy(&failures, true));
     }
 
     #[test]
