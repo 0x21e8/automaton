@@ -92,16 +92,27 @@ function normalizeMessageContent(content) {
   return "";
 }
 
+function normalizeToolArguments(rawArgs) {
+  if (typeof rawArgs !== "string") {
+    return null;
+  }
+  const trimmed = rawArgs.trim();
+  if (!trimmed || trimmed === "null") {
+    return "{}";
+  }
+  return rawArgs;
+}
+
 function parseToolCalls(message) {
   const rawToolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
   return rawToolCalls
     .map((toolCall) => {
       const tool = toolCall?.function?.name;
-      const argsJson = toolCall?.function?.arguments;
+      const argsJson = normalizeToolArguments(toolCall?.function?.arguments);
       if (typeof tool !== "string" || !tool.trim()) {
         return null;
       }
-      if (typeof argsJson !== "string") {
+      if (argsJson === null) {
         return null;
       }
       return {

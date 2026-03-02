@@ -1150,7 +1150,11 @@ struct StrategyIntentArgs {
 fn parse_list_strategy_templates_args(
     args_json: &str,
 ) -> Result<ListStrategyTemplatesArgs, String> {
-    serde_json::from_str(args_json)
+    let trimmed = args_json.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        return Ok(ListStrategyTemplatesArgs::default());
+    }
+    serde_json::from_str(trimmed)
         .map_err(|error| format!("invalid list_strategy_templates args json: {error}"))
 }
 
@@ -1896,6 +1900,26 @@ mod tests {
         assert!(records[0]
             .output
             .contains("\"template_id\":\"tool-transfer\""));
+    }
+
+    #[test]
+    fn list_strategy_templates_tool_accepts_empty_args_json() {
+        stable::init_storage();
+        seed_strategy_template_and_artifact();
+
+        let out = list_strategy_templates_tool("")
+            .expect("empty list_strategy_templates args should default to optional fields");
+        assert!(out.contains("\"template_id\":\"tool-transfer\""));
+    }
+
+    #[test]
+    fn list_strategy_templates_tool_accepts_null_args_json() {
+        stable::init_storage();
+        seed_strategy_template_and_artifact();
+
+        let out = list_strategy_templates_tool("null")
+            .expect("null list_strategy_templates args should default to optional fields");
+        assert!(out.contains("\"template_id\":\"tool-transfer\""));
     }
 
     #[test]

@@ -736,6 +736,14 @@ fn should_skip_periodic_turn_for_proxy_wait(
     !stable::has_buffered_inference_proxy_callback_results()
 }
 
+fn should_apply_autonomy_suppression(
+    trigger: ScheduledTurnTrigger,
+    has_external_input: bool,
+    inference_round_count: usize,
+) -> bool {
+    trigger == ScheduledTurnTrigger::Periodic && !has_external_input && inference_round_count == 1
+}
+
 // ── Context builders ─────────────────────────────────────────────────────────
 
 /// Renders the `### Pending Obligations` section for the dynamic context block.
@@ -1383,7 +1391,8 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 }
             }
             let mut suppressed_autonomy_calls = Vec::new();
-            if inference_round_count == 1 && !has_external_input {
+            if should_apply_autonomy_suppression(trigger, has_external_input, inference_round_count)
+            {
                 let suppressed_calls = suppress_autonomy_tool_calls(
                     &planned_tool_calls,
                     started_at_ns,
@@ -2331,6 +2340,30 @@ mod tests {
             suppressed.is_empty(),
             "disabled dedupe should not suppress identical successful calls"
         );
+    }
+
+    #[test]
+    fn autonomy_suppression_applies_only_to_periodic_no_input_first_round() {
+        assert!(should_apply_autonomy_suppression(
+            ScheduledTurnTrigger::Periodic,
+            false,
+            1
+        ));
+        assert!(!should_apply_autonomy_suppression(
+            ScheduledTurnTrigger::InferenceProxyResume,
+            false,
+            1
+        ));
+        assert!(!should_apply_autonomy_suppression(
+            ScheduledTurnTrigger::Periodic,
+            true,
+            1
+        ));
+        assert!(!should_apply_autonomy_suppression(
+            ScheduledTurnTrigger::Periodic,
+            false,
+            2
+        ));
     }
 
     #[test]
