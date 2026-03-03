@@ -21,8 +21,10 @@
 /// | `MAX_MEMORY_RECALL_RESULTS`     | 50     |
 /// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
-    AgentState, MemoryFact, PromptLayer, StrategyExecutionIntent, StrategyTemplateKey,
-    SurvivalOperationClass, TemplateVersion, ToolCall, ToolCallOutcome, ToolCallRecord,
+    AbiArtifactKey, AbiFunctionSpec, ActionSpec, AgentState, ContractRoleBinding, MemoryFact,
+    PromptLayer, StrategyExecutionIntent, StrategyTemplate, StrategyTemplateKey,
+    SurvivalOperationClass, TemplateActivationState, TemplateStatus, ToolCall, ToolCallOutcome,
+    ToolCallRecord,
 };
 use crate::features::canister_call::canister_call_tool;
 use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool};
@@ -31,8 +33,9 @@ use crate::features::http_fetch::http_fetch_tool;
 use crate::prompt;
 use crate::sanitize::contains_forbidden_prompt_layer_phrase;
 use crate::storage::{sqlite, stable};
-use crate::strategy::{compiler, learner, registry, validator};
+use crate::strategy::{abi, compiler, learner, registry, validator};
 use crate::timing::current_time_ns;
+use crate::util::normalize_evm_address;
 use alloy_primitives::U256;
 use async_trait::async_trait;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -52,6 +55,12 @@ const MAX_MEMORY_RECALL_RESULTS: usize = 50;
 const MAX_STRATEGY_TEMPLATE_RESULTS: usize = 50;
 /// Maximum number of rows returned by the `sql_query` tool.
 const MAX_SQL_QUERY_ROWS: usize = 100;
+/// Default call-count cap for agent-authored templates.
+const REGISTER_STRATEGY_DEFAULT_MAX_CALLS: usize = 5;
+/// Default per-call value cap for agent-authored templates (0.1 ETH in wei).
+const REGISTER_STRATEGY_DEFAULT_MAX_VALUE_WEI_PER_CALL: &str = "100000000000000000";
+/// Default lifetime template budget cap for agent-authored templates (1 ETH in wei).
+const REGISTER_STRATEGY_DEFAULT_TEMPLATE_BUDGET_WEI: &str = "1000000000000000000";
 /// Maximum character count for content written via `update_prompt_layer`.
 pub const MAX_PROMPT_LAYER_CONTENT_CHARS: usize = 4_000;
 
@@ -402,6 +411,13 @@ impl ToolManager {
             },
         );
         policies.insert(
+            "register_strategy".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
             "simulate_strategy_action".to_string(),
             ToolPolicy {
                 enabled: true,
@@ -697,6 +713,7 @@ impl ToolManager {
             "top_up_status" => Ok(top_up_status_tool()),
             "trigger_top_up" => trigger_top_up_tool(),
             "list_strategy_templates" => list_strategy_templates_tool(&call.args_json),
+            "register_strategy" => register_strategy_tool(&call.args_json),
             "simulate_strategy_action" => {
                 let now_ns = current_time_ns();
                 if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns) {
@@ -1469,18 +1486,58 @@ impl PartialStrategyTemplateKey {
 #[derive(Debug, Deserialize)]
 struct StrategyOutcomesArgs {
     key: StrategyTemplateKey,
-    version: TemplateVersion,
 }
 
 #[derive(Debug, Deserialize)]
 struct StrategyIntentArgs {
     key: StrategyTemplateKey,
-    version: TemplateVersion,
     action_id: String,
     #[serde(default)]
     typed_params_json: Option<String>,
     #[serde(default)]
     typed_params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyRecipe {
+    protocol: String,
+    primitive: String,
+    chain_id: u64,
+    template_id: String,
+    contracts: Vec<StrategyRecipeContract>,
+    actions: Vec<StrategyRecipeAction>,
+    #[serde(default)]
+    max_value_wei_per_call: Option<String>,
+    #[serde(default)]
+    template_budget_wei: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyRecipeContract {
+    role: String,
+    address: String,
+    abi_json: String,
+    source_ref: String,
+    #[serde(default)]
+    codehash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyRecipeAction {
+    action_id: String,
+    calls: Vec<StrategyRecipeActionCall>,
+    #[serde(default)]
+    preconditions: Vec<String>,
+    postconditions: Vec<String>,
+    #[serde(default)]
+    risk_checks: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrategyRecipeActionCall {
+    role: String,
+    #[serde(rename = "function")]
+    function_name: String,
 }
 
 /// Parse args for `list_strategy_templates`; all fields are optional.
@@ -1495,10 +1552,15 @@ fn parse_list_strategy_templates_args(
         .map_err(|error| format!("invalid list_strategy_templates args json: {error}"))
 }
 
-/// Parse `key` and `version` for the `get_strategy_outcomes` tool.
+/// Parse `key` for the `get_strategy_outcomes` tool.
 fn parse_strategy_outcomes_args(args_json: &str) -> Result<StrategyOutcomesArgs, String> {
     serde_json::from_str(args_json)
         .map_err(|error| format!("invalid get_strategy_outcomes args json: {error}"))
+}
+
+fn parse_register_strategy_args(args_json: &str) -> Result<StrategyRecipe, String> {
+    serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid register_strategy args json: {error}"))
 }
 
 /// Parse strategy action intent args, normalising `typed_params` vs `typed_params_json`.
@@ -1518,7 +1580,6 @@ fn parse_strategy_intent_args(args_json: &str) -> Result<StrategyExecutionIntent
     };
     Ok(StrategyExecutionIntent {
         key: args.key,
-        version: args.version,
         action_id: args.action_id,
         typed_params_json,
     })
@@ -1549,19 +1610,243 @@ fn list_strategy_templates_tool(args_json: &str) -> Result<String, String> {
         .map_err(|error| format!("failed to serialize templates: {error}"))
 }
 
+struct ResolvedRecipeContract {
+    binding: ContractRoleBinding,
+    functions_by_name: HashMap<String, Vec<AbiFunctionSpec>>,
+}
+
+fn normalize_required_recipe_field(raw: &str, field: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field} must be non-empty"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_optional_check_list(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn normalize_required_check_list(values: Vec<String>, field: &str) -> Result<Vec<String>, String> {
+    let normalized = normalize_optional_check_list(values);
+    if normalized.is_empty() {
+        return Err(format!("{field} must contain at least one non-empty entry"));
+    }
+    Ok(normalized)
+}
+
+fn normalize_recipe_decimal(raw: &str, field: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    parse_u256_decimal(trimmed)
+        .map_err(|error| format!("{field} must be a decimal string: {error}"))?;
+    Ok(trimmed.to_string())
+}
+
+/// Register an agent-authored strategy recipe, validate via dry-run compile, then activate it.
+fn register_strategy_tool(args_json: &str) -> Result<String, String> {
+    let recipe = parse_register_strategy_args(args_json)?;
+    let protocol = normalize_required_recipe_field(&recipe.protocol, "protocol")?;
+    let primitive = normalize_required_recipe_field(&recipe.primitive, "primitive")?;
+    let template_id = normalize_required_recipe_field(&recipe.template_id, "template_id")?;
+    if recipe.chain_id == 0 {
+        return Err("chain_id must be greater than zero".to_string());
+    }
+    if recipe.contracts.is_empty() {
+        return Err("contracts must contain at least one entry".to_string());
+    }
+    if recipe.actions.is_empty() {
+        return Err("actions must contain at least one entry".to_string());
+    }
+
+    let key = StrategyTemplateKey {
+        protocol,
+        primitive,
+        chain_id: recipe.chain_id,
+        template_id,
+    };
+    let now_ns = current_time_ns();
+    log!(
+        StrategyToolLogPriority::Info,
+        "strategy_register_start protocol={} primitive={} template_id={} chain_id={}",
+        key.protocol,
+        key.primitive,
+        key.template_id,
+        key.chain_id
+    );
+
+    let mut resolved_contracts: HashMap<String, ResolvedRecipeContract> = HashMap::new();
+    for contract in recipe.contracts {
+        let role = normalize_required_recipe_field(&contract.role, "contracts.role")?;
+        if resolved_contracts.contains_key(&role) {
+            return Err(format!("duplicate contract role in recipe: {role}"));
+        }
+        let address = normalize_evm_address(&contract.address)?;
+        let source_ref =
+            normalize_required_recipe_field(&contract.source_ref, "contracts.source_ref")?;
+        let artifact_key = AbiArtifactKey {
+            protocol: key.protocol.clone(),
+            chain_id: key.chain_id,
+            role: role.clone(),
+        };
+        let artifact = abi::normalize_abi_artifact(
+            artifact_key,
+            &contract.abi_json,
+            &source_ref,
+            contract.codehash.clone(),
+            &[],
+            now_ns,
+        )?;
+        let artifact = registry::upsert_abi_artifact(artifact)?;
+        let mut functions_by_name: HashMap<String, Vec<AbiFunctionSpec>> = HashMap::new();
+        for function in artifact.functions {
+            functions_by_name
+                .entry(function.name.clone())
+                .or_default()
+                .push(function);
+        }
+        resolved_contracts.insert(
+            role.clone(),
+            ResolvedRecipeContract {
+                binding: ContractRoleBinding {
+                    role,
+                    address,
+                    source_ref,
+                    codehash: contract.codehash,
+                },
+                functions_by_name,
+            },
+        );
+    }
+
+    let mut actions = Vec::with_capacity(recipe.actions.len());
+    for action in recipe.actions {
+        let action_id = normalize_required_recipe_field(&action.action_id, "actions.action_id")?;
+        if action.calls.is_empty() {
+            return Err(format!(
+                "action `{action_id}` must contain at least one call"
+            ));
+        }
+        let mut call_sequence = Vec::with_capacity(action.calls.len());
+        for call in action.calls {
+            let role = normalize_required_recipe_field(&call.role, "actions.calls.role")?;
+            let function_name =
+                normalize_required_recipe_field(&call.function_name, "actions.calls.function")?;
+            let resolved = resolved_contracts
+                .get(&role)
+                .ok_or_else(|| format!("action `{action_id}` references unknown role `{role}`"))?;
+            let Some(candidates) = resolved.functions_by_name.get(&function_name) else {
+                return Err(format!(
+                    "action `{action_id}` function `{function_name}` not found in ABI for role `{role}`"
+                ));
+            };
+            if candidates.len() > 1 {
+                return Err(format!(
+                    "action `{action_id}` function `{function_name}` is overloaded in role `{role}` ABI; provide a non-overloaded function"
+                ));
+            }
+            let function = candidates
+                .first()
+                .cloned()
+                .ok_or_else(|| "recipe function lookup failed unexpectedly".to_string())?;
+            abi::verify_function_selector(&function).map_err(|error| {
+                format!(
+                    "invalid selector for action `{action_id}` role `{role}` function `{function_name}`: {error}"
+                )
+            })?;
+            call_sequence.push(function);
+        }
+        actions.push(ActionSpec {
+            action_id,
+            call_sequence,
+            preconditions: normalize_optional_check_list(action.preconditions),
+            postconditions: normalize_required_check_list(
+                action.postconditions,
+                "actions.postconditions",
+            )?,
+            risk_checks: normalize_optional_check_list(action.risk_checks),
+        });
+    }
+
+    let mut contract_roles = resolved_contracts
+        .into_values()
+        .map(|resolved| resolved.binding)
+        .collect::<Vec<_>>();
+    contract_roles.sort_by(|left, right| left.role.cmp(&right.role));
+
+    let max_value_wei_per_call = normalize_recipe_decimal(
+        recipe
+            .max_value_wei_per_call
+            .as_deref()
+            .unwrap_or(REGISTER_STRATEGY_DEFAULT_MAX_VALUE_WEI_PER_CALL),
+        "max_value_wei_per_call",
+    )?;
+    let template_budget_wei = normalize_recipe_decimal(
+        recipe
+            .template_budget_wei
+            .as_deref()
+            .unwrap_or(REGISTER_STRATEGY_DEFAULT_TEMPLATE_BUDGET_WEI),
+        "template_budget_wei",
+    )?;
+    let constraints_json = serde_json::json!({
+        "max_calls": REGISTER_STRATEGY_DEFAULT_MAX_CALLS,
+        "max_value_wei_per_call": max_value_wei_per_call,
+        "max_total_value_wei": max_value_wei_per_call,
+        "template_budget_wei": template_budget_wei,
+    })
+    .to_string();
+
+    let stored_draft = registry::upsert_template(StrategyTemplate {
+        key: key.clone(),
+        status: TemplateStatus::Draft,
+        contract_roles,
+        actions,
+        constraints_json,
+        created_at_ns: now_ns,
+        updated_at_ns: now_ns,
+    })?;
+
+    compiler::dry_run_compile(&key)?;
+
+    let activated_template = registry::upsert_template(StrategyTemplate {
+        status: TemplateStatus::Active,
+        updated_at_ns: current_time_ns(),
+        ..stored_draft
+    })?;
+    let activation = registry::set_activation(TemplateActivationState {
+        key,
+        enabled: true,
+        updated_at_ns: current_time_ns(),
+        reason: Some("register_strategy auto-activated after dry-run compile".to_string()),
+    })?;
+    log!(
+        StrategyToolLogPriority::Info,
+        "strategy_register_ok protocol={} primitive={} template_id={} chain_id={}",
+        activated_template.key.protocol,
+        activated_template.key.primitive,
+        activated_template.key.template_id,
+        activated_template.key.chain_id
+    );
+    serde_json::to_string(&serde_json::json!({
+        "template": activated_template,
+        "activation": activation,
+    }))
+    .map_err(|error| format!("failed to serialize register_strategy result: {error}"))
+}
+
 /// Compile and validate a strategy intent without submitting any transactions.
 /// Returns the compiled plan and validation findings as JSON.
 fn simulate_strategy_action_tool(args_json: &str) -> Result<String, String> {
     let intent = parse_strategy_intent_args(args_json)?;
     log!(
         StrategyToolLogPriority::Info,
-        "strategy_compile_start mode=simulate protocol={} primitive={} template_id={} version={}.{}.{} action_id={}",
+        "strategy_compile_start mode=simulate protocol={} primitive={} template_id={} action_id={}",
         intent.key.protocol,
         intent.key.primitive,
         intent.key.template_id,
-        intent.version.major,
-        intent.version.minor,
-        intent.version.patch,
         intent.action_id
     );
     let plan = compiler::compile_intent(&intent)?;
@@ -1601,13 +1886,10 @@ async fn execute_strategy_action_tool(
     let intent = parse_strategy_intent_args(args_json)?;
     log!(
         StrategyToolLogPriority::Info,
-        "strategy_compile_start mode=execute protocol={} primitive={} template_id={} version={}.{}.{} action_id={}",
+        "strategy_compile_start mode=execute protocol={} primitive={} template_id={} action_id={}",
         intent.key.protocol,
         intent.key.primitive,
         intent.key.template_id,
-        intent.version.major,
-        intent.version.minor,
-        intent.version.patch,
         intent.action_id
     );
     let plan = compiler::compile_intent(&intent)?;
@@ -1679,20 +1961,23 @@ async fn execute_strategy_action_tool(
     );
     serde_json::to_string(&serde_json::json!({
         "key": plan.key,
-        "version": plan.version,
         "action_id": plan.action_id,
         "tx_hashes": tx_hashes
     }))
     .map_err(|error| format!("failed to serialize execution result: {error}"))
 }
 
-/// Query the learner's outcome statistics for a specific template version.
+/// Query the learner's outcome statistics for a strategy template.
 fn get_strategy_outcomes_tool(args_json: &str) -> Result<String, String> {
     let args = parse_strategy_outcomes_args(args_json)?;
-    let stats = learner::outcome_stats(&args.key, &args.version);
+    let stats = learner::outcome_stats(&args.key);
+    let summary = stats
+        .as_ref()
+        .map(learner::summary_for_llm)
+        .unwrap_or_else(|| "0 runs: no outcomes recorded yet.".to_string());
     serde_json::to_string(&serde_json::json!({
         "key": args.key,
-        "version": args.version,
+        "summary": summary,
         "stats": stats,
     }))
     .map_err(|error| format!("failed to serialize strategy outcomes: {error}"))
@@ -1710,13 +1995,12 @@ fn record_strategy_budget_spend(plan: &crate::domain::types::ExecutionPlan) -> R
         return Ok(());
     }
 
-    let current_spent_raw = stable::strategy_template_budget_spent_wei(&plan.key, &plan.version)
-        .unwrap_or_else(|| "0".to_string());
+    let current_spent_raw =
+        stable::strategy_template_budget_spent_wei(&plan.key).unwrap_or_else(|| "0".to_string());
     let current_spent = parse_u256_decimal(&current_spent_raw)
         .map_err(|error| format!("invalid stored template budget: {error}"))?;
     let updated = current_spent.saturating_add(spent_total);
-    stable::set_strategy_template_budget_spent_wei(&plan.key, &plan.version, updated.to_string())
-        .map(|_| ())
+    stable::set_strategy_template_budget_spent_wei(&plan.key, updated.to_string()).map(|_| ())
 }
 
 /// Parse a decimal (non-hex) string into a `U256`.  Rejects empty input and hex strings.
@@ -1833,15 +2117,14 @@ mod tests {
     use crate::domain::types::{
         AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, AgentState,
         ContractRoleBinding, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
-        SurvivalTier, TemplateActivationState, TemplateStatus, TemplateVersion,
+        SurvivalTier, TemplateActivationState, TemplateStatus,
     };
     use crate::features::cycle_topup::TopUpStage;
     use crate::storage::stable;
     use crate::timing;
+    use crate::util::block_on_with_spin;
     use async_trait::async_trait;
     use std::cell::Cell;
-    use std::future::Future;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     struct CountingSigner {
         calls: Cell<u32>,
@@ -1883,33 +2166,6 @@ mod tests {
         }
     }
 
-    fn block_on_with_spin<F: Future>(future: F) -> F::Output {
-        unsafe fn clone(_ptr: *const ()) -> RawWaker {
-            dummy_raw_waker()
-        }
-        unsafe fn wake(_ptr: *const ()) {}
-        unsafe fn wake_by_ref(_ptr: *const ()) {}
-        unsafe fn drop(_ptr: *const ()) {}
-
-        fn dummy_raw_waker() -> RawWaker {
-            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-
-        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-        let mut context = Context::from_waker(&waker);
-        let mut future = Box::pin(future);
-
-        for _ in 0..10_000 {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => std::hint::spin_loop(),
-            }
-        }
-
-        panic!("future did not complete in test polling loop");
-    }
-
     struct TimeOverrideGuard;
 
     impl Drop for TimeOverrideGuard {
@@ -1932,17 +2188,8 @@ mod tests {
         }
     }
 
-    fn sample_version() -> TemplateVersion {
-        TemplateVersion {
-            major: 1,
-            minor: 0,
-            patch: 0,
-        }
-    }
-
     fn seed_strategy_template_and_artifact() {
         let key = sample_strategy_key();
-        let version = sample_version();
         let function = AbiFunctionSpec {
             role: "token".to_string(),
             name: "transfer".to_string(),
@@ -1965,7 +2212,6 @@ mod tests {
         };
         crate::strategy::registry::upsert_template(StrategyTemplate {
             key: key.clone(),
-            version: version.clone(),
             status: TemplateStatus::Active,
             contract_roles: vec![ContractRoleBinding {
                 role: "token".to_string(),
@@ -1980,7 +2226,7 @@ mod tests {
                 postconditions: vec!["balance_delta_positive".to_string()],
                 risk_checks: vec!["max_notional".to_string()],
             }],
-            constraints_json: r#"{"max_calls":1,"max_total_value_wei":"100","max_notional_wei":"100","template_budget_wei":"100","required_postconditions":["balance_delta_positive"]}"#.to_string(),
+            constraints_json: r#"{"max_calls":1,"max_total_value_wei":"100","template_budget_wei":"100","required_postconditions":["balance_delta_positive"]}"#.to_string(),
             created_at_ns: 1,
             updated_at_ns: 1,
         })
@@ -1990,7 +2236,6 @@ mod tests {
                 protocol: key.protocol.clone(),
                 chain_id: key.chain_id,
                 role: "token".to_string(),
-                version: version.clone(),
             },
             source_ref: "https://example.com/token-abi".to_string(),
             codehash: None,
@@ -2002,7 +2247,6 @@ mod tests {
         .expect("abi artifact should persist");
         crate::strategy::registry::set_activation(TemplateActivationState {
             key,
-            version,
             enabled: true,
             updated_at_ns: 1,
             reason: Some("seed".to_string()),
@@ -2291,6 +2535,158 @@ mod tests {
     }
 
     #[test]
+    fn register_strategy_tool_registers_and_auto_activates_template() {
+        stable::init_storage();
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let abi_json = r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable","inputs":[{"type":"address"},{"type":"uint256"}],"outputs":[{"type":"bool"}]}]"#;
+        let key = StrategyTemplateKey {
+            protocol: "erc20".to_string(),
+            primitive: "transfer".to_string(),
+            chain_id: 8453,
+            template_id: "agent-generated-transfer".to_string(),
+        };
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "register_strategy".to_string(),
+            args_json: serde_json::json!({
+                "protocol": key.protocol,
+                "primitive": key.primitive,
+                "chain_id": key.chain_id,
+                "template_id": key.template_id,
+                "contracts": [
+                    {
+                        "role": "token",
+                        "address": "0x2222222222222222222222222222222222222222",
+                        "abi_json": abi_json,
+                        "source_ref": "https://example.com/token"
+                    }
+                ],
+                "actions": [
+                    {
+                        "action_id": "transfer",
+                        "calls": [{"role":"token","function":"transfer"}],
+                        "postconditions": ["balance_delta_positive"]
+                    }
+                ]
+            })
+            .to_string(),
+        }];
+
+        let records = block_on_with_spin(manager.execute_actions(
+            &state,
+            &calls,
+            &signer,
+            "turn-register-strategy",
+        ));
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].success,
+            "register_strategy should succeed: {:?}",
+            records[0]
+        );
+
+        let stored = crate::strategy::registry::get_template(&key)
+            .expect("registered template should be persisted");
+        assert!(matches!(stored.status, TemplateStatus::Active));
+        let activation =
+            crate::strategy::registry::activation(&key).expect("activation should persist");
+        assert!(activation.enabled);
+        let artifact_key = AbiArtifactKey {
+            protocol: "erc20".to_string(),
+            chain_id: 8453,
+            role: "token".to_string(),
+        };
+        assert!(
+            crate::strategy::registry::get_abi_artifact(&artifact_key).is_some(),
+            "abi artifact should persist"
+        );
+    }
+
+    #[test]
+    fn register_strategy_tool_applies_safe_budget_defaults() {
+        stable::init_storage();
+        let abi_json = r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable","inputs":[{"type":"address"},{"type":"uint256"}],"outputs":[{"type":"bool"}]}]"#;
+        let output = register_strategy_tool(
+            &serde_json::json!({
+                "protocol": "erc20",
+                "primitive": "transfer",
+                "chain_id": 8453,
+                "template_id": "agent-default-budgets",
+                "contracts": [
+                    {
+                        "role": "token",
+                        "address": "0x2222222222222222222222222222222222222222",
+                        "abi_json": abi_json,
+                        "source_ref": "https://example.com/token"
+                    }
+                ],
+                "actions": [
+                    {
+                        "action_id": "transfer",
+                        "calls": [{"role":"token","function":"transfer"}],
+                        "postconditions": ["balance_delta_positive"]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("register_strategy should succeed with defaults");
+        let payload: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid json");
+        let constraints_raw = payload
+            .get("template")
+            .and_then(|template| template.get("constraints_json"))
+            .and_then(|value| value.as_str())
+            .expect("template constraints_json should be present");
+        let constraints: serde_json::Value =
+            serde_json::from_str(constraints_raw).expect("constraints_json should parse");
+        assert_eq!(
+            constraints
+                .get("max_calls")
+                .and_then(|value| value.as_u64()),
+            Some(REGISTER_STRATEGY_DEFAULT_MAX_CALLS as u64)
+        );
+        assert_eq!(
+            constraints
+                .get("max_value_wei_per_call")
+                .and_then(|value| value.as_str()),
+            Some(REGISTER_STRATEGY_DEFAULT_MAX_VALUE_WEI_PER_CALL)
+        );
+        assert_eq!(
+            constraints
+                .get("max_total_value_wei")
+                .and_then(|value| value.as_str()),
+            Some(REGISTER_STRATEGY_DEFAULT_MAX_VALUE_WEI_PER_CALL)
+        );
+        assert_eq!(
+            constraints
+                .get("template_budget_wei")
+                .and_then(|value| value.as_str()),
+            Some(REGISTER_STRATEGY_DEFAULT_TEMPLATE_BUDGET_WEI)
+        );
+    }
+
+    #[test]
+    fn register_strategy_tool_is_blocked_in_inferring_state() {
+        stable::init_storage();
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "register_strategy".to_string(),
+            args_json: "{}".to_string(),
+        }];
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-blocked"));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert_eq!(records[0].error.as_deref(), Some("tool blocked"));
+    }
+
+    #[test]
     fn simulate_strategy_action_tool_compiles_and_validates_plan() {
         stable::init_storage();
         stable::set_evm_chain_id(8453).expect("chain id should be configurable");
@@ -2310,7 +2706,6 @@ mod tests {
             tool: "simulate_strategy_action".to_string(),
             args_json: serde_json::json!({
                 "key": sample_strategy_key(),
-                "version": sample_version(),
                 "action_id": "transfer",
                 "typed_params": {
                     "calls": [
@@ -2368,7 +2763,6 @@ mod tests {
                 tool: "execute_strategy_action".to_string(),
                 args_json: serde_json::json!({
                     "key": sample_strategy_key(),
-                    "version": sample_version(),
                     "action_id": "transfer",
                     "typed_params": {
                         "calls": [
@@ -2388,8 +2782,7 @@ mod tests {
                 tool_call_id: None,
                 tool: "get_strategy_outcomes".to_string(),
                 args_json: serde_json::json!({
-                    "key": sample_strategy_key(),
-                    "version": sample_version()
+                    "key": sample_strategy_key()
                 })
                 .to_string(),
             },
@@ -2410,10 +2803,9 @@ mod tests {
             records[1]
         );
         assert!(records[1].output.contains("\"total_runs\":1"));
-        assert!(records[1].output.contains("\"confidence_bps\""));
+        assert!(records[1].output.contains("\"summary\""));
         assert_eq!(
-            stable::strategy_template_budget_spent_wei(&sample_strategy_key(), &sample_version())
-                .as_deref(),
+            stable::strategy_template_budget_spent_wei(&sample_strategy_key()).as_deref(),
             Some("1")
         );
     }
@@ -2464,7 +2856,6 @@ mod tests {
             tool: "execute_strategy_action".to_string(),
             args_json: serde_json::json!({
                 "key": sample_strategy_key(),
-                "version": sample_version(),
                 "action_id": "transfer",
                 "typed_params": {
                     "calls": [
@@ -2530,7 +2921,6 @@ mod tests {
             tool: "execute_strategy_action".to_string(),
             args_json: serde_json::json!({
                 "key": sample_strategy_key(),
-                "version": sample_version(),
                 "action_id": "transfer",
                 "typed_params": {
                     "calls": [
@@ -2603,12 +2993,8 @@ mod tests {
         ))
         .expect("evm address should set");
         seed_strategy_template_and_artifact();
-        stable::set_strategy_template_budget_spent_wei(
-            &sample_strategy_key(),
-            &sample_version(),
-            "100".to_string(),
-        )
-        .expect("budget should persist");
+        stable::set_strategy_template_budget_spent_wei(&sample_strategy_key(), "100".to_string())
+            .expect("budget should persist");
 
         struct HexSigner;
         #[async_trait(?Send)]
@@ -2626,7 +3012,6 @@ mod tests {
             tool: "execute_strategy_action".to_string(),
             args_json: serde_json::json!({
                 "key": sample_strategy_key(),
-                "version": sample_version(),
                 "action_id": "transfer",
                 "typed_params": {
                     "calls": [

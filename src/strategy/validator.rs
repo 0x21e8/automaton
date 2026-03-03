@@ -1,6 +1,6 @@
 /// Multi-layer execution plan validation.
 ///
-/// [`validate_execution_plan`] runs five ordered validation layers against an
+/// [`validate_execution_plan`] runs four ordered validation layers against an
 /// [`ExecutionPlan`] before it is submitted on-chain.  Each layer appends
 /// [`ValidationFinding`]s to a shared list; the plan passes only when the list is empty.
 ///
@@ -10,8 +10,7 @@
 /// |-----------------|-------------|
 /// | **Schema**      | Required fields are non-empty; `chain_id > 0`; calls list is non-empty; per-call `value_wei` is a decimal string and `data` is valid `0x`-hex with a 4-byte selector. |
 /// | **Address**     | Runtime `chain_id` matches the plan; `to` addresses are valid 20-byte hex; each call's `to` agrees with the template's `contract_roles` binding. |
-/// | **Policy**      | Template status is `Active`; activation record exists and is enabled; no revocation; no kill-switch; numeric constraint limits (`max_calls`, `max_notional_wei`, etc.) are respected; required postconditions are present. |
-/// | **Preflight**   | Skipped if earlier layers produced findings.  For each call: `eth_estimateGas` and `eth_call` are simulated against the live EVM node.  Failures are classified as deterministic or nondeterministic by [`classify_failure_determinism`]. |
+/// | **Policy**      | Template status is `Active`; activation record exists and is enabled; no revocation; no kill-switch; numeric constraint limits (`max_calls`, `max_value_wei_per_call`, `max_total_value_wei`, etc.) are respected; required postconditions are present. |
 /// | **Postcondition** | The plan declares at least one non-empty postcondition string. |
 ///
 /// # Determinism classification
@@ -23,15 +22,13 @@
 /// [`ExecutionPlan`]: crate::domain::types::ExecutionPlan
 /// [`ValidationFinding`]: crate::domain::types::ValidationFinding
 use crate::domain::types::{ExecutionPlan, ValidationFinding, ValidationLayer, ValidationReport};
-use crate::features::evm::HttpEvmRpcClient;
 use crate::storage::stable;
 use crate::strategy::registry;
 use crate::timing::current_time_ns;
+use crate::util::{normalize_evm_address, normalize_hex_blob};
 use alloy_primitives::U256;
 use serde::Deserialize;
-use std::future::Future;
 use std::str::FromStr;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 // ── Internal types ───────────────────────────────────────────────────────────
 
@@ -43,8 +40,6 @@ struct ConstraintPolicy {
     #[serde(default)]
     max_total_value_wei: Option<String>,
     #[serde(default)]
-    max_notional_wei: Option<String>,
-    #[serde(default)]
     max_value_wei_per_call: Option<String>,
     #[serde(default)]
     template_budget_wei: Option<String>,
@@ -54,7 +49,7 @@ struct ConstraintPolicy {
 
 // ── Public surface ───────────────────────────────────────────────────────────
 
-/// Run all five validation layers against `plan` and return a [`ValidationReport`].
+/// Run all validation layers against `plan` and return a [`ValidationReport`].
 ///
 /// Returns `Ok(report)` regardless of whether the plan passes; the caller must check
 /// `report.passed` (and `report.findings`) before proceeding with submission.
@@ -64,10 +59,9 @@ pub fn validate_execution_plan(plan: &ExecutionPlan) -> Result<ValidationReport,
     let mut findings = Vec::new();
 
     validate_schema_layer(plan, &mut findings);
-    let template = registry::get_template(&plan.key, &plan.version);
+    let template = registry::get_template(&plan.key);
     validate_address_layer(plan, template.as_ref(), &snapshot, &mut findings);
     validate_policy_layer(plan, template.as_ref(), &mut findings);
-    validate_preflight_layer(plan, &snapshot, &mut findings);
     validate_postcondition_layer(plan, template.as_ref(), &mut findings);
 
     Ok(ValidationReport {
@@ -247,7 +241,7 @@ fn validate_address_layer(
     }
 
     for (index, call) in plan.calls.iter().enumerate() {
-        if let Err(error) = normalize_address(&call.to) {
+        if let Err(error) = normalize_evm_address(&call.to) {
             findings.push(finding(
                 ValidationLayer::Address,
                 "invalid_to_address",
@@ -261,7 +255,7 @@ fn validate_address_layer(
         findings.push(finding(
             ValidationLayer::Address,
             "template_not_found",
-            "strategy template not found for execution plan key/version".to_string(),
+            "strategy template not found for execution plan key".to_string(),
             true,
         ));
         return;
@@ -291,8 +285,8 @@ fn validate_address_layer(
             ));
             continue;
         }
-        let expected = normalize_address(&binding.address);
-        let actual = normalize_address(&call.to);
+        let expected = normalize_evm_address(&binding.address);
+        let actual = normalize_evm_address(&call.to);
         if let (Ok(expected), Ok(actual)) = (expected, actual) {
             if expected != actual {
                 findings.push(finding(
@@ -329,7 +323,7 @@ fn validate_policy_layer(
         ));
     }
 
-    match registry::activation(&plan.key, &plan.version) {
+    match registry::activation(&plan.key) {
         Some(state) if state.enabled => {}
         Some(_state) => findings.push(finding(
             ValidationLayer::Policy,
@@ -345,7 +339,7 @@ fn validate_policy_layer(
         )),
     }
 
-    if let Some(state) = registry::revocation(&plan.key, &plan.version) {
+    if let Some(state) = registry::revocation(&plan.key) {
         if state.revoked {
             findings.push(finding(
                 ValidationLayer::Policy,
@@ -389,29 +383,7 @@ fn validate_policy_layer(
         };
         total_value = total_value.saturating_add(value_wei);
 
-        if let Some(raw_limit) = constraints.max_notional_wei.as_deref() {
-            if let Ok(limit) = parse_u256_decimal(raw_limit, "max_notional_wei") {
-                if value_wei > limit {
-                    findings.push(finding(
-                        ValidationLayer::Policy,
-                        "max_notional_exceeded",
-                        format!(
-                            "call[{index}] value_wei={} exceeds max_notional_wei={}",
-                            call.value_wei, raw_limit
-                        ),
-                        true,
-                    ));
-                }
-            } else {
-                findings.push(finding(
-                    ValidationLayer::Policy,
-                    "invalid_max_notional_wei",
-                    format!("constraints max_notional_wei is invalid: {raw_limit}"),
-                    true,
-                ));
-            }
-        }
-
+        // Per-call cap: each individual call value must stay below this limit.
         if let Some(raw_limit) = constraints.max_value_wei_per_call.as_deref() {
             if let Ok(limit) = parse_u256_decimal(raw_limit, "max_value_wei_per_call") {
                 if value_wei > limit {
@@ -431,6 +403,7 @@ fn validate_policy_layer(
 
     if let Some(raw_limit) = constraints.max_total_value_wei.as_deref() {
         if let Ok(limit) = parse_u256_decimal(raw_limit, "max_total_value_wei") {
+            // Total cap: the summed value across all calls in this plan.
             if total_value > limit {
                 findings.push(finding(
                     ValidationLayer::Policy,
@@ -452,25 +425,9 @@ fn validate_policy_layer(
         }
     }
 
-    if let Some(raw_limit) = constraints.max_notional_wei.as_deref() {
-        if let Ok(limit) = parse_u256_decimal(raw_limit, "max_notional_wei") {
-            if total_value > limit {
-                findings.push(finding(
-                    ValidationLayer::Policy,
-                    "total_notional_exceeded",
-                    format!(
-                        "plan total value {} exceeds max_notional_wei={raw_limit}",
-                        total_value
-                    ),
-                    true,
-                ));
-            }
-        }
-    }
-
     if let Some(raw_limit) = constraints.template_budget_wei.as_deref() {
         if let Ok(limit) = parse_u256_decimal(raw_limit, "template_budget_wei") {
-            let spent_raw = stable::strategy_template_budget_spent_wei(&plan.key, &plan.version)
+            let spent_raw = stable::strategy_template_budget_spent_wei(&plan.key)
                 .unwrap_or_else(|| "0".to_string());
             if let Ok(spent) = parse_u256_decimal(&spent_raw, "strategy budget spent_wei") {
                 let projected = spent.saturating_add(total_value);
@@ -517,89 +474,7 @@ fn validate_policy_layer(
     }
 }
 
-/// Layer 4 — live EVM preflight simulation via `eth_estimateGas` and `eth_call`.
-///
-/// Skipped entirely if any earlier layer produced a finding, avoiding unnecessary
-/// RPC calls when the plan is already known to be invalid.
-fn validate_preflight_layer(
-    plan: &ExecutionPlan,
-    snapshot: &crate::domain::types::RuntimeSnapshot,
-    findings: &mut Vec<ValidationFinding>,
-) {
-    if !findings.is_empty() {
-        findings.push(finding(
-            ValidationLayer::Preflight,
-            "preflight_skipped_due_to_prior_failures",
-            "preflight skipped because earlier validation layers failed".to_string(),
-            true,
-        ));
-        return;
-    }
-
-    let from = match snapshot.evm_address.as_deref() {
-        Some(address) => match normalize_address(address) {
-            Ok(address) => address,
-            Err(error) => {
-                findings.push(finding(
-                    ValidationLayer::Preflight,
-                    "invalid_from_address",
-                    format!("runtime evm address is invalid: {error}"),
-                    true,
-                ));
-                return;
-            }
-        },
-        None => {
-            findings.push(finding(
-                ValidationLayer::Preflight,
-                "missing_from_address",
-                "runtime evm address is not configured".to_string(),
-                true,
-            ));
-            return;
-        }
-    };
-
-    let rpc = match HttpEvmRpcClient::from_snapshot(snapshot) {
-        Ok(rpc) => rpc,
-        Err(error) => {
-            findings.push(finding(
-                ValidationLayer::Preflight,
-                "preflight_unavailable",
-                format!("failed to initialize rpc preflight client: {error}"),
-                classify_failure_determinism(&error),
-            ));
-            return;
-        }
-    };
-
-    for (index, call) in plan.calls.iter().enumerate() {
-        let Ok(value_wei) = parse_u256_decimal(&call.value_wei, "value_wei") else {
-            continue;
-        };
-        match block_on_with_spin(rpc.eth_estimate_gas(&from, &call.to, value_wei, &call.data)) {
-            Ok(_estimate) => {}
-            Err(error) => findings.push(finding(
-                ValidationLayer::Preflight,
-                "estimate_gas_failed",
-                format!("call[{index}] eth_estimateGas failed: {error}"),
-                classify_failure_determinism(&error),
-            )),
-        }
-
-        match block_on_with_spin(rpc.eth_call(&call.to, &call.data)) {
-            Ok(_result) => {}
-            Err(error) => findings.push(finding(
-                ValidationLayer::Preflight,
-                "eth_call_failed",
-                format!("call[{index}] eth_call failed: {error}"),
-                classify_failure_determinism(&error),
-            )),
-        }
-    }
-}
-
-/// Layer 5 — postcondition presence: the plan must declare at least one non-empty
+/// Layer 4 — postcondition presence: the plan must declare at least one non-empty
 /// postcondition string so that outcome verification has something to evaluate.
 fn validate_postcondition_layer(
     plan: &ExecutionPlan,
@@ -661,39 +536,6 @@ fn parse_u256_decimal(raw: &str, field: &str) -> Result<U256, String> {
     U256::from_str(trimmed).map_err(|error| format!("failed to parse {field}: {error}"))
 }
 
-fn normalize_hex_blob(raw: &str, field: &str) -> Result<String, String> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    let without_prefix = trimmed
-        .strip_prefix("0x")
-        .ok_or_else(|| format!("{field} must be 0x-prefixed hex"))?;
-    if without_prefix.len() % 2 != 0 {
-        return Err(format!("{field} hex length must be even"));
-    }
-    if !without_prefix
-        .as_bytes()
-        .iter()
-        .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(format!("{field} must be valid hex"));
-    }
-    Ok(trimmed)
-}
-
-fn normalize_address(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    let valid = trimmed.len() == 42
-        && trimmed.starts_with("0x")
-        && trimmed
-            .as_bytes()
-            .iter()
-            .skip(2)
-            .all(|byte| byte.is_ascii_hexdigit());
-    if !valid {
-        return Err("address must be a 0x-prefixed 20-byte hex string".to_string());
-    }
-    Ok(trimmed)
-}
-
 fn finding(
     layer: ValidationLayer,
     code: &str,
@@ -708,45 +550,12 @@ fn finding(
     }
 }
 
-/// Synchronously drive a `Future` to completion using a no-op waker and a busy-spin loop.
-///
-/// Used to call async EVM RPC methods from within the synchronous validator on the IC,
-/// where `tokio` / `async-std` runtimes are unavailable.  Panics if the future does not
-/// resolve within 10 000 spin iterations, which indicates a logic error (futures used here
-/// should be backed by the IC's deterministic message execution and always terminate).
-fn block_on_with_spin<F: Future>(future: F) -> F::Output {
-    unsafe fn clone(_ptr: *const ()) -> RawWaker {
-        dummy_raw_waker()
-    }
-    unsafe fn wake(_ptr: *const ()) {}
-    unsafe fn wake_by_ref(_ptr: *const ()) {}
-    unsafe fn drop(_ptr: *const ()) {}
-
-    fn dummy_raw_waker() -> RawWaker {
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-
-    let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-    let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-
-    for _ in 0..10_000 {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => std::hint::spin_loop(),
-        }
-    }
-
-    panic!("future did not complete in validator polling loop");
-}
-
 #[cfg(test)]
 mod tests {
     use super::{classify_failure_determinism, validate_execution_plan};
     use crate::domain::types::{
         ActionSpec, ContractRoleBinding, ExecutionPlan, StrategyExecutionCall, StrategyTemplate,
-        StrategyTemplateKey, TemplateActivationState, TemplateStatus, TemplateVersion,
+        StrategyTemplateKey, TemplateActivationState, TemplateStatus,
     };
     use crate::storage::stable;
     use crate::strategy::registry;
@@ -760,18 +569,9 @@ mod tests {
         }
     }
 
-    fn sample_version() -> TemplateVersion {
-        TemplateVersion {
-            major: 1,
-            minor: 0,
-            patch: 0,
-        }
-    }
-
     fn sample_plan(template_id: &str) -> ExecutionPlan {
         ExecutionPlan {
             key: sample_key(template_id),
-            version: sample_version(),
             action_id: "transfer".to_string(),
             calls: vec![StrategyExecutionCall {
                 role: "token".to_string(),
@@ -786,10 +586,8 @@ mod tests {
 
     fn seed_template(template_id: &str) {
         let key = sample_key(template_id);
-        let version = sample_version();
         registry::upsert_template(StrategyTemplate {
             key: key.clone(),
-            version: version.clone(),
             status: TemplateStatus::Active,
             contract_roles: vec![ContractRoleBinding {
                 role: "token".to_string(),
@@ -811,7 +609,6 @@ mod tests {
         .expect("template should persist");
         registry::set_activation(TemplateActivationState {
             key,
-            version,
             enabled: true,
             updated_at_ns: 1,
             reason: None,
@@ -898,13 +695,12 @@ mod tests {
         let template_id = "validator-budget";
         seed_template(template_id);
         let key = sample_key(template_id);
-        let version = sample_version();
 
-        let mut template = registry::get_template(&key, &version).expect("template should exist");
+        let mut template = registry::get_template(&key).expect("template should exist");
         template.constraints_json =
             r#"{"template_budget_wei":"0","max_calls":2,"max_total_value_wei":"1000"}"#.to_string();
         registry::upsert_template(template).expect("template should update");
-        stable::set_strategy_template_budget_spent_wei(&key, &version, "0".to_string())
+        stable::set_strategy_template_budget_spent_wei(&key, "0".to_string())
             .expect("budget spent should persist");
 
         let mut plan = sample_plan(template_id);
@@ -918,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_execution_plan_enforces_max_notional_cap() {
+    fn validate_execution_plan_enforces_max_value_per_call_cap() {
         stable::init_storage();
         stable::set_evm_chain_id(8453).expect("chain id should persist");
         stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
@@ -928,14 +724,14 @@ mod tests {
             "0x1111111111111111111111111111111111111111".to_string(),
         ))
         .expect("evm address should persist");
-        let template_id = "validator-notional";
+        let template_id = "validator-max-value";
         seed_template(template_id);
         let key = sample_key(template_id);
-        let version = sample_version();
 
-        let mut template = registry::get_template(&key, &version).expect("template should exist");
+        let mut template = registry::get_template(&key).expect("template should exist");
         template.constraints_json =
-            r#"{"max_notional_wei":"0","max_calls":2,"max_total_value_wei":"1000"}"#.to_string();
+            r#"{"max_value_wei_per_call":"0","max_calls":2,"max_total_value_wei":"1000"}"#
+                .to_string();
         registry::upsert_template(template).expect("template should update");
 
         let mut plan = sample_plan(template_id);
@@ -945,6 +741,6 @@ mod tests {
         assert!(report
             .findings
             .iter()
-            .any(|finding| finding.code == "max_notional_exceeded"));
+            .any(|finding| finding.code == "value_per_call_exceeded"));
     }
 }
