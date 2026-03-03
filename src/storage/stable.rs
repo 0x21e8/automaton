@@ -22,8 +22,8 @@ use crate::domain::types::{
     StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats, StrategyTemplate,
     StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind,
     TaskLane, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
-    TemplateRevocationState, TemplateVersion, ToolCallRecord, TransitionLogRecord, TurnRecord,
-    TurnWindowSummary, WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
+    TemplateRevocationState, ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary,
+    WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
     WalletBalanceTelemetryView,
 };
 pub use crate::domain::types::{
@@ -32,6 +32,7 @@ pub use crate::domain::types::{
 };
 use crate::features::cycle_topup::TopUpStage;
 use crate::prompt;
+use crate::util::normalize_evm_address;
 use candid::Principal;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
@@ -1421,21 +1422,6 @@ fn is_local_http_url(url: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1")
 }
 
-fn normalize_evm_hex_address(raw: &str, field: &str) -> Result<String, String> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    let valid_len = trimmed.len() == 42;
-    let valid_prefix = trimmed.starts_with("0x");
-    let valid_hex = trimmed
-        .as_bytes()
-        .iter()
-        .skip(2)
-        .all(|byte| byte.is_ascii_hexdigit());
-    if !(valid_len && valid_prefix && valid_hex) {
-        return Err(format!("{field} must be a 0x-prefixed 20-byte hex string"));
-    }
-    Ok(trimmed)
-}
-
 fn evm_address_to_topic(address: &str) -> String {
     let suffix = address.strip_prefix("0x").unwrap_or(address);
     format!("0x{:0>64}", suffix)
@@ -1466,7 +1452,10 @@ pub fn get_ecdsa_key_name() -> String {
 /// Pass `None` to clear.
 pub fn set_evm_address(address: Option<String>) -> Result<Option<String>, String> {
     let normalized = match address {
-        Some(raw) => Some(normalize_evm_hex_address(&raw, "evm address")?),
+        Some(raw) => Some(
+            normalize_evm_address(&raw)
+                .map_err(|_| "evm address must be a 0x-prefixed 20-byte hex string".to_string())?,
+        ),
         None => None,
     };
 
@@ -1495,7 +1484,8 @@ fn normalize_steward_state(mut steward: StewardState) -> Result<StewardState, St
     if steward.chain_id == 0 {
         return Err("steward chain id must be greater than 0".to_string());
     }
-    steward.address = normalize_evm_hex_address(&steward.address, "steward address")?;
+    steward.address = normalize_evm_address(&steward.address)
+        .map_err(|_| "steward address must be a 0x-prefixed 20-byte hex string".to_string())?;
     if steward.principal == Some(Principal::anonymous()) {
         return Err("steward principal cannot be anonymous".to_string());
     }
@@ -1587,7 +1577,9 @@ pub fn get_discovered_usdc_address() -> Option<String> {
 /// Sets the inbox contract address and mirrors it to `evm_cursor.contract_address`.
 pub fn set_inbox_contract_address(address: Option<String>) -> Result<Option<String>, String> {
     let normalized = match address {
-        Some(raw) => Some(normalize_evm_hex_address(&raw, "inbox contract address")?),
+        Some(raw) => Some(normalize_evm_address(&raw).map_err(|_| {
+            "inbox contract address must be a 0x-prefixed 20-byte hex string".to_string()
+        })?),
         None => None,
     };
 
@@ -2485,15 +2477,8 @@ pub fn upsert_strategy_template(template: StrategyTemplate) -> Result<StrategyTe
     Ok(template)
 }
 
-pub fn strategy_template(
-    key: &StrategyTemplateKey,
-    version: &TemplateVersion,
-) -> Option<StrategyTemplate> {
-    sqlite::strategy_template(key, version).ok().flatten()
-}
-
-pub fn list_strategy_template_versions(key: &StrategyTemplateKey) -> Vec<TemplateVersion> {
-    sqlite::list_strategy_template_versions(key).unwrap_or_default()
+pub fn strategy_template(key: &StrategyTemplateKey) -> Option<StrategyTemplate> {
+    sqlite::strategy_template(key).ok().flatten()
 }
 
 pub fn list_strategy_templates(key: &StrategyTemplateKey, limit: usize) -> Vec<StrategyTemplate> {
@@ -2519,31 +2504,19 @@ pub fn abi_artifact(key: &AbiArtifactKey) -> Option<AbiArtifact> {
     sqlite::abi_artifact(key).ok().flatten()
 }
 
-pub fn list_abi_artifact_versions(
-    protocol: &str,
-    chain_id: u64,
-    role: &str,
-) -> Vec<TemplateVersion> {
-    sqlite::list_abi_artifact_versions(protocol, chain_id, role).unwrap_or_default()
-}
-
 // ── Strategy activations / revocations / kill switches / outcome stats ───────
 
 pub fn set_strategy_template_activation(
     state: TemplateActivationState,
 ) -> Result<TemplateActivationState, String> {
     validate_strategy_template_key(&state.key)?;
-    validate_template_version(&state.version)?;
-    let record_key = template_state_record_key("activation", &state.key, &state.version);
+    let record_key = template_state_record_key("activation", &state.key);
     sqlite::upsert_strategy_activation(&record_key, &state)?;
     Ok(state)
 }
 
-pub fn strategy_template_activation(
-    key: &StrategyTemplateKey,
-    version: &TemplateVersion,
-) -> Option<TemplateActivationState> {
-    let record_key = template_state_record_key("activation", key, version);
+pub fn strategy_template_activation(key: &StrategyTemplateKey) -> Option<TemplateActivationState> {
+    let record_key = template_state_record_key("activation", key);
     sqlite::get_strategy_activation::<TemplateActivationState>(&record_key)
         .ok()
         .flatten()
@@ -2553,18 +2526,14 @@ pub fn set_strategy_template_revocation(
     state: TemplateRevocationState,
 ) -> Result<TemplateRevocationState, String> {
     validate_strategy_template_key(&state.key)?;
-    validate_template_version(&state.version)?;
-    let record_key = template_state_record_key("revocation", &state.key, &state.version);
+    let record_key = template_state_record_key("revocation", &state.key);
     sqlite::upsert_strategy_revocation(&record_key, &state)?;
     Ok(state)
 }
 
 #[allow(dead_code)]
-pub fn strategy_template_revocation(
-    key: &StrategyTemplateKey,
-    version: &TemplateVersion,
-) -> Option<TemplateRevocationState> {
-    let record_key = template_state_record_key("revocation", key, version);
+pub fn strategy_template_revocation(key: &StrategyTemplateKey) -> Option<TemplateRevocationState> {
+    let record_key = template_state_record_key("revocation", key);
     sqlite::get_strategy_revocation::<TemplateRevocationState>(&record_key)
         .ok()
         .flatten()
@@ -2586,11 +2555,8 @@ pub fn strategy_kill_switch(key: &StrategyTemplateKey) -> Option<StrategyKillSwi
         .flatten()
 }
 
-pub fn strategy_outcome_stats(
-    key: &StrategyTemplateKey,
-    version: &TemplateVersion,
-) -> Option<StrategyOutcomeStats> {
-    let record_key = strategy_outcome_stats_record_key(key, version);
+pub fn strategy_outcome_stats(key: &StrategyTemplateKey) -> Option<StrategyOutcomeStats> {
+    let record_key = strategy_outcome_stats_record_key(key);
     sqlite::get_strategy_outcome_stats::<StrategyOutcomeStats>(&record_key)
         .ok()
         .flatten()
@@ -2600,29 +2566,23 @@ pub fn upsert_strategy_outcome_stats(
     stats: StrategyOutcomeStats,
 ) -> Result<StrategyOutcomeStats, String> {
     validate_strategy_template_key(&stats.key)?;
-    validate_template_version(&stats.version)?;
-    let record_key = strategy_outcome_stats_record_key(&stats.key, &stats.version);
+    let record_key = strategy_outcome_stats_record_key(&stats.key);
     sqlite::upsert_strategy_outcome_stats(&record_key, &stats)?;
     Ok(stats)
 }
 
-pub fn strategy_template_budget_spent_wei(
-    key: &StrategyTemplateKey,
-    version: &TemplateVersion,
-) -> Option<String> {
-    let record_key = strategy_budget_record_key(key, version);
+pub fn strategy_template_budget_spent_wei(key: &StrategyTemplateKey) -> Option<String> {
+    let record_key = strategy_budget_record_key(key);
     sqlite::get_strategy_budget(&record_key).ok().flatten()
 }
 
 pub fn set_strategy_template_budget_spent_wei(
     key: &StrategyTemplateKey,
-    version: &TemplateVersion,
     spent_wei: String,
 ) -> Result<String, String> {
     validate_strategy_template_key(key)?;
-    validate_template_version(version)?;
     let normalized = normalize_decimal_string(&spent_wei, "strategy budget spent_wei")?;
-    let record_key = strategy_budget_record_key(key, version);
+    let record_key = strategy_budget_record_key(key);
     sqlite::upsert_strategy_budget(&record_key, &normalized)?;
     Ok(normalized)
 }
@@ -2645,13 +2605,6 @@ fn validate_strategy_template_key(key: &StrategyTemplateKey) -> Result<(), Strin
     Ok(())
 }
 
-fn validate_template_version(version: &TemplateVersion) -> Result<(), String> {
-    if version.major == 0 && version.minor == 0 && version.patch == 0 {
-        return Err("template version must not be 0.0.0".to_string());
-    }
-    Ok(())
-}
-
 fn strategy_template_lookup_key(key: &StrategyTemplateKey) -> String {
     let normalized = format!(
         "{}|{}|{}|{}",
@@ -2663,46 +2616,20 @@ fn strategy_template_lookup_key(key: &StrategyTemplateKey) -> String {
     lookup_digest("strategy:template", &normalized)
 }
 
-fn template_version_sort_key(version: &TemplateVersion) -> String {
-    format!(
-        "{:05}.{:05}.{:05}",
-        version.major, version.minor, version.patch
-    )
-}
-
-fn template_state_record_key(
-    kind: &str,
-    key: &StrategyTemplateKey,
-    version: &TemplateVersion,
-) -> String {
-    format!(
-        "strategy:{kind}:{}:{}",
-        strategy_template_lookup_key(key),
-        template_version_sort_key(version)
-    )
+fn template_state_record_key(kind: &str, key: &StrategyTemplateKey) -> String {
+    format!("strategy:{kind}:{}", strategy_template_lookup_key(key))
 }
 
 fn strategy_kill_switch_record_key(key: &StrategyTemplateKey) -> String {
     format!("strategy:kill_switch:{}", strategy_template_lookup_key(key))
 }
 
-fn strategy_outcome_stats_record_key(
-    key: &StrategyTemplateKey,
-    version: &TemplateVersion,
-) -> String {
-    format!(
-        "strategy:outcome:{}:{}",
-        strategy_template_lookup_key(key),
-        template_version_sort_key(version)
-    )
+fn strategy_outcome_stats_record_key(key: &StrategyTemplateKey) -> String {
+    format!("strategy:outcome:{}", strategy_template_lookup_key(key))
 }
 
-fn strategy_budget_record_key(key: &StrategyTemplateKey, version: &TemplateVersion) -> String {
-    format!(
-        "strategy:budget:{}:{}",
-        strategy_template_lookup_key(key),
-        template_version_sort_key(version)
-    )
+fn strategy_budget_record_key(key: &StrategyTemplateKey) -> String {
+    format!("strategy:budget:{}", strategy_template_lookup_key(key))
 }
 
 fn lookup_digest(prefix: &str, payload: &str) -> String {
@@ -2728,27 +2655,20 @@ pub fn record_strategy_outcome(
     outcome: StrategyOutcomeEvent,
 ) -> Result<StrategyOutcomeStats, String> {
     validate_strategy_template_key(&outcome.key)?;
-    validate_template_version(&outcome.version)?;
     if outcome.action_id.trim().is_empty() {
         return Err("outcome action_id must be non-empty".to_string());
     }
 
-    let mut stats = strategy_outcome_stats(&outcome.key, &outcome.version).unwrap_or_else(|| {
-        StrategyOutcomeStats {
-            key: outcome.key.clone(),
-            version: outcome.version.clone(),
-            total_runs: 0,
-            success_runs: 0,
-            deterministic_failures: 0,
-            nondeterministic_failures: 0,
-            deterministic_failure_streak: 0,
-            confidence_bps: 0,
-            ranking_score_bps: 0,
-            parameter_priors: crate::domain::types::StrategyParameterPriors::default(),
-            last_error: None,
-            last_tx_hash: None,
-            last_observed_at_ns: None,
-        }
+    let mut stats = strategy_outcome_stats(&outcome.key).unwrap_or_else(|| StrategyOutcomeStats {
+        key: outcome.key.clone(),
+        total_runs: 0,
+        success_runs: 0,
+        deterministic_failures: 0,
+        nondeterministic_failures: 0,
+        deterministic_failure_streak: 0,
+        last_error: None,
+        last_tx_hash: None,
+        last_observed_at_ns: None,
     });
 
     stats.total_runs = stats.total_runs.saturating_add(1);

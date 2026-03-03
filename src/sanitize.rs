@@ -31,6 +31,7 @@ pub const SENSITIVE_TOOLS: &[&str] = &[
     "sign_message",
     "broadcast_transaction",
     "update_prompt_layer",
+    "register_strategy",
     // canister_call can make state-mutating update calls (e.g. withdraw cycles),
     // so it must not follow untrusted content.
     "canister_call",
@@ -285,6 +286,18 @@ mod tests {
             .expect_err("sensitive tool should be blocked after inbox context");
         assert!(blocked.contains("update_prompt_layer"));
         assert!(blocked.contains("inbox"));
+    }
+
+    #[test]
+    fn tool_sequence_validator_blocks_http_fetch_to_register_strategy() {
+        let mut validator = ToolSequenceValidator::new();
+        assert!(validator.validate_next("http_fetch").is_ok());
+
+        let blocked = validator
+            .validate_next("register_strategy")
+            .expect_err("register_strategy after http_fetch should be blocked");
+        assert!(blocked.contains("register_strategy"));
+        assert!(blocked.contains("possible prompt injection"));
     }
 
     #[test]

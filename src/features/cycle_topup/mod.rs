@@ -22,6 +22,7 @@
 /// stages return `Ok(false)` so the scheduler can defer the next tick.
 // ── Imports ──────────────────────────────────────────────────────────────────
 use crate::timing::current_time_ns;
+use crate::util::{normalize_evm_address, normalize_hex_blob};
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::{length_of_length, BufMut, Encodable, Header};
 use async_trait::async_trait;
@@ -646,24 +647,6 @@ fn parse_hex_u256(raw: &str, field: &str) -> Result<U256, String> {
     Ok(U256::from_be_slice(&bytes))
 }
 
-fn normalize_hex_blob(raw: &str, field: &str) -> Result<String, String> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    let without_prefix = trimmed
-        .strip_prefix("0x")
-        .ok_or_else(|| format!("{field} must be 0x-prefixed hex"))?;
-    if without_prefix.len() % 2 != 0 {
-        return Err(format!("{field} hex length must be even"));
-    }
-    if !without_prefix
-        .as_bytes()
-        .iter()
-        .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(format!("{field} must be valid hex"));
-    }
-    Ok(trimmed)
-}
-
 fn normalize_hex_quantity(raw: &str, field: &str) -> Result<String, String> {
     let trimmed = raw.trim().to_ascii_lowercase();
     let without_prefix = trimmed
@@ -680,18 +663,8 @@ fn normalize_hex_quantity(raw: &str, field: &str) -> Result<String, String> {
 }
 
 pub(crate) fn normalize_evm_hex_address(raw: &str, field: &str) -> Result<String, String> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    let valid = trimmed.len() == 42
-        && trimmed.starts_with("0x")
-        && trimmed
-            .as_bytes()
-            .iter()
-            .skip(2)
-            .all(|byte| byte.is_ascii_hexdigit());
-    if !valid {
-        return Err(format!("{field} must be a 0x-prefixed 20-byte hex string"));
-    }
-    Ok(trimmed)
+    normalize_evm_address(raw)
+        .map_err(|_| format!("{field} must be a 0x-prefixed 20-byte hex string"))
 }
 
 fn normalize_address(raw: &str) -> Result<String, String> {
@@ -1705,36 +1678,8 @@ pub(crate) fn topup_status_from_stage(state: Option<TopUpStage>) -> TopUpStatus 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::block_on_with_spin;
     use std::cell::RefCell;
-    use std::future::Future;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    fn block_on_with_spin<F: Future>(future: F) -> F::Output {
-        unsafe fn clone(_ptr: *const ()) -> RawWaker {
-            dummy_raw_waker()
-        }
-        unsafe fn wake(_ptr: *const ()) {}
-        unsafe fn wake_by_ref(_ptr: *const ()) {}
-        unsafe fn drop(_ptr: *const ()) {}
-
-        fn dummy_raw_waker() -> RawWaker {
-            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-
-        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-        let mut context = Context::from_waker(&waker);
-        let mut future = Box::pin(future);
-
-        for _ in 0..10_000 {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => std::hint::spin_loop(),
-            }
-        }
-
-        panic!("future did not complete in test polling loop");
-    }
 
     #[derive(Debug, Clone, Default)]
     struct TestEvmPort {

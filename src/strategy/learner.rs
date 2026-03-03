@@ -1,32 +1,16 @@
-/// Outcome learning — accumulate execution results and derive adaptive parameter priors.
+/// Outcome learning — persist raw strategy outcomes and enforce safety automation.
 ///
 /// After each strategy execution the agent records an [`StrategyOutcomeEvent`] here.
 /// This module:
 ///
 /// 1. Appends the raw event to stable storage via `stable::record_strategy_outcome`.
-/// 2. Recomputes derived statistics (`confidence_bps`, `ranking_score_bps`, and
-///    [`StrategyParameterPriors`]) via `apply_learning_updates`.
-/// 3. Persists the updated [`StrategyOutcomeStats`].
-/// 4. Auto-deactivates the template if `deterministic_failure_streak` reaches
+/// 2. Auto-deactivates the template if `deterministic_failure_streak` reaches
 ///    [`AUTO_DEACTIVATE_DETERMINISTIC_STREAK`].
-///
-/// # Scoring model
-///
-/// All scores are expressed in basis points (0–10 000 = 0–100 %).
-///
-/// - **confidence** = success_rate − deterministic_penalty − nondeterministic_penalty
-///   (deterministic failures penalised at 0.5×, nondeterministic at 0.25×).
-/// - **ranking** = confidence × 0.8 + sample_bonus (up to 50 runs × 40 bps = 2 000 bps).
-/// - **slippage_bps prior** = 100 + scaled deterministic/nondeterministic failure rates,
-///   clamped to [25, 500].
-/// - **gas_buffer_bps prior** = 120 + scaled failure rates, clamped to [100, 500].
 ///
 /// [`StrategyOutcomeEvent`]: crate::domain::types::StrategyOutcomeEvent
 /// [`StrategyOutcomeStats`]: crate::domain::types::StrategyOutcomeStats
-/// [`StrategyParameterPriors`]: crate::domain::types::StrategyParameterPriors
 use crate::domain::types::{
-    StrategyOutcomeEvent, StrategyOutcomeStats, StrategyParameterPriors, StrategyTemplateKey,
-    TemplateActivationState, TemplateVersion,
+    StrategyOutcomeEvent, StrategyOutcomeStats, StrategyTemplateKey, TemplateActivationState,
 };
 use crate::storage::stable;
 
@@ -44,93 +28,39 @@ const AUTO_DEACTIVATE_DETERMINISTIC_STREAK: u32 = 3;
 
 /// Record a strategy execution outcome event and return the updated [`StrategyOutcomeStats`].
 ///
-/// Appends the raw event, recomputes all derived stats, persists them, and — if the
-/// deterministic failure streak has reached [`AUTO_DEACTIVATE_DETERMINISTIC_STREAK`] —
-/// deactivates the template.
+/// Appends the raw event and — if the deterministic failure streak has reached
+/// [`AUTO_DEACTIVATE_DETERMINISTIC_STREAK`] — deactivates the template.
 pub fn record_outcome(event: StrategyOutcomeEvent) -> Result<StrategyOutcomeStats, String> {
     let observed_at_ns = event.observed_at_ns;
     let stats = stable::record_strategy_outcome(event)?;
-    let learned = apply_learning_updates(stats);
-    let persisted = stable::upsert_strategy_outcome_stats(learned)?;
-    maybe_auto_deactivate_on_deterministic_failures(&persisted, observed_at_ns)?;
-    Ok(persisted)
+    maybe_auto_deactivate_on_deterministic_failures(&stats, observed_at_ns)?;
+    Ok(stats)
 }
 
-/// Retrieve the current [`StrategyOutcomeStats`] for a template version without recording
+/// Retrieve the current [`StrategyOutcomeStats`] for a template without recording
 /// a new event.  Returns `None` if no outcomes have been recorded yet.
-pub fn outcome_stats(
-    key: &StrategyTemplateKey,
-    version: &TemplateVersion,
-) -> Option<StrategyOutcomeStats> {
-    stable::strategy_outcome_stats(key, version)
+pub fn outcome_stats(key: &StrategyTemplateKey) -> Option<StrategyOutcomeStats> {
+    stable::strategy_outcome_stats(key)
 }
 
-// ── Learning internals ───────────────────────────────────────────────────────
-
-/// Recompute all derived stats from the raw counters in `stats`.
-///
-/// Called after every `record_outcome` call.  All arithmetic uses saturating operations
-/// to prevent overflow on adversarial inputs.
-fn apply_learning_updates(mut stats: StrategyOutcomeStats) -> StrategyOutcomeStats {
-    if stats.total_runs == 0 {
-        stats.confidence_bps = 0;
-        stats.ranking_score_bps = 0;
-        stats.parameter_priors = StrategyParameterPriors::default();
-        return stats;
-    }
-
-    let total = stats.total_runs.max(1);
-    let success_rate_bps = ratio_bps(stats.success_runs, total);
-    let deterministic_rate_bps = ratio_bps(stats.deterministic_failures, total);
-    let nondeterministic_rate_bps = ratio_bps(stats.nondeterministic_failures, total);
-
-    // Deterministic failures are penalised more heavily (0.5×) than nondeterministic
-    // ones (0.25×) because they indicate a structural problem rather than transient noise.
-    let deterministic_penalty = deterministic_rate_bps / 2;
-    let nondeterministic_penalty = nondeterministic_rate_bps / 4;
-    let confidence = success_rate_bps
-        .saturating_sub(deterministic_penalty)
-        .saturating_sub(nondeterministic_penalty);
-
-    // Sample bonus rewards templates with more observations (capped at 50 runs × 40 bps).
-    // Ranking weights confidence at 80 % and sample depth at 20 %.
-    let sample_bonus = u16::try_from(stats.total_runs.min(50))
-        .unwrap_or(50)
-        .saturating_mul(40);
-    let ranking = ((u32::from(confidence) * 8) / 10)
-        .saturating_add(u32::from(sample_bonus))
-        .min(10_000) as u16;
-
-    // Slippage and gas-buffer priors grow with failure rates so riskier templates are
-    // allocated wider execution margins.
-    let slippage = 100u16
-        .saturating_add(deterministic_rate_bps / 100)
-        .saturating_add(nondeterministic_rate_bps / 200)
-        .clamp(25, 500);
-    let gas_buffer = 120u16
-        .saturating_add(deterministic_rate_bps / 200)
-        .saturating_add(nondeterministic_rate_bps / 50)
-        .clamp(100, 500);
-
-    stats.confidence_bps = confidence.min(10_000);
-    stats.ranking_score_bps = ranking;
-    stats.parameter_priors = StrategyParameterPriors {
-        slippage_bps: slippage,
-        gas_buffer_bps: gas_buffer,
-    };
-    stats
-}
-
-/// Compute `numerator / denominator` expressed in basis points, saturating at 10 000.
-fn ratio_bps(numerator: u64, denominator: u64) -> u16 {
-    if denominator == 0 {
-        return 0;
-    }
-    let bps = numerator
-        .saturating_mul(10_000)
-        .checked_div(denominator)
-        .unwrap_or(0);
-    u16::try_from(bps).unwrap_or(10_000).min(10_000)
+/// Format outcome stats into a compact sentence suitable for LLM context.
+pub fn summary_for_llm(stats: &StrategyOutcomeStats) -> String {
+    let last_error_segment = stats
+        .last_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" (last error: {value})"))
+        .unwrap_or_default();
+    format!(
+        "{} runs: {} succeeded, {} deterministic failures{}, {} transient. Streak: {} consecutive deterministic failures.",
+        stats.total_runs,
+        stats.success_runs,
+        stats.deterministic_failures,
+        last_error_segment,
+        stats.nondeterministic_failures,
+        stats.deterministic_failure_streak
+    )
 }
 
 /// Deactivate the template if `deterministic_failure_streak` has reached the threshold.
@@ -144,7 +74,7 @@ fn maybe_auto_deactivate_on_deterministic_failures(
     if stats.deterministic_failure_streak < AUTO_DEACTIVATE_DETERMINISTIC_STREAK {
         return Ok(());
     }
-    let currently_enabled = stable::strategy_template_activation(&stats.key, &stats.version)
+    let currently_enabled = stable::strategy_template_activation(&stats.key)
         .map(|state| state.enabled)
         .unwrap_or(false);
     if !currently_enabled {
@@ -153,7 +83,6 @@ fn maybe_auto_deactivate_on_deterministic_failures(
 
     stable::set_strategy_template_activation(TemplateActivationState {
         key: stats.key.clone(),
-        version: stats.version.clone(),
         enabled: false,
         updated_at_ns: observed_at_ns,
         reason: Some(format!(
@@ -167,7 +96,7 @@ fn maybe_auto_deactivate_on_deterministic_failures(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::types::{StrategyOutcomeKind, StrategyTemplateKey, TemplateVersion};
+    use crate::domain::types::{StrategyOutcomeKind, StrategyTemplateKey};
 
     fn key(template_id: &str) -> StrategyTemplateKey {
         StrategyTemplateKey {
@@ -178,23 +107,13 @@ mod tests {
         }
     }
 
-    fn version() -> TemplateVersion {
-        TemplateVersion {
-            major: 1,
-            minor: 0,
-            patch: 0,
-        }
-    }
-
     #[test]
-    fn record_outcome_updates_confidence_priors_and_ranking() {
+    fn record_outcome_updates_raw_counters() {
         stable::init_storage();
         let key = key("learner-confidence");
-        let version = version();
 
         record_outcome(StrategyOutcomeEvent {
             key: key.clone(),
-            version: version.clone(),
             action_id: "swap_exact_in".to_string(),
             outcome: StrategyOutcomeKind::Success,
             tx_hash: Some("0xaaa".to_string()),
@@ -204,7 +123,6 @@ mod tests {
         .expect("success outcome should persist");
         let stats = record_outcome(StrategyOutcomeEvent {
             key,
-            version,
             action_id: "swap_exact_in".to_string(),
             outcome: StrategyOutcomeKind::DeterministicFailure,
             tx_hash: Some("0xbbb".to_string()),
@@ -217,20 +135,39 @@ mod tests {
         assert_eq!(stats.success_runs, 1);
         assert_eq!(stats.deterministic_failures, 1);
         assert_eq!(stats.deterministic_failure_streak, 1);
-        assert!(stats.confidence_bps > 0);
-        assert!(stats.ranking_score_bps > 0);
-        assert!(stats.parameter_priors.slippage_bps >= 100);
-        assert!(stats.parameter_priors.gas_buffer_bps >= 120);
+        assert_eq!(stats.nondeterministic_failures, 0);
+        assert_eq!(stats.last_error.as_deref(), Some("slippage exceeded"));
+        assert_eq!(stats.last_tx_hash.as_deref(), Some("0xbbb"));
+        assert_eq!(stats.last_observed_at_ns, Some(11));
+    }
+
+    #[test]
+    fn summary_for_llm_includes_counts_and_streak() {
+        let summary = summary_for_llm(&StrategyOutcomeStats {
+            key: key("learner-summary"),
+            total_runs: 23,
+            success_runs: 18,
+            deterministic_failures: 3,
+            nondeterministic_failures: 2,
+            deterministic_failure_streak: 0,
+            last_error: Some("insufficient balance".to_string()),
+            last_tx_hash: Some("0xabc".to_string()),
+            last_observed_at_ns: Some(100),
+        });
+
+        assert!(summary.contains("23 runs"));
+        assert!(summary.contains("18 succeeded"));
+        assert!(summary.contains("3 deterministic failures"));
+        assert!(summary.contains("2 transient"));
+        assert!(summary.contains("Streak: 0 consecutive deterministic failures."));
     }
 
     #[test]
     fn deterministic_failure_streak_auto_deactivates_template() {
         stable::init_storage();
         let key = key("learner-autodeactivate");
-        let version = version();
         stable::set_strategy_template_activation(TemplateActivationState {
             key: key.clone(),
-            version: version.clone(),
             enabled: true,
             updated_at_ns: 1,
             reason: Some("seed".to_string()),
@@ -240,7 +177,6 @@ mod tests {
         for idx in 0..AUTO_DEACTIVATE_DETERMINISTIC_STREAK {
             record_outcome(StrategyOutcomeEvent {
                 key: key.clone(),
-                version: version.clone(),
                 action_id: "swap_exact_in".to_string(),
                 outcome: StrategyOutcomeKind::DeterministicFailure,
                 tx_hash: None,
@@ -250,8 +186,8 @@ mod tests {
             .expect("deterministic failure should record");
         }
 
-        let activation = stable::strategy_template_activation(&key, &version)
-            .expect("activation should still exist");
+        let activation =
+            stable::strategy_template_activation(&key).expect("activation should still exist");
         assert!(!activation.enabled);
         assert!(activation
             .reason

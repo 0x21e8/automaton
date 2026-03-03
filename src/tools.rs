@@ -40,6 +40,7 @@ use alloy_primitives::U256;
 use async_trait::async_trait;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::Deserialize;
+use serde_json::json;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -63,6 +64,8 @@ const REGISTER_STRATEGY_DEFAULT_MAX_VALUE_WEI_PER_CALL: &str = "1000000000000000
 const REGISTER_STRATEGY_DEFAULT_TEMPLATE_BUDGET_WEI: &str = "1000000000000000000";
 /// Maximum character count for content written via `update_prompt_layer`.
 pub const MAX_PROMPT_LAYER_CONTENT_CHARS: usize = 4_000;
+/// Number of consecutive market endpoint failures before requiring re-discovery.
+const MARKET_ENDPOINT_STALE_FAILURE_THRESHOLD: u32 = 2;
 
 struct MarketEndpointProvider {
     id: &'static str,
@@ -707,6 +710,11 @@ impl ToolManager {
                         let _ =
                             persist_market_endpoint_fact(&endpoint_key, &endpoint_origin, turn_id);
                     }
+                    if let Some(handshake) = prepared.handshake.as_ref() {
+                        let _ = persist_market_fetch_handshake_success(handshake, turn_id);
+                    }
+                } else if let Some(handshake) = prepared.handshake.as_ref() {
+                    let _ = record_market_fetch_handshake_failure(handshake, turn_id);
                 }
                 result
             }
@@ -952,6 +960,16 @@ fn parse_sign_message_args(args_json: &str) -> Result<String, String> {
 struct PreparedMarketHttpFetchArgs {
     effective_args_json: String,
     endpoint_fact: Option<(String, String)>,
+    handshake: Option<MarketFetchHandshake>,
+}
+
+struct MarketFetchHandshake {
+    endpoint_key: String,
+    endpoint_origin: String,
+    status_key: String,
+    failure_count_key: String,
+    extract_key: String,
+    extract_signature: Option<String>,
 }
 
 fn prepare_market_http_fetch_args(args_json: &str) -> Result<PreparedMarketHttpFetchArgs, String> {
@@ -959,23 +977,27 @@ fn prepare_market_http_fetch_args(args_json: &str) -> Result<PreparedMarketHttpF
         return Ok(PreparedMarketHttpFetchArgs {
             effective_args_json: args_json.to_string(),
             endpoint_fact: None,
+            handshake: None,
         });
     };
     let Some(args_object) = value.as_object_mut() else {
         return Ok(PreparedMarketHttpFetchArgs {
             effective_args_json: args_json.to_string(),
             endpoint_fact: None,
+            handshake: None,
         });
     };
     let Some(raw_url) = args_object.get("url").and_then(|entry| entry.as_str()) else {
         return Ok(PreparedMarketHttpFetchArgs {
             effective_args_json: args_json.to_string(),
             endpoint_fact: None,
+            handshake: None,
         });
     };
+    let raw_url = raw_url.to_string();
 
-    let parsed = extract_https_host_and_suffix(raw_url);
-    if url_looks_like_market_provider(raw_url) {
+    let parsed = extract_https_host_and_suffix(&raw_url);
+    if url_looks_like_market_provider(&raw_url) {
         let (host, suffix) =
             parsed.map_err(|error| format!("invalid market-data url: {error}; url={raw_url}"))?;
         let Some(provider) = market_endpoint_provider_for_host(&host) else {
@@ -984,21 +1006,53 @@ fn prepare_market_http_fetch_args(args_json: &str) -> Result<PreparedMarketHttpF
                 known_market_hosts_summary()
             ));
         };
-        validate_market_provider_path(provider, suffix, raw_url)?;
+        validate_market_provider_path(provider, suffix, &raw_url)?;
         let endpoint_key = format!("config.endpoint.{}.latest", provider.id);
         let endpoint_origin = stable::get_memory_fact(&endpoint_key)
             .and_then(|fact| normalize_market_endpoint_origin(&fact.value, provider))
             .unwrap_or_else(|| provider.default_origin.to_string());
+        let status_key = format!("config.endpoint.{}.status.latest", provider.id);
+        let failure_count_key = format!("config.endpoint.{}.failure_count.latest", provider.id);
+        let extract_key = format!("config.endpoint.{}.extract.latest", provider.id);
+        let status = stable::get_memory_fact(&status_key)
+            .map(|fact| fact.value.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "unverified".to_string());
+        let stored_extract = stable::get_memory_fact(&extract_key)
+            .map(|fact| fact.value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let mut extract_signature = parse_market_extract_signature(args_object);
+        let verified = status == "verified" && stored_extract.is_some();
+        if extract_signature.is_none() && verified {
+            if let Some(stored) = stored_extract.clone() {
+                inject_market_extract_signature(args_object, &stored)?;
+                extract_signature = Some(stored);
+            }
+        }
+        if !verified && extract_signature.is_none() {
+            return Err(format!(
+                "market endpoint discovery required for provider `{}`: include `extract` (json_path or regex) so the runtime can verify and persist a canonical endpoint/path",
+                provider.id
+            ));
+        }
         let rewritten_url = if suffix.is_empty() {
             endpoint_origin.clone()
         } else {
             format!("{}{}", endpoint_origin.trim_end_matches('/'), suffix)
         };
         args_object.insert("url".to_string(), serde_json::Value::String(rewritten_url));
+        let handshake = MarketFetchHandshake {
+            endpoint_key: endpoint_key.clone(),
+            endpoint_origin: endpoint_origin.clone(),
+            status_key,
+            failure_count_key,
+            extract_key,
+            extract_signature,
+        };
         return Ok(PreparedMarketHttpFetchArgs {
             effective_args_json: serde_json::to_string(&value)
                 .unwrap_or_else(|_| args_json.to_string()),
             endpoint_fact: Some((endpoint_key, endpoint_origin)),
+            handshake: Some(handshake),
         });
     }
 
@@ -1006,29 +1060,63 @@ fn prepare_market_http_fetch_args(args_json: &str) -> Result<PreparedMarketHttpF
         return Ok(PreparedMarketHttpFetchArgs {
             effective_args_json: args_json.to_string(),
             endpoint_fact: None,
+            handshake: None,
         });
     };
     let Some(provider) = market_endpoint_provider_for_host(&host) else {
         return Ok(PreparedMarketHttpFetchArgs {
             effective_args_json: args_json.to_string(),
             endpoint_fact: None,
+            handshake: None,
         });
     };
-    validate_market_provider_path(provider, suffix, raw_url)?;
+    validate_market_provider_path(provider, suffix, &raw_url)?;
     let endpoint_key = format!("config.endpoint.{}.latest", provider.id);
     let endpoint_origin = stable::get_memory_fact(&endpoint_key)
         .and_then(|fact| normalize_market_endpoint_origin(&fact.value, provider))
         .unwrap_or_else(|| provider.default_origin.to_string());
+    let status_key = format!("config.endpoint.{}.status.latest", provider.id);
+    let failure_count_key = format!("config.endpoint.{}.failure_count.latest", provider.id);
+    let extract_key = format!("config.endpoint.{}.extract.latest", provider.id);
+    let status = stable::get_memory_fact(&status_key)
+        .map(|fact| fact.value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "unverified".to_string());
+    let stored_extract = stable::get_memory_fact(&extract_key)
+        .map(|fact| fact.value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut extract_signature = parse_market_extract_signature(args_object);
+    let verified = status == "verified" && stored_extract.is_some();
+    if extract_signature.is_none() && verified {
+        if let Some(stored) = stored_extract.clone() {
+            inject_market_extract_signature(args_object, &stored)?;
+            extract_signature = Some(stored);
+        }
+    }
+    if !verified && extract_signature.is_none() {
+        return Err(format!(
+            "market endpoint discovery required for provider `{}`: include `extract` (json_path or regex) so the runtime can verify and persist a canonical endpoint/path",
+            provider.id
+        ));
+    }
     let rewritten_url = if suffix.is_empty() {
         endpoint_origin.clone()
     } else {
         format!("{}{}", endpoint_origin.trim_end_matches('/'), suffix)
     };
     args_object.insert("url".to_string(), serde_json::Value::String(rewritten_url));
+    let handshake = MarketFetchHandshake {
+        endpoint_key: endpoint_key.clone(),
+        endpoint_origin: endpoint_origin.clone(),
+        status_key,
+        failure_count_key,
+        extract_key,
+        extract_signature,
+    };
     Ok(PreparedMarketHttpFetchArgs {
         effective_args_json: serde_json::to_string(&value)
             .unwrap_or_else(|_| args_json.to_string()),
         endpoint_fact: Some((endpoint_key, endpoint_origin)),
+        handshake: Some(handshake),
     })
 }
 
@@ -1052,6 +1140,111 @@ fn persist_market_endpoint_fact(key: &str, origin: &str, turn_id: &str) -> Resul
         updated_at_ns: now_ns,
         source_turn_id: turn_id.to_string(),
     })
+}
+
+fn upsert_memory_fact(key: &str, value: &str, turn_id: &str) -> Result<(), String> {
+    let now_ns = current_time_ns();
+    let existing = stable::get_memory_fact(key);
+    if existing
+        .as_ref()
+        .map(|fact| fact.value.as_str() == value)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    stable::set_memory_fact(&MemoryFact {
+        key: key.to_string(),
+        value: value.to_string(),
+        created_at_ns: existing
+            .as_ref()
+            .map(|fact| fact.created_at_ns)
+            .unwrap_or(now_ns),
+        updated_at_ns: now_ns,
+        source_turn_id: turn_id.to_string(),
+    })
+}
+
+fn parse_market_extract_signature(
+    args_object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let extract = args_object.get("extract")?.as_object()?;
+    let mode = extract.get("mode")?.as_str()?.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "json_path" => {
+            let path = extract.get("path")?.as_str()?.trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(format!("json_path:{path}"))
+        }
+        "regex" => {
+            let pattern = extract.get("pattern")?.as_str()?.trim();
+            if pattern.is_empty() {
+                return None;
+            }
+            Some(format!("regex:{pattern}"))
+        }
+        _ => None,
+    }
+}
+
+fn inject_market_extract_signature(
+    args_object: &mut serde_json::Map<String, serde_json::Value>,
+    signature: &str,
+) -> Result<(), String> {
+    if let Some(path) = signature.strip_prefix("json_path:") {
+        args_object.insert(
+            "extract".to_string(),
+            json!({
+                "mode": "json_path",
+                "path": path,
+            }),
+        );
+        return Ok(());
+    }
+    if let Some(pattern) = signature.strip_prefix("regex:") {
+        args_object.insert(
+            "extract".to_string(),
+            json!({
+                "mode": "regex",
+                "pattern": pattern,
+            }),
+        );
+        return Ok(());
+    }
+    Err("invalid stored market extract signature".to_string())
+}
+
+fn persist_market_fetch_handshake_success(
+    handshake: &MarketFetchHandshake,
+    turn_id: &str,
+) -> Result<(), String> {
+    persist_market_endpoint_fact(&handshake.endpoint_key, &handshake.endpoint_origin, turn_id)?;
+    if let Some(signature) = handshake.extract_signature.as_deref() {
+        upsert_memory_fact(&handshake.extract_key, signature, turn_id)?;
+    }
+    upsert_memory_fact(&handshake.failure_count_key, "0", turn_id)?;
+    upsert_memory_fact(&handshake.status_key, "verified", turn_id)?;
+    Ok(())
+}
+
+fn record_market_fetch_handshake_failure(
+    handshake: &MarketFetchHandshake,
+    turn_id: &str,
+) -> Result<(), String> {
+    let failure_count = stable::get_memory_fact(&handshake.failure_count_key)
+        .and_then(|fact| fact.value.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    upsert_memory_fact(
+        &handshake.failure_count_key,
+        &failure_count.to_string(),
+        turn_id,
+    )?;
+    if failure_count >= MARKET_ENDPOINT_STALE_FAILURE_THRESHOLD {
+        upsert_memory_fact(&handshake.status_key, "stale", turn_id)?;
+    }
+    Ok(())
 }
 
 fn market_endpoint_provider_for_host(host: &str) -> Option<&'static MarketEndpointProvider> {
@@ -3466,7 +3659,7 @@ mod tests {
     #[test]
     fn http_fetch_tool_requires_allowlisted_domain() {
         stable::init_storage();
-        stable::set_http_allowed_domains(vec!["api.coingecko.com".to_string()])
+        stable::set_http_allowed_domains(vec!["example.com".to_string()])
             .expect("allowlist should set");
         let state = AgentState::ExecutingActions;
         let signer = CountingSigner::new();
@@ -3475,12 +3668,12 @@ mod tests {
             ToolCall {
                 tool_call_id: None,
                 tool: "http_fetch".to_string(),
-                args_json: r#"{"url":"https://api.coingecko.com/api/v3/ping"}"#.to_string(),
+                args_json: r#"{"url":"https://example.com/allowed"}"#.to_string(),
             },
             ToolCall {
                 tool_call_id: None,
                 tool: "http_fetch".to_string(),
-                args_json: r#"{"url":"https://example.com/forbidden"}"#.to_string(),
+                args_json: r#"{"url":"https://forbidden.example.org/forbidden"}"#.to_string(),
             },
         ];
 
@@ -3508,8 +3701,7 @@ mod tests {
         let calls = vec![ToolCall {
             tool_call_id: None,
             tool: "http_fetch".to_string(),
-            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0x1234"}"#
-                .to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0x1234","extract":{"mode":"regex","pattern":"stub"}}"#.to_string(),
         }];
 
         let records =
@@ -3520,6 +3712,18 @@ mod tests {
         let fact = stable::get_memory_fact("config.endpoint.dexscreener.latest")
             .expect("market endpoint fact should be stored");
         assert_eq!(fact.value, "https://api.dexscreener.com");
+        assert_eq!(
+            stable::get_memory_fact("config.endpoint.dexscreener.status.latest")
+                .expect("market endpoint status fact should be stored")
+                .value,
+            "verified"
+        );
+        assert_eq!(
+            stable::get_memory_fact("config.endpoint.dexscreener.extract.latest")
+                .expect("market endpoint extract fact should be stored")
+                .value,
+            "regex:stub"
+        );
     }
 
     #[test]
@@ -3534,8 +3738,7 @@ mod tests {
         let first_turn_calls = vec![ToolCall {
             tool_call_id: None,
             tool: "http_fetch".to_string(),
-            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0x1234"}"#
-                .to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0x1234","extract":{"mode":"regex","pattern":"stub"}}"#.to_string(),
         }];
         let first_records = block_on_with_spin(manager.execute_actions(
             &state,
@@ -3562,6 +3765,77 @@ mod tests {
         assert!(
             second_records[0].success,
             "drifted market host should be rewritten to stored canonical endpoint"
+        );
+    }
+
+    #[test]
+    fn market_http_fetch_requires_extract_until_endpoint_is_verified() {
+        stable::init_storage();
+        stable::set_http_allowed_domains(vec!["api.dexscreener.com".to_string()])
+            .expect("allowlist should set");
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0x1234"}"#
+                .to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-market"));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert!(records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("market endpoint discovery required"));
+    }
+
+    #[test]
+    fn market_handshake_marks_status_stale_after_repeated_failures() {
+        stable::init_storage();
+        let handshake = MarketFetchHandshake {
+            endpoint_key: "config.endpoint.dexscreener.latest".to_string(),
+            endpoint_origin: "https://api.dexscreener.com".to_string(),
+            status_key: "config.endpoint.dexscreener.status.latest".to_string(),
+            failure_count_key: "config.endpoint.dexscreener.failure_count.latest".to_string(),
+            extract_key: "config.endpoint.dexscreener.extract.latest".to_string(),
+            extract_signature: Some("regex:stub".to_string()),
+        };
+        upsert_memory_fact(&handshake.status_key, "verified", "turn-0")
+            .expect("status should be seedable");
+
+        record_market_fetch_handshake_failure(&handshake, "turn-1")
+            .expect("first failure should be recorded");
+        assert_eq!(
+            stable::get_memory_fact(&handshake.status_key)
+                .expect("status should remain present")
+                .value,
+            "verified"
+        );
+        assert_eq!(
+            stable::get_memory_fact(&handshake.failure_count_key)
+                .expect("failure count should be present")
+                .value,
+            "1"
+        );
+
+        record_market_fetch_handshake_failure(&handshake, "turn-2")
+            .expect("second failure should be recorded");
+        assert_eq!(
+            stable::get_memory_fact(&handshake.status_key)
+                .expect("status should be present")
+                .value,
+            "stale"
+        );
+        assert_eq!(
+            stable::get_memory_fact(&handshake.failure_count_key)
+                .expect("failure count should be present")
+                .value,
+            "2"
         );
     }
 

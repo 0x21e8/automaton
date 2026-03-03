@@ -1,7 +1,7 @@
 /// ABI artifact normalisation — parse, canonicalise, and selector-verify Solidity ABI JSON.
 ///
 /// Consumers supply raw ABI JSON (either a bare array or an object with an `"abi"` key), an
-/// [`AbiArtifactKey`] that identifies the protocol/chain/role/version, and an optional list of
+/// [`AbiArtifactKey`] that identifies the protocol/chain/role, and an optional list of
 /// [`AbiSelectorAssertion`]s that act as compile-time pin-tests for known 4-byte selectors.
 ///
 /// The public API is intentionally small:
@@ -10,12 +10,12 @@
 /// - [`verify_function_selector`] — recompute the selector from an [`AbiFunctionSpec`] and
 ///   assert it matches the stored `selector_hex`.
 /// - [`canonical_signature`] / [`recompute_selector_hex`] — low-level helpers used by the
-///   compiler and registry canary probe.
+///   compiler and dry-run compile validation.
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiSelectorAssertion, AbiTypeSpec,
-    TemplateVersion,
 };
 use crate::storage::stable;
+use crate::util::normalize_selector_hex;
 use alloy_primitives::keccak256;
 use serde::Deserialize;
 use serde_json::Value;
@@ -52,7 +52,7 @@ struct RawAbiParam {
 /// Parse and canonicalise a raw Solidity ABI JSON string into an [`AbiArtifact`].
 ///
 /// Steps performed:
-/// 1. Validate the [`AbiArtifactKey`] (non-empty protocol/role, non-zero chain_id, valid version).
+/// 1. Validate the [`AbiArtifactKey`] (non-empty protocol/role, non-zero chain_id).
 /// 2. Decode the JSON (bare array or `{"abi": […]}`).
 /// 3. For every `"function"` entry: canonicalise types, recompute the 4-byte selector, build an
 ///    [`AbiFunctionSpec`], and detect duplicate signatures.
@@ -232,13 +232,6 @@ fn validate_abi_artifact_key(key: &AbiArtifactKey) -> Result<(), String> {
     if key.role.trim().is_empty() {
         return Err("abi artifact role must be non-empty".to_string());
     }
-    validate_template_version(&key.version)
-}
-
-fn validate_template_version(version: &TemplateVersion) -> Result<(), String> {
-    if version.major == 0 && version.minor == 0 && version.patch == 0 {
-        return Err("template version must not be 0.0.0".to_string());
-    }
     Ok(())
 }
 
@@ -335,18 +328,6 @@ fn normalize_signature_string(raw_signature: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-fn normalize_selector_hex(raw_selector: &str) -> Result<String, String> {
-    let compact = raw_selector.trim().to_lowercase();
-    let normalized = compact.strip_prefix("0x").unwrap_or(&compact);
-    if normalized.len() != 8 {
-        return Err("selector must be exactly 4 bytes hex".to_string());
-    }
-    if !normalized.chars().all(|char| char.is_ascii_hexdigit()) {
-        return Err("selector must be valid hex".to_string());
-    }
-    Ok(format!("0x{normalized}"))
-}
-
 fn split_base_and_suffix(kind: &str) -> (&str, &str) {
     if let Some(start) = kind.find('[') {
         (&kind[..start], &kind[start..])
@@ -384,7 +365,7 @@ mod tests {
         verify_function_selector,
     };
     use crate::domain::types::{
-        AbiArtifactKey, AbiFunctionSpec, AbiSelectorAssertion, AbiTypeSpec, TemplateVersion,
+        AbiArtifactKey, AbiFunctionSpec, AbiSelectorAssertion, AbiTypeSpec,
     };
 
     fn sample_artifact_key() -> AbiArtifactKey {
@@ -392,11 +373,6 @@ mod tests {
             protocol: "erc20".to_string(),
             chain_id: 8453,
             role: "token".to_string(),
-            version: TemplateVersion {
-                major: 1,
-                minor: 0,
-                patch: 0,
-            },
         }
     }
 

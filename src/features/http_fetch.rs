@@ -28,8 +28,10 @@ use ic_cdk::management_canister::{http_request, HttpMethod, HttpRequestArgs};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Maximum number of bytes the IC HTTPS outcall may return — 64 KiB.
-const HTTP_FETCH_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+/// Initial max response size for the first HTTP outcall attempt.
+const HTTP_FETCH_INITIAL_RESPONSE_BYTES: u64 = 64 * 1024;
+/// Hard cap for HTTP outcall response bytes after exponential retries.
+const HTTP_FETCH_MAX_RESPONSE_BYTES: u64 = 512 * 1024;
 
 /// Maximum number of UTF-8 characters returned to the agent after fetching.
 /// Responses are truncated at this boundary with a `[truncated, N total bytes]` suffix.
@@ -37,17 +39,8 @@ const HTTP_FETCH_MAX_OUTPUT_CHARS: usize = 8_000;
 const HTTP_FETCH_REGEX_MAX_PATTERN_CHARS: usize = 256;
 const HTTP_FETCH_REGEX_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const HTTP_FETCH_REGEX_DFA_SIZE_LIMIT_BYTES: usize = 256 * 1024;
-const HTTP_FETCH_OUTCALL_TIMEOUT_MS: u64 = 20_000;
-const HTTP_FETCH_OUTCALL_TIMEOUT_NS: u64 = HTTP_FETCH_OUTCALL_TIMEOUT_MS * 1_000_000;
 const JSON_PATH_HINT_MAX_KEYS: usize = 8;
 const JSON_PATH_FALLBACK_MAX_ATTEMPTS: usize = 4;
-
-fn http_fetch_timeout_message(elapsed_ms: u64) -> String {
-    format!(
-        "http_fetch outcall timeout envelope exceeded: elapsed={} ms timeout={} ms",
-        elapsed_ms, HTTP_FETCH_OUTCALL_TIMEOUT_MS
-    )
-}
 
 // ── Tool entry point ─────────────────────────────────────────────────────────
 
@@ -77,28 +70,11 @@ pub async fn http_fetch_tool(args_json: &str) -> Result<String, String> {
     let args = parse_http_fetch_args(args_json)?;
     let host = extract_https_host(&args.url)?;
     ensure_host_allowed(&host, &args.url)?;
-    ensure_http_fetch_affordable(
-        u64::try_from(args.url.len().saturating_add(128)).unwrap_or(u64::MAX),
-        HTTP_FETCH_MAX_RESPONSE_BYTES,
-    )?;
+    let request_size_bytes = u64::try_from(args.url.len().saturating_add(128)).unwrap_or(u64::MAX);
 
     let outcall_started_at_ns = current_time_ns();
-    let body_result = http_get(&args.url, HTTP_FETCH_MAX_RESPONSE_BYTES).await;
+    let body_result = http_get_with_size_retry(&args.url, request_size_bytes).await;
     let outcall_finished_at_ns = current_time_ns();
-    let outcall_elapsed_ms =
-        outcall_finished_at_ns.saturating_sub(outcall_started_at_ns) / 1_000_000;
-    if outcall_finished_at_ns.saturating_sub(outcall_started_at_ns) > HTTP_FETCH_OUTCALL_TIMEOUT_NS
-    {
-        let message = http_fetch_timeout_message(outcall_elapsed_ms);
-        stable::record_outcall_timing(
-            stable::RuntimeOutcallKind::HttpFetch,
-            outcall_started_at_ns,
-            outcall_finished_at_ns,
-            Some(message.as_str()),
-            true,
-        );
-        return Err(message);
-    }
     let body = match body_result {
         Ok(body) => {
             stable::record_outcall_timing(
@@ -111,12 +87,13 @@ pub async fn http_fetch_tool(args_json: &str) -> Result<String, String> {
             body
         }
         Err(error) => {
+            let timeout_failure = error.to_ascii_lowercase().contains("timeout");
             stable::record_outcall_timing(
                 stable::RuntimeOutcallKind::HttpFetch,
                 outcall_started_at_ns,
                 outcall_finished_at_ns,
                 Some(error.as_str()),
-                false,
+                timeout_failure,
             );
             return Err(error);
         }
@@ -126,6 +103,37 @@ pub async fn http_fetch_tool(args_json: &str) -> Result<String, String> {
     let extracted = extract_http_fetch_content(&body, args.extract.as_ref())?;
     let output = truncate_http_fetch_output(&extracted);
     Ok(frame_untrusted_content("http_fetch", &output))
+}
+
+async fn http_get_with_size_retry(url: &str, request_size_bytes: u64) -> Result<Vec<u8>, String> {
+    let mut max_response_bytes = HTTP_FETCH_INITIAL_RESPONSE_BYTES;
+    loop {
+        ensure_http_fetch_affordable(request_size_bytes, max_response_bytes)?;
+        match http_get(url, max_response_bytes).await {
+            Ok(body) => return Ok(body),
+            Err(error) => {
+                let Some(next_max) = next_retry_response_bytes(max_response_bytes, &error) else {
+                    return Err(error);
+                };
+                max_response_bytes = next_max;
+            }
+        }
+    }
+}
+
+fn next_retry_response_bytes(current_max_response_bytes: u64, error: &str) -> Option<u64> {
+    if !is_response_too_large_error(error)
+        || current_max_response_bytes >= HTTP_FETCH_MAX_RESPONSE_BYTES
+    {
+        return None;
+    }
+    Some((current_max_response_bytes.saturating_mul(2)).min(HTTP_FETCH_MAX_RESPONSE_BYTES))
+}
+
+fn is_response_too_large_error(error: &str) -> bool {
+    let normalized = error.trim().to_ascii_lowercase();
+    normalized.contains("http body exceeds size limit")
+        || normalized.contains("response exceeded max_response_bytes")
 }
 
 fn parse_http_fetch_args(args_json: &str) -> Result<HttpFetchArgs, String> {
@@ -575,35 +583,7 @@ fn truncate_http_fetch_output(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    fn block_on_with_spin<F: Future>(future: F) -> F::Output {
-        unsafe fn clone(_ptr: *const ()) -> RawWaker {
-            dummy_raw_waker()
-        }
-        unsafe fn wake(_ptr: *const ()) {}
-        unsafe fn wake_by_ref(_ptr: *const ()) {}
-        unsafe fn drop(_ptr: *const ()) {}
-
-        fn dummy_raw_waker() -> RawWaker {
-            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-
-        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-        let mut context = Context::from_waker(&waker);
-        let mut future = Box::pin(future);
-
-        for _ in 0..10_000 {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => std::hint::spin_loop(),
-            }
-        }
-
-        panic!("future did not complete in test polling loop");
-    }
+    use crate::util::block_on_with_spin;
 
     #[test]
     fn extract_https_host_rejects_non_https_urls() {
@@ -637,6 +617,51 @@ mod tests {
             "outcall telemetry should capture latency"
         );
         assert!(stats.last_error.is_none());
+    }
+
+    #[test]
+    fn response_size_retry_caps_double_until_hard_limit() {
+        assert_eq!(
+            next_retry_response_bytes(
+                64 * 1024,
+                "HTTP fetch failed: call rejected: 1 - Http body exceeds size limit of 65536 bytes."
+            ),
+            Some(128 * 1024)
+        );
+        assert_eq!(
+            next_retry_response_bytes(
+                128 * 1024,
+                "HTTP fetch failed: call rejected: 1 - Http body exceeds size limit of 131072 bytes."
+            ),
+            Some(256 * 1024)
+        );
+        assert_eq!(
+            next_retry_response_bytes(
+                256 * 1024,
+                "HTTP fetch failed: call rejected: 1 - Http body exceeds size limit of 262144 bytes."
+            ),
+            Some(512 * 1024)
+        );
+        assert_eq!(
+            next_retry_response_bytes(
+                512 * 1024,
+                "HTTP fetch failed: call rejected: 1 - Http body exceeds size limit of 524288 bytes."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn response_size_retry_only_triggers_for_too_large_errors() {
+        assert!(is_response_too_large_error(
+            "HTTP fetch failed: call rejected: 1 - Http body exceeds size limit of 65536 bytes."
+        ));
+        assert!(is_response_too_large_error(
+            "host rpc response exceeded max_response_bytes=65536"
+        ));
+        assert!(!is_response_too_large_error(
+            "HTTP 404 from https://example.com"
+        ));
     }
 
     #[test]

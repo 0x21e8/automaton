@@ -223,31 +223,7 @@ mod tests {
     use super::*;
     use crate::domain::types::{CanisterCallPermission, CanisterCallType, SkillRecord};
     use crate::storage::stable;
-    use std::future::Future;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    /// Minimal single-threaded async executor for use in tests (no tokio required).
-    fn block_on_with_spin<F: Future>(future: F) -> F::Output {
-        unsafe fn clone(_ptr: *const ()) -> RawWaker {
-            dummy_raw_waker()
-        }
-        unsafe fn wake(_ptr: *const ()) {}
-        unsafe fn wake_by_ref(_ptr: *const ()) {}
-        unsafe fn drop(_ptr: *const ()) {}
-        fn dummy_raw_waker() -> RawWaker {
-            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-        let mut cx = Context::from_waker(&waker);
-        let mut future = Box::pin(future);
-        loop {
-            match future.as_mut().poll(&mut cx) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => {}
-            }
-        }
-    }
+    use crate::util::block_on_with_spin;
 
     fn make_skill(canister_id: &str, method: &str, enabled: bool) -> SkillRecord {
         SkillRecord {

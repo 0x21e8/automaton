@@ -335,7 +335,7 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<JobDispatchOutcome, String> 
 }
 
 /// Runs the strategy reconciliation job: iterates registered templates, disabling
-/// stale or provenance-failed entries and activating those that pass the canary probe.
+/// stale or provenance-failed entries and activating those that pass dry-run compile.
 fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
     let templates = crate::strategy::registry::list_all_templates(STRATEGY_RECONCILE_MAX_TEMPLATES);
     if templates.is_empty() {
@@ -348,11 +348,10 @@ fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
 
     let mut stale_disabled = 0u32;
     let mut provenance_disabled = 0u32;
-    let mut canary_activated = 0u32;
+    let mut dry_run_activated = 0u32;
 
     for template in templates {
         let key = template.key.clone();
-        let version = template.version.clone();
 
         let age_secs = if now_ns >= template.updated_at_ns {
             now_ns
@@ -365,7 +364,6 @@ fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
         if age_secs > STRATEGY_TEMPLATE_FRESHNESS_WINDOW_SECS {
             let _ = stable::set_strategy_template_activation(TemplateActivationState {
                 key: key.clone(),
-                version: version.clone(),
                 enabled: false,
                 updated_at_ns: now_ns,
                 reason: Some(format!(
@@ -376,13 +374,12 @@ fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
             continue;
         }
 
-        if let Err(error) = crate::strategy::registry::canary_probe_template(&key, &version) {
+        if let Err(error) = crate::strategy::compiler::dry_run_compile(&key) {
             let _ = stable::set_strategy_template_activation(TemplateActivationState {
                 key: key.clone(),
-                version: version.clone(),
                 enabled: false,
                 updated_at_ns: now_ns,
-                reason: Some(format!("provenance_or_canary_failed: {error}")),
+                reason: Some(format!("provenance_or_dry_run_failed: {error}")),
             });
             provenance_disabled = provenance_disabled.saturating_add(1);
             continue;
@@ -391,7 +388,7 @@ fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
         if !matches!(template.status, TemplateStatus::Active) {
             continue;
         }
-        let currently_enabled = stable::strategy_template_activation(&key, &version)
+        let currently_enabled = stable::strategy_template_activation(&key)
             .map(|state| state.enabled)
             .unwrap_or(false);
         if currently_enabled {
@@ -400,20 +397,19 @@ fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
 
         stable::set_strategy_template_activation(TemplateActivationState {
             key,
-            version,
             enabled: true,
             updated_at_ns: now_ns,
-            reason: Some("scheduler canary probe passed".to_string()),
+            reason: Some("scheduler dry-run compile passed".to_string()),
         })?;
-        canary_activated = canary_activated.saturating_add(1);
+        dry_run_activated = dry_run_activated.saturating_add(1);
     }
 
     log!(
         SchedulerLogPriority::Info,
-        "scheduler_reconcile_strategy stale_disabled={} provenance_disabled={} canary_activated={}",
+        "scheduler_reconcile_strategy stale_disabled={} provenance_disabled={} dry_run_activated={}",
         stale_disabled,
         provenance_disabled,
-        canary_activated
+        dry_run_activated
     );
 
     Ok(())
@@ -1348,11 +1344,10 @@ mod tests {
         EvmEvent, InboxMessageSource, InboxMessageStatus, RecoveryOperation, RecoveryPolicyAction,
         ResponseLimitAdjustment, RetentionConfig, StrategyTemplate, StrategyTemplateKey,
         SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
-        TemplateStatus, TemplateVersion, WalletBalanceSnapshot, WalletBalanceSyncConfig,
+        TemplateStatus, WalletBalanceSnapshot, WalletBalanceSyncConfig,
     };
     use crate::storage::stable;
-    use std::future::Future;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use crate::util::block_on_with_spin;
 
     fn settle_pending_topup_jobs(now_ns: u64) {
         for job in stable::list_recent_jobs(500)
@@ -1368,33 +1363,6 @@ mod tests {
             .into_iter()
             .filter(|job| job.kind == TaskKind::TopUpCycles)
             .count()
-    }
-
-    fn block_on_with_spin<F: Future>(future: F) -> F::Output {
-        unsafe fn clone(_ptr: *const ()) -> RawWaker {
-            dummy_raw_waker()
-        }
-        unsafe fn wake(_ptr: *const ()) {}
-        unsafe fn wake_by_ref(_ptr: *const ()) {}
-        unsafe fn drop(_ptr: *const ()) {}
-
-        fn dummy_raw_waker() -> RawWaker {
-            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-
-        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-        let mut context = Context::from_waker(&waker);
-        let mut future = Box::pin(future);
-
-        for _ in 0..10_000 {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => std::hint::spin_loop(),
-            }
-        }
-
-        panic!("future did not complete in test polling loop");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1434,14 +1402,6 @@ mod tests {
         }
     }
 
-    fn strategy_version() -> TemplateVersion {
-        TemplateVersion {
-            major: 1,
-            minor: 0,
-            patch: 0,
-        }
-    }
-
     fn seed_strategy_for_reconcile(
         template_id: &str,
         updated_at_ns: u64,
@@ -1450,7 +1410,6 @@ mod tests {
         activation_enabled: bool,
     ) {
         let key = strategy_key(template_id);
-        let version = strategy_version();
         let function = AbiFunctionSpec {
             role: "token".to_string(),
             name: "transfer".to_string(),
@@ -1473,7 +1432,6 @@ mod tests {
         };
         crate::strategy::registry::upsert_template(StrategyTemplate {
             key: key.clone(),
-            version: version.clone(),
             status,
             contract_roles: vec![ContractRoleBinding {
                 role: "token".to_string(),
@@ -1498,7 +1456,6 @@ mod tests {
                 protocol: key.protocol.clone(),
                 chain_id: key.chain_id,
                 role: "token".to_string(),
-                version: version.clone(),
             },
             source_ref: "https://example.com/token-abi".to_string(),
             codehash: None,
@@ -1510,7 +1467,6 @@ mod tests {
         .expect("abi should persist");
         crate::strategy::registry::set_activation(TemplateActivationState {
             key,
-            version,
             enabled: activation_enabled,
             updated_at_ns,
             reason: Some("seed".to_string()),
@@ -2249,7 +2205,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_job_activates_template_when_canary_passes() {
+    fn reconcile_job_activates_template_when_dry_run_compile_passes() {
         stable::init_storage();
         stable::init_scheduler_defaults(0);
         for kind in TaskKind::all() {
@@ -2274,17 +2230,14 @@ mod tests {
         assert!(reconcile_job.is_some(), "reconcile job should enqueue");
         block_on_with_spin(scheduler_tick());
 
-        let activation = crate::strategy::registry::activation(
-            &strategy_key("reconcile-activate"),
-            &strategy_version(),
-        )
-        .expect("activation should exist");
+        let activation = crate::strategy::registry::activation(&strategy_key("reconcile-activate"))
+            .expect("activation should exist");
         assert!(activation.enabled);
         assert!(activation
             .reason
             .as_deref()
             .unwrap_or_default()
-            .contains("canary"));
+            .contains("dry-run"));
     }
 
     #[test]
@@ -2318,11 +2271,8 @@ mod tests {
         assert!(reconcile_job.is_some(), "reconcile job should enqueue");
         block_on_with_spin(scheduler_tick());
 
-        let activation = crate::strategy::registry::activation(
-            &strategy_key("reconcile-stale"),
-            &strategy_version(),
-        )
-        .expect("activation should exist");
+        let activation = crate::strategy::registry::activation(&strategy_key("reconcile-stale"))
+            .expect("activation should exist");
         assert!(!activation.enabled);
         assert!(activation
             .reason
@@ -2357,17 +2307,15 @@ mod tests {
         assert!(reconcile_job.is_some(), "reconcile job should enqueue");
         block_on_with_spin(scheduler_tick());
 
-        let activation = crate::strategy::registry::activation(
-            &strategy_key("reconcile-provenance"),
-            &strategy_version(),
-        )
-        .expect("activation should exist");
+        let activation =
+            crate::strategy::registry::activation(&strategy_key("reconcile-provenance"))
+                .expect("activation should exist");
         assert!(!activation.enabled);
         assert!(activation
             .reason
             .as_deref()
             .unwrap_or_default()
-            .contains("provenance_or_canary_failed"));
+            .contains("provenance_or_dry_run_failed"));
     }
 
     #[test]

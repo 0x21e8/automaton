@@ -7,7 +7,7 @@ use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, ConversationEntry, ConversationLog, InboxMessage, MemoryFact,
     OutboxMessage, RuntimeSnapshot, ScheduledJob, SchedulerRuntime, SkillRecord, StrategyTemplate,
     StrategyTemplateKey, SurvivalOperationClass, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
-    TemplateVersion, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use crate::features::cycle_topup::TopUpStage;
 #[cfg(target_arch = "wasm32")]
@@ -376,36 +376,15 @@ fn from_payload_json<T: serde::de::DeserializeOwned>(payload_json: String) -> Re
     serde_json::from_str::<T>(&payload_json).map_err(|err| err.to_string())
 }
 
-fn canonicalize_version_list(mut versions: Vec<TemplateVersion>) -> Vec<TemplateVersion> {
-    versions.sort();
-    versions.dedup();
-    versions.reverse();
-    versions
-}
-
-fn strategy_template_pk(key: &StrategyTemplateKey, version: &TemplateVersion) -> String {
+fn strategy_template_pk(key: &StrategyTemplateKey) -> String {
     format!(
-        "{}:{}:{}:{}@{}.{}.{}",
-        key.protocol,
-        key.primitive,
-        key.chain_id,
-        key.template_id,
-        version.major,
-        version.minor,
-        version.patch
+        "{}:{}:{}:{}",
+        key.protocol, key.primitive, key.chain_id, key.template_id
     )
 }
 
 fn abi_artifact_pk(key: &AbiArtifactKey) -> String {
-    format!(
-        "{}:{}:{}@{}.{}.{}",
-        key.protocol,
-        key.chain_id,
-        key.role,
-        key.version.major,
-        key.version.minor,
-        key.version.patch
-    )
+    format!("{}:{}:{}", key.protocol, key.chain_id, key.role)
 }
 
 fn normalized_sql_query(raw: &str) -> Result<String, String> {
@@ -1035,7 +1014,7 @@ pub fn delete_skill(name: &str) -> Result<(), String> {
 
 pub fn upsert_strategy_template(template: &StrategyTemplate) -> Result<(), String> {
     let payload_json = row_payload(template)?;
-    let template_id = strategy_template_pk(&template.key, &template.version);
+    let template_id = strategy_template_pk(&template.key);
     backend::with_connection(|conn| {
         conn.execute(
             "INSERT OR REPLACE INTO strategy_templates(template_id, protocol, primitive, chain_id, updated_at_ns, payload_json)
@@ -1256,11 +1235,8 @@ pub fn list_skills() -> Result<Vec<SkillRecord>, String> {
     })
 }
 
-pub fn strategy_template(
-    key: &StrategyTemplateKey,
-    version: &TemplateVersion,
-) -> Result<Option<StrategyTemplate>, String> {
-    let pk = strategy_template_pk(key, version);
+pub fn strategy_template(key: &StrategyTemplateKey) -> Result<Option<StrategyTemplate>, String> {
+    let pk = strategy_template_pk(key);
     backend::with_connection(|conn| {
         let mut stmt = conn
             .prepare("SELECT payload_json FROM strategy_templates WHERE template_id = ?1")
@@ -1275,33 +1251,6 @@ pub fn strategy_template(
     })
 }
 
-pub fn list_strategy_template_versions(
-    key: &StrategyTemplateKey,
-) -> Result<Vec<TemplateVersion>, String> {
-    let pattern = format!(
-        "{}:{}:{}:{}@%",
-        key.protocol, key.primitive, key.chain_id, key.template_id
-    );
-    backend::with_connection(|conn| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT payload_json FROM strategy_templates
-                 WHERE template_id LIKE ?1",
-            )
-            .map_err(|err| err.to_string())?;
-        let rows = stmt
-            .query_map([pattern.as_str()], |row| row.get::<_, String>(0))
-            .map_err(|err| err.to_string())?;
-        let mut versions = Vec::new();
-        for row in rows {
-            let template: StrategyTemplate =
-                from_payload_json(row.map_err(|err| err.to_string())?)?;
-            versions.push(template.version);
-        }
-        Ok(canonicalize_version_list(versions))
-    })
-}
-
 pub fn list_strategy_templates(
     key: &StrategyTemplateKey,
     limit: usize,
@@ -1310,21 +1259,18 @@ pub fn list_strategy_templates(
         return Ok(Vec::new());
     }
     let keep = bounded_limit(limit, 25, 1_000);
-    let pattern = format!(
-        "{}:{}:{}:{}@%",
-        key.protocol, key.primitive, key.chain_id, key.template_id
-    );
+    let template_id = strategy_template_pk(key);
     backend::with_connection(|conn| {
         let mut stmt = conn
             .prepare(
                 "SELECT payload_json FROM strategy_templates
-                 WHERE template_id LIKE ?1
+                 WHERE template_id = ?1
                  ORDER BY updated_at_ns DESC
                  LIMIT ?2",
             )
             .map_err(|err| err.to_string())?;
         let rows = stmt
-            .query_map((pattern.as_str(), keep as i64), |row| {
+            .query_map((template_id.as_str(), keep as i64), |row| {
                 row.get::<_, String>(0)
             })
             .map_err(|err| err.to_string())?;
@@ -1373,32 +1319,6 @@ pub fn abi_artifact(key: &AbiArtifactKey) -> Result<Option<AbiArtifact>, String>
             Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
             None => Ok(None),
         }
-    })
-}
-
-pub fn list_abi_artifact_versions(
-    protocol: &str,
-    chain_id: u64,
-    role: &str,
-) -> Result<Vec<TemplateVersion>, String> {
-    backend::with_connection(|conn| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT payload_json FROM abi_artifacts
-                 WHERE protocol = ?1 AND role = ?2 AND chain_id = ?3",
-            )
-            .map_err(|err| err.to_string())?;
-        let rows = stmt
-            .query_map((protocol, role, chain_id as i64), |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|err| err.to_string())?;
-        let mut versions = Vec::new();
-        for row in rows {
-            let artifact: AbiArtifact = from_payload_json(row.map_err(|err| err.to_string())?)?;
-            versions.push(artifact.key.version);
-        }
-        Ok(canonicalize_version_list(versions))
     })
 }
 
@@ -2663,7 +2583,7 @@ mod tests {
         ActionSpec, AgentEvent, AgentState, ContractRoleBinding, InboxMessageSource,
         InboxMessageStatus, JobStatus, RuntimeSnapshot, SchedulerRuntime, SurvivalOperationClass,
         TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, TemplateStatus,
-        TemplateVersion, ToolCallRecord,
+        ToolCallRecord,
     };
     use crate::features::cycle_topup::TopUpStage;
 
@@ -2876,11 +2796,6 @@ mod tests {
                 chain_id: 8453,
                 template_id: "id".to_string(),
             },
-            version: TemplateVersion {
-                major: 1,
-                minor: 0,
-                patch: 0,
-            },
             status: TemplateStatus::Draft,
             contract_roles: vec![ContractRoleBinding {
                 role: "pool".to_string(),
@@ -3027,20 +2942,8 @@ mod tests {
             chain_id: 8453,
             template_id: "id".to_string(),
         };
-        let v1 = TemplateVersion {
-            major: 1,
-            minor: 0,
-            patch: 0,
-        };
-        let v2 = TemplateVersion {
-            major: 1,
-            minor: 1,
-            patch: 0,
-        };
-
-        let mut template = StrategyTemplate {
+        let template = StrategyTemplate {
             key: key.clone(),
-            version: v1.clone(),
             status: TemplateStatus::Draft,
             contract_roles: vec![ContractRoleBinding {
                 role: "pool".to_string(),
@@ -3059,27 +2962,21 @@ mod tests {
             created_at_ns: 1,
             updated_at_ns: 2,
         };
-        upsert_strategy_template(&template).expect("template v1");
-        template.version = v2.clone();
-        template.updated_at_ns = 3;
-        upsert_strategy_template(&template).expect("template v2");
+        upsert_strategy_template(&template).expect("template");
 
-        let loaded = strategy_template(&key, &v2)
+        let loaded = strategy_template(&key)
             .expect("query strategy")
             .expect("exists");
-        assert_eq!(loaded.version, v2);
+        assert_eq!(loaded.updated_at_ns, 2);
 
-        let versions = list_strategy_template_versions(&key).expect("versions");
-        assert_eq!(versions, vec![v2.clone(), v1.clone()]);
         let listed = list_strategy_templates(&key, 10).expect("templates list");
-        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.len(), 1);
 
         let artifact = AbiArtifact {
             key: AbiArtifactKey {
                 protocol: key.protocol.clone(),
                 chain_id: key.chain_id,
                 role: "pool".to_string(),
-                version: v2.clone(),
             },
             source_ref: "src".to_string(),
             codehash: None,
@@ -3090,8 +2987,6 @@ mod tests {
         };
         upsert_abi_artifact(&artifact).expect("artifact");
         assert!(abi_artifact(&artifact.key).expect("abi query").is_some());
-        let abi_versions = list_abi_artifact_versions("p", 8453, "pool").expect("abi versions");
-        assert_eq!(abi_versions, vec![v2]);
     }
 
     #[test]

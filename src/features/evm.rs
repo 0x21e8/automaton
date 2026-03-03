@@ -22,6 +22,7 @@ use crate::domain::types::{
 use crate::storage::stable;
 use crate::timing::current_time_ns;
 use crate::tools::SignerPort;
+use crate::util::{normalize_evm_address, normalize_hex_blob};
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::{length_of_length, BufMut, Encodable, Header};
 use async_trait::async_trait;
@@ -131,7 +132,7 @@ pub fn decode_message_queued_payload(
     }
 
     let sender = format!("0x{}", hex::encode(&bytes[12..32]));
-    let sender = normalize_address(&sender)?;
+    let sender = normalize_evm_address(&sender)?;
     let message_offset = read_usize_word(&bytes[32..64], "message offset")?;
     let usdc_amount = U256::from_be_slice(&bytes[64..96]);
     let eth_amount = U256::from_be_slice(&bytes[96..128]);
@@ -227,7 +228,7 @@ impl HttpEvmPoller {
             .as_deref()
             .or(snapshot.inbox_contract_address.as_deref())
             .ok_or_else(|| "inbox contract address is not configured".to_string())
-            .and_then(normalize_address)?;
+            .and_then(normalize_evm_address)?;
         let log_filter_topic1 = match snapshot.evm_cursor.automaton_address_topic.as_deref() {
             Some(topic) => normalize_topic(topic, "automaton address topic")?,
             None => {
@@ -1161,7 +1162,7 @@ fn host_rpc_stub_eth_get_code_result(request: &Value) -> Result<Value, String> {
         .pointer("/params/0")
         .and_then(Value::as_str)
         .ok_or_else(|| "host rpc stub eth_getCode missing address".to_string())?;
-    let normalized = normalize_address(address)?;
+    let normalized = normalize_evm_address(address)?;
     let result = if normalized == HOST_EIP1271_STUB_CONTRACT_ADDRESS {
         HOST_EIP1271_STUB_DELEGATED_CODE
     } else {
@@ -1178,21 +1179,6 @@ fn parse_hex_u64(raw: &str, field: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{field} must be 0x-prefixed hex"))?;
     u64::from_str_radix(without_prefix, 16)
         .map_err(|error| format!("failed to parse {field} as hex u64: {error}"))
-}
-
-fn normalize_address(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    let valid = trimmed.len() == 42
-        && trimmed.starts_with("0x")
-        && trimmed
-            .as_bytes()
-            .iter()
-            .skip(2)
-            .all(|byte| byte.is_ascii_hexdigit());
-    if !valid {
-        return Err("address must be a 0x-prefixed 20-byte hex string".to_string());
-    }
-    Ok(trimmed)
 }
 
 /// Verifies an EVM steward proof against the active steward identity and nonce cursor.
@@ -1293,7 +1279,7 @@ fn prepare_steward_verification(
         return Err("active steward is disabled".to_string());
     }
 
-    let normalized_address = normalize_address(&proof.address)?;
+    let normalized_address = normalize_evm_address(&proof.address)?;
     let command_hash = normalize_command_hash(&proof.command_hash, "proof command hash")?;
     let expected_command_hash =
         normalize_command_hash(&context.expected_command_hash, "expected command hash")?;
@@ -1320,7 +1306,7 @@ fn prepare_steward_verification(
         ));
     }
 
-    let active_address = normalize_address(&active_steward.address)?;
+    let active_address = normalize_evm_address(&active_steward.address)?;
     if normalized_address != active_address {
         return Err(format!(
             "proof address does not match active steward: expected={} got={}",
@@ -1502,7 +1488,7 @@ fn inbox_message_queued_topic0() -> String {
 }
 
 fn address_to_topic(raw: &str) -> Result<String, String> {
-    let normalized = normalize_address(raw)?;
+    let normalized = normalize_evm_address(raw)?;
     let bytes = normalized.trim_start_matches("0x");
     Ok(format!("0x{:0>64}", bytes))
 }
@@ -1518,7 +1504,7 @@ fn encode_call_no_args(signature: &str) -> String {
 
 #[allow(dead_code)]
 fn encode_call_single_address_arg(signature: &str, address: &str) -> Result<String, String> {
-    let normalized = normalize_address(address)?;
+    let normalized = normalize_evm_address(address)?;
     Ok(format!(
         "0x{}{:0>64}",
         function_selector_hex(signature),
@@ -1553,7 +1539,7 @@ fn decode_address_word_from_eth_call(raw: &str, field: &str) -> Result<String, S
     let decoded = hex::decode(word)
         .map_err(|error| format!("failed to decode {field} return data: {error}"))?;
     let address = format!("0x{}", hex::encode(&decoded[12..32]));
-    normalize_address(&address)
+    normalize_evm_address(&address)
 }
 
 fn normalize_topic(raw: &str, field: &str) -> Result<String, String> {
@@ -1562,24 +1548,6 @@ fn normalize_topic(raw: &str, field: &str) -> Result<String, String> {
         return Err(format!("{field} must be a 32-byte topic"));
     }
     Ok(normalized)
-}
-
-fn normalize_hex_blob(raw: &str, field: &str) -> Result<String, String> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    let without_prefix = trimmed
-        .strip_prefix("0x")
-        .ok_or_else(|| format!("{field} must be 0x-prefixed hex"))?;
-    if without_prefix.len() % 2 != 0 {
-        return Err(format!("{field} hex length must be even"));
-    }
-    if !without_prefix
-        .as_bytes()
-        .iter()
-        .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(format!("{field} must be valid hex"));
-    }
-    Ok(trimmed)
 }
 
 fn normalize_hex_quantity(raw: &str, field: &str) -> Result<String, String> {
@@ -1618,7 +1586,7 @@ fn filter_route_matched_logs(
     expected_topic1: &str,
     max_logs_per_poll: usize,
 ) -> Result<Vec<EvmEvent>, String> {
-    let expected_contract = normalize_address(expected_contract)?;
+    let expected_contract = normalize_evm_address(expected_contract)?;
     let expected_topic0 = inbox_message_queued_topic0();
     let expected_topic1 = normalize_topic(expected_topic1, "topic1")?;
 
@@ -1647,7 +1615,7 @@ fn filter_route_matched_logs(
             continue;
         }
 
-        let source = match normalize_address(&log.address) {
+        let source = match normalize_evm_address(&log.address) {
             Ok(value) if value == expected_contract => value,
             _ => continue,
         };
@@ -1728,7 +1696,7 @@ fn parse_required_evm_read_address(args: &EvmReadArgs, method: &str) -> Result<S
     args.address
         .as_deref()
         .ok_or_else(|| format!("address is required for {method}"))
-        .and_then(normalize_address)
+        .and_then(normalize_evm_address)
 }
 
 fn parse_generic_evm_read_params(
@@ -1760,7 +1728,20 @@ fn is_forbidden_generic_evm_read_method(method: &str) -> bool {
 }
 
 fn parse_evm_read_args(args_json: &str) -> Result<ParsedEvmReadArgs, String> {
-    let args: EvmReadArgs = serde_json::from_str(args_json)
+    let raw_args: Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid evm_read args json: {error}"))?;
+    if !raw_args.is_object() {
+        return Err("invalid evm_read args json: expected JSON object".to_string());
+    }
+    if let Some(raw_address) = raw_args.get("address") {
+        if !raw_address.is_string() && !raw_address.is_null() {
+            return Err(format!(
+                "invalid evm_read address: expected 0x-prefixed string; got {}",
+                raw_address
+            ));
+        }
+    }
+    let args: EvmReadArgs = serde_json::from_value(raw_args)
         .map_err(|error| format!("invalid evm_read args json: {error}"))?;
 
     let method_name = args.method.trim();
@@ -1834,7 +1815,7 @@ pub async fn fetch_wallet_balance_sync_read(
         .evm_address
         .as_deref()
         .ok_or_else(|| "evm address is not configured".to_string())
-        .and_then(normalize_address)?;
+        .and_then(normalize_evm_address)?;
     let rpc = HttpEvmRpcClient::from_snapshot(snapshot)?;
     let max_response_bytes = clamp_response_bytes(snapshot.wallet_balance_sync.max_response_bytes);
     let usdc_contract_address =
@@ -1863,7 +1844,7 @@ async fn resolve_usdc_contract_address(
     max_response_bytes: u64,
 ) -> Result<String, String> {
     if let Some(explicit) = snapshot.wallet_balance.usdc_contract_address.as_deref() {
-        return normalize_address(explicit);
+        return normalize_evm_address(explicit);
     }
     if !snapshot.wallet_balance_sync.discover_usdc_via_inbox {
         return Err("usdc contract address is not configured".to_string());
@@ -1881,7 +1862,7 @@ pub async fn fetch_eth_balance_wei_hex(
     wallet_address: &str,
     max_response_bytes: u64,
 ) -> Result<String, String> {
-    let wallet = normalize_address(wallet_address)?;
+    let wallet = normalize_evm_address(wallet_address)?;
     rpc.eth_get_balance_with_limit(&wallet, max_response_bytes)
         .await
 }
@@ -1893,8 +1874,8 @@ pub async fn fetch_usdc_balance_raw_hex(
     wallet_address: &str,
     max_response_bytes: u64,
 ) -> Result<String, String> {
-    let usdc_contract = normalize_address(usdc_contract_address)?;
-    let wallet = normalize_address(wallet_address)?;
+    let usdc_contract = normalize_evm_address(usdc_contract_address)?;
+    let wallet = normalize_evm_address(wallet_address)?;
     let calldata = encode_call_single_address_arg(ERC20_BALANCE_OF_FUNCTION_SIGNATURE, &wallet)?;
     let raw = rpc
         .eth_call_with_limit(&usdc_contract, &calldata, max_response_bytes)
@@ -1908,7 +1889,7 @@ pub async fn discover_usdc_contract_address_via_inbox(
     inbox_contract_address: &str,
     max_response_bytes: u64,
 ) -> Result<String, String> {
-    let inbox_contract = normalize_address(inbox_contract_address)?;
+    let inbox_contract = normalize_evm_address(inbox_contract_address)?;
     let calldata = encode_call_no_args(INBOX_USDC_FUNCTION_SIGNATURE);
     let raw = rpc
         .eth_call_with_limit(&inbox_contract, &calldata, max_response_bytes)
@@ -2096,7 +2077,7 @@ fn parse_send_eth_args(args_json: &str) -> Result<ParsedSendEthArgs, String> {
     let args: SendEthArgs = serde_json::from_str(args_json)
         .map_err(|error| format!("invalid send_eth args json: {error}"))?;
 
-    let to_hex = normalize_address(&args.to)?;
+    let to_hex = normalize_evm_address(&args.to)?;
     let to = Address::from_str(&to_hex)
         .map_err(|error| format!("invalid destination address for send_eth: {error}"))?;
     let value_wei = parse_decimal_u256(&args.value_wei, "value_wei")?;
@@ -2318,7 +2299,7 @@ pub async fn send_eth_tool(args_json: &str, signer: &dyn SignerPort) -> Result<S
 
 #[allow(dead_code)]
 pub fn strategy_call_to_send_eth_args_json(call: &StrategyExecutionCall) -> Result<String, String> {
-    let to = normalize_address(&call.to)?;
+    let to = normalize_evm_address(&call.to)?;
     let value_wei = parse_decimal_u256(&call.value_wei, "value_wei")?.to_string();
     let data = normalize_hex_blob(&call.data, "data")?;
     Ok(format!(
@@ -2360,13 +2341,10 @@ pub async fn execute_strategy_plan(
 ) -> Result<Vec<String>, String> {
     log!(
         StrategyExecutionLogPriority::Info,
-        "strategy_execute_plan_start protocol={} primitive={} template_id={} version={}.{}.{} action_id={} call_count={}",
+        "strategy_execute_plan_start protocol={} primitive={} template_id={} action_id={} call_count={}",
         plan.key.protocol,
         plan.key.primitive,
         plan.key.template_id,
-        plan.version.major,
-        plan.version.minor,
-        plan.version.patch,
         plan.action_id,
         plan.calls.len()
     );
@@ -2482,7 +2460,6 @@ fn persist_strategy_outcome(
 ) -> Result<(), String> {
     crate::strategy::learner::record_outcome(StrategyOutcomeEvent {
         key: plan.key.clone(),
-        version: plan.version.clone(),
         action_id: plan.action_id.clone(),
         outcome,
         tx_hash,
@@ -2496,12 +2473,12 @@ fn persist_strategy_outcome(
 mod tests {
     use super::*;
     use crate::tools::SignerPort;
+    use crate::util::block_on_with_spin;
     use async_trait::async_trait;
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use serde_json::Map;
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use std::fs;
-    use std::future::Future;
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use std::net::TcpListener;
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
@@ -2510,38 +2487,10 @@ mod tests {
     use std::process::{Child, Command, Stdio};
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use std::sync::{Mutex, OnceLock};
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use std::thread;
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     use std::time::Duration;
-
-    fn block_on_with_spin<F: Future>(future: F) -> F::Output {
-        unsafe fn clone(_ptr: *const ()) -> RawWaker {
-            dummy_raw_waker()
-        }
-        unsafe fn wake(_ptr: *const ()) {}
-        unsafe fn wake_by_ref(_ptr: *const ()) {}
-        unsafe fn drop(_ptr: *const ()) {}
-
-        fn dummy_raw_waker() -> RawWaker {
-            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-
-        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-        let mut context = Context::from_waker(&waker);
-        let mut future = Box::pin(future);
-
-        for _ in 0..10_000 {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => std::hint::spin_loop(),
-            }
-        }
-
-        panic!("future did not complete in test polling loop");
-    }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn with_host_stub_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
@@ -2586,7 +2535,8 @@ mod tests {
         expires_at_ns: u64,
         signing_key: &k256::ecdsa::SigningKey,
     ) -> EvmStewardProof {
-        let normalized_address = normalize_address(address).expect("test address should normalize");
+        let normalized_address =
+            normalize_evm_address(address).expect("test address should normalize");
         let normalized_hash =
             normalize_command_hash(command_hash, "test command hash").expect("hash should parse");
         let payload = canonical_steward_signing_payload(
@@ -2796,7 +2746,7 @@ mod tests {
         let expires_at_ns: u64 = 1_772_447_162_556_949_500;
 
         let normalized_address =
-            normalize_address(&signer_address).expect("test address should normalize");
+            normalize_evm_address(&signer_address).expect("test address should normalize");
         let normalized_hash =
             normalize_command_hash(&command_hash, "test command hash").expect("hash should parse");
         let payload = canonical_steward_signing_payload(
@@ -2989,6 +2939,25 @@ mod tests {
         assert!(
             parse_evm_read_args(r#"{"method":"eth_getCode","params_json":"[\"0x1111111111111111111111111111111111111111\",\"latest\"]"}"#).is_ok()
         );
+    }
+
+    #[test]
+    fn parse_evm_read_args_rejects_non_string_address_values() {
+        let numeric_error =
+            match parse_evm_read_args(r#"{"method":"eth_getBalance","address":12345}"#) {
+                Ok(_) => panic!("numeric address should be rejected explicitly"),
+                Err(error) => error,
+            };
+        assert!(numeric_error.contains("invalid evm_read address"));
+        assert!(numeric_error.contains("expected 0x-prefixed string"));
+
+        let scientific_error =
+            match parse_evm_read_args(r#"{"method":"eth_getBalance","address":1e21}"#) {
+                Ok(_) => panic!("scientific address should be rejected explicitly"),
+                Err(error) => error,
+            };
+        assert!(scientific_error.contains("invalid evm_read address"));
+        assert!(scientific_error.contains("expected 0x-prefixed string"));
     }
 
     #[test]
@@ -3548,11 +3517,6 @@ mod tests {
                 chain_id: 8453,
                 template_id: "execute-strategy-failure".to_string(),
             },
-            version: crate::domain::types::TemplateVersion {
-                major: 1,
-                minor: 0,
-                patch: 0,
-            },
             action_id: "transfer".to_string(),
             calls: vec![crate::domain::types::StrategyExecutionCall {
                 role: "token".to_string(),
@@ -3572,7 +3536,7 @@ mod tests {
             "expected address validation error, got {err}"
         );
 
-        let stats = crate::storage::stable::strategy_outcome_stats(&plan.key, &plan.version)
+        let stats = crate::storage::stable::strategy_outcome_stats(&plan.key)
             .expect("failure evidence should persist");
         assert_eq!(stats.total_runs, 1);
         assert_eq!(stats.deterministic_failures, 1);
@@ -3708,7 +3672,7 @@ mod tests {
                 decode_message_queued_payload(&event.payload).expect("event payload should decode");
             assert_eq!(
                 decoded.sender,
-                normalize_address(&payer).unwrap_or_default()
+                normalize_evm_address(&payer).unwrap_or_default()
             );
             assert_eq!(decoded.message, message);
             assert_eq!(decoded.usdc_amount, usdc_amount);
@@ -3765,7 +3729,7 @@ mod tests {
             let account = value
                 .as_str()
                 .ok_or_else(|| "eth_accounts result must contain strings".to_string())?;
-            accounts.push(normalize_address(account)?);
+            accounts.push(normalize_evm_address(account)?);
         }
         if accounts.len() < 2 {
             return Err("anvil did not return enough unlocked accounts".to_string());
@@ -3811,7 +3775,7 @@ mod tests {
             .get("contractAddress")
             .and_then(Value::as_str)
             .ok_or_else(|| "transaction receipt missing contractAddress".to_string())?;
-        normalize_address(contract_address)
+        normalize_evm_address(contract_address)
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
@@ -3823,9 +3787,12 @@ mod tests {
         value_wei: Option<U256>,
     ) -> Result<Value, String> {
         let mut tx = Map::new();
-        tx.insert("from".to_string(), Value::String(normalize_address(from)?));
+        tx.insert(
+            "from".to_string(),
+            Value::String(normalize_evm_address(from)?),
+        );
         if let Some(to) = to {
-            tx.insert("to".to_string(), Value::String(normalize_address(to)?));
+            tx.insert("to".to_string(), Value::String(normalize_evm_address(to)?));
         }
         tx.insert(
             "data".to_string(),
@@ -3933,7 +3900,7 @@ mod tests {
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "anvil_e2e"))]
     fn encode_address_word_hex(address: &str) -> Result<String, String> {
-        let normalized = normalize_address(address)?;
+        let normalized = normalize_evm_address(address)?;
         Ok(format!("{:0>64}", normalized.trim_start_matches("0x")))
     }
 
@@ -3954,7 +3921,7 @@ mod tests {
         }
 
         let sender = format!("0x{}", hex::encode(&bytes[12..32]));
-        let sender = normalize_address(&sender)?;
+        let sender = normalize_evm_address(&sender)?;
         let message_offset = read_usize_word(&bytes[32..64], "message offset")?;
         let usdc_amount = U256::from_be_slice(&bytes[64..96]);
         let eth_amount = U256::from_be_slice(&bytes[96..128]);

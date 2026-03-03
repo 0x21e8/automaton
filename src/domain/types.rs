@@ -376,17 +376,14 @@ pub enum StewardCommand {
     },
     ActivateStrategyTemplate {
         key: StrategyTemplateKey,
-        version: TemplateVersion,
         reason: Option<String>,
     },
     DeprecateStrategyTemplate {
         key: StrategyTemplateKey,
-        version: TemplateVersion,
         reason: Option<String>,
     },
     RevokeStrategyTemplate {
         key: StrategyTemplateKey,
-        version: TemplateVersion,
         reason: Option<String>,
     },
     SetStrategyKillSwitch {
@@ -995,7 +992,8 @@ pub struct StrategyTemplateKey {
 
 /// Semantic version for a strategy template or ABI artefact.
 ///
-/// Versions are totally ordered; `0.0.0` is reserved and invalid.
+/// Retained for Candid backward compatibility even though strategy entities are
+/// now keyed without versions.
 #[derive(
     CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
 )]
@@ -1057,7 +1055,7 @@ pub struct ActionSpec {
     pub risk_checks: Vec<String>,
 }
 
-/// A versioned strategy template defining the actions, contract roles, and
+/// A strategy template defining the actions, contract roles, and
 /// constraints for an on-chain DeFi operation (e.g. a Uniswap swap).
 ///
 /// Templates are stored in `STRATEGY_TEMPLATE_MAP` and referenced by agents
@@ -1065,7 +1063,6 @@ pub struct ActionSpec {
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct StrategyTemplate {
     pub key: StrategyTemplateKey,
-    pub version: TemplateVersion,
     pub status: TemplateStatus,
     pub contract_roles: Vec<ContractRoleBinding>,
     pub actions: Vec<ActionSpec>,
@@ -1074,13 +1071,12 @@ pub struct StrategyTemplate {
     pub updated_at_ns: u64,
 }
 
-/// Composite key for an ABI artefact: protocol + chain + contract role + version.
+/// Composite key for an ABI artefact: protocol + chain + contract role.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AbiArtifactKey {
     pub protocol: String,
     pub chain_id: u64,
     pub role: String,
-    pub version: TemplateVersion,
 }
 
 /// A versioned ABI artefact stored in `ABI_ARTIFACT_MAP`, providing the raw
@@ -1112,7 +1108,6 @@ pub struct AbiSelectorAssertion {
 #[allow(dead_code)]
 pub struct StrategyExecutionIntent {
     pub key: StrategyTemplateKey,
-    pub version: TemplateVersion,
     pub action_id: String,
     /// JSON object whose fields match the action's typed parameter schema.
     pub typed_params_json: String,
@@ -1136,7 +1131,6 @@ pub struct StrategyExecutionCall {
 #[allow(dead_code)]
 pub struct ExecutionPlan {
     pub key: StrategyTemplateKey,
-    pub version: TemplateVersion,
     pub action_id: String,
     pub calls: Vec<StrategyExecutionCall>,
     pub preconditions: Vec<String>,
@@ -1150,6 +1144,10 @@ pub enum ValidationLayer {
     Schema,
     Address,
     Policy,
+    /// Deprecated: retained for serialized data compatibility.
+    #[deprecated(
+        note = "retained for serialization compatibility; no longer emitted by the validator"
+    )]
     Preflight,
     Postcondition,
 }
@@ -1188,7 +1186,6 @@ pub enum StrategyOutcomeKind {
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct StrategyOutcomeEvent {
     pub key: StrategyTemplateKey,
-    pub version: TemplateVersion,
     pub action_id: String,
     pub outcome: StrategyOutcomeKind,
     pub tx_hash: Option<String>,
@@ -1196,27 +1193,17 @@ pub struct StrategyOutcomeEvent {
     pub observed_at_ns: u64,
 }
 
-/// Running execution statistics for a strategy version, stored in
+/// Running execution statistics for a strategy template, stored in
 /// `STRATEGY_OUTCOME_STATS_MAP`.
-///
-/// `confidence_bps` and `ranking_score_bps` are derived metrics (basis points,
-/// 0–10000) updated each time `record_strategy_outcome` is called.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct StrategyOutcomeStats {
     pub key: StrategyTemplateKey,
-    pub version: TemplateVersion,
     pub total_runs: u64,
     pub success_runs: u64,
     pub deterministic_failures: u64,
     pub nondeterministic_failures: u64,
     #[serde(default)]
     pub deterministic_failure_streak: u32,
-    #[serde(default)]
-    pub confidence_bps: u16,
-    #[serde(default)]
-    pub ranking_score_bps: u16,
-    #[serde(default)]
-    pub parameter_priors: StrategyParameterPriors,
     #[serde(default)]
     pub last_error: Option<String>,
     #[serde(default)]
@@ -1225,51 +1212,28 @@ pub struct StrategyOutcomeStats {
     pub last_observed_at_ns: Option<u64>,
 }
 
-/// Adaptive parameter priors for a strategy, updated from observed outcomes.
-///
-/// Expressed in basis points (100 bps = 1%).  Used to tune slippage tolerance
-/// and gas buffer multipliers before building the next execution plan.
-#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct StrategyParameterPriors {
-    #[serde(default = "default_strategy_slippage_bps")]
-    pub slippage_bps: u16,
-    #[serde(default = "default_strategy_gas_buffer_bps")]
-    pub gas_buffer_bps: u16,
-}
-
-impl Default for StrategyParameterPriors {
-    fn default() -> Self {
-        Self {
-            slippage_bps: default_strategy_slippage_bps(),
-            gas_buffer_bps: default_strategy_gas_buffer_bps(),
-        }
-    }
-}
-
-/// Records whether a specific strategy version is enabled for execution.
+/// Records whether a strategy template is enabled for execution.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TemplateActivationState {
     pub key: StrategyTemplateKey,
-    pub version: TemplateVersion,
     pub enabled: bool,
     pub updated_at_ns: u64,
     #[serde(default)]
     pub reason: Option<String>,
 }
 
-/// Records whether a specific strategy version has been permanently revoked.
+/// Records whether a strategy template has been permanently revoked.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TemplateRevocationState {
     pub key: StrategyTemplateKey,
-    pub version: TemplateVersion,
     pub revoked: bool,
     pub updated_at_ns: u64,
     #[serde(default)]
     pub reason: Option<String>,
 }
 
-/// An emergency circuit-breaker that halts all executions of a strategy
-/// regardless of version, stored in `STRATEGY_KILL_SWITCH_MAP`.
+/// An emergency circuit-breaker that halts all executions of a strategy,
+/// stored in `STRATEGY_KILL_SWITCH_MAP`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct StrategyKillSwitchState {
     pub key: StrategyTemplateKey,
@@ -2385,14 +2349,6 @@ fn default_wallet_balance_sync_low_cycles_interval_secs() -> u64 {
 
 fn default_wallet_balance_sync_freshness_window_secs() -> u64 {
     600
-}
-
-fn default_strategy_slippage_bps() -> u16 {
-    100
-}
-
-fn default_strategy_gas_buffer_bps() -> u16 {
-    120
 }
 
 fn default_wallet_balance_sync_max_response_bytes() -> u64 {

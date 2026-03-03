@@ -29,6 +29,7 @@ mod strategy;
 mod test_support;
 mod timing;
 mod tools;
+mod util;
 
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, AutonomySuppressionConfig, ConversationLog,
@@ -40,8 +41,7 @@ use crate::domain::types::{
     StewardState, StewardStatusView, StrategyKillSwitchState, StrategyOutcomeStats,
     StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, TaskKind, TaskScheduleConfig,
     TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState, TemplateStatus,
-    TemplateVersion, ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView,
-    WalletBalanceTelemetryView,
+    ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
@@ -435,22 +435,13 @@ fn update_active_steward_and_maybe_reset_nonce(
     Ok((previous, stored, nonce_reset))
 }
 
-/// Looks up a strategy template by key and version, returning a descriptive
+/// Looks up a strategy template by key, returning a descriptive
 /// error when not found.
-fn require_strategy_template(
-    key: &StrategyTemplateKey,
-    version: &TemplateVersion,
-) -> Result<StrategyTemplate, String> {
-    crate::strategy::registry::get_template(key, version).ok_or_else(|| {
+fn require_strategy_template(key: &StrategyTemplateKey) -> Result<StrategyTemplate, String> {
+    crate::strategy::registry::get_template(key).ok_or_else(|| {
         format!(
-            "strategy template not found for {}:{}:{}:{}@{}.{}.{}",
-            key.protocol,
-            key.primitive,
-            key.chain_id,
-            key.template_id,
-            version.major,
-            version.minor,
-            version.patch
+            "strategy template not found for {}:{}:{}:{}",
+            key.protocol, key.primitive, key.chain_id, key.template_id
         )
     })
 }
@@ -458,10 +449,9 @@ fn require_strategy_template(
 /// Atomically sets a template's `status` field and bumps `updated_at_ns`.
 fn upsert_template_status(
     key: StrategyTemplateKey,
-    version: TemplateVersion,
     status: TemplateStatus,
 ) -> Result<StrategyTemplate, String> {
-    let mut template = require_strategy_template(&key, &version)?;
+    let mut template = require_strategy_template(&key)?;
     template.status = status;
     template.updated_at_ns = current_time_ns();
     crate::strategy::registry::upsert_template(template)
@@ -955,57 +945,40 @@ async fn dispatch_steward_command(
             )?;
             Ok("strategy_abi_artifact_ingested".to_string())
         }
-        StewardCommand::ActivateStrategyTemplate {
-            key,
-            version,
-            reason,
-        } => {
-            let _ = upsert_template_status(key.clone(), version.clone(), TemplateStatus::Active)?;
-            crate::strategy::registry::canary_probe_template(&key, &version)?;
+        StewardCommand::ActivateStrategyTemplate { key, reason } => {
+            let _ = upsert_template_status(key.clone(), TemplateStatus::Active)?;
+            crate::strategy::compiler::dry_run_compile(&key)?;
             let _ = crate::strategy::registry::set_activation(TemplateActivationState {
                 key,
-                version,
                 enabled: true,
                 updated_at_ns: current_time_ns(),
                 reason: reason
-                    .or_else(|| Some("controller activation after canary probe".to_string())),
+                    .or_else(|| Some("controller activation after dry-run compile".to_string())),
             })?;
             Ok("strategy_template_activated".to_string())
         }
-        StewardCommand::DeprecateStrategyTemplate {
-            key,
-            version,
-            reason,
-        } => {
-            let _ =
-                upsert_template_status(key.clone(), version.clone(), TemplateStatus::Deprecated)?;
+        StewardCommand::DeprecateStrategyTemplate { key, reason } => {
+            let _ = upsert_template_status(key.clone(), TemplateStatus::Deprecated)?;
             let _ = crate::strategy::registry::set_activation(TemplateActivationState {
                 key,
-                version,
                 enabled: false,
                 updated_at_ns: current_time_ns(),
                 reason,
             });
             Ok("strategy_template_deprecated".to_string())
         }
-        StewardCommand::RevokeStrategyTemplate {
-            key,
-            version,
-            reason,
-        } => {
-            let _ = upsert_template_status(key.clone(), version.clone(), TemplateStatus::Revoked)?;
+        StewardCommand::RevokeStrategyTemplate { key, reason } => {
+            let _ = upsert_template_status(key.clone(), TemplateStatus::Revoked)?;
             let now_ns = current_time_ns();
             let revocation_reason = reason.clone();
             let _ = crate::strategy::registry::set_revocation(TemplateRevocationState {
                 key: key.clone(),
-                version: version.clone(),
                 revoked: true,
                 updated_at_ns: now_ns,
                 reason: revocation_reason,
             })?;
             let _ = crate::strategy::registry::set_activation(TemplateActivationState {
                 key,
-                version,
                 enabled: false,
                 updated_at_ns: now_ns,
                 reason: reason.or_else(|| Some("revoked".to_string())),
@@ -1621,23 +1594,17 @@ fn list_strategy_templates(key: Option<StrategyTemplateKey>, limit: u32) -> Vec<
     }
 }
 
-/// Returns a single strategy template by key and version, or `None` if absent.
+/// Returns a single strategy template by key, or `None` if absent.
 #[ic_cdk::query]
-fn get_strategy_template(
-    key: StrategyTemplateKey,
-    version: TemplateVersion,
-) -> Option<StrategyTemplate> {
-    crate::strategy::registry::get_template(&key, &version)
+fn get_strategy_template(key: StrategyTemplateKey) -> Option<StrategyTemplate> {
+    crate::strategy::registry::get_template(&key)
 }
 
 /// Returns accumulated outcome statistics (success/failure counts, last outcome)
 /// for the given template, or `None` if no executions have been recorded yet.
 #[ic_cdk::query]
-fn get_strategy_outcome_stats(
-    key: StrategyTemplateKey,
-    version: TemplateVersion,
-) -> Option<StrategyOutcomeStats> {
-    crate::strategy::learner::outcome_stats(&key, &version)
+fn get_strategy_outcome_stats(key: StrategyTemplateKey) -> Option<StrategyOutcomeStats> {
+    crate::strategy::learner::outcome_stats(&key)
 }
 
 /// Inserts or updates a strategy template (controller only).
@@ -1669,23 +1636,21 @@ fn ingest_strategy_abi_artifact_admin(args: StrategyAbiIngestArgs) -> Result<Abi
     )
 }
 
-/// Transitions a template to `Active`, runs a canary probe to validate it,
+/// Transitions a template to `Active`, runs a dry-run compile to validate it,
 /// and records an activation state entry (controller only).
 #[ic_cdk::update]
 fn activate_strategy_template_admin(
     key: StrategyTemplateKey,
-    version: TemplateVersion,
     reason: Option<String>,
 ) -> Result<TemplateActivationState, String> {
     ensure_controller()?;
-    let _template = upsert_template_status(key.clone(), version.clone(), TemplateStatus::Active)?;
-    crate::strategy::registry::canary_probe_template(&key, &version)?;
+    let _template = upsert_template_status(key.clone(), TemplateStatus::Active)?;
+    crate::strategy::compiler::dry_run_compile(&key)?;
     crate::strategy::registry::set_activation(TemplateActivationState {
         key,
-        version,
         enabled: true,
         updated_at_ns: current_time_ns(),
-        reason: reason.or_else(|| Some("controller activation after canary probe".to_string())),
+        reason: reason.or_else(|| Some("controller activation after dry-run compile".to_string())),
     })
 }
 
@@ -1694,15 +1659,12 @@ fn activate_strategy_template_admin(
 #[ic_cdk::update]
 fn deprecate_strategy_template_admin(
     key: StrategyTemplateKey,
-    version: TemplateVersion,
     reason: Option<String>,
 ) -> Result<StrategyTemplate, String> {
     ensure_controller()?;
-    let template =
-        upsert_template_status(key.clone(), version.clone(), TemplateStatus::Deprecated)?;
+    let template = upsert_template_status(key.clone(), TemplateStatus::Deprecated)?;
     let _ = crate::strategy::registry::set_activation(TemplateActivationState {
         key,
-        version,
         enabled: false,
         updated_at_ns: current_time_ns(),
         reason,
@@ -1716,22 +1678,19 @@ fn deprecate_strategy_template_admin(
 #[ic_cdk::update]
 fn revoke_strategy_template_admin(
     key: StrategyTemplateKey,
-    version: TemplateVersion,
     reason: Option<String>,
 ) -> Result<TemplateRevocationState, String> {
     ensure_controller()?;
-    let _ = upsert_template_status(key.clone(), version.clone(), TemplateStatus::Revoked)?;
+    let _ = upsert_template_status(key.clone(), TemplateStatus::Revoked)?;
     let now_ns = current_time_ns();
     let revocation = crate::strategy::registry::set_revocation(TemplateRevocationState {
         key: key.clone(),
-        version: version.clone(),
         revoked: true,
         updated_at_ns: now_ns,
         reason: reason.clone(),
     })?;
     let _ = crate::strategy::registry::set_activation(TemplateActivationState {
         key,
-        version,
         enabled: false,
         updated_at_ns: now_ns,
         reason: reason.or_else(|| Some("revoked".to_string())),
@@ -1739,7 +1698,7 @@ fn revoke_strategy_template_admin(
     Ok(revocation)
 }
 
-/// Arms or disarms the kill switch for all versions of a strategy template.
+/// Arms or disarms the kill switch for a strategy template.
 /// When `enabled` is `true` the agent will refuse to execute any action for
 /// that template (controller only).
 #[ic_cdk::update]
@@ -1807,7 +1766,7 @@ mod tests {
         AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, InboxMessageSource,
         InferenceProxyResultPayload, MemoryFact, OpenRouterProxyWorkerConfig,
         PendingInferenceProxyJob, SkillRecord, StewardNonceState, StrategyTemplate,
-        StrategyTemplateKey, SubmitInferenceResultArgs, TemplateStatus, TemplateVersion,
+        StrategyTemplateKey, SubmitInferenceResultArgs, TemplateStatus,
     };
     use sha3::{Digest, Keccak256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -2696,18 +2655,9 @@ mod tests {
         }
     }
 
-    fn sample_version() -> TemplateVersion {
-        TemplateVersion {
-            major: 1,
-            minor: 0,
-            patch: 0,
-        }
-    }
-
     fn sample_template(status: TemplateStatus) -> StrategyTemplate {
         StrategyTemplate {
             key: sample_strategy_key(),
-            version: sample_version(),
             status,
             contract_roles: vec![ContractRoleBinding {
                 role: "token".to_string(),
@@ -2757,7 +2707,6 @@ mod tests {
                 protocol: "erc20".to_string(),
                 chain_id: 8453,
                 role: "token".to_string(),
-                version: sample_version(),
             },
             abi_json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable","inputs":[{"type":"address"},{"type":"uint256"}],"outputs":[{"type":"bool"}]}]"#.to_string(),
             source_ref: "https://example.com/token-abi".to_string(),
@@ -2777,7 +2726,6 @@ mod tests {
 
         let activated = activate_strategy_template_admin(
             sample_strategy_key(),
-            sample_version(),
             Some("manual activation".to_string()),
         )
         .expect("activation should succeed");
@@ -2785,7 +2733,6 @@ mod tests {
 
         let deprecated = deprecate_strategy_template_admin(
             sample_strategy_key(),
-            sample_version(),
             Some("rotating template".to_string()),
         )
         .expect("deprecation should succeed");
@@ -2793,7 +2740,6 @@ mod tests {
 
         let revoked = revoke_strategy_template_admin(
             sample_strategy_key(),
-            sample_version(),
             Some("safety incident".to_string()),
         )
         .expect("revocation should succeed");
@@ -2815,10 +2761,8 @@ mod tests {
 
         let listed = list_strategy_templates(Some(sample_strategy_key()), 10);
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].version, sample_version());
 
-        let fetched = get_strategy_template(sample_strategy_key(), sample_version())
-            .expect("template exists");
+        let fetched = get_strategy_template(sample_strategy_key()).expect("template exists");
         assert_eq!(fetched.actions[0].action_id, "transfer");
     }
 

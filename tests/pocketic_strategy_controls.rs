@@ -33,13 +33,6 @@ struct StrategyTemplateKey {
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct TemplateVersion {
-    major: u16,
-    minor: u16,
-    patch: u16,
-}
-
-#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum TemplateStatus {
     Draft,
     Active,
@@ -83,7 +76,6 @@ struct ActionSpec {
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct StrategyTemplate {
     key: StrategyTemplateKey,
-    version: TemplateVersion,
     status: TemplateStatus,
     contract_roles: Vec<ContractRoleBinding>,
     actions: Vec<ActionSpec>,
@@ -97,7 +89,6 @@ struct AbiArtifactKey {
     protocol: String,
     chain_id: u64,
     role: String,
-    version: TemplateVersion,
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -129,7 +120,6 @@ struct AbiArtifact {
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct TemplateActivationState {
     key: StrategyTemplateKey,
-    version: TemplateVersion,
     enabled: bool,
     updated_at_ns: u64,
     reason: Option<String>,
@@ -228,18 +218,9 @@ fn sample_key() -> StrategyTemplateKey {
     }
 }
 
-fn sample_version() -> TemplateVersion {
-    TemplateVersion {
-        major: 1,
-        minor: 0,
-        patch: 0,
-    }
-}
-
 fn sample_template() -> StrategyTemplate {
     StrategyTemplate {
         key: sample_key(),
-        version: sample_version(),
         status: TemplateStatus::Draft,
         contract_roles: vec![ContractRoleBinding {
             role: "token".to_string(),
@@ -296,7 +277,6 @@ fn strategy_control_plane_lifecycle_and_controller_gating_work_in_pocketic() {
             protocol: sample_key().protocol.clone(),
             chain_id: sample_key().chain_id,
             role: "token".to_string(),
-            version: sample_version(),
         },
         abi_json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable","inputs":[{"type":"address"},{"type":"uint256"}],"outputs":[{"type":"bool"}]}]"#.to_string(),
         source_ref: "https://example.com/token-abi".to_string(),
@@ -315,10 +295,10 @@ fn strategy_control_plane_lifecycle_and_controller_gating_work_in_pocketic() {
     );
     assert!(abi_ingested.is_ok(), "abi ingest failed: {abi_ingested:?}");
 
-    let activate_payload =
-        encode_args((sample_key(), sample_version(), Some("activate".to_string()))).unwrap_or_else(
-            |error| panic!("failed to encode activate_strategy_template_admin args: {error}"),
-        );
+    let activate_payload = encode_args((sample_key(), Some("activate".to_string())))
+        .unwrap_or_else(|error| {
+            panic!("failed to encode activate_strategy_template_admin args: {error}")
+        });
     let activation: Result<TemplateActivationState, String> = call_update(
         &pic,
         canister_id,
@@ -345,8 +325,7 @@ fn strategy_control_plane_lifecycle_and_controller_gating_work_in_pocketic() {
         &pic,
         canister_id,
         "get_strategy_template",
-        encode_args((sample_key(), sample_version()))
-            .expect("failed to encode get_strategy_template args"),
+        encode_args((sample_key(),)).expect("failed to encode get_strategy_template args"),
     );
     let fetched = fetched.expect("strategy template should be fetchable");
     assert!(matches!(fetched.status, TemplateStatus::Active));

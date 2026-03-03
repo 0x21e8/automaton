@@ -9,11 +9,10 @@
 /// 3. [`registry`]  — thin persistence façade over `storage::stable`; stores and retrieves
 ///    strategy templates, ABI artifacts, activation/revocation/kill-switch state,
 ///    and outcome stats.
-/// 4. [`learner`]   — accumulate execution outcome events and derive confidence, ranking, and
-///    parameter-prior estimates; auto-deactivates templates on repeated
-///    deterministic failures.
+/// 4. [`learner`]   — accumulate execution outcome events and auto-deactivate
+///    templates on repeated deterministic failures.
 /// 5. [`validator`] — multi-layer gate that checks schema correctness, address consistency,
-///    policy constraints, EVM preflight simulation, and postcondition presence
+///    policy constraints, and postcondition presence
 ///    before a plan is submitted on-chain.
 ///
 /// [`AbiArtifact`]: crate::domain::types::AbiArtifact

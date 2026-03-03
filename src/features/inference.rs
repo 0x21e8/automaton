@@ -211,6 +211,24 @@ fn run_deterministic_inference(
         || input
             .context_snippet
             .contains("request_remember_failure_loop_probe:true");
+    let list_templates_malformed_probe_request = input
+        .input
+        .contains("request_list_templates_malformed_probe:true")
+        || input
+            .context_snippet
+            .contains("request_list_templates_malformed_probe:true");
+    let remember_malformed_probe_request = input
+        .input
+        .contains("request_remember_malformed_probe:true")
+        || input
+            .context_snippet
+            .contains("request_remember_malformed_probe:true");
+    let evm_read_malformed_probe_request = input
+        .input
+        .contains("request_evm_read_malformed_probe:true")
+        || input
+            .context_snippet
+            .contains("request_evm_read_malformed_probe:true");
     let continuation_loop_request = input.input.contains("request_continuation_loop:true")
         || input
             .context_snippet
@@ -249,6 +267,24 @@ fn run_deterministic_inference(
                 args_json: r#"{"prefix":"config.endpoint.keepalive"}"#.to_string(),
             },
         ]
+    } else if list_templates_malformed_probe_request {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "list_strategy_templates".to_string(),
+            args_json: r#"{"key":42}"#.to_string(),
+        }]
+    } else if remember_malformed_probe_request {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "remember".to_string(),
+            args_json: r#"{"value":"missing-key"}"#.to_string(),
+        }]
+    } else if evm_read_malformed_probe_request {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "evm_read".to_string(),
+            args_json: r#"{"method":"eth_getBalance","address":1e21}"#.to_string(),
+        }]
     } else if remember_capacity_probe_request {
         vec![ToolCall {
             tool_call_id: None,
@@ -832,9 +868,69 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
+            name: "register_strategy".to_string(),
+            description: Some(
+                "Register a new strategy template from contract ABIs. Use http_fetch to retrieve ABIs from block explorers first. The system validates selectors, runs a dry-run compile, and auto-activates on success."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "protocol".to_string(),
+                        description: Some("Strategy protocol namespace (e.g. `uniswap-v3`).".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "primitive".to_string(),
+                        description: Some("Strategy primitive class (e.g. `swap`).".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "integer".to_string(),
+                        name: "chain_id".to_string(),
+                        description: Some("Target EVM chain id.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "template_id".to_string(),
+                        description: Some("Template identifier unique within protocol+primitive+chain.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "array".to_string(),
+                        name: "contracts".to_string(),
+                        description: Some("Contract entries: [{\"role\":\"router\",\"address\":\"0x...\",\"abi_json\":\"[...]\",\"source_ref\":\"https://...\"}].".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "array".to_string(),
+                        name: "actions".to_string(),
+                        description: Some("Action entries: [{\"action_id\":\"...\",\"calls\":[{\"role\":\"router\",\"function\":\"exactInputSingle\"}],\"postconditions\":[\"...\"]}] with optional preconditions and risk_checks.".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "max_value_wei_per_call".to_string(),
+                        description: Some("Optional decimal wei cap per call (default: 100000000000000000).".to_string()),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "template_budget_wei".to_string(),
+                        description: Some("Optional decimal wei lifetime budget cap (default: 1000000000000000000).".to_string()),
+                    },
+                ]),
+                required: Some(vec![
+                    "protocol".to_string(),
+                    "primitive".to_string(),
+                    "chain_id".to_string(),
+                    "template_id".to_string(),
+                    "contracts".to_string(),
+                    "actions".to_string(),
+                ]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
             name: "simulate_strategy_action".to_string(),
             description: Some(
-                "Compile and validate a strategy action without broadcasting transactions. Requires `key`, `version`, `action_id`, and one of `typed_params` or `typed_params_json`."
+                "Compile and validate a strategy action without broadcasting transactions. Requires `key`, `action_id`, and one of `typed_params` or `typed_params_json`."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -845,14 +941,6 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         name: "key".to_string(),
                         description: Some(
                             "Template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
-                                .to_string(),
-                        ),
-                    },
-                    IcLlmProperty {
-                        type_: "object".to_string(),
-                        name: "version".to_string(),
-                        description: Some(
-                            "Template version object: {\"major\":1,\"minor\":0,\"patch\":0}."
                                 .to_string(),
                         ),
                     },
@@ -880,7 +968,6 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 ]),
                 required: Some(vec![
                     "key".to_string(),
-                    "version".to_string(),
                     "action_id".to_string(),
                 ]),
             }),
@@ -888,7 +975,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "execute_strategy_action".to_string(),
             description: Some(
-                "Compile, validate, and execute a strategy action (broadcasts real transactions). Requires `key`, `version`, `action_id`, and one of `typed_params` or `typed_params_json`."
+                "Compile, validate, and execute a strategy action (broadcasts real transactions). Requires `key`, `action_id`, and one of `typed_params` or `typed_params_json`."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -899,14 +986,6 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         name: "key".to_string(),
                         description: Some(
                             "Template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
-                                .to_string(),
-                        ),
-                    },
-                    IcLlmProperty {
-                        type_: "object".to_string(),
-                        name: "version".to_string(),
-                        description: Some(
-                            "Template version object: {\"major\":1,\"minor\":0,\"patch\":0}."
                                 .to_string(),
                         ),
                     },
@@ -934,7 +1013,6 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 ]),
                 required: Some(vec![
                     "key".to_string(),
-                    "version".to_string(),
                     "action_id".to_string(),
                 ]),
             }),
@@ -942,7 +1020,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "get_strategy_outcomes".to_string(),
             description: Some(
-                "Read outcome statistics for a specific strategy template version."
+                "Read outcome statistics for a specific strategy template."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -956,16 +1034,8 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                                 .to_string(),
                         ),
                     },
-                    IcLlmProperty {
-                        type_: "object".to_string(),
-                        name: "version".to_string(),
-                        description: Some(
-                            "Template version object: {\"major\":1,\"minor\":0,\"patch\":0}."
-                                .to_string(),
-                        ),
-                    },
                 ]),
-                required: Some(vec!["key".to_string(), "version".to_string()]),
+                required: Some(vec!["key".to_string()]),
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
@@ -2255,34 +2325,7 @@ mod tests {
     use super::*;
     use crate::domain::types::SkillRecord;
     use crate::storage::stable;
-    use std::future::Future;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    fn block_on_with_spin<F: Future>(future: F) -> F::Output {
-        unsafe fn clone(_ptr: *const ()) -> RawWaker {
-            dummy_raw_waker()
-        }
-        unsafe fn wake(_ptr: *const ()) {}
-        unsafe fn wake_by_ref(_ptr: *const ()) {}
-        unsafe fn drop(_ptr: *const ()) {}
-
-        fn dummy_raw_waker() -> RawWaker {
-            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-
-        let waker = unsafe { Waker::from_raw(dummy_raw_waker()) };
-        let mut context = Context::from_waker(&waker);
-        let mut future = Box::pin(future);
-
-        for _ in 0..10_000 {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => std::hint::spin_loop(),
-            }
-        }
-        panic!("future did not complete in test polling loop");
-    }
+    use crate::util::block_on_with_spin;
 
     #[test]
     fn parses_ic_llm_models() {
@@ -2812,6 +2855,7 @@ mod tests {
         assert!(names.contains(&"http_fetch".to_string()));
         assert!(names.contains(&"update_prompt_layer".to_string()));
         assert!(names.contains(&"list_strategy_templates".to_string()));
+        assert!(names.contains(&"register_strategy".to_string()));
         assert!(names.contains(&"simulate_strategy_action".to_string()));
         assert!(names.contains(&"execute_strategy_action".to_string()));
         assert!(names.contains(&"get_strategy_outcomes".to_string()));
@@ -2882,6 +2926,7 @@ mod tests {
         assert!(names.contains(&"http_fetch"));
         assert!(names.contains(&"update_prompt_layer"));
         assert!(names.contains(&"list_strategy_templates"));
+        assert!(names.contains(&"register_strategy"));
         assert!(names.contains(&"simulate_strategy_action"));
         assert!(names.contains(&"execute_strategy_action"));
         assert!(names.contains(&"get_strategy_outcomes"));
@@ -3011,6 +3056,7 @@ mod tests {
         assert!(!names.contains(&"execute_strategy_action".to_string()));
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"list_strategy_templates".to_string()));
+        assert!(names.contains(&"register_strategy".to_string()));
         assert!(names.contains(&"memory_stats".to_string()));
         assert!(names.contains(&"simulate_strategy_action".to_string()));
         assert!(names.contains(&"get_strategy_outcomes".to_string()));
@@ -3049,6 +3095,7 @@ mod tests {
         assert!(!names.contains(&"execute_strategy_action"));
         assert!(names.contains(&"remember"));
         assert!(names.contains(&"list_strategy_templates"));
+        assert!(names.contains(&"register_strategy"));
         assert!(names.contains(&"memory_stats"));
         assert!(names.contains(&"simulate_strategy_action"));
         assert!(names.contains(&"get_strategy_outcomes"));
