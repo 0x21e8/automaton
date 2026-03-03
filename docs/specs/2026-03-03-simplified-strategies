@@ -316,7 +316,7 @@ Strategy Subsystem Simplification + Agent Self-Authoring                        
 [x] 5. Replace canary with dry-run compile                                                                                                        │
 [x] 6. Add register_strategy tool (depends on steps 3-5 for simplified types)                                                                     │
 [x] 7. Fix max_notional overlap                                                                                                                  │
-[] 8. Minor cleanups                                                                                                                             │
+[x] 8. Minor cleanups                                                                                                                            │
 │                                                                                                                                               │
 │ ---                                                                                                                                           │
 │ Verification                                                                                                                                  │
@@ -362,3 +362,7 @@ Strategy Subsystem Simplification + Agent Self-Authoring                        
 │ - Step 7 removed `max_notional_wei` from validator constraint parsing/enforcement. Runtime semantics are now explicit:                            │
 │ `max_value_wei_per_call` is the per-call cap, and `max_total_value_wei` is the total plan cap. Legacy templates relying only on                 │
 │ `max_notional_wei` should be migrated to one or both explicit fields.                                                                            │
+│ - Step 8 implementation note: the spec reference to `registry.rs:259` is stale on this branch (that selector-matching loop no longer exists      │
+│ after Step 5 canary removal and Step 6 tool wiring). Selector-loop cleanup was applied to `strategy/compiler.rs`, which is the active runtime path.│
+│ - Verification note: this repo's canonical canister build path is `icp build` (WASI workflow). Running `cargo build --target wasm32-unknown-     │
+│ unknown` can require network fetches for extra target artifacts and is not required for Step 8 validation here.                                   │

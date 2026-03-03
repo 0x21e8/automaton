@@ -25,11 +25,13 @@
 /// [`AbiArtifact`]: crate::domain::types::AbiArtifact
 use crate::domain::types::{
     AbiArtifactKey, AbiTypeSpec, ExecutionPlan, StrategyExecutionCall, StrategyExecutionIntent,
+    StrategyTemplateKey,
 };
 use crate::strategy::{abi, registry};
+use crate::util::{normalize_evm_address, normalize_hex_blob, normalize_selector_hex};
 use alloy_primitives::U256;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -60,16 +62,10 @@ struct IntentTypedCall {
 /// surface to callers and is used by the learner to classify failure determinism.
 pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan, String> {
     let action_id = normalize_non_empty(&intent.action_id, "action_id")?;
-    let template = registry::get_template(&intent.key, &intent.version).ok_or_else(|| {
+    let template = registry::get_template(&intent.key).ok_or_else(|| {
         format!(
-            "strategy template not found for {}:{}:{}:{}@{}.{}.{}",
-            intent.key.protocol,
-            intent.key.primitive,
-            intent.key.chain_id,
-            intent.key.template_id,
-            intent.version.major,
-            intent.version.minor,
-            intent.version.patch
+            "strategy template not found for {}:{}:{}:{}",
+            intent.key.protocol, intent.key.primitive, intent.key.chain_id, intent.key.template_id
         )
     })?;
     let action = template
@@ -109,6 +105,7 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
     let mut calls = Vec::with_capacity(action.call_sequence.len());
     for (index, function) in action.call_sequence.iter().enumerate() {
         let signature = abi::verify_function_selector(function)?;
+        let normalized_selector = normalize_selector_hex(&function.selector_hex)?;
         let role = normalize_non_empty(&function.role, "call role")?;
         let binding = role_bindings
             .get(&role)
@@ -116,23 +113,17 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
         if binding.source_ref.trim().is_empty() {
             return Err(format!("missing source_ref for role binding: {role}"));
         }
-        let to = normalize_address(&binding.address)?;
+        let to = normalize_evm_address(&binding.address)?;
 
         let artifact_key = AbiArtifactKey {
             protocol: intent.key.protocol.clone(),
             chain_id: intent.key.chain_id,
             role: role.clone(),
-            version: intent.version.clone(),
         };
         let artifact = registry::get_abi_artifact(&artifact_key).ok_or_else(|| {
             format!(
-                "abi artifact missing for protocol={} role={} chain_id={} version={}.{}.{}",
-                artifact_key.protocol,
-                artifact_key.role,
-                artifact_key.chain_id,
-                artifact_key.version.major,
-                artifact_key.version.minor,
-                artifact_key.version.patch
+                "abi artifact missing for protocol={} role={} chain_id={}",
+                artifact_key.protocol, artifact_key.role, artifact_key.chain_id
             )
         })?;
         if artifact.source_ref.trim().is_empty() {
@@ -141,11 +132,10 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
                 artifact_key.role
             ));
         }
-        let has_matching_fn = artifact.functions.iter().any(|candidate| {
-            abi::verify_function_selector(candidate)
-                .map(|candidate_sig| candidate_sig == signature)
-                .unwrap_or(false)
-        });
+        let has_matching_fn = artifact
+            .functions
+            .iter()
+            .any(|candidate| candidate.selector_hex == normalized_selector);
         if !has_matching_fn {
             return Err(format!(
                 "abi artifact for role={role} missing function signature {signature}"
@@ -169,11 +159,10 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
         )?
         .to_string();
         let encoded_args = encode_abi_params(&function.inputs, &typed_call.args)?;
-        let selector_hex = normalize_selector_hex(&function.selector_hex)?;
         // Calldata = 4-byte selector || ABI-encoded arguments (no length prefix).
         let data = format!(
             "0x{}{}",
-            selector_hex.trim_start_matches("0x"),
+            normalized_selector.trim_start_matches("0x"),
             hex::encode(encoded_args)
         );
 
@@ -187,11 +176,58 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
 
     Ok(ExecutionPlan {
         key: intent.key.clone(),
-        version: intent.version.clone(),
         action_id,
         calls,
         preconditions: action.preconditions.clone(),
         postconditions: action.postconditions.clone(),
+    })
+}
+
+/// Run a full compile-path validation for a template by compiling a synthetic intent.
+///
+/// The dry-run uses the template's first action and injects zero-value arguments for every
+/// ABI input so `compile_intent` exercises template lookup, role binding, artifact checks,
+/// selector verification, and ABI encoding end-to-end.
+pub fn dry_run_compile(key: &StrategyTemplateKey) -> Result<(), String> {
+    let template = registry::get_template(key).ok_or_else(|| {
+        format!(
+            "strategy template not found for {}:{}:{}:{}",
+            key.protocol, key.primitive, key.chain_id, key.template_id
+        )
+    })?;
+    let first_action = template
+        .actions
+        .first()
+        .ok_or_else(|| "template has no actions".to_string())?;
+    if first_action.call_sequence.is_empty() {
+        return Err(format!(
+            "template action {} has an empty call_sequence",
+            first_action.action_id
+        ));
+    }
+
+    let mut calls = Vec::with_capacity(first_action.call_sequence.len());
+    for function in &first_action.call_sequence {
+        let mut args = Vec::with_capacity(function.inputs.len());
+        for input in &function.inputs {
+            args.push(synthetic_zero_value(input)?);
+        }
+        calls.push(json!({
+            "args": args,
+            "value_wei": "0",
+        }));
+    }
+
+    let intent = StrategyExecutionIntent {
+        key: key.clone(),
+        action_id: first_action.action_id.clone(),
+        typed_params_json: json!({ "calls": calls }).to_string(),
+    };
+    compile_intent(&intent).map(|_| ()).map_err(|error| {
+        format!(
+            "dry-run compile failed for {}:{}:{}:{} action={}: {error}",
+            key.protocol, key.primitive, key.chain_id, key.template_id, first_action.action_id
+        )
     })
 }
 
@@ -203,57 +239,6 @@ fn normalize_non_empty(raw: &str, field: &str) -> Result<String, String> {
         return Err(format!("{field} must be non-empty"));
     }
     Ok(trimmed.to_string())
-}
-
-fn normalize_selector_hex(raw: &str) -> Result<String, String> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    let without_prefix = normalized
-        .strip_prefix("0x")
-        .ok_or_else(|| "selector must be 0x-prefixed".to_string())?;
-    if without_prefix.len() != 8 {
-        return Err("selector must be exactly 4 bytes".to_string());
-    }
-    if !without_prefix
-        .as_bytes()
-        .iter()
-        .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err("selector must be valid hex".to_string());
-    }
-    Ok(normalized)
-}
-
-fn normalize_address(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    let valid = trimmed.len() == 42
-        && trimmed.starts_with("0x")
-        && trimmed
-            .as_bytes()
-            .iter()
-            .skip(2)
-            .all(|byte| byte.is_ascii_hexdigit());
-    if !valid {
-        return Err("address must be a 0x-prefixed 20-byte hex string".to_string());
-    }
-    Ok(trimmed)
-}
-
-fn normalize_hex_blob(raw: &str, field: &str) -> Result<String, String> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    let without_prefix = trimmed
-        .strip_prefix("0x")
-        .ok_or_else(|| format!("{field} must be 0x-prefixed hex"))?;
-    if without_prefix.len() % 2 != 0 {
-        return Err(format!("{field} hex length must be even"));
-    }
-    if !without_prefix
-        .as_bytes()
-        .iter()
-        .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(format!("{field} must be valid hex"));
-    }
-    Ok(trimmed)
 }
 
 fn parse_u256_from_decimal_or_hex(raw: &str, field: &str) -> Result<U256, String> {
@@ -285,6 +270,46 @@ fn parse_tuple_values<'a>(value: &'a Value, field: &str) -> Result<&'a [Value], 
         .as_array()
         .map(Vec::as_slice)
         .ok_or_else(|| format!("{field} must be a JSON array"))
+}
+
+fn synthetic_zero_value(spec: &AbiTypeSpec) -> Result<Value, String> {
+    if let Some((element_kind, maybe_len)) = split_array_type(spec.kind.trim()) {
+        let element_spec = AbiTypeSpec {
+            kind: element_kind,
+            components: spec.components.clone(),
+        };
+        let len = maybe_len.unwrap_or(0);
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(synthetic_zero_value(&element_spec)?);
+        }
+        return Ok(Value::Array(values));
+    }
+
+    let kind = spec.kind.trim().to_ascii_lowercase();
+    if kind == "tuple" {
+        let mut values = Vec::with_capacity(spec.components.len());
+        for component in &spec.components {
+            values.push(synthetic_zero_value(component)?);
+        }
+        return Ok(Value::Array(values));
+    }
+
+    match kind.as_str() {
+        "address" => Ok(Value::String(
+            "0x0000000000000000000000000000000000000000".to_string(),
+        )),
+        "bool" => Ok(Value::Bool(false)),
+        "string" => Ok(Value::String(String::new())),
+        "bytes" => Ok(Value::String("0x".to_string())),
+        _ if kind.starts_with("uint") => Ok(Value::String("0".to_string())),
+        _ if kind.starts_with("int") => Ok(Value::String("0".to_string())),
+        _ if kind.starts_with("bytes") => Ok(Value::String("0x".to_string())),
+        _ => Err(format!(
+            "unsupported abi type for synthetic dry-run arg: {}",
+            spec.kind
+        )),
+    }
 }
 
 fn split_array_type(kind: &str) -> Option<(String, Option<usize>)> {
@@ -500,20 +525,20 @@ fn encode_abi_dynamic(spec: &AbiTypeSpec, value: &Value, field: &str) -> Result<
         let normalized = normalize_hex_blob(raw, field)?;
         let bytes = hex::decode(normalized.trim_start_matches("0x"))
             .map_err(|error| format!("failed to decode {field}: {error}"))?;
-        return encode_dynamic_bytes(&bytes);
+        return Ok(encode_dynamic_bytes(&bytes));
     }
     if kind == "string" {
         let text = value
             .as_str()
             .ok_or_else(|| format!("{field} must be a string"))?;
-        return encode_dynamic_bytes(text.as_bytes());
+        return Ok(encode_dynamic_bytes(text.as_bytes()));
     }
     Err(format!("unsupported dynamic abi type: {kind}"))
 }
 
 /// Encode a byte slice as an ABI dynamic-bytes value: length word followed by
 /// the payload zero-padded to the next 32-byte boundary.
-fn encode_dynamic_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn encode_dynamic_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_u256_word(U256::from(bytes.len())));
     out.extend_from_slice(bytes);
@@ -522,7 +547,7 @@ fn encode_dynamic_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if padding > 0 {
         out.extend(vec![0u8; padding]);
     }
-    Ok(out)
+    out
 }
 
 fn encode_abi_primitive_word(kind: &str, value: &Value, field: &str) -> Result<Vec<u8>, String> {
@@ -531,7 +556,7 @@ fn encode_abi_primitive_word(kind: &str, value: &Value, field: &str) -> Result<V
             let raw = value
                 .as_str()
                 .ok_or_else(|| format!("{field} address must be a string"))?;
-            let normalized = normalize_address(raw)?;
+            let normalized = normalize_evm_address(raw)?;
             let mut word = vec![0u8; 32];
             let bytes = hex::decode(normalized.trim_start_matches("0x"))
                 .map_err(|error| format!("failed to decode {field} address: {error}"))?;
@@ -608,34 +633,19 @@ fn parse_i128_from_json(value: &Value, field: &str) -> Result<i128, String> {
 
 /// Encode a `U256` as a big-endian 32-byte ABI word.
 fn encode_u256_word(value: U256) -> Vec<u8> {
-    let mut out = [0u8; 32];
-    let mut index = 0usize;
-    for byte in value.to_be_bytes::<32>() {
-        out[index] = byte;
-        index = index.saturating_add(1);
-    }
-    out.to_vec()
+    value.to_be_bytes::<32>().to_vec()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::compile_intent;
+    use super::{compile_intent, dry_run_compile};
     use crate::domain::types::{
         AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding,
         StrategyExecutionIntent, StrategyTemplate, StrategyTemplateKey, TemplateStatus,
-        TemplateVersion,
     };
     use crate::storage::stable;
     use crate::strategy::registry;
     use alloy_primitives::U256;
-
-    fn sample_version() -> TemplateVersion {
-        TemplateVersion {
-            major: 1,
-            minor: 0,
-            patch: 0,
-        }
-    }
 
     fn sample_key(template_id: &str) -> StrategyTemplateKey {
         StrategyTemplateKey {
@@ -669,19 +679,24 @@ mod tests {
         }
     }
 
-    fn store_template_and_abi(template_id: &str) {
+    fn transfer_function_with_selector(role: &str, selector_hex: &str) -> AbiFunctionSpec {
+        let mut function = transfer_function(role);
+        function.selector_hex = selector_hex.to_string();
+        function
+    }
+
+    fn store_template_and_abi_with_selector(template_id: &str, selector_hex: &str) {
         let key = sample_key(template_id);
-        let version = sample_version();
+        let function = transfer_function_with_selector("token", selector_hex);
         let action = ActionSpec {
             action_id: "transfer".to_string(),
-            call_sequence: vec![transfer_function("token")],
+            call_sequence: vec![function.clone()],
             preconditions: vec!["allowance_ok".to_string()],
             postconditions: vec!["balance_delta_gt_zero".to_string()],
             risk_checks: vec!["max_notional".to_string()],
         };
         registry::upsert_template(StrategyTemplate {
             key: key.clone(),
-            version: version.clone(),
             status: TemplateStatus::Active,
             contract_roles: vec![ContractRoleBinding {
                 role: "token".to_string(),
@@ -701,16 +716,19 @@ mod tests {
                 protocol: key.protocol.clone(),
                 chain_id: key.chain_id,
                 role: "token".to_string(),
-                version: version.clone(),
             },
             source_ref: "https://example.com/token-abi".to_string(),
             codehash: None,
             abi_json: "[]".to_string(),
-            functions: vec![transfer_function("token")],
+            functions: vec![function],
             created_at_ns: 1,
             updated_at_ns: 1,
         })
         .expect("abi artifact should persist");
+    }
+
+    fn store_template_and_abi(template_id: &str) {
+        store_template_and_abi_with_selector(template_id, "0xa9059cbb");
     }
 
     #[test]
@@ -719,18 +737,15 @@ mod tests {
         let template_id = "compiler-success";
         store_template_and_abi(template_id);
         let key = sample_key(template_id);
-        let version = sample_version();
 
         let intent = StrategyExecutionIntent {
             key: key.clone(),
-            version: version.clone(),
             action_id: "transfer".to_string(),
             typed_params_json: r#"{"calls":[{"args":["0x3333333333333333333333333333333333333333","1000"],"value_wei":"0"}]}"#
                 .to_string(),
         };
         let plan = compile_intent(&intent).expect("intent should compile");
         assert_eq!(plan.key, key);
-        assert_eq!(plan.version, version);
         assert_eq!(plan.calls.len(), 1);
         assert_eq!(
             plan.calls[0].to,
@@ -758,7 +773,6 @@ mod tests {
 
         let intent = StrategyExecutionIntent {
             key: sample_key(template_id),
-            version: sample_version(),
             action_id: "transfer".to_string(),
             typed_params_json: r#"{"calls":[{"args":["0x3333333333333333333333333333333333333333"],"value_wei":"0"}]}"#
                 .to_string(),
@@ -767,6 +781,30 @@ mod tests {
         assert!(
             err.contains("argument count mismatch"),
             "expected argument mismatch error, got {err}"
+        );
+    }
+
+    #[test]
+    fn dry_run_compile_succeeds_with_synthetic_zero_args() {
+        stable::init_storage();
+        let template_id = "compiler-dry-run-success";
+        store_template_and_abi(template_id);
+
+        let result = dry_run_compile(&sample_key(template_id));
+        assert!(result.is_ok(), "dry-run compile should pass: {result:?}");
+    }
+
+    #[test]
+    fn dry_run_compile_fails_when_selector_is_invalid() {
+        stable::init_storage();
+        let template_id = "compiler-dry-run-selector-fail";
+        store_template_and_abi_with_selector(template_id, "0xdeadbeef");
+
+        let err = dry_run_compile(&sample_key(template_id))
+            .expect_err("dry-run compile should fail on selector mismatch");
+        assert!(
+            err.contains("selector mismatch"),
+            "expected selector mismatch error, got {err}"
         );
     }
 }
