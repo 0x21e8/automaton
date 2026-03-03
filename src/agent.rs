@@ -1048,6 +1048,10 @@ fn proxy_wait_fail_close_reply(state: &InboxProxyWaitState) -> String {
     format!("Unable to complete async inference in time (job_id={job}). Please retry your request.")
 }
 
+fn missing_final_reply_fallback() -> String {
+    "I could not produce a final answer for your request. Please try again.".to_string()
+}
+
 // ── Context builders ─────────────────────────────────────────────────────────
 
 /// Renders the `### Pending Obligations` section for the dynamic context block.
@@ -2015,7 +2019,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
 
             if let Some(tool_results_reply) = render_tool_results_reply(&round_tool_records) {
                 append_inner_dialogue(&mut inner_dialogue, &tool_results_reply);
-                assistant_reply = Some(tool_results_reply);
             }
 
             // Surface record_signal payloads into inner_dialogue so the agent's
@@ -2104,26 +2107,31 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 last_error = Some(reason);
             } else if !inference_deferred {
                 if staged_message_count > 0 && !staged_external_input_handled {
-                    if let Some(reply) = assistant_reply.clone().or_else(|| inner_dialogue.clone())
-                    {
-                        match stable::post_outbox_message(
-                            turn_id.clone(),
-                            reply.clone(),
-                            staged_message_ids.clone(),
-                        ) {
-                            Ok(outbox_message_id) => {
-                                record_conversation_entries(
-                                    &turn_id,
-                                    &staged_messages,
-                                    &staged_message_ids,
-                                    &outbox_message_id,
-                                    &reply,
-                                    current_time_ns(),
-                                );
-                            }
-                            Err(error) => {
-                                last_error = Some(error);
-                            }
+                    let reply = assistant_reply.clone().unwrap_or_else(|| {
+                        let fallback = missing_final_reply_fallback();
+                        append_inner_dialogue(
+                            &mut inner_dialogue,
+                            "fallback: missing final assistant reply; posted generic retry prompt",
+                        );
+                        fallback
+                    });
+                    match stable::post_outbox_message(
+                        turn_id.clone(),
+                        reply.clone(),
+                        staged_message_ids.clone(),
+                    ) {
+                        Ok(outbox_message_id) => {
+                            record_conversation_entries(
+                                &turn_id,
+                                &staged_messages,
+                                &staged_message_ids,
+                                &outbox_message_id,
+                                &reply,
+                                current_time_ns(),
+                            );
+                        }
+                        Err(error) => {
+                            last_error = Some(error);
                         }
                     }
                 }
@@ -3734,8 +3742,12 @@ mod tests {
         let outbox = stable::list_outbox_messages(10);
         assert_eq!(outbox.len(), 1, "reply should still be posted");
         assert!(
-            outbox[0].body.contains("result: tools"),
-            "fallback response should use deterministic tool summary"
+            outbox[0].body.contains("deterministic inference for"),
+            "degraded continuation should preserve the prior user-facing inference reply"
+        );
+        assert!(
+            !outbox[0].body.contains("result: tools"),
+            "outbox reply must not expose internal tool execution summaries"
         );
     }
 
