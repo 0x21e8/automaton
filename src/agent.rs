@@ -422,6 +422,7 @@ fn suppress_autonomy_tool_calls(
         }
 
         let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+        let failure_scope_fingerprint = tool_failure_scope_fingerprint(&call.tool, &call.args_json);
         if config.tool_dedupe_enabled {
             if let Some(last_success_ns) = stable::autonomy_tool_last_success_ns(&fingerprint) {
                 let elapsed_ns = now_ns.saturating_sub(last_success_ns);
@@ -438,9 +439,14 @@ fn suppress_autonomy_tool_calls(
             }
         }
 
-        let Some(cooldown) = stable::autonomy_tool_failure_cooldown(&fingerprint, now_ns) else {
-            continue;
-        };
+        let cooldown = stable::autonomy_tool_failure_cooldown(&fingerprint, now_ns).or_else(|| {
+            stable::autonomy_tool_failure_class_scope_cooldown(
+                &call.tool,
+                &failure_scope_fingerprint,
+                now_ns,
+            )
+        });
+        let Some(cooldown) = cooldown else { continue };
         suppressed.push(SuppressedAutonomyToolCall {
             index,
             call: call.clone(),
@@ -569,6 +575,29 @@ fn is_remember_capacity_failure(record: &ToolCallRecord) -> bool {
     normalized.starts_with("memory full:")
 }
 
+fn is_malformed_autonomy_tool_arg_failure(record: &ToolCallRecord) -> bool {
+    let Some(error) = record.error.as_deref() else {
+        return false;
+    };
+    let normalized = error.trim().to_ascii_lowercase();
+    match record.tool.as_str() {
+        "list_strategy_templates" => {
+            normalized.starts_with("invalid list_strategy_templates args json:")
+        }
+        "remember" => {
+            normalized.starts_with("invalid remember args json:")
+                || normalized == "missing required field: key"
+                || normalized == "missing required field: value"
+                || normalized == "remember value must be a json scalar"
+        }
+        "evm_read" => {
+            normalized.starts_with("invalid evm_read args json:")
+                || normalized.starts_with("invalid evm_read address:")
+        }
+        _ => false,
+    }
+}
+
 fn should_degrade_tool_failures_for_autonomy(
     tool_failures: &[&ToolCallRecord],
     has_external_input: bool,
@@ -577,7 +606,9 @@ fn should_degrade_tool_failures_for_autonomy(
         return false;
     }
     tool_failures.iter().all(|record| {
-        is_http_fetch_recoverable_failure(record) || is_remember_capacity_failure(record)
+        is_http_fetch_recoverable_failure(record)
+            || is_remember_capacity_failure(record)
+            || is_malformed_autonomy_tool_arg_failure(record)
     })
 }
 
@@ -588,6 +619,217 @@ fn normalize_tool_failure_reason(error: &str) -> String {
         .join(" ")
         .trim()
         .to_ascii_lowercase()
+}
+
+fn normalize_tool_failure_class(tool: &str, normalized_error: &str) -> String {
+    let normalized_tool = tool.trim().to_ascii_lowercase();
+    match normalized_tool.as_str() {
+        "http_fetch" => {
+            if normalized_error.starts_with("json_path extraction failed: path `") {
+                return "json_path_missing_path".to_string();
+            }
+            if normalized_error
+                .starts_with("json_path extraction failed: response is not valid json")
+            {
+                return "json_path_invalid_json".to_string();
+            }
+            if normalized_error.starts_with("regex extraction failed: no matching lines") {
+                return "regex_no_match".to_string();
+            }
+            if normalized_error.starts_with("http 4") {
+                return "http_4xx".to_string();
+            }
+            if normalized_error.contains("response exceeded max_response_bytes")
+                || normalized_error.contains("http body exceeds size limit")
+            {
+                return "response_too_large".to_string();
+            }
+            if normalized_error.contains("domain not in allowlist") {
+                return "domain_not_allowlisted".to_string();
+            }
+            if normalized_error.starts_with("invalid market-data url") {
+                return "invalid_market_url".to_string();
+            }
+            fallback_error_class(normalized_error)
+        }
+        "remember" => {
+            if normalized_error.starts_with("invalid remember args json:") {
+                return "invalid_args_json".to_string();
+            }
+            if normalized_error.starts_with("missing required field: key") {
+                return "missing_key".to_string();
+            }
+            if normalized_error.starts_with("missing required field: value") {
+                return "missing_value".to_string();
+            }
+            if normalized_error == "remember value must be a json scalar" {
+                return "value_not_scalar".to_string();
+            }
+            if normalized_error.starts_with("memory full:") {
+                return "memory_full".to_string();
+            }
+            fallback_error_class(normalized_error)
+        }
+        "evm_read" => {
+            if normalized_error.starts_with("invalid evm_read args json:") {
+                return "invalid_args_json".to_string();
+            }
+            if normalized_error.starts_with("invalid evm_read address:") {
+                return "invalid_address".to_string();
+            }
+            fallback_error_class(normalized_error)
+        }
+        "list_strategy_templates" => {
+            if normalized_error.starts_with("invalid list_strategy_templates args json:") {
+                return "invalid_args_json".to_string();
+            }
+            fallback_error_class(normalized_error)
+        }
+        _ => fallback_error_class(normalized_error),
+    }
+}
+
+fn fallback_error_class(normalized_error: &str) -> String {
+    sanitize_error_class_segment(
+        normalized_error
+            .split(':')
+            .next()
+            .unwrap_or(normalized_error),
+    )
+}
+
+fn sanitize_error_class_segment(raw: &str) -> String {
+    let mut out = String::new();
+    let mut previous_was_separator = false;
+    for ch in raw.chars().take(64) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            out.push('_');
+            previous_was_separator = true;
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn tool_failure_scope_fingerprint(tool: &str, args_json: &str) -> String {
+    let shape = tool_failure_scope_shape_signature(args_json);
+    let discriminator = tool_failure_scope_discriminator(tool, args_json);
+    let mut hasher = Keccak256::new();
+    hasher.update(tool.trim().as_bytes());
+    hasher.update(b":");
+    hasher.update(shape.as_bytes());
+    hasher.update(b":");
+    hasher.update(discriminator.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn tool_failure_scope_shape_signature(args_json: &str) -> String {
+    let trimmed = args_json.trim();
+    if trimmed.is_empty() {
+        return "empty".to_string();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return "raw".to_string();
+    };
+    json_shape_signature(&value)
+}
+
+fn json_shape_signature(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(_) => "bool".to_string(),
+        serde_json::Value::Number(_) => "number".to_string(),
+        serde_json::Value::String(_) => "string".to_string(),
+        serde_json::Value::Array(items) => {
+            let rendered = items
+                .iter()
+                .map(json_shape_signature)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{rendered}]")
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let rendered = keys
+                .into_iter()
+                .map(|key| format!("{key}:{}", json_shape_signature(&map[key])))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{rendered}}}")
+        }
+    }
+}
+
+fn tool_failure_scope_discriminator(tool: &str, args_json: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return "raw".to_string();
+    };
+    let Some(object) = value.as_object() else {
+        return "non_object".to_string();
+    };
+    match tool.trim() {
+        "http_fetch" => {
+            let host = object
+                .get("url")
+                .and_then(|entry| entry.as_str())
+                .and_then(extract_https_host_for_scope)
+                .unwrap_or_else(|| "unknown".to_string());
+            let mode = object
+                .get("extract")
+                .and_then(|entry| entry.get("mode"))
+                .and_then(|entry| entry.as_str())
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or_else(|| "none".to_string());
+            format!("host={host};mode={mode}")
+        }
+        "evm_read" => {
+            let method = object
+                .get("method")
+                .and_then(|entry| entry.as_str())
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or_else(|| "missing".to_string());
+            format!("method={method}")
+        }
+        "remember" => {
+            let namespace = object
+                .get("key")
+                .and_then(|entry| entry.as_str())
+                .and_then(|raw| crate::tools::canonicalize_memory_key_for_dedupe(raw).ok())
+                .map(|key| key.split('.').take(2).collect::<Vec<_>>().join("."))
+                .filter(|segment| !segment.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("namespace={namespace}")
+        }
+        _ => "none".to_string(),
+    }
+}
+
+fn extract_https_host_for_scope(raw_url: &str) -> Option<String> {
+    let trimmed = raw_url.trim();
+    let remainder = trimmed.strip_prefix("https://")?;
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if authority.is_empty() || authority.contains('@') || authority.starts_with('[') {
+        return None;
+    }
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    Some(host)
 }
 
 /// Records autonomy tool outcomes for both success dedupe and repeated-failure cooldowns.
@@ -607,9 +849,11 @@ fn record_autonomy_tool_outcomes(
             continue;
         }
         let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+        let failure_scope_fingerprint = tool_failure_scope_fingerprint(&call.tool, &call.args_json);
         if record.success {
             stable::record_autonomy_tool_success(&fingerprint, recorded_at_ns);
             stable::clear_autonomy_tool_failure(&fingerprint);
+            stable::clear_autonomy_tool_failure_class_scope(&call.tool, &failure_scope_fingerprint);
             continue;
         }
         if is_sequence_validator_block(record) {
@@ -624,8 +868,19 @@ fn record_autonomy_tool_outcomes(
         if normalized.is_empty() {
             continue;
         }
+        let error_class = normalize_tool_failure_class(&call.tool, &normalized);
         let _ = stable::record_autonomy_tool_failure(
             &fingerprint,
+            &normalized,
+            recorded_at_ns,
+            suppression_config.failure_repeat_window_secs,
+            suppression_config.failure_repeat_threshold,
+            suppression_config.failure_cooldown_secs,
+        );
+        let _ = stable::record_autonomy_tool_failure_class_scope(
+            &call.tool,
+            &failure_scope_fingerprint,
+            &error_class,
             &normalized,
             recorded_at_ns,
             suppression_config.failure_repeat_window_secs,
@@ -1713,8 +1968,15 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                         repeat_count,
                     } => {
                         let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+                        let failure_scope_fingerprint =
+                            tool_failure_scope_fingerprint(&call.tool, &call.args_json);
                         stable::note_autonomy_tool_failure_suppressed(
                             &fingerprint,
+                            execution_completed_ns,
+                        );
+                        stable::note_autonomy_tool_failure_class_scope_suppressed(
+                            &call.tool,
+                            &failure_scope_fingerprint,
                             execution_completed_ns,
                         );
                         round_tool_records.push(synthetic_failure_suppressed_tool_record(
@@ -2435,6 +2697,101 @@ mod tests {
             &config,
         );
         assert!(suppressed_late.is_empty());
+    }
+
+    #[test]
+    fn failure_cooldown_aggregates_near_duplicate_http_fetch_failures_by_error_class() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        let config = AutonomySuppressionConfig {
+            failure_repeat_threshold: 2,
+            failure_repeat_window_secs: 600,
+            failure_cooldown_secs: 120,
+            ..AutonomySuppressionConfig::default()
+        };
+
+        let call_a = ToolCall {
+            tool_call_id: None,
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0xaaaa","extract":{"mode":"json_path","path":"pairs[0].priceUsd"}}"#.to_string(),
+        };
+        let call_b = ToolCall {
+            tool_call_id: None,
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0xbbbb","extract":{"mode":"json_path","path":"pairs[0].priceUsd"}}"#.to_string(),
+        };
+        for call in [&call_a, &call_b] {
+            let fingerprint = tool_call_fingerprint(&call.tool, &call.args_json);
+            stable::clear_autonomy_tool_failure(&fingerprint);
+            let scope = tool_failure_scope_fingerprint(&call.tool, &call.args_json);
+            stable::clear_autonomy_tool_failure_class_scope(&call.tool, &scope);
+        }
+
+        for (call, now_ns) in [(&call_a, 10_000_000_000), (&call_b, 20_000_000_000)] {
+            let failed_record = ToolCallRecord {
+                turn_id: "turn-failed".to_string(),
+                tool: call.tool.clone(),
+                args_json: call.args_json.clone(),
+                output: "tool execution failed".to_string(),
+                success: false,
+                outcome: ToolCallOutcome::Executed,
+                error: Some(
+                    "json_path extraction failed: path `pairs[0].priceUsd` not found".to_string(),
+                ),
+            };
+            record_autonomy_tool_outcomes(
+                std::slice::from_ref(call),
+                &[PlannedToolCallExecution::Execute],
+                &[failed_record],
+                now_ns,
+                &config,
+            );
+        }
+
+        let near_duplicate = ToolCall {
+            tool_call_id: None,
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0xcccc","extract":{"mode":"json_path","path":"pairs[0].priceUsd"}}"#.to_string(),
+        };
+        let suppressed = suppress_autonomy_tool_calls(
+            std::slice::from_ref(&near_duplicate),
+            30_000_000_000,
+            &config,
+        );
+        assert_eq!(suppressed.len(), 1);
+        assert!(matches!(
+            suppressed[0].reason,
+            AutonomySuppressionReason::FailureCooldown { .. }
+        ));
+
+        let different_host_call = ToolCall {
+            tool_call_id: None,
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.coingecko.com/api/v3/ping","extract":{"mode":"json_path","path":"pairs[0].priceUsd"}}"#.to_string(),
+        };
+        let unsuppressed_different_host = suppress_autonomy_tool_calls(
+            std::slice::from_ref(&different_host_call),
+            30_000_000_000,
+            &config,
+        );
+        assert!(
+            unsuppressed_different_host.is_empty(),
+            "cooldown scope should not suppress unrelated provider hosts"
+        );
+
+        let different_tool_call = ToolCall {
+            tool_call_id: None,
+            tool: "evm_read".to_string(),
+            args_json: r#"{"method":"eth_blockNumber"}"#.to_string(),
+        };
+        let unsuppressed_different_tool = suppress_autonomy_tool_calls(
+            std::slice::from_ref(&different_tool_call),
+            30_000_000_000,
+            &config,
+        );
+        assert!(
+            unsuppressed_different_tool.is_empty(),
+            "cooldown scope should remain tool-specific"
+        );
     }
 
     #[test]
@@ -3457,6 +3814,78 @@ mod tests {
                 .contains("autonomy degraded after recoverable tool failure"),
             "inner dialogue should capture degraded remember-capacity path"
         );
+    }
+
+    #[test]
+    fn autonomy_turn_with_malformed_list_templates_args_degrades_without_faulting() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.list_templates_malformed_probe".to_string(),
+            value: "request_list_templates_malformed_probe:true".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok());
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].error.is_none());
+        assert_eq!(stable::runtime_snapshot().state, AgentState::Sleeping);
+        let dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(dialogue.contains("autonomy degraded after recoverable tool failure"));
+        assert!(dialogue.contains("list_strategy_templates"));
+    }
+
+    #[test]
+    fn autonomy_turn_with_malformed_remember_args_degrades_without_faulting() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.remember_malformed_probe".to_string(),
+            value: "request_remember_malformed_probe:true".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok());
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].error.is_none());
+        assert_eq!(stable::runtime_snapshot().state, AgentState::Sleeping);
+        let dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(dialogue.contains("autonomy degraded after recoverable tool failure"));
+        assert!(dialogue.contains("remember"));
+    }
+
+    #[test]
+    fn autonomy_turn_with_malformed_evm_read_args_degrades_without_faulting() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.evm_read_malformed_probe".to_string(),
+            value: "request_evm_read_malformed_probe:true".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok());
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].error.is_none());
+        assert_eq!(stable::runtime_snapshot().state, AgentState::Sleeping);
+        let dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(dialogue.contains("autonomy degraded after recoverable tool failure"));
+        assert!(dialogue.contains("evm_read"));
     }
 
     #[test]

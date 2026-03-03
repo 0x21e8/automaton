@@ -149,6 +149,7 @@ const MAX_MEMORY_ROLLUP_FACTS_PER_NAMESPACE: usize = 5;
 const MAX_FIELD_TRUNCATION_MARKER_RESERVE_CHARS: usize = 120;
 const AUTONOMY_TOOL_SUCCESS_KEY_PREFIX: &str = "autonomy.tool_success.";
 const AUTONOMY_TOOL_FAILURE_KEY_PREFIX: &str = "autonomy.tool_failure.";
+const AUTONOMY_TOOL_FAILURE_CLASS_KEY_PREFIX: &str = "autonomy.tool_failure_class.";
 const EVM_INGEST_DEDUPE_KEY_PREFIX: &str = "evm.ingest";
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_TOTAL_CYCLES_OVERRIDE_KEY: &str = "host.total_cycles";
@@ -2803,17 +2804,46 @@ pub fn autonomy_tool_failure_cooldown(
     now_ns: u64,
 ) -> Option<AutonomyToolFailureCooldown> {
     let key = autonomy_tool_failure_key(fingerprint);
-    let tracker: AutonomyToolFailureTracker =
-        sqlite::get_autonomy_tool_failure(&key).ok().flatten()?;
-    let cooldown_until_ns = tracker.cooldown_until_ns?;
-    if cooldown_until_ns <= now_ns {
-        return None;
+    active_autonomy_tool_failure_cooldown_for_key(&key, now_ns)
+}
+
+/// Returns active cooldown metadata for a tool + args-scope failure class key.
+pub fn autonomy_tool_failure_class_scope_cooldown(
+    tool: &str,
+    args_scope_fingerprint: &str,
+    now_ns: u64,
+) -> Option<AutonomyToolFailureCooldown> {
+    let prefix = autonomy_tool_failure_class_scope_prefix(tool, args_scope_fingerprint);
+    let records: Vec<(String, AutonomyToolFailureTracker)> =
+        sqlite::list_autonomy_tool_failures().unwrap_or_default();
+    let mut best: Option<AutonomyToolFailureCooldown> = None;
+
+    for (key, tracker) in records {
+        if !key.starts_with(prefix.as_str()) {
+            continue;
+        }
+        let Some(cooldown_until_ns) = tracker.cooldown_until_ns else {
+            continue;
+        };
+        if cooldown_until_ns <= now_ns {
+            continue;
+        }
+        let candidate = AutonomyToolFailureCooldown {
+            normalized_error: tracker.normalized_error.clone(),
+            repeat_count: tracker.repeat_count,
+            cooldown_until_ns,
+        };
+        let should_replace = best.as_ref().is_none_or(|existing| {
+            candidate.repeat_count > existing.repeat_count
+                || (candidate.repeat_count == existing.repeat_count
+                    && candidate.cooldown_until_ns > existing.cooldown_until_ns)
+        });
+        if should_replace {
+            best = Some(candidate);
+        }
     }
-    Some(AutonomyToolFailureCooldown {
-        normalized_error: tracker.normalized_error,
-        repeat_count: tracker.repeat_count,
-        cooldown_until_ns,
-    })
+
+    best
 }
 
 /// Records an autonomy tool failure and returns a newly-active cooldown when
@@ -2826,14 +2856,118 @@ pub fn record_autonomy_tool_failure(
     repeat_threshold: u32,
     cooldown_secs: u64,
 ) -> Option<AutonomyToolFailureCooldown> {
+    let key = autonomy_tool_failure_key(fingerprint);
+    record_autonomy_tool_failure_by_key(
+        &key,
+        normalized_error,
+        failed_at_ns,
+        repeat_window_secs,
+        repeat_threshold,
+        cooldown_secs,
+    )
+}
+
+/// Records an autonomy failure at tool + args-scope + normalized-error-class granularity.
+#[allow(clippy::too_many_arguments)]
+pub fn record_autonomy_tool_failure_class_scope(
+    tool: &str,
+    args_scope_fingerprint: &str,
+    normalized_error_class: &str,
+    normalized_error: &str,
+    failed_at_ns: u64,
+    repeat_window_secs: u64,
+    repeat_threshold: u32,
+    cooldown_secs: u64,
+) -> Option<AutonomyToolFailureCooldown> {
+    let key =
+        autonomy_tool_failure_class_scope_key(tool, args_scope_fingerprint, normalized_error_class);
+    record_autonomy_tool_failure_by_key(
+        &key,
+        normalized_error,
+        failed_at_ns,
+        repeat_window_secs,
+        repeat_threshold,
+        cooldown_secs,
+    )
+}
+
+/// Clears stored autonomy failure streak/cooldown state for a tool fingerprint.
+pub fn clear_autonomy_tool_failure(fingerprint: &str) {
+    let _ = sqlite::delete_autonomy_tool_failure(&autonomy_tool_failure_key(fingerprint));
+}
+
+/// Clears stored autonomy failure streak/cooldown state for a tool + args scope.
+pub fn clear_autonomy_tool_failure_class_scope(tool: &str, args_scope_fingerprint: &str) {
+    let prefix = autonomy_tool_failure_class_scope_prefix(tool, args_scope_fingerprint);
+    let records: Vec<(String, AutonomyToolFailureTracker)> =
+        sqlite::list_autonomy_tool_failures().unwrap_or_default();
+    for (key, _) in records {
+        if key.starts_with(prefix.as_str()) {
+            let _ = sqlite::delete_autonomy_tool_failure(&key);
+        }
+    }
+}
+
+/// Records that a failure-cooldown suppression was applied for a fingerprint.
+pub fn note_autonomy_tool_failure_suppressed(fingerprint: &str, now_ns: u64) {
+    let key = autonomy_tool_failure_key(fingerprint);
+    note_autonomy_tool_failure_suppressed_by_key(&key, now_ns);
+}
+
+/// Records suppression telemetry for tool + args-scope failure-class trackers.
+pub fn note_autonomy_tool_failure_class_scope_suppressed(
+    tool: &str,
+    args_scope_fingerprint: &str,
+    now_ns: u64,
+) {
+    let prefix = autonomy_tool_failure_class_scope_prefix(tool, args_scope_fingerprint);
+    let records: Vec<(String, AutonomyToolFailureTracker)> =
+        sqlite::list_autonomy_tool_failures().unwrap_or_default();
+    for (key, tracker) in records {
+        if !key.starts_with(prefix.as_str()) {
+            continue;
+        }
+        if tracker
+            .cooldown_until_ns
+            .is_none_or(|until| until <= now_ns)
+        {
+            continue;
+        }
+        note_autonomy_tool_failure_suppressed_by_key(&key, now_ns);
+    }
+}
+
+fn active_autonomy_tool_failure_cooldown_for_key(
+    key: &str,
+    now_ns: u64,
+) -> Option<AutonomyToolFailureCooldown> {
+    let tracker: AutonomyToolFailureTracker =
+        sqlite::get_autonomy_tool_failure(key).ok().flatten()?;
+    let cooldown_until_ns = tracker.cooldown_until_ns?;
+    if cooldown_until_ns <= now_ns {
+        return None;
+    }
+    Some(AutonomyToolFailureCooldown {
+        normalized_error: tracker.normalized_error,
+        repeat_count: tracker.repeat_count,
+        cooldown_until_ns,
+    })
+}
+
+fn record_autonomy_tool_failure_by_key(
+    key: &str,
+    normalized_error: &str,
+    failed_at_ns: u64,
+    repeat_window_secs: u64,
+    repeat_threshold: u32,
+    cooldown_secs: u64,
+) -> Option<AutonomyToolFailureCooldown> {
     let trimmed_error = normalized_error.trim();
     if trimmed_error.is_empty() {
         return None;
     }
-
-    let key = autonomy_tool_failure_key(fingerprint);
     let existing: Option<AutonomyToolFailureTracker> =
-        sqlite::get_autonomy_tool_failure(&key).ok().flatten();
+        sqlite::get_autonomy_tool_failure(key).ok().flatten();
 
     let mut tracker = existing.unwrap_or_default();
     let repeat_window_ns = repeat_window_secs.saturating_mul(1_000_000_000);
@@ -2853,8 +2987,7 @@ pub fn record_autonomy_tool_failure(
     } else {
         tracker.cooldown_until_ns = None;
     }
-
-    let _ = sqlite::upsert_autonomy_tool_failure(&key, &tracker);
+    let _ = sqlite::upsert_autonomy_tool_failure(key, &tracker);
 
     tracker
         .cooldown_until_ns
@@ -2866,22 +2999,52 @@ pub fn record_autonomy_tool_failure(
         })
 }
 
-/// Clears stored autonomy failure streak/cooldown state for a tool fingerprint.
-pub fn clear_autonomy_tool_failure(fingerprint: &str) {
-    let _ = sqlite::delete_autonomy_tool_failure(&autonomy_tool_failure_key(fingerprint));
-}
-
-/// Records that a failure-cooldown suppression was applied for a fingerprint.
-pub fn note_autonomy_tool_failure_suppressed(fingerprint: &str, now_ns: u64) {
-    let key = autonomy_tool_failure_key(fingerprint);
+fn note_autonomy_tool_failure_suppressed_by_key(key: &str, now_ns: u64) {
     let Some(mut tracker): Option<AutonomyToolFailureTracker> =
-        sqlite::get_autonomy_tool_failure(&key).ok().flatten()
+        sqlite::get_autonomy_tool_failure(key).ok().flatten()
     else {
         return;
     };
     tracker.last_suppressed_at_ns = Some(now_ns);
     tracker.suppressed_count = tracker.suppressed_count.saturating_add(1);
-    let _ = sqlite::upsert_autonomy_tool_failure(&key, &tracker);
+    let _ = sqlite::upsert_autonomy_tool_failure(key, &tracker);
+}
+
+fn autonomy_tool_failure_class_scope_key(
+    tool: &str,
+    args_scope_fingerprint: &str,
+    normalized_error_class: &str,
+) -> String {
+    format!(
+        "{}{}",
+        autonomy_tool_failure_class_scope_prefix(tool, args_scope_fingerprint),
+        normalize_autonomy_failure_key_segment(normalized_error_class)
+    )
+}
+
+fn autonomy_tool_failure_class_scope_prefix(tool: &str, args_scope_fingerprint: &str) -> String {
+    format!(
+        "{AUTONOMY_TOOL_FAILURE_CLASS_KEY_PREFIX}{}.{}.",
+        normalize_autonomy_failure_key_segment(tool),
+        normalize_autonomy_failure_key_segment(args_scope_fingerprint)
+    )
+}
+
+fn normalize_autonomy_failure_key_segment(raw: &str) -> String {
+    let mut normalized = String::new();
+    for ch in raw.chars().take(96) {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+        } else {
+            normalized.push('_');
+        }
+    }
+    let trimmed = normalized.trim_matches('_');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn autonomy_tool_failure_key(fingerprint: &str) -> String {

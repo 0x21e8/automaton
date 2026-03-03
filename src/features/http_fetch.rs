@@ -40,6 +40,7 @@ const HTTP_FETCH_REGEX_DFA_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const HTTP_FETCH_OUTCALL_TIMEOUT_MS: u64 = 20_000;
 const HTTP_FETCH_OUTCALL_TIMEOUT_NS: u64 = HTTP_FETCH_OUTCALL_TIMEOUT_MS * 1_000_000;
 const JSON_PATH_HINT_MAX_KEYS: usize = 8;
+const JSON_PATH_FALLBACK_MAX_ATTEMPTS: usize = 4;
 
 fn http_fetch_timeout_message(elapsed_ms: u64) -> String {
     format!(
@@ -157,9 +158,30 @@ fn extract_json_path(body: &str, path: &str) -> Result<String, String> {
         format!("json_path extraction failed: response is not valid JSON: {error}")
     })?;
 
-    let segments = parse_json_path_segments(trimmed_path)?;
+    let primary = extract_json_path_from_root(&root, trimmed_path);
+    let Err(primary_error) = &primary else {
+        return primary;
+    };
+    if !primary_error.starts_with("json_path extraction failed: path `") {
+        return primary;
+    }
+    for fallback_path in json_path_fallback_candidates(trimmed_path)
+        .into_iter()
+        .take(JSON_PATH_FALLBACK_MAX_ATTEMPTS)
+    {
+        if fallback_path == trimmed_path {
+            continue;
+        }
+        if let Ok(extracted) = extract_json_path_from_root(&root, &fallback_path) {
+            return Ok(extracted);
+        }
+    }
+    primary
+}
 
-    let mut current = &root;
+fn extract_json_path_from_root(root: &Value, path: &str) -> Result<String, String> {
+    let segments = parse_json_path_segments(path)?;
+    let mut current = root;
     for segment in segments {
         let next = match &segment {
             JsonPathSegment::Field(name) => resolve_json_path_field(current, name),
@@ -167,17 +189,53 @@ fn extract_json_path(body: &str, path: &str) -> Result<String, String> {
         };
         current = next.ok_or_else(|| {
             format!(
-                "json_path extraction failed: path `{trimmed_path}` not found{}",
+                "json_path extraction failed: path `{path}` not found{}",
                 json_path_missing_hint(current)
             )
         })?;
     }
+    serialize_json_path_value(current)
+}
 
-    match current {
-        Value::String(value) => Ok(value.clone()),
-        value => serde_json::to_string(value).map_err(|error| {
+fn serialize_json_path_value(value: &Value) -> Result<String, String> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        other => serde_json::to_string(other).map_err(|error| {
             format!("json_path extraction failed: could not serialize extracted value: {error}")
         }),
+    }
+}
+
+fn json_path_fallback_candidates(path: &str) -> Vec<String> {
+    let normalized = path
+        .trim()
+        .strip_prefix("$.")
+        .or_else(|| path.trim().strip_prefix('$'))
+        .unwrap_or(path.trim());
+    let mut candidates = Vec::new();
+
+    if let Some(rest) = normalized.strip_prefix("pairs[0].") {
+        push_unique_json_path_candidate(&mut candidates, format!("pair.{rest}"));
+    }
+    if let Some(rest) = normalized.strip_prefix("pair.") {
+        push_unique_json_path_candidate(&mut candidates, format!("pairs[0].{rest}"));
+    }
+    if normalized == "market_data.current_price.usd" {
+        push_unique_json_path_candidate(&mut candidates, "0.current_price".to_string());
+    }
+    if normalized == "0.current_price" {
+        push_unique_json_path_candidate(
+            &mut candidates,
+            "market_data.current_price.usd".to_string(),
+        );
+    }
+
+    candidates
+}
+
+fn push_unique_json_path_candidate(candidates: &mut Vec<String>, candidate: String) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
     }
 }
 
@@ -667,6 +725,40 @@ mod tests {
         let out = extract_json_path(r#"[{"current_price":"123.45"}]"#, "0.current_price")
             .expect("dot-number array alias should resolve to index");
         assert_eq!(out, "123.45");
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_fallbacks_dexscreener_pair_object_variant() {
+        let out = extract_json_path(r#"{"pair":{"priceUsd":"0.31"}}"#, "pairs[0].priceUsd")
+            .expect("fallback should resolve dexscreener pair object variant");
+        assert_eq!(out, "0.31");
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_fallbacks_dexscreener_pairs_array_variant() {
+        let out = extract_json_path(r#"{"pairs":[{"priceUsd":"0.32"}]}"#, "pair.priceUsd")
+            .expect("fallback should resolve dexscreener pairs array variant");
+        assert_eq!(out, "0.32");
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_fallbacks_coingecko_markets_array_variant() {
+        let out = extract_json_path(
+            r#"[{"current_price":1234.56}]"#,
+            "market_data.current_price.usd",
+        )
+        .expect("fallback should resolve coingecko markets array variant");
+        assert_eq!(out, "1234.56");
+    }
+
+    #[test]
+    fn http_fetch_tool_json_path_fallbacks_coingecko_market_data_object_variant() {
+        let out = extract_json_path(
+            r#"{"market_data":{"current_price":{"usd":1234.56}}}"#,
+            "0.current_price",
+        )
+        .expect("fallback should resolve coingecko market_data object variant");
+        assert_eq!(out, "1234.56");
     }
 
     #[test]

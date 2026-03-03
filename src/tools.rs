@@ -55,6 +55,32 @@ const MAX_SQL_QUERY_ROWS: usize = 100;
 /// Maximum character count for content written via `update_prompt_layer`.
 pub const MAX_PROMPT_LAYER_CONTENT_CHARS: usize = 4_000;
 
+struct MarketEndpointProvider {
+    id: &'static str,
+    hosts: &'static [&'static str],
+    default_origin: &'static str,
+    api_path_prefixes: &'static [&'static str],
+}
+
+const MARKET_ENDPOINT_PROVIDERS: &[MarketEndpointProvider] = &[
+    MarketEndpointProvider {
+        id: "dexscreener",
+        hosts: &[
+            "api.dexscreener.com",
+            "dexscreener.com",
+            "www.dexscreener.com",
+        ],
+        default_origin: "https://api.dexscreener.com",
+        api_path_prefixes: &["/latest/", "/token-profiles/", "/token-boosts/", "/orders/"],
+    },
+    MarketEndpointProvider {
+        id: "coingecko",
+        hosts: &["api.coingecko.com", "coingecko.com", "www.coingecko.com"],
+        default_origin: "https://api.coingecko.com",
+        api_path_prefixes: &["/api/"],
+    },
+];
+
 fn survival_operation_max_backoff_secs(operation: &SurvivalOperationClass) -> u64 {
     match operation {
         SurvivalOperationClass::Inference => stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE,
@@ -657,7 +683,17 @@ impl ToolManager {
             "memory_stats" => memory_stats_tool(),
             "sql_query" => sql_query_tool(&call.args_json),
             "forget" => forget_fact_tool(&call.args_json),
-            "http_fetch" => http_fetch_tool(&call.args_json).await,
+            "http_fetch" => {
+                let prepared = prepare_market_http_fetch_args(&call.args_json)?;
+                let result = http_fetch_tool(&prepared.effective_args_json).await;
+                if result.is_ok() {
+                    if let Some((endpoint_key, endpoint_origin)) = prepared.endpoint_fact {
+                        let _ =
+                            persist_market_endpoint_fact(&endpoint_key, &endpoint_origin, turn_id);
+                    }
+                }
+                result
+            }
             "top_up_status" => Ok(top_up_status_tool()),
             "trigger_top_up" => trigger_top_up_tool(),
             "list_strategy_templates" => list_strategy_templates_tool(&call.args_json),
@@ -896,6 +932,239 @@ fn parse_sign_message_args(args_json: &str) -> Result<String, String> {
         .ok_or_else(|| "missing required field: message_hash".to_string())
 }
 
+struct PreparedMarketHttpFetchArgs {
+    effective_args_json: String,
+    endpoint_fact: Option<(String, String)>,
+}
+
+fn prepare_market_http_fetch_args(args_json: &str) -> Result<PreparedMarketHttpFetchArgs, String> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return Ok(PreparedMarketHttpFetchArgs {
+            effective_args_json: args_json.to_string(),
+            endpoint_fact: None,
+        });
+    };
+    let Some(args_object) = value.as_object_mut() else {
+        return Ok(PreparedMarketHttpFetchArgs {
+            effective_args_json: args_json.to_string(),
+            endpoint_fact: None,
+        });
+    };
+    let Some(raw_url) = args_object.get("url").and_then(|entry| entry.as_str()) else {
+        return Ok(PreparedMarketHttpFetchArgs {
+            effective_args_json: args_json.to_string(),
+            endpoint_fact: None,
+        });
+    };
+
+    let parsed = extract_https_host_and_suffix(raw_url);
+    if url_looks_like_market_provider(raw_url) {
+        let (host, suffix) =
+            parsed.map_err(|error| format!("invalid market-data url: {error}; url={raw_url}"))?;
+        let Some(provider) = market_endpoint_provider_for_host(&host) else {
+            return Err(format!(
+                "invalid market-data url host `{host}`; expected one of: {}",
+                known_market_hosts_summary()
+            ));
+        };
+        validate_market_provider_path(provider, suffix, raw_url)?;
+        let endpoint_key = format!("config.endpoint.{}.latest", provider.id);
+        let endpoint_origin = stable::get_memory_fact(&endpoint_key)
+            .and_then(|fact| normalize_market_endpoint_origin(&fact.value, provider))
+            .unwrap_or_else(|| provider.default_origin.to_string());
+        let rewritten_url = if suffix.is_empty() {
+            endpoint_origin.clone()
+        } else {
+            format!("{}{}", endpoint_origin.trim_end_matches('/'), suffix)
+        };
+        args_object.insert("url".to_string(), serde_json::Value::String(rewritten_url));
+        return Ok(PreparedMarketHttpFetchArgs {
+            effective_args_json: serde_json::to_string(&value)
+                .unwrap_or_else(|_| args_json.to_string()),
+            endpoint_fact: Some((endpoint_key, endpoint_origin)),
+        });
+    }
+
+    let Ok((host, suffix)) = parsed else {
+        return Ok(PreparedMarketHttpFetchArgs {
+            effective_args_json: args_json.to_string(),
+            endpoint_fact: None,
+        });
+    };
+    let Some(provider) = market_endpoint_provider_for_host(&host) else {
+        return Ok(PreparedMarketHttpFetchArgs {
+            effective_args_json: args_json.to_string(),
+            endpoint_fact: None,
+        });
+    };
+    validate_market_provider_path(provider, suffix, raw_url)?;
+    let endpoint_key = format!("config.endpoint.{}.latest", provider.id);
+    let endpoint_origin = stable::get_memory_fact(&endpoint_key)
+        .and_then(|fact| normalize_market_endpoint_origin(&fact.value, provider))
+        .unwrap_or_else(|| provider.default_origin.to_string());
+    let rewritten_url = if suffix.is_empty() {
+        endpoint_origin.clone()
+    } else {
+        format!("{}{}", endpoint_origin.trim_end_matches('/'), suffix)
+    };
+    args_object.insert("url".to_string(), serde_json::Value::String(rewritten_url));
+    Ok(PreparedMarketHttpFetchArgs {
+        effective_args_json: serde_json::to_string(&value)
+            .unwrap_or_else(|_| args_json.to_string()),
+        endpoint_fact: Some((endpoint_key, endpoint_origin)),
+    })
+}
+
+fn persist_market_endpoint_fact(key: &str, origin: &str, turn_id: &str) -> Result<(), String> {
+    let now_ns = current_time_ns();
+    let existing = stable::get_memory_fact(key);
+    if existing
+        .as_ref()
+        .map(|fact| fact.value.as_str() == origin)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    stable::set_memory_fact(&MemoryFact {
+        key: key.to_string(),
+        value: origin.to_string(),
+        created_at_ns: existing
+            .as_ref()
+            .map(|fact| fact.created_at_ns)
+            .unwrap_or(now_ns),
+        updated_at_ns: now_ns,
+        source_turn_id: turn_id.to_string(),
+    })
+}
+
+fn market_endpoint_provider_for_host(host: &str) -> Option<&'static MarketEndpointProvider> {
+    MARKET_ENDPOINT_PROVIDERS
+        .iter()
+        .find(|provider| provider.hosts.contains(&host))
+}
+
+fn url_looks_like_market_provider(raw_url: &str) -> bool {
+    let lower = raw_url.trim().to_ascii_lowercase();
+    lower.contains("coingecko") || lower.contains("dexscreener")
+}
+
+fn known_market_hosts_summary() -> String {
+    let mut hosts = MARKET_ENDPOINT_PROVIDERS
+        .iter()
+        .flat_map(|provider| provider.hosts.iter().copied())
+        .collect::<Vec<_>>();
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts.join(", ")
+}
+
+fn market_path_only(suffix: &str) -> &str {
+    let mut end = suffix.len();
+    if let Some(index) = suffix.find('?') {
+        end = end.min(index);
+    }
+    if let Some(index) = suffix.find('#') {
+        end = end.min(index);
+    }
+    &suffix[..end]
+}
+
+fn validate_market_provider_path(
+    provider: &MarketEndpointProvider,
+    suffix: &str,
+    raw_url: &str,
+) -> Result<(), String> {
+    let path = market_path_only(suffix);
+    if path.is_empty() || path == "/" {
+        return Err(format!(
+            "invalid market-data url for {}: expected API path starting with one of [{}]; url={}",
+            provider.id,
+            provider.api_path_prefixes.join(", "),
+            raw_url
+        ));
+    }
+    if path.contains("//") {
+        return Err(format!(
+            "invalid market-data url for {}: malformed path `{path}`; url={raw_url}",
+            provider.id
+        ));
+    }
+    if provider
+        .api_path_prefixes
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid market-data url for {}: path `{path}` is not an API endpoint; expected prefix one of [{}]",
+        provider.id,
+        provider.api_path_prefixes.join(", ")
+    ))
+}
+
+fn normalize_market_endpoint_origin(
+    raw_value: &str,
+    provider: &MarketEndpointProvider,
+) -> Option<String> {
+    let (host, _suffix) = extract_https_host_and_suffix(raw_value).ok()?;
+    if !provider.hosts.contains(&host.as_str()) {
+        return None;
+    }
+    Some(format!("https://{host}"))
+}
+
+fn extract_https_host_and_suffix(raw_url: &str) -> Result<(String, &str), String> {
+    let trimmed = raw_url.trim();
+    let remainder = trimmed
+        .strip_prefix("https://")
+        .ok_or_else(|| "only HTTPS URLs are allowed".to_string())?;
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if authority.is_empty() {
+        return Err("could not parse host".to_string());
+    }
+    if authority.contains('@') {
+        return Err("user info is not allowed in URL".to_string());
+    }
+    if authority.starts_with('[') {
+        return Err("IPv6 hosts are not supported".to_string());
+    }
+
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("could not parse host".to_string());
+    }
+    if host.starts_with('.') || host.ends_with('.') {
+        return Err("host is invalid".to_string());
+    }
+
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err("host is invalid".to_string());
+        }
+        let bytes = label.as_bytes();
+        if !bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            || !bytes
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return Err("host is invalid".to_string());
+        }
+    }
+
+    Ok((host, &remainder[authority_end..]))
+}
+
 /// Trim, lowercase, and validate a memory key.
 fn normalize_memory_key(raw: &str) -> Result<String, String> {
     let normalized = raw.trim().to_ascii_lowercase();
@@ -1035,14 +1304,22 @@ fn parse_remember_args(args_json: &str) -> Result<(String, String), String> {
         .ok_or_else(|| "missing required field: key".to_string())?;
     let value_raw = value
         .get("value")
-        .and_then(|entry| entry.as_str())
         .ok_or_else(|| "missing required field: value".to_string())?;
-    if value_raw.len() > MAX_MEMORY_VALUE_BYTES {
+    // Keep string behavior unchanged; other scalar JSON values are canonicalized
+    // via serde-json serialization for deterministic storage.
+    let value = match value_raw {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null => {
+            value_raw.to_string()
+        }
+        _ => return Err("remember value must be a JSON scalar".to_string()),
+    };
+    if value.len() > MAX_MEMORY_VALUE_BYTES {
         return Err(format!(
             "value must be at most {MAX_MEMORY_VALUE_BYTES} bytes"
         ));
     }
-    Ok((normalize_memory_key(key_raw)?, value_raw.to_string()))
+    Ok((normalize_memory_key(key_raw)?, value))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
@@ -1133,9 +1410,60 @@ fn parse_update_prompt_layer_args(args_json: &str) -> Result<(u8, String), Strin
 #[derive(Debug, Deserialize, Default)]
 struct ListStrategyTemplatesArgs {
     #[serde(default)]
-    key: Option<StrategyTemplateKey>,
+    key: Option<PartialStrategyTemplateKey>,
     #[serde(default)]
     limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PartialStrategyTemplateKey {
+    #[serde(default)]
+    protocol: Option<String>,
+    #[serde(default)]
+    primitive: Option<String>,
+    #[serde(default)]
+    chain_id: Option<u64>,
+    #[serde(default)]
+    template_id: Option<String>,
+}
+
+impl PartialStrategyTemplateKey {
+    fn is_empty(&self) -> bool {
+        self.protocol.is_none()
+            && self.primitive.is_none()
+            && self.chain_id.is_none()
+            && self.template_id.is_none()
+    }
+
+    fn to_full_key(&self) -> Option<StrategyTemplateKey> {
+        Some(StrategyTemplateKey {
+            protocol: self.protocol.clone()?,
+            primitive: self.primitive.clone()?,
+            chain_id: self.chain_id?,
+            template_id: self.template_id.clone()?,
+        })
+    }
+
+    fn matches(&self, key: &StrategyTemplateKey) -> bool {
+        self.protocol
+            .as_deref()
+            .map(|value| value == key.protocol.as_str())
+            .unwrap_or(true)
+            && self
+                .primitive
+                .as_deref()
+                .map(|value| value == key.primitive.as_str())
+                .unwrap_or(true)
+            && self
+                .chain_id
+                .map(|value| value == key.chain_id)
+                .unwrap_or(true)
+            && self
+                .template_id
+                .as_deref()
+                .map(|value| value == key.template_id.as_str())
+                .unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1204,7 +1532,17 @@ fn list_strategy_templates_tool(args_json: &str) -> Result<String, String> {
         .unwrap_or(20)
         .min(MAX_STRATEGY_TEMPLATE_RESULTS);
     let templates = match args.key {
-        Some(key) => registry::list_templates(&key, limit),
+        Some(key) if key.is_empty() => registry::list_all_templates(limit),
+        Some(key) => {
+            if let Some(full_key) = key.to_full_key() {
+                registry::list_templates(&full_key, limit)
+            } else {
+                let mut filtered = registry::list_all_templates(MAX_STRATEGY_TEMPLATE_RESULTS);
+                filtered.retain(|template| key.matches(&template.key));
+                filtered.truncate(limit);
+                filtered
+            }
+        }
         None => registry::list_all_templates(limit),
     };
     serde_json::to_string(&templates)
@@ -1932,6 +2270,27 @@ mod tests {
     }
 
     #[test]
+    fn list_strategy_templates_tool_supports_partial_key_filters() {
+        stable::init_storage();
+        seed_strategy_template_and_artifact();
+        let mut alternate = crate::strategy::registry::list_all_templates(1)
+            .into_iter()
+            .next()
+            .expect("seeded template should list");
+        alternate.key.template_id = "tool-transfer-alt".to_string();
+        alternate.updated_at_ns = alternate.updated_at_ns.saturating_add(1);
+        crate::strategy::registry::upsert_template(alternate)
+            .expect("alternate template should persist");
+
+        let out = list_strategy_templates_tool(
+            r#"{"key":{"protocol":"erc20","primitive":"transfer","chain_id":8453},"limit":10}"#,
+        )
+        .expect("partial key args should degrade to deterministic filtered listing");
+        assert!(out.contains("\"template_id\":\"tool-transfer\""));
+        assert!(out.contains("\"template_id\":\"tool-transfer-alt\""));
+    }
+
+    #[test]
     fn simulate_strategy_action_tool_compiles_and_validates_plan() {
         stable::init_storage();
         stable::set_evm_chain_id(8453).expect("chain id should be configurable");
@@ -2320,6 +2679,32 @@ mod tests {
         assert!(records[0].success);
         assert!(records[1].success);
         assert!(records[1].output.contains("strategy=buy-dips"));
+    }
+
+    #[test]
+    fn parse_remember_args_accepts_scalar_json_values() {
+        let (_key, number_value) = parse_remember_args(r#"{"key":"signal.price","value":123.45}"#)
+            .expect("numeric remember value should parse");
+        assert_eq!(number_value, "123.45");
+
+        let (_key, bool_value) = parse_remember_args(r#"{"key":"signal.live","value":true}"#)
+            .expect("bool remember value should parse");
+        assert_eq!(bool_value, "true");
+
+        let (_key, null_value) = parse_remember_args(r#"{"key":"signal.optional","value":null}"#)
+            .expect("null remember value should parse");
+        assert_eq!(null_value, "null");
+
+        let (_key, string_value) = parse_remember_args(r#"{"key":"signal.note","value":"keep"}"#)
+            .expect("string remember value should stay unchanged");
+        assert_eq!(string_value, "keep");
+    }
+
+    #[test]
+    fn parse_remember_args_rejects_non_scalar_values() {
+        let error = parse_remember_args(r#"{"key":"signal.note","value":{"nested":true}}"#)
+            .expect_err("object remember value should be rejected");
+        assert!(error.contains("remember value must be a JSON scalar"));
     }
 
     #[test]
@@ -2725,6 +3110,134 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("domain not in allowlist"));
+    }
+
+    #[test]
+    fn market_http_fetch_persists_canonical_endpoint_fact() {
+        stable::init_storage();
+        stable::set_http_allowed_domains(vec!["api.dexscreener.com".to_string()])
+            .expect("allowlist should set");
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0x1234"}"#
+                .to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-market"));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success);
+
+        let fact = stable::get_memory_fact("config.endpoint.dexscreener.latest")
+            .expect("market endpoint fact should be stored");
+        assert_eq!(fact.value, "https://api.dexscreener.com");
+    }
+
+    #[test]
+    fn market_http_fetch_reuses_endpoint_fact_to_prevent_host_drift() {
+        stable::init_storage();
+        stable::set_http_allowed_domains(vec!["api.dexscreener.com".to_string()])
+            .expect("allowlist should set");
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+
+        let first_turn_calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api.dexscreener.com/latest/dex/pairs/base/0x1234"}"#
+                .to_string(),
+        }];
+        let first_records = block_on_with_spin(manager.execute_actions(
+            &state,
+            &first_turn_calls,
+            &signer,
+            "turn-market-1",
+        ));
+        assert_eq!(first_records.len(), 1);
+        assert!(first_records[0].success);
+
+        let drifted_second_turn_calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://www.dexscreener.com/latest/dex/pairs/base/0x1234"}"#
+                .to_string(),
+        }];
+        let second_records = block_on_with_spin(manager.execute_actions(
+            &state,
+            &drifted_second_turn_calls,
+            &signer,
+            "turn-market-2",
+        ));
+        assert_eq!(second_records.len(), 1);
+        assert!(
+            second_records[0].success,
+            "drifted market host should be rewritten to stored canonical endpoint"
+        );
+    }
+
+    #[test]
+    fn market_http_fetch_rejects_non_api_coingecko_pages_early() {
+        stable::init_storage();
+        stable::set_http_allowed_domains(vec!["api.coingecko.com".to_string()])
+            .expect("allowlist should set");
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://www.coingecko.com/en/coins/ethereum"}"#.to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-market"));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert!(records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invalid market-data url for coingecko"));
+        assert!(records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("/api/"));
+    }
+
+    #[test]
+    fn market_http_fetch_rejects_malformed_market_host_early() {
+        stable::init_storage();
+        stable::set_http_allowed_domains(vec!["api.coingecko.com".to_string()])
+            .expect("allowlist should set");
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "http_fetch".to_string(),
+            args_json: r#"{"url":"https://api..coingecko.com/api/v3/ping"}"#.to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-market"));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert!(records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invalid market-data url"));
+        assert!(records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("host is invalid"));
     }
 
     #[test]
