@@ -1692,11 +1692,133 @@ struct ParsedEvmReadArgs {
     params_json: Option<String>,
 }
 
-fn parse_required_evm_read_address(args: &EvmReadArgs, method: &str) -> Result<String, String> {
-    args.address
-        .as_deref()
+fn normalize_evm_read_address(raw: &str) -> Result<String, String> {
+    normalize_evm_address(raw).map_err(|error| format!("invalid evm_read address: {error}"))
+}
+
+fn parse_required_evm_read_address(
+    canonical_address: Option<String>,
+    compat_address: Option<String>,
+    method: &str,
+) -> Result<String, String> {
+    canonical_address
+        .or(compat_address)
         .ok_or_else(|| format!("address is required for {method}"))
-        .and_then(normalize_evm_address)
+}
+
+fn parse_evm_read_args_params_json_array_for_compat(
+    method: &str,
+    params_json: Option<&str>,
+    required_for_fallback: bool,
+) -> Result<Option<Vec<Value>>, String> {
+    let Some(params_json) = params_json else {
+        return Ok(None);
+    };
+    let parsed: Value = match serde_json::from_str(params_json) {
+        Ok(value) => value,
+        Err(error) => {
+            if required_for_fallback {
+                return Err(format!("invalid params_json for {method}: {error}"));
+            }
+            return Ok(None);
+        }
+    };
+    let Some(array) = parsed.as_array() else {
+        if required_for_fallback {
+            return Err(format!("params_json for {method} must be a JSON array"));
+        }
+        return Ok(None);
+    };
+    Ok(Some(array.to_vec()))
+}
+
+fn parse_evm_read_args_first_param_address(
+    method: &str,
+    params: &[Value],
+    required_for_fallback: bool,
+) -> Result<Option<String>, String> {
+    let Some(first) = params.first() else {
+        return Ok(None);
+    };
+    let Some(address) = first.as_str() else {
+        if required_for_fallback {
+            return Err(format!(
+                "params_json[0] for {method} must be an address string"
+            ));
+        }
+        return Ok(None);
+    };
+    Ok(Some(normalize_evm_read_address(address)?))
+}
+
+fn parse_eth_call_params_json_compat(
+    params: &[Value],
+    required_for_fallback: bool,
+) -> Result<(Option<String>, Option<String>), String> {
+    let Some(first) = params.first() else {
+        return Ok((None, None));
+    };
+    let Some(first_object) = first.as_object() else {
+        if required_for_fallback {
+            return Err(
+                "params_json[0] for eth_call must be an object with optional to/data fields"
+                    .to_string(),
+            );
+        }
+        return Ok((None, None));
+    };
+    let address = match first_object.get("to") {
+        Some(value) if !value.is_null() => {
+            let address = value.as_str().ok_or_else(|| {
+                "params_json[0].to for eth_call must be a string address".to_string()
+            })?;
+            Some(normalize_evm_read_address(address)?)
+        }
+        _ => None,
+    };
+    let calldata = match first_object.get("data") {
+        Some(value) if !value.is_null() => {
+            let data = value
+                .as_str()
+                .ok_or_else(|| "params_json[0].data for eth_call must be a string".to_string())?;
+            Some(normalize_hex_blob(data, "calldata")?)
+        }
+        _ => None,
+    };
+    Ok((address, calldata))
+}
+
+fn read_optional_string_field(
+    raw_args: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = raw_args.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let string_value = value
+        .as_str()
+        .ok_or_else(|| format!("invalid evm_read {context}: expected string; got {value}"))?;
+    Ok(Some(string_value.to_string()))
+}
+
+fn ensure_evm_read_compat_consistent(
+    field: &str,
+    method: &str,
+    first: Option<&str>,
+    second: Option<&str>,
+) -> Result<(), String> {
+    if let (Some(first), Some(second)) = (first, second) {
+        if first != second {
+            return Err(format!(
+                "conflicting {field} values for {method}: canonical `{first}` does not match compatibility `{second}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_generic_evm_read_params(
@@ -1733,7 +1855,10 @@ fn parse_evm_read_args(args_json: &str) -> Result<ParsedEvmReadArgs, String> {
     if !raw_args.is_object() {
         return Err("invalid evm_read args json: expected JSON object".to_string());
     }
-    if let Some(raw_address) = raw_args.get("address") {
+    let raw_args_object = raw_args
+        .as_object()
+        .ok_or_else(|| "invalid evm_read args json: expected JSON object".to_string())?;
+    if let Some(raw_address) = raw_args_object.get("address") {
         if !raw_address.is_string() && !raw_address.is_null() {
             return Err(format!(
                 "invalid evm_read address: expected 0x-prefixed string; got {}",
@@ -1741,7 +1866,7 @@ fn parse_evm_read_args(args_json: &str) -> Result<ParsedEvmReadArgs, String> {
             ));
         }
     }
-    let args: EvmReadArgs = serde_json::from_value(raw_args)
+    let args: EvmReadArgs = serde_json::from_value(raw_args.clone())
         .map_err(|error| format!("invalid evm_read args json: {error}"))?;
 
     let method_name = args.method.trim();
@@ -1761,24 +1886,120 @@ fn parse_evm_read_args(args_json: &str) -> Result<ParsedEvmReadArgs, String> {
         }
     };
 
-    let address = match &method {
-        EvmReadMethod::Call | EvmReadMethod::GetBalance | EvmReadMethod::GetTransactionCount => {
-            Some(parse_required_evm_read_address(&args, method_name)?)
+    let (address, calldata) = match &method {
+        EvmReadMethod::GetBalance | EvmReadMethod::GetTransactionCount => {
+            let canonical_address = args
+                .address
+                .as_deref()
+                .map(normalize_evm_read_address)
+                .transpose()?;
+            let params_compat = parse_evm_read_args_params_json_array_for_compat(
+                method_name,
+                args.params_json.as_deref(),
+                canonical_address.is_none(),
+            )?;
+            let compat_address = match params_compat.as_deref() {
+                Some(params) => parse_evm_read_args_first_param_address(
+                    method_name,
+                    params,
+                    canonical_address.is_none(),
+                )?,
+                None => None,
+            };
+            ensure_evm_read_compat_consistent(
+                "address",
+                method_name,
+                canonical_address.as_deref(),
+                compat_address.as_deref(),
+            )?;
+            let address =
+                parse_required_evm_read_address(canonical_address, compat_address, method_name)?;
+            (Some(address), None)
         }
-        EvmReadMethod::BlockNumber | EvmReadMethod::JsonRpc(_) => None,
-    };
-
-    let calldata = match &method {
         EvmReadMethod::Call => {
-            let value = args
+            let canonical_address = args
+                .address
+                .as_deref()
+                .map(normalize_evm_read_address)
+                .transpose()?;
+            let canonical_calldata = args
                 .calldata
+                .as_deref()
+                .map(|value| normalize_hex_blob(value, "calldata"))
+                .transpose()?;
+
+            let alias_address =
+                read_optional_string_field(raw_args_object, "to", "address alias `to`")?
+                    .as_deref()
+                    .map(normalize_evm_read_address)
+                    .transpose()?;
+            let alias_calldata =
+                read_optional_string_field(raw_args_object, "data", "calldata alias `data`")?
+                    .as_deref()
+                    .map(|value| normalize_hex_blob(value, "calldata"))
+                    .transpose()?;
+
+            let need_params_json_compat = (canonical_address.is_none() && alias_address.is_none())
+                || (canonical_calldata.is_none() && alias_calldata.is_none());
+            let params_compat = parse_evm_read_args_params_json_array_for_compat(
+                method_name,
+                args.params_json.as_deref(),
+                need_params_json_compat,
+            )?;
+            let (params_address, params_calldata) = match params_compat.as_deref() {
+                Some(params) => parse_eth_call_params_json_compat(params, need_params_json_compat)?,
+                None => (None, None),
+            };
+
+            ensure_evm_read_compat_consistent(
+                "address",
+                method_name,
+                canonical_address.as_deref(),
+                alias_address.as_deref(),
+            )?;
+            ensure_evm_read_compat_consistent(
+                "address",
+                method_name,
+                canonical_address.as_deref(),
+                params_address.as_deref(),
+            )?;
+            ensure_evm_read_compat_consistent(
+                "address",
+                method_name,
+                alias_address.as_deref(),
+                params_address.as_deref(),
+            )?;
+            ensure_evm_read_compat_consistent(
+                "calldata",
+                method_name,
+                canonical_calldata.as_deref(),
+                alias_calldata.as_deref(),
+            )?;
+            ensure_evm_read_compat_consistent(
+                "calldata",
+                method_name,
+                canonical_calldata.as_deref(),
+                params_calldata.as_deref(),
+            )?;
+            ensure_evm_read_compat_consistent(
+                "calldata",
+                method_name,
+                alias_calldata.as_deref(),
+                params_calldata.as_deref(),
+            )?;
+
+            let address = parse_required_evm_read_address(
+                canonical_address,
+                alias_address.or(params_address),
+                method_name,
+            )?;
+            let calldata = canonical_calldata
+                .or(alias_calldata)
+                .or(params_calldata)
                 .ok_or_else(|| "calldata is required for eth_call".to_string())?;
-            Some(normalize_hex_blob(&value, "calldata")?)
+            (Some(address), Some(calldata))
         }
-        EvmReadMethod::GetBalance
-        | EvmReadMethod::BlockNumber
-        | EvmReadMethod::GetTransactionCount
-        | EvmReadMethod::JsonRpc(_) => None,
+        EvmReadMethod::BlockNumber | EvmReadMethod::JsonRpc(_) => (None, None),
     };
 
     let params_json = match &method {
@@ -2958,6 +3179,84 @@ mod tests {
             };
         assert!(scientific_error.contains("invalid evm_read address"));
         assert!(scientific_error.contains("expected 0x-prefixed string"));
+    }
+
+    #[test]
+    fn parse_evm_read_args_accepts_eth_get_balance_params_json_compat() {
+        let parsed = parse_evm_read_args(
+            r#"{"method":"eth_getBalance","params_json":"[\"0x1111111111111111111111111111111111111111\",\"latest\"]"}"#,
+        )
+        .expect("eth_getBalance should accept params_json[0] compatibility address");
+        assert!(matches!(&parsed.method, EvmReadMethod::GetBalance));
+        assert_eq!(
+            parsed.address.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert!(parsed.calldata.is_none());
+    }
+
+    #[test]
+    fn parse_evm_read_args_accepts_eth_call_to_data_aliases() {
+        let parsed = parse_evm_read_args(
+            r#"{"method":"eth_call","to":"0x1111111111111111111111111111111111111111","data":"0x70A08231"}"#,
+        )
+        .expect("eth_call should accept to/data compatibility aliases");
+        assert!(matches!(&parsed.method, EvmReadMethod::Call));
+        assert_eq!(
+            parsed.address.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(parsed.calldata.as_deref(), Some("0x70a08231"));
+    }
+
+    #[test]
+    fn parse_evm_read_args_accepts_eth_call_params_json_compat() {
+        let parsed = parse_evm_read_args(
+            r#"{"method":"eth_call","params_json":"[{\"to\":\"0x1111111111111111111111111111111111111111\",\"data\":\"0x70A08231\"},\"latest\"]"}"#,
+        )
+        .expect("eth_call should accept params_json compatibility object");
+        assert!(matches!(&parsed.method, EvmReadMethod::Call));
+        assert_eq!(
+            parsed.address.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(parsed.calldata.as_deref(), Some("0x70a08231"));
+    }
+
+    #[test]
+    fn parse_evm_read_args_accepts_eth_get_transaction_count_params_json_compat() {
+        let parsed = parse_evm_read_args(
+            r#"{"method":"eth_getTransactionCount","params_json":"[\"0x1111111111111111111111111111111111111111\",\"latest\"]"}"#,
+        )
+        .expect("eth_getTransactionCount should accept params_json[0] compatibility address");
+        assert!(matches!(&parsed.method, EvmReadMethod::GetTransactionCount));
+        assert_eq!(
+            parsed.address.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert!(parsed.calldata.is_none());
+    }
+
+    #[test]
+    fn parse_evm_read_args_rejects_conflicting_canonical_and_compat_values() {
+        let error = match parse_evm_read_args(
+            r#"{"method":"eth_getBalance","address":"0x1111111111111111111111111111111111111111","params_json":"[\"0x2222222222222222222222222222222222222222\",\"latest\"]"}"#,
+        ) {
+            Ok(_) => panic!("conflicting canonical and compatibility addresses must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("conflicting address values for eth_getBalance"));
+    }
+
+    #[test]
+    fn parse_evm_read_args_rejects_non_array_params_json_for_compat() {
+        let error = match parse_evm_read_args(
+            r#"{"method":"eth_getBalance","params_json":"{\"address\":\"0x1111111111111111111111111111111111111111\"}"}"#,
+        ) {
+            Ok(_) => panic!("compatibility params_json must be a JSON array"),
+            Err(error) => error,
+        };
+        assert!(error.contains("params_json for eth_getBalance must be a JSON array"));
     }
 
     #[test]

@@ -32,6 +32,35 @@ icp canister call <principal> <method> '<candid_args>' -n ic
 
 Query methods run instantly and are free. Update methods require a round-trip and cost cycles — avoid them for inspection.
 
+### Local network (`-e local`) troubleshooting first
+
+Before debugging a local canister, verify your local network plumbing:
+
+```bash
+icp canister list -e local
+lsof -iTCP:8000 -sTCP:LISTEN -n -P
+```
+
+If `icp` returns `no descriptor found for port 8000`:
+
+1. Ensure PocketIC/local network is actually running and listening on `127.0.0.1:8000`.
+2. Run commands from the project root (where `icp.yaml` is discoverable).
+3. If your environment cannot write to the default identity dir, use a writable `ICP_HOME`:
+
+```bash
+ICP_HOME=/tmp/icp-home icp canister call <principal> <method> '<args>' -e local
+```
+
+If `curl http://<canister>.localhost:8000/...` fails but local canister calls work, try:
+
+```bash
+curl -sS http://127.0.0.1:8000/api/snapshot
+```
+
+In sandboxed environments, loopback and identity paths may require elevated execution even for read-only queries.
+
+If `get_runtime_view`/`get_inference_config` decode with numeric field IDs in local output, use `/api/snapshot` as the canonical readable health view for runtime/scheduler/cycles.
+
 ---
 
 ## 3. Most useful query methods

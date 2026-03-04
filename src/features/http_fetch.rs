@@ -49,6 +49,8 @@ struct HttpFetchArgs {
     url: String,
     #[serde(default)]
     extract: Option<ExtractionMode>,
+    #[serde(default)]
+    max_response_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -71,9 +73,15 @@ pub async fn http_fetch_tool(args_json: &str) -> Result<String, String> {
     let host = extract_https_host(&args.url)?;
     ensure_host_allowed(&host, &args.url)?;
     let request_size_bytes = u64::try_from(args.url.len().saturating_add(128)).unwrap_or(u64::MAX);
+    let initial_max_response_bytes = args
+        .max_response_bytes
+        .filter(|value| *value > 0)
+        .map(|value| value.min(HTTP_FETCH_MAX_RESPONSE_BYTES))
+        .unwrap_or(HTTP_FETCH_INITIAL_RESPONSE_BYTES);
 
     let outcall_started_at_ns = current_time_ns();
-    let body_result = http_get_with_size_retry(&args.url, request_size_bytes).await;
+    let body_result =
+        http_get_with_size_retry(&args.url, request_size_bytes, initial_max_response_bytes).await;
     let outcall_finished_at_ns = current_time_ns();
     let body = match body_result {
         Ok(body) => {
@@ -105,8 +113,12 @@ pub async fn http_fetch_tool(args_json: &str) -> Result<String, String> {
     Ok(frame_untrusted_content("http_fetch", &output))
 }
 
-async fn http_get_with_size_retry(url: &str, request_size_bytes: u64) -> Result<Vec<u8>, String> {
-    let mut max_response_bytes = HTTP_FETCH_INITIAL_RESPONSE_BYTES;
+async fn http_get_with_size_retry(
+    url: &str,
+    request_size_bytes: u64,
+    initial_max_response_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let mut max_response_bytes = initial_max_response_bytes;
     loop {
         ensure_http_fetch_affordable(request_size_bytes, max_response_bytes)?;
         match http_get(url, max_response_bytes).await {

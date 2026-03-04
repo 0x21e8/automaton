@@ -201,6 +201,7 @@ fn steward_command_label(command: &StewardCommand) -> &'static str {
         StewardCommand::SetRetentionConfig { .. } => "set_retention_config",
         StewardCommand::UpdateSoul { .. } => "update_soul",
         StewardCommand::UpsertSkill { .. } => "upsert_skill",
+        StewardCommand::RegisterStrategy { .. } => "register_strategy",
         StewardCommand::IngestStrategyTemplate { .. } => "ingest_strategy_template",
         StewardCommand::IngestStrategyAbiArtifact { .. } => "ingest_strategy_abi_artifact",
         StewardCommand::ActivateStrategyTemplate { .. } => "activate_strategy_template",
@@ -918,6 +919,19 @@ async fn dispatch_steward_command(
             stable::upsert_skill(&skill);
             Ok(format!("skill_upserted name={}", skill.name))
         }
+        StewardCommand::RegisterStrategy { recipe_json } => {
+            let recipe: crate::strategy::registry::StrategyRecipe =
+                serde_json::from_str(&recipe_json)
+                    .map_err(|error| format!("invalid strategy recipe JSON: {error}"))?;
+            let result = crate::strategy::registry::register_from_recipe(recipe)?;
+            Ok(format!(
+                "strategy_registered protocol={} primitive={} template_id={} chain_id={}",
+                result.template.key.protocol,
+                result.template.key.primitive,
+                result.template.key.template_id,
+                result.template.key.chain_id
+            ))
+        }
         StewardCommand::IngestStrategyTemplate { template } => {
             let mut template = template;
             let now_ns = current_time_ns();
@@ -1607,8 +1621,23 @@ fn get_strategy_outcome_stats(key: StrategyTemplateKey) -> Option<StrategyOutcom
     crate::strategy::learner::outcome_stats(&key)
 }
 
+/// Register a strategy from a compact recipe (controller only).
+///
+/// Replaces the previous multi-step workflow (`ingest_strategy_template_admin` +
+/// `ingest_strategy_abi_artifact_admin` + `activate_strategy_template_admin`) with
+/// a single call.  Accepts the same JSON recipe format as the agent's
+/// `register_strategy` tool.
+#[ic_cdk::update]
+fn register_strategy_admin(recipe_json: String) -> Result<StrategyTemplate, String> {
+    ensure_controller()?;
+    let recipe: crate::strategy::registry::StrategyRecipe = serde_json::from_str(&recipe_json)
+        .map_err(|error| format!("invalid strategy recipe JSON: {error}"))?;
+    let result = crate::strategy::registry::register_from_recipe(recipe)?;
+    Ok(result.template)
+}
+
+/// Deprecated: use `register_strategy_admin` instead.
 /// Inserts or updates a strategy template (controller only).
-/// Stamps `created_at_ns` on first insert and always updates `updated_at_ns`.
 #[ic_cdk::update]
 fn ingest_strategy_template_admin(template: StrategyTemplate) -> Result<StrategyTemplate, String> {
     ensure_controller()?;
@@ -1621,6 +1650,7 @@ fn ingest_strategy_template_admin(template: StrategyTemplate) -> Result<Strategy
     crate::strategy::registry::upsert_template(template)
 }
 
+/// Deprecated: use `register_strategy_admin` instead.
 /// Normalises and stores an ABI artifact, optionally verifying selector hashes
 /// (controller only).
 #[ic_cdk::update]
@@ -1636,6 +1666,7 @@ fn ingest_strategy_abi_artifact_admin(args: StrategyAbiIngestArgs) -> Result<Abi
     )
 }
 
+/// Deprecated: use `register_strategy_admin` instead.
 /// Transitions a template to `Active`, runs a dry-run compile to validate it,
 /// and records an activation state entry (controller only).
 #[ic_cdk::update]
@@ -2006,6 +2037,7 @@ mod tests {
             ("set_retention_config", "set_retention_config"),
             ("update_soul", "update_soul"),
             ("upsert_skill", "upsert_skill"),
+            ("register_strategy_admin", "register_strategy"),
             ("ingest_strategy_template_admin", "ingest_strategy_template"),
             (
                 "ingest_strategy_abi_artifact_admin",

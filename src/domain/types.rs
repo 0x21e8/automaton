@@ -116,6 +116,8 @@ pub struct ToolCallRecord {
     #[serde(default)]
     pub outcome: ToolCallOutcome,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<ToolFailureKind>,
 }
 
 /// Classification of a persisted tool-call record.
@@ -132,6 +134,17 @@ pub enum ToolCallOutcome {
     SuppressedFailureCooldown,
     /// Call blocked by tool sequence policy.
     BlockedSequence,
+}
+
+/// Coarse classification of executed tool failures for autonomy handling.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum ToolFailureKind {
+    /// Tool call arguments or local validation failed before a real execution.
+    MalformedInput,
+    /// External dependency or outcall failed after a valid invocation.
+    OutcallFailure,
+    /// Non-malformed local/runtime failures.
+    InternalFailure,
 }
 
 // ── Memory types ─────────────────────────────────────────────────────────────
@@ -364,9 +377,14 @@ pub enum StewardCommand {
     UpsertSkill {
         skill: SkillRecord,
     },
+    RegisterStrategy {
+        recipe_json: String,
+    },
+    /// Deprecated: use `RegisterStrategy` instead.
     IngestStrategyTemplate {
         template: StrategyTemplate,
     },
+    /// Deprecated: use `RegisterStrategy` instead.
     IngestStrategyAbiArtifact {
         key: AbiArtifactKey,
         abi_json: String,
@@ -374,6 +392,7 @@ pub enum StewardCommand {
         codehash: Option<String>,
         selector_assertions: Vec<AbiSelectorAssertion>,
     },
+    /// Deprecated: use `RegisterStrategy` instead.
     ActivateStrategyTemplate {
         key: StrategyTemplateKey,
         reason: Option<String>,

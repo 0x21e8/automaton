@@ -29,8 +29,10 @@ use crate::domain::state_machine;
 use crate::domain::types::{
     AgentEvent, AgentState, AutonomySuppressionConfig, ContinuationStopReason, ConversationEntry,
     InboxMessage, InboxProxyWaitState, InferenceInput, InferenceProvider, MemoryFact, MemoryRollup,
-    RuntimeSnapshot, ToolCall, ToolCallOutcome, ToolCallRecord, TurnRecord, WalletBalanceStatus,
+    RuntimeSnapshot, ToolCall, ToolCallOutcome, ToolCallRecord, ToolFailureKind, TurnRecord,
+    WalletBalanceStatus,
 };
+use crate::features::inference::canonicalize_tool_name;
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
 use crate::features::{
@@ -46,7 +48,7 @@ use alloy_primitives::U256;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::timing::{self, current_time_ns};
 
@@ -66,6 +68,7 @@ const MAX_STAGED_INBOX_MESSAGES_PER_TURN: usize = 1;
 /// suppressed by the autonomy deduplication window.
 const AUTONOMY_DEDUPE_SKIP_REASON: &str = "skipped due to freshness dedupe";
 const AUTONOMY_FAILURE_COOLDOWN_SKIP_REASON: &str = "suppressed due to repeated failure cooldown";
+const AUTONOMY_CONSECUTIVE_DEGRADE_CAP: u32 = 3;
 const TOOL_SEQUENCE_VALIDATOR_BLOCK_PREFIX: &str = "tool sequence validator blocked";
 const PROXY_WAIT_MAX_ATTEMPTS_FOR_STAGED_INBOX: u32 = 8;
 const PROXY_WAIT_FAIL_CLOSE_GRACE_SECS: u64 = 60;
@@ -215,7 +218,10 @@ fn summarize_tool_call(call: &ToolCallRecord) -> String {
     }
 
     if call.success {
-        let output = if call.tool == "http_fetch" || call.tool == "canister_call" {
+        let output = if call.tool == "http_fetch"
+            || call.tool == "market_fetch"
+            || call.tool == "canister_call"
+        {
             extract_framed_untrusted_payload(call.output.as_str())
                 .unwrap_or_else(|| call.output.clone())
         } else {
@@ -405,6 +411,10 @@ enum AutonomySuppressionReason {
         normalized_error: String,
         repeat_count: u32,
     },
+    ConsecutiveDegradeCap {
+        consecutive_degrade_count: u32,
+        error_class: String,
+    },
 }
 
 /// Evaluates all autonomy suppression checks in one pass.
@@ -472,9 +482,19 @@ enum PlannedToolCallExecution {
         normalized_error: String,
         repeat_count: u32,
     },
+    ConsecutiveDegradeCapSuppressed {
+        consecutive_degrade_count: u32,
+        error_class: String,
+    },
     SequenceBlocked {
         reason: String,
     },
+}
+
+#[derive(Clone, Debug)]
+struct ConsecutiveDegradeCapState {
+    consecutive_degrade_count: u32,
+    error_class: String,
 }
 
 /// Produces a synthetic `ToolCallRecord` for a dedupe-suppressed autonomy call.
@@ -495,6 +515,7 @@ fn synthetic_dedupe_suppressed_tool_record(
         success: false,
         outcome: ToolCallOutcome::SuppressedDedupe,
         error: None,
+        failure_kind: None,
     }
 }
 
@@ -512,6 +533,7 @@ fn synthetic_sequence_blocked_tool_record(
         success: false,
         outcome: ToolCallOutcome::BlockedSequence,
         error: Some(message),
+        failure_kind: None,
     }
 }
 
@@ -546,11 +568,34 @@ fn synthetic_failure_suppressed_tool_record(
         success: false,
         outcome: ToolCallOutcome::SuppressedFailureCooldown,
         error: None,
+        failure_kind: None,
+    }
+}
+
+fn synthetic_consecutive_degrade_cap_tool_record(
+    turn_id: &str,
+    call: &ToolCall,
+    consecutive_degrade_count: u32,
+    error_class: &str,
+) -> ToolCallRecord {
+    ToolCallRecord {
+        turn_id: turn_id.to_string(),
+        tool: call.tool.clone(),
+        args_json: call.args_json.clone(),
+        output: format!(
+            "{AUTONOMY_FAILURE_COOLDOWN_SKIP_REASON}: consecutive_degrade_count={} error_class={}",
+            consecutive_degrade_count,
+            sanitize_preview(error_class, 120)
+        ),
+        success: false,
+        outcome: ToolCallOutcome::SuppressedFailureCooldown,
+        error: None,
+        failure_kind: None,
     }
 }
 
 fn is_http_fetch_recoverable_failure(record: &ToolCallRecord) -> bool {
-    if record.tool != "http_fetch" {
+    if record.tool != "http_fetch" && record.tool != "market_fetch" {
         return false;
     }
     let Some(error) = record.error.as_deref() else {
@@ -576,26 +621,7 @@ fn is_remember_capacity_failure(record: &ToolCallRecord) -> bool {
 }
 
 fn is_malformed_autonomy_tool_arg_failure(record: &ToolCallRecord) -> bool {
-    let Some(error) = record.error.as_deref() else {
-        return false;
-    };
-    let normalized = error.trim().to_ascii_lowercase();
-    match record.tool.as_str() {
-        "list_strategy_templates" => {
-            normalized.starts_with("invalid list_strategy_templates args json:")
-        }
-        "remember" => {
-            normalized.starts_with("invalid remember args json:")
-                || normalized == "missing required field: key"
-                || normalized == "missing required field: value"
-                || normalized == "remember value must be a json scalar"
-        }
-        "evm_read" => {
-            normalized.starts_with("invalid evm_read args json:")
-                || normalized.starts_with("invalid evm_read address:")
-        }
-        _ => false,
-    }
+    matches!(record.failure_kind, Some(ToolFailureKind::MalformedInput))
 }
 
 fn should_degrade_tool_failures_for_autonomy(
@@ -649,6 +675,52 @@ fn normalize_tool_failure_class(tool: &str, normalized_error: &str) -> String {
             }
             if normalized_error.starts_with("invalid market-data url") {
                 return "invalid_market_url".to_string();
+            }
+            fallback_error_class(normalized_error)
+        }
+        "market_fetch" => {
+            if normalized_error.starts_with("invalid market_fetch args json:") {
+                return "invalid_args_json".to_string();
+            }
+            if normalized_error.starts_with("unsupported market endpoint") {
+                return "unsupported_endpoint".to_string();
+            }
+            if normalized_error.starts_with("missing required field:") {
+                return "missing_required_field".to_string();
+            }
+            if normalized_error.starts_with("missing required param:") {
+                return "missing_required_param".to_string();
+            }
+            if normalized_error.starts_with("unsupported param") {
+                return "unsupported_param".to_string();
+            }
+            if normalized_error.starts_with("invalid param") {
+                return "invalid_param".to_string();
+            }
+            if normalized_error.starts_with("invalid market-data url") {
+                return "invalid_market_url".to_string();
+            }
+            if normalized_error.starts_with("json_path extraction failed: path `") {
+                return "json_path_missing_path".to_string();
+            }
+            if normalized_error
+                .starts_with("json_path extraction failed: response is not valid json")
+            {
+                return "json_path_invalid_json".to_string();
+            }
+            if normalized_error.starts_with("regex extraction failed: no matching lines") {
+                return "regex_no_match".to_string();
+            }
+            if normalized_error.starts_with("http 4") {
+                return "http_4xx".to_string();
+            }
+            if normalized_error.contains("response exceeded max_response_bytes")
+                || normalized_error.contains("http body exceeds size limit")
+            {
+                return "response_too_large".to_string();
+            }
+            if normalized_error.contains("domain not in allowlist") {
+                return "domain_not_allowlisted".to_string();
             }
             fallback_error_class(normalized_error)
         }
@@ -716,6 +788,96 @@ fn sanitize_error_class_segment(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn consecutive_degrade_fingerprint_key(tool: &str, error_class: &str) -> String {
+    let normalized_tool = canonicalize_tool_name(tool);
+    let normalized_error_class = error_class.trim().to_ascii_lowercase();
+    format!("{normalized_tool}:{normalized_error_class}")
+}
+
+fn classify_tool_failure_for_degrade_counter(
+    record: &ToolCallRecord,
+) -> Option<(String, String, String)> {
+    let raw_error = record
+        .error
+        .as_deref()
+        .filter(|error| !error.trim().is_empty())
+        .unwrap_or(record.output.as_str());
+    let normalized = normalize_tool_failure_reason(raw_error);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let tool = canonicalize_tool_name(&record.tool);
+    let error_class = normalize_tool_failure_class(&tool, &normalized);
+    let fingerprint = consecutive_degrade_fingerprint_key(&tool, &error_class);
+    Some((fingerprint, tool, error_class))
+}
+
+fn clear_consecutive_degrade_tracking_for_tool(
+    consecutive_degrade_count: &mut BTreeMap<String, u32>,
+    consecutive_degrade_cap_by_tool: &mut BTreeMap<String, ConsecutiveDegradeCapState>,
+    tool: &str,
+) {
+    let normalized_tool = canonicalize_tool_name(tool);
+    let prefix = format!("{normalized_tool}:");
+    consecutive_degrade_count.retain(|fingerprint, _| !fingerprint.starts_with(prefix.as_str()));
+    consecutive_degrade_cap_by_tool.remove(normalized_tool.as_str());
+}
+
+fn bump_consecutive_degrade_counts(
+    failed_tool_records: &[&ToolCallRecord],
+    consecutive_degrade_count: &mut BTreeMap<String, u32>,
+    consecutive_degrade_cap_by_tool: &mut BTreeMap<String, ConsecutiveDegradeCapState>,
+) -> Vec<String> {
+    let mut observed_fingerprints = BTreeMap::<String, (String, String)>::new();
+    for record in failed_tool_records {
+        let Some((fingerprint, tool, error_class)) =
+            classify_tool_failure_for_degrade_counter(record)
+        else {
+            continue;
+        };
+        observed_fingerprints
+            .entry(fingerprint)
+            .or_insert((tool, error_class));
+    }
+
+    if observed_fingerprints.is_empty() {
+        consecutive_degrade_count.clear();
+        return Vec::new();
+    }
+
+    consecutive_degrade_count
+        .retain(|fingerprint, _| observed_fingerprints.contains_key(fingerprint));
+
+    let mut newly_capped_details = Vec::new();
+    for (fingerprint, (tool, error_class)) in observed_fingerprints {
+        let next = consecutive_degrade_count
+            .get(&fingerprint)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        consecutive_degrade_count.insert(fingerprint, next);
+
+        if next >= AUTONOMY_CONSECUTIVE_DEGRADE_CAP
+            && !consecutive_degrade_cap_by_tool.contains_key(tool.as_str())
+        {
+            consecutive_degrade_cap_by_tool.insert(
+                tool.clone(),
+                ConsecutiveDegradeCapState {
+                    consecutive_degrade_count: next,
+                    error_class: error_class.clone(),
+                },
+            );
+            newly_capped_details.push(format!(
+                "{} consecutive_degrade_count={} error_class={}",
+                tool, next, error_class
+            ));
+        }
+    }
+
+    newly_capped_details
 }
 
 fn tool_failure_scope_fingerprint(tool: &str, args_json: &str) -> String {
@@ -789,6 +951,27 @@ fn tool_failure_scope_discriminator(tool: &str, args_json: &str) -> String {
                 .map(|value| value.trim().to_ascii_lowercase())
                 .unwrap_or_else(|| "none".to_string());
             format!("host={host};mode={mode}")
+        }
+        "market_fetch" => {
+            let provider = object
+                .get("provider")
+                .and_then(|entry| entry.as_str())
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            let endpoint = object
+                .get("endpoint")
+                .and_then(|entry| entry.as_str())
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            let mode = object
+                .get("extract")
+                .and_then(|entry| entry.get("mode"))
+                .and_then(|entry| entry.as_str())
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or_else(|| "none".to_string());
+            format!("provider={provider};endpoint={endpoint};mode={mode}")
         }
         "evm_read" => {
             let method = object
@@ -905,6 +1088,7 @@ fn normalize_tool_call_ids(calls: Vec<ToolCall>, round_index: usize) -> Vec<Tool
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("round-{round_index}-tool-{tool_index}"));
             call.tool_call_id = Some(normalized_id);
+            call.tool = canonicalize_tool_name(&call.tool);
             call
         })
         .collect()
@@ -918,6 +1102,7 @@ fn continuation_tool_content(record: &ToolCallRecord) -> String {
         "outcome": format!("{:?}", record.outcome),
         "output": record.output,
         "error": record.error,
+        "failure_kind": record.failure_kind,
     })
     .to_string()
 }
@@ -1441,6 +1626,8 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     let mut inner_dialogue: Option<String> = None;
     let mut inference_round_count = 0usize;
     let mut continuation_stop_reason = ContinuationStopReason::None;
+    let mut consecutive_degrade_count = BTreeMap::<String, u32>::new();
+    let mut consecutive_degrade_cap_by_tool = BTreeMap::<String, ConsecutiveDegradeCapState>::new();
 
     if let Err(error) = advance_state(&mut state, &AgentEvent::TimerTick, &turn_id) {
         let _ = advance_state(
@@ -1845,6 +2032,67 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 }
                 suppressed_autonomy_calls = suppressed_calls;
             }
+            if !has_external_input && !consecutive_degrade_cap_by_tool.is_empty() {
+                let mut suppressed_indexes = suppressed_autonomy_calls
+                    .iter()
+                    .map(|entry| entry.index)
+                    .collect::<BTreeSet<_>>();
+                let mut cap_suppressed_calls = Vec::new();
+                for (index, call) in planned_tool_calls.iter().enumerate() {
+                    if suppressed_indexes.contains(&index) {
+                        continue;
+                    }
+                    let Some(cap_state) = consecutive_degrade_cap_by_tool.get(call.tool.as_str())
+                    else {
+                        continue;
+                    };
+                    cap_suppressed_calls.push(SuppressedAutonomyToolCall {
+                        index,
+                        call: call.clone(),
+                        reason: AutonomySuppressionReason::ConsecutiveDegradeCap {
+                            consecutive_degrade_count: cap_state.consecutive_degrade_count,
+                            error_class: cap_state.error_class.clone(),
+                        },
+                    });
+                    suppressed_indexes.insert(index);
+                }
+
+                if !cap_suppressed_calls.is_empty() {
+                    let cap_details = cap_suppressed_calls
+                        .iter()
+                        .filter_map(|entry| match &entry.reason {
+                            AutonomySuppressionReason::ConsecutiveDegradeCap {
+                                consecutive_degrade_count,
+                                error_class,
+                            } => Some(format!(
+                                "{} consecutive_degrade_count={} error_class={}",
+                                entry.call.tool, consecutive_degrade_count, error_class
+                            )),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if !cap_details.is_empty() {
+                        let cap_details_joined = cap_details.join(", ");
+                        append_inner_dialogue(
+                            &mut inner_dialogue,
+                            &format!(
+                                "skip: autonomy consecutive-degrade cap suppressed {} call(s): {}",
+                                cap_details.len(),
+                                cap_details_joined
+                            ),
+                        );
+                        log!(
+                            AgentLogPriority::Info,
+                            "turn={} autonomy_consecutive_degrade_cap_suppressed count={} details={}",
+                            turn_id,
+                            cap_details.len(),
+                            sanitize_preview(&cap_details_joined, 500),
+                        );
+                    }
+                    suppressed_autonomy_calls.extend(cap_suppressed_calls);
+                    suppressed_autonomy_calls.sort_by_key(|entry| entry.index);
+                }
+            }
 
             if planned_tool_calls.is_empty() {
                 break;
@@ -1878,6 +2126,17 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                                     remaining_secs,
                                     normalized_error,
                                     repeat_count,
+                                },
+                            );
+                        }
+                        AutonomySuppressionReason::ConsecutiveDegradeCap {
+                            consecutive_degrade_count,
+                            error_class,
+                        } => {
+                            planned_execution.push(
+                                PlannedToolCallExecution::ConsecutiveDegradeCapSuppressed {
+                                    consecutive_degrade_count,
+                                    error_class,
                                 },
                             );
                         }
@@ -1991,6 +2250,17 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                             *repeat_count,
                         ));
                     }
+                    PlannedToolCallExecution::ConsecutiveDegradeCapSuppressed {
+                        consecutive_degrade_count,
+                        error_class,
+                    } => {
+                        round_tool_records.push(synthetic_consecutive_degrade_cap_tool_record(
+                            &turn_id,
+                            call,
+                            *consecutive_degrade_count,
+                            error_class,
+                        ));
+                    }
                     PlannedToolCallExecution::SequenceBlocked { reason } => {
                         round_tool_records.push(synthetic_sequence_blocked_tool_record(
                             &turn_id, call, reason,
@@ -2038,13 +2308,25 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 }
             }
 
+            if !has_external_input {
+                for record in round_tool_records
+                    .iter()
+                    .filter(|record| record.outcome == ToolCallOutcome::Executed && record.success)
+                {
+                    clear_consecutive_degrade_tracking_for_tool(
+                        &mut consecutive_degrade_count,
+                        &mut consecutive_degrade_cap_by_tool,
+                        &record.tool,
+                    );
+                }
+            }
+
             let failed_tool_records = round_tool_records
                 .iter()
                 .filter(|record| {
                     is_executed_failure(record) && !is_sequence_validator_block(record)
                 })
                 .collect::<Vec<_>>();
-            let mut stop_after_degraded_tool_failures = false;
             if !failed_tool_records.is_empty() {
                 if should_degrade_tool_failures_for_autonomy(
                     &failed_tool_records,
@@ -2061,7 +2343,21 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                             "autonomy degraded after recoverable tool failure(s):\n- {details}"
                         ),
                     );
-                    stop_after_degraded_tool_failures = true;
+                    let newly_capped = bump_consecutive_degrade_counts(
+                        &failed_tool_records,
+                        &mut consecutive_degrade_count,
+                        &mut consecutive_degrade_cap_by_tool,
+                    );
+                    if !newly_capped.is_empty() {
+                        append_inner_dialogue(
+                            &mut inner_dialogue,
+                            &format!(
+                                "autonomy consecutive-degrade cap armed at {}: {}",
+                                AUTONOMY_CONSECUTIVE_DEGRADE_CAP,
+                                newly_capped.join(", ")
+                            ),
+                        );
+                    }
                 } else {
                     last_error = Some(format_terminal_tool_execution_error(&failed_tool_records));
                 }
@@ -2076,12 +2372,26 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 }
             }
 
+            let executed_call_count = planned_execution
+                .iter()
+                .filter(|execution| matches!(execution, PlannedToolCallExecution::Execute))
+                .count();
+            let has_consecutive_cap_suppression = planned_execution.iter().any(|execution| {
+                matches!(
+                    execution,
+                    PlannedToolCallExecution::ConsecutiveDegradeCapSuppressed { .. }
+                )
+            });
             all_tool_calls.extend(round_tool_records);
 
-            if stop_after_degraded_tool_failures {
+            if last_error.is_some() {
                 break;
             }
-            if last_error.is_some() {
+            if has_consecutive_cap_suppression && executed_call_count == 0 {
+                append_inner_dialogue(
+                    &mut inner_dialogue,
+                    "continuation stopped: consecutive-degrade cap suppressed all planned tool calls",
+                );
                 break;
             }
         }
@@ -2227,7 +2537,7 @@ mod tests {
         ContinuationStopReason, EvmPollCursor, InboxMessageSource, InboxMessageStatus,
         InboxProxyWaitState, InferenceProxyResultPayload, MemoryFact, MemoryRollup,
         PendingInferenceProxyJob, RuntimeSnapshot, SubmitInferenceResultArgs, SurvivalTier,
-        ToolCall, ToolCallRecord,
+        ToolCall, ToolCallRecord, ToolFailureKind,
     };
     use crate::util::block_on_with_spin;
 
@@ -2266,6 +2576,20 @@ mod tests {
     }
 
     #[test]
+    fn normalize_tool_call_ids_canonicalizes_tool_name() {
+        let calls = vec![ToolCall {
+            tool_call_id: Some(" call-1 ".to_string()),
+            tool: "  Canister_Call ".to_string(),
+            args_json: "{}".to_string(),
+        }];
+
+        let normalized = normalize_tool_call_ids(calls, 0);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(normalized[0].tool, "canister_call");
+    }
+
+    #[test]
     fn render_tool_results_reply_formats_success_tool_result() {
         let calls = vec![ToolCallRecord {
             turn_id: "turn-1".to_string(),
@@ -2277,6 +2601,7 @@ mod tests {
             success: true,
             outcome: ToolCallOutcome::Executed,
             error: None,
+        failure_kind: None,
         }];
 
         let reply = render_tool_results_reply(&calls).expect("reply should be rendered");
@@ -2295,6 +2620,7 @@ mod tests {
                 success: true,
                 outcome: ToolCallOutcome::Executed,
                 error: None,
+            failure_kind: None,
             },
             ToolCallRecord {
                 turn_id: "turn-1".to_string(),
@@ -2304,6 +2630,7 @@ mod tests {
                 success: false,
                 outcome: ToolCallOutcome::Executed,
                 error: Some("rpc timeout".to_string()),
+            failure_kind: None,
             },
         ];
 
@@ -2323,6 +2650,7 @@ mod tests {
             success: false,
             outcome: ToolCallOutcome::SuppressedDedupe,
             error: None,
+            failure_kind: None,
         }];
 
         let reply = render_tool_results_reply(&calls).expect("reply should be rendered");
@@ -2344,6 +2672,7 @@ mod tests {
             success: true,
             outcome: ToolCallOutcome::Executed,
             error: None,
+            failure_kind: None,
         }];
 
         let reply = render_tool_results_reply(&calls).expect("reply should be rendered");
@@ -2366,6 +2695,7 @@ mod tests {
             success: true,
             outcome: ToolCallOutcome::Executed,
             error: None,
+        failure_kind: None,
         }];
 
         let reply = render_tool_results_reply(&calls).expect("reply should be rendered");
@@ -2384,6 +2714,7 @@ mod tests {
             success: false,
             outcome: ToolCallOutcome::Executed,
             error: Some("rpc timeout".to_string()),
+            failure_kind: None,
         };
         let failure_b = ToolCallRecord {
             turn_id: "turn-1".to_string(),
@@ -2393,6 +2724,7 @@ mod tests {
             success: false,
             outcome: ToolCallOutcome::Executed,
             error: Some("HTTP 404 from https://example.com/missing".to_string()),
+            failure_kind: None,
         };
 
         let failures = vec![&failure_a, &failure_b];
@@ -2429,6 +2761,7 @@ mod tests {
                 success: false,
                 outcome: ToolCallOutcome::Executed,
                 error: Some(long_reason),
+                failure_kind: None,
             },
             ToolCallRecord {
                 turn_id: "turn-1".to_string(),
@@ -2438,6 +2771,7 @@ mod tests {
                 success: false,
                 outcome: ToolCallOutcome::Executed,
                 error: Some("HTTP 500".to_string()),
+                failure_kind: None,
             },
             ToolCallRecord {
                 turn_id: "turn-1".to_string(),
@@ -2447,6 +2781,7 @@ mod tests {
                 success: false,
                 outcome: ToolCallOutcome::Executed,
                 error: Some("storage write rejected".to_string()),
+                failure_kind: None,
             },
             ToolCallRecord {
                 turn_id: "turn-1".to_string(),
@@ -2456,6 +2791,7 @@ mod tests {
                 success: false,
                 outcome: ToolCallOutcome::Executed,
                 error: Some("quota reached".to_string()),
+                failure_kind: None,
             },
         ];
         let failure_refs = failures.iter().collect::<Vec<_>>();
@@ -2510,6 +2846,7 @@ mod tests {
             success: false,
             outcome: ToolCallOutcome::Executed,
             error: Some("regex extraction failed: no matching lines".to_string()),
+            failure_kind: None,
         };
         let failures = vec![&failed];
         assert!(should_degrade_tool_failures_for_autonomy(&failures, false));
@@ -2525,6 +2862,7 @@ mod tests {
             success: false,
             outcome: ToolCallOutcome::Executed,
             error: Some("json_path extraction failed: path `pairs[0]` not found".to_string()),
+            failure_kind: None,
         };
         let failures = vec![&failed];
         assert!(!should_degrade_tool_failures_for_autonomy(&failures, true));
@@ -2545,6 +2883,7 @@ mod tests {
                 "HTTP 404 from https://api.geckoterminal.com/api/v2/networks/base/pools/0xdead"
                     .to_string(),
             ),
+            failure_kind: None,
         };
         let failures = vec![&failed];
         assert!(should_degrade_tool_failures_for_autonomy(&failures, false));
@@ -2563,6 +2902,7 @@ mod tests {
                 "HTTP fetch failed: call rejected: 1 - Http body exceeds size limit of 65536 bytes."
                     .to_string(),
             ),
+            failure_kind: None,
         };
         let failures = vec![&failed];
         assert!(should_degrade_tool_failures_for_autonomy(&failures, false));
@@ -2581,6 +2921,7 @@ mod tests {
                 "HTTP fetch failed: call rejected: 1 - Http body exceeds size limit of 65536 bytes."
                     .to_string(),
             ),
+            failure_kind: None,
         };
         let failures = vec![&failed];
         assert!(!should_degrade_tool_failures_for_autonomy(&failures, true));
@@ -2599,6 +2940,7 @@ mod tests {
                 "memory full: non-evictable capacity reached (all stored facts are critical)"
                     .to_string(),
             ),
+            failure_kind: None,
         };
         let failures = vec![&failed];
         assert!(should_degrade_tool_failures_for_autonomy(&failures, false));
@@ -2617,6 +2959,7 @@ mod tests {
                 "memory full: non-evictable capacity reached (all stored facts are critical)"
                     .to_string(),
             ),
+            failure_kind: None,
         };
         let failures = vec![&failed];
         assert!(!should_degrade_tool_failures_for_autonomy(&failures, true));
@@ -2632,6 +2975,7 @@ mod tests {
             success: false,
             outcome: ToolCallOutcome::Executed,
             error: Some("HTTP fetch failed: call rejected: 2 - timed out".to_string()),
+            failure_kind: None,
         };
         let failed_other = ToolCallRecord {
             turn_id: "turn-1".to_string(),
@@ -2641,9 +2985,45 @@ mod tests {
             success: false,
             outcome: ToolCallOutcome::Executed,
             error: Some("rpc timeout".to_string()),
+            failure_kind: None,
         };
         let failures = vec![&failed_http, &failed_other];
         assert!(!should_degrade_tool_failures_for_autonomy(&failures, false));
+    }
+
+    #[test]
+    fn autonomy_degrade_classification_uses_failure_kind_not_error_text() {
+        let malformed_like_but_internal = ToolCallRecord {
+            turn_id: "turn-1".to_string(),
+            tool: "evm_read".to_string(),
+            args_json: "{}".to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            outcome: ToolCallOutcome::Executed,
+            error: Some("invalid evm_read args json: expected object".to_string()),
+            failure_kind: Some(ToolFailureKind::InternalFailure),
+        };
+        let internal_failures = vec![&malformed_like_but_internal];
+        assert!(!should_degrade_tool_failures_for_autonomy(
+            &internal_failures,
+            false
+        ));
+
+        let malformed_kind_with_generic_error = ToolCallRecord {
+            turn_id: "turn-2".to_string(),
+            tool: "remember".to_string(),
+            args_json: "{}".to_string(),
+            output: "tool execution failed".to_string(),
+            success: false,
+            outcome: ToolCallOutcome::Executed,
+            error: Some("generic parse error".to_string()),
+            failure_kind: Some(ToolFailureKind::MalformedInput),
+        };
+        let malformed_failures = vec![&malformed_kind_with_generic_error];
+        assert!(should_degrade_tool_failures_for_autonomy(
+            &malformed_failures,
+            false
+        ));
     }
 
     #[test]
@@ -2717,6 +3097,7 @@ mod tests {
                 error: Some(
                     "json_path extraction failed: path `pairs[0].priceUsd` not found".to_string(),
                 ),
+                failure_kind: None,
             };
             record_autonomy_tool_outcomes(
                 std::slice::from_ref(call),
@@ -3192,6 +3573,7 @@ mod tests {
                     success: true,
                     outcome: ToolCallOutcome::Executed,
                     error: None,
+                    failure_kind: None,
                 },
                 ToolCallRecord {
                     turn_id: turn_id.to_string(),
@@ -3201,6 +3583,7 @@ mod tests {
                     success: true,
                     outcome: ToolCallOutcome::Executed,
                     error: None,
+                    failure_kind: None,
                 },
                 ToolCallRecord {
                     turn_id: turn_id.to_string(),
@@ -3210,6 +3593,7 @@ mod tests {
                     success: true,
                     outcome: ToolCallOutcome::Executed,
                     error: None,
+                    failure_kind: None,
                 },
             ],
         );
@@ -3873,6 +4257,106 @@ mod tests {
     }
 
     #[test]
+    fn autonomy_turn_with_missing_evm_read_address_degrades_without_faulting() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.evm_read_missing_address_probe".to_string(),
+            value: "request_evm_read_missing_address_probe:true".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok());
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].error.is_none());
+        assert_eq!(stable::runtime_snapshot().state, AgentState::Sleeping);
+        let dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(dialogue.contains("autonomy degraded after recoverable tool failure"));
+        assert!(dialogue.contains("evm_read"));
+        assert!(dialogue.contains("address is required for eth_getBalance"));
+    }
+
+    #[test]
+    fn autonomy_turn_with_missing_evm_read_calldata_degrades_without_faulting() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.evm_read_missing_calldata_probe".to_string(),
+            value: "request_evm_read_missing_calldata_probe:true".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok());
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].error.is_none());
+        assert_eq!(stable::runtime_snapshot().state, AgentState::Sleeping);
+        let dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(dialogue.contains("autonomy degraded after recoverable tool failure"));
+        assert!(dialogue.contains("evm_read"));
+        assert!(dialogue.contains("calldata is required for eth_call"));
+    }
+
+    #[test]
+    fn autonomy_turn_with_remember_empty_key_degrades_without_faulting() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.remember_empty_key_probe".to_string(),
+            value: "request_remember_empty_key_probe:true".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok());
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].error.is_none());
+        assert_eq!(stable::runtime_snapshot().state, AgentState::Sleeping);
+        let dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(dialogue.contains("autonomy degraded after recoverable tool failure"));
+        assert!(dialogue.contains("remember"));
+        assert!(dialogue.contains("key must be 1-"));
+    }
+
+    #[test]
+    fn autonomy_turn_with_market_fetch_missing_extract_degrades_without_faulting() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.market_fetch_missing_extract_probe".to_string(),
+            value: "request_market_fetch_missing_extract_probe:true".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok());
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].error.is_none());
+        assert_eq!(stable::runtime_snapshot().state, AgentState::Sleeping);
+        let dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(dialogue.contains("autonomy degraded after recoverable tool failure"));
+        assert!(dialogue.contains("market_fetch"));
+        assert!(dialogue.contains("market endpoint discovery required"));
+    }
+
+    #[test]
     fn inbox_turn_remember_capacity_failure_is_terminal() {
         reset_runtime(AgentState::Sleeping, true, false, 0);
         for idx in 0..stable::MAX_MEMORY_FACTS {
@@ -3916,7 +4400,89 @@ mod tests {
     }
 
     #[test]
-    fn repeated_autonomy_remember_failures_trigger_cooldown_suppression() {
+    fn inbox_turn_with_missing_evm_read_address_remains_terminal() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::post_inbox_message(
+            "request_evm_read_missing_address_probe:true".to_string(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )
+        .expect("inbox probe should be accepted");
+        assert_eq!(stable::stage_pending_inbox_messages(10, 100), 1);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_err(),
+            "inbox-driven malformed evm_read args should remain terminal"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("tool execution reported failures"),
+            "inbox turn should surface hard tool failure"
+        );
+        assert_eq!(
+            stable::runtime_snapshot().state,
+            AgentState::Faulted,
+            "terminal inbox failure should fault runtime state"
+        );
+    }
+
+    #[test]
+    fn autonomy_repeated_malformed_evm_read_hits_failure_cooldown() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.evm_read_missing_address_probe".to_string(),
+            value: "request_evm_read_missing_address_probe:true".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        for _ in 0..4 {
+            let result = block_on_with_spin(run_scheduled_turn_job());
+            assert!(
+                result.is_ok(),
+                "autonomy malformed evm_read should degrade/suppress instead of faulting"
+            );
+        }
+
+        let turns = stable::list_turns(4);
+        assert_eq!(turns.len(), 4);
+        assert!(
+            turns.iter().all(|turn| turn.error.is_none()),
+            "all turns should complete without terminal errors"
+        );
+
+        let latest_turn = &turns[0];
+        let latest_tools = stable::get_tools_for_turn(&latest_turn.id);
+        assert!(
+            latest_tools.iter().any(|record| {
+                record.tool == "evm_read"
+                    && record.outcome == ToolCallOutcome::SuppressedFailureCooldown
+                    && record
+                        .output
+                        .contains("suppressed due to repeated failure cooldown")
+            }),
+            "latest turn should suppress repeated malformed evm_read call during cooldown"
+        );
+        assert!(
+            latest_turn
+                .inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("repeated-failure cooldown suppressed"),
+            "inner dialogue should include suppression diagnostics"
+        );
+    }
+
+    #[test]
+    fn autonomy_failure_cooldown_scope_does_not_suppress_unrelated_tools() {
         reset_runtime(AgentState::Sleeping, true, false, 0);
         for idx in 0..stable::MAX_MEMORY_FACTS.saturating_sub(2) {
             stable::set_memory_fact(&MemoryFact {
@@ -3986,6 +4552,66 @@ mod tests {
                 .contains("repeated-failure cooldown suppressed"),
             "inner dialogue should include suppression diagnostics"
         );
+    }
+
+    #[test]
+    fn consecutive_degrade_cap_pauses_after_threshold() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.evm_read_missing_address_loop_probe".to_string(),
+            value: "request_evm_read_missing_address_probe:true request_continuation_loop:true"
+                .to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("loop probe trigger should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job_with_limits(
+            ScheduledTurnTrigger::Periodic,
+            8,
+            u64::MAX,
+        ));
+        assert!(
+            result.is_ok(),
+            "autonomy turn should pause via cap without faulting"
+        );
+
+        let turn = stable::list_turns(1)
+            .into_iter()
+            .next()
+            .expect("latest turn should be recorded");
+        assert!(
+            turn.error.is_none(),
+            "consecutive cap should avoid terminal error"
+        );
+        assert_eq!(stable::runtime_snapshot().state, AgentState::Sleeping);
+
+        let tool_records = stable::get_tools_for_turn(&turn.id);
+        let failed_evm_read = tool_records
+            .iter()
+            .filter(|record| {
+                record.tool == "evm_read"
+                    && record.outcome == ToolCallOutcome::Executed
+                    && !record.success
+            })
+            .count();
+        assert_eq!(
+            failed_evm_read,
+            usize::try_from(AUTONOMY_CONSECUTIVE_DEGRADE_CAP).expect("cap fits usize"),
+            "malformed evm_read should execute only up to the consecutive degrade cap"
+        );
+        assert!(
+            tool_records.iter().any(|record| {
+                record.tool == "evm_read"
+                    && record.outcome == ToolCallOutcome::SuppressedFailureCooldown
+                    && record.output.contains("consecutive_degrade_count=")
+            }),
+            "post-cap rounds should persist suppression records"
+        );
+        let dialogue = turn.inner_dialogue.as_deref().unwrap_or_default();
+        assert!(dialogue.contains("autonomy consecutive-degrade cap armed at 3"));
+        assert!(dialogue.contains("consecutive-degrade cap suppressed"));
     }
 
     #[test]

@@ -139,13 +139,15 @@ Lower-numbered layers take precedence in all conflicts. Forbidden-phrase detecti
 ### Strategy Engine
 A structured DeFi strategy execution framework (in `src/strategy/`) enables the agent to execute template-based on-chain actions safely:
 
-- **Registry** -- Stores `StrategyTemplate` records keyed by `(protocol, primitive, chain_id, template_id)`, with versioned ABI artifact binding and lifecycle states (Draft → Active → Deprecated → Revoked)
+- **Registry** -- Stores `StrategyTemplate` records keyed by `(protocol, primitive, chain_id, template_id)` with lifecycle states (Draft → Active → Deprecated → Revoked)
 - **Compiler** -- Resolves a `StrategyExecutionIntent` against a registered template and ABI artifacts into a concrete `ExecutionPlan` of typed EVM calls
-- **Validator** -- Multi-layer validation pipeline (Schema → Address → Policy → Preflight → Postcondition) with deterministic/non-deterministic failure classification
-- **Learner** -- Tracks `StrategyOutcomeStats` per template/version, computing confidence scores, ranking scores, and adaptive parameter priors (slippage bps, gas buffer) based on historical success/failure
+- **Validator** -- Multi-layer validation pipeline (Schema → Address → Policy → Postcondition) with deterministic/non-deterministic failure classification
+- **Learner** -- Tracks `StrategyOutcomeStats` per template and auto-deactivates templates after repeated deterministic failures
 - **ABI** -- Stores raw ABI JSON artifacts with function selector assertions for on-chain binding verification
+- **Authoring** -- Supports both controller-managed templates and agent-authored templates via `register_strategy`
 
 A kill-switch mechanism allows per-strategy emergency disablement independent of template lifecycle state.
+See [docs/strategies/README.md](docs/strategies/README.md) for user documentation and examples.
 
 ### Autonomous Cycle Top-Up
 The agent can replenish its own ICP cycles from its USDC balance without operator intervention:

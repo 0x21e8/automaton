@@ -223,12 +223,36 @@ fn run_deterministic_inference(
         || input
             .context_snippet
             .contains("request_remember_malformed_probe:true");
+    let remember_empty_key_probe_request = input
+        .input
+        .contains("request_remember_empty_key_probe:true")
+        || input
+            .context_snippet
+            .contains("request_remember_empty_key_probe:true");
     let evm_read_malformed_probe_request = input
         .input
         .contains("request_evm_read_malformed_probe:true")
         || input
             .context_snippet
             .contains("request_evm_read_malformed_probe:true");
+    let evm_read_missing_address_probe_request = input
+        .input
+        .contains("request_evm_read_missing_address_probe:true")
+        || input
+            .context_snippet
+            .contains("request_evm_read_missing_address_probe:true");
+    let evm_read_missing_calldata_probe_request = input
+        .input
+        .contains("request_evm_read_missing_calldata_probe:true")
+        || input
+            .context_snippet
+            .contains("request_evm_read_missing_calldata_probe:true");
+    let market_fetch_missing_extract_probe_request = input
+        .input
+        .contains("request_market_fetch_missing_extract_probe:true")
+        || input
+            .context_snippet
+            .contains("request_market_fetch_missing_extract_probe:true");
     let continuation_loop_request = input.input.contains("request_continuation_loop:true")
         || input
             .context_snippet
@@ -279,11 +303,39 @@ fn run_deterministic_inference(
             tool: "remember".to_string(),
             args_json: r#"{"value":"missing-key"}"#.to_string(),
         }]
+    } else if remember_empty_key_probe_request {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "remember".to_string(),
+            args_json: r#"{"key":"","value":"probe"}"#.to_string(),
+        }]
     } else if evm_read_malformed_probe_request {
         vec![ToolCall {
             tool_call_id: None,
             tool: "evm_read".to_string(),
             args_json: r#"{"method":"eth_getBalance","address":1e21}"#.to_string(),
+        }]
+    } else if evm_read_missing_address_probe_request {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "evm_read".to_string(),
+            args_json: r#"{"method":"eth_getBalance"}"#.to_string(),
+        }]
+    } else if evm_read_missing_calldata_probe_request {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "evm_read".to_string(),
+            args_json:
+                r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111"}"#
+                    .to_string(),
+        }]
+    } else if market_fetch_missing_extract_probe_request {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "market_fetch".to_string(),
+            args_json:
+                r#"{"provider":"dexscreener","endpoint":"search_pairs","params":{"q":"eth"}}"#
+                    .to_string(),
         }]
     } else if remember_capacity_probe_request {
         vec![ToolCall {
@@ -1269,6 +1321,10 @@ fn ic_llm_parameters_to_openrouter(parameters: IcLlmParameters) -> Value {
     Value::Object(openrouter_parameters)
 }
 
+pub fn canonicalize_tool_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
 fn parse_ic_llm_response(response: IcLlmResponse) -> Result<InferenceOutput, String> {
     let mut tool_calls = Vec::new();
     for tool_call in response.message.tool_calls {
@@ -1280,7 +1336,7 @@ fn parse_ic_llm_response(response: IcLlmResponse) -> Result<InferenceOutput, Str
             .map_err(|error| format!("failed to serialize ic_llm tool args: {error}"))?;
         tool_calls.push(ToolCall {
             tool_call_id: Some(tool_call.id).filter(|id| !id.trim().is_empty()),
-            tool: tool_call.function.name,
+            tool: canonicalize_tool_name(&tool_call.function.name),
             args_json,
         });
     }
@@ -2415,7 +2471,7 @@ fn parse_openrouter_completion(raw: &str) -> Result<InferenceOutput, String> {
 
             tool_calls.push(ToolCall {
                 tool_call_id: tool_call.id.clone().filter(|id| !id.trim().is_empty()),
-                tool: tool_call.function.name.clone(),
+                tool: canonicalize_tool_name(&tool_call.function.name),
                 args_json: parsed_arguments.to_string(),
             });
         }
@@ -2515,6 +2571,54 @@ mod tests {
             out.tool_calls[0].args_json,
             r#"{"message_hash":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#
         );
+    }
+
+    #[test]
+    fn parse_openrouter_completion_trims_and_normalizes_tool_name() {
+        let payload = r#"{
+            "choices": [
+                {
+                    "message": {
+                        "content": "calling tool",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "  Canister_Call ",
+                                    "arguments": "{}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }"#;
+
+        let out = parse_openrouter_completion(payload).expect("response should parse");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].tool, "canister_call");
+    }
+
+    #[test]
+    fn parse_ic_llm_response_trims_and_normalizes_tool_name() {
+        let response: IcLlmResponse = serde_json::from_value(json!({
+            "message": {
+                "content": "ok",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "  EVM_READ ",
+                            "arguments": []
+                        }
+                    }
+                ]
+            }
+        }))
+        .expect("response fixture should deserialize");
+
+        let out = parse_ic_llm_response(response).expect("response should parse");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].tool, "evm_read");
     }
 
     #[test]

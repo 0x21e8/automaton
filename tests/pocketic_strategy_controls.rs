@@ -85,39 +85,6 @@ struct StrategyTemplate {
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct AbiArtifactKey {
-    protocol: String,
-    chain_id: u64,
-    role: String,
-}
-
-#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct AbiSelectorAssertion {
-    signature: String,
-    selector_hex: String,
-}
-
-#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct StrategyAbiIngestArgs {
-    key: AbiArtifactKey,
-    abi_json: String,
-    source_ref: String,
-    codehash: Option<String>,
-    selector_assertions: Vec<AbiSelectorAssertion>,
-}
-
-#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct AbiArtifact {
-    key: AbiArtifactKey,
-    source_ref: String,
-    codehash: Option<String>,
-    abi_json: String,
-    functions: Vec<AbiFunctionSpec>,
-    created_at_ns: u64,
-    updated_at_ns: u64,
-}
-
-#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct TemplateActivationState {
     key: StrategyTemplateKey,
     enabled: bool,
@@ -218,96 +185,53 @@ fn sample_key() -> StrategyTemplateKey {
     }
 }
 
-fn sample_template() -> StrategyTemplate {
-    StrategyTemplate {
-        key: sample_key(),
-        status: TemplateStatus::Draft,
-        contract_roles: vec![ContractRoleBinding {
-            role: "token".to_string(),
-            address: "0x2222222222222222222222222222222222222222".to_string(),
-            source_ref: "https://example.com/token-address".to_string(),
-            codehash: None,
-        }],
-        actions: vec![ActionSpec {
-            action_id: "transfer".to_string(),
-            call_sequence: vec![AbiFunctionSpec {
-                role: "token".to_string(),
-                name: "transfer".to_string(),
-                selector_hex: "0xa9059cbb".to_string(),
-                inputs: vec![
-                    AbiTypeSpec {
-                        kind: "address".to_string(),
-                        components: Vec::new(),
-                    },
-                    AbiTypeSpec {
-                        kind: "uint256".to_string(),
-                        components: Vec::new(),
-                    },
-                ],
-                outputs: vec![AbiTypeSpec {
-                    kind: "bool".to_string(),
-                    components: Vec::new(),
-                }],
-                state_mutability: "nonpayable".to_string(),
-            }],
-            preconditions: vec!["allowance_ok".to_string()],
-            postconditions: vec!["balance_delta_positive".to_string()],
-            risk_checks: vec!["max_notional".to_string()],
-        }],
-        constraints_json:
-            r#"{"max_calls":1,"max_total_value_wei":"100","template_budget_wei":"100"}"#.to_string(),
-        created_at_ns: 0,
-        updated_at_ns: 0,
-    }
+fn sample_recipe_json() -> String {
+    r#"{
+        "protocol": "erc20",
+        "primitive": "transfer",
+        "chain_id": 8453,
+        "template_id": "pocketic-strategy",
+        "contracts": [
+            {
+                "role": "token",
+                "address": "0x2222222222222222222222222222222222222222",
+                "abi_json": "[{\"type\":\"function\",\"name\":\"transfer\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"type\":\"address\"},{\"type\":\"uint256\"}],\"outputs\":[{\"type\":\"bool\"}]}]",
+                "source_ref": "https://example.com/token-abi"
+            }
+        ],
+        "actions": [
+            {
+                "action_id": "transfer",
+                "calls": [{ "role": "token", "function": "transfer" }],
+                "preconditions": ["allowance_ok"],
+                "postconditions": ["balance_delta_positive"],
+                "risk_checks": ["max_notional"]
+            }
+        ],
+        "max_value_wei_per_call": "100",
+        "template_budget_wei": "100"
+    }"#
+    .to_string()
 }
 
 #[test]
-fn strategy_control_plane_lifecycle_and_controller_gating_work_in_pocketic() {
+fn strategy_register_and_lifecycle_work_in_pocketic() {
     let (pic, canister_id) = with_backend_canister();
-    let template = sample_template();
-    let payload = encode_args((template,)).unwrap_or_else(|error| {
-        panic!("failed to encode ingest_strategy_template_admin args: {error}")
-    });
-    let ingested: Result<StrategyTemplate, String> =
-        call_update(&pic, canister_id, "ingest_strategy_template_admin", payload);
-    assert!(ingested.is_ok(), "template ingest failed: {ingested:?}");
 
-    let abi_payload = encode_args((StrategyAbiIngestArgs {
-        key: AbiArtifactKey {
-            protocol: sample_key().protocol.clone(),
-            chain_id: sample_key().chain_id,
-            role: "token".to_string(),
-        },
-        abi_json: r#"[{"type":"function","name":"transfer","stateMutability":"nonpayable","inputs":[{"type":"address"},{"type":"uint256"}],"outputs":[{"type":"bool"}]}]"#.to_string(),
-        source_ref: "https://example.com/token-abi".to_string(),
-        codehash: None,
-        selector_assertions: vec![AbiSelectorAssertion {
-            signature: "transfer(address,uint256)".to_string(),
-            selector_hex: "0xa9059cbb".to_string(),
-        }],
-    },))
-    .unwrap_or_else(|error| panic!("failed to encode ingest_strategy_abi_artifact_admin args: {error}"));
-    let abi_ingested: Result<AbiArtifact, String> = call_update(
-        &pic,
-        canister_id,
-        "ingest_strategy_abi_artifact_admin",
-        abi_payload,
+    // Register strategy from recipe (single call replaces ingest+ingest+activate)
+    let recipe_json = sample_recipe_json();
+    let payload = encode_args((recipe_json,))
+        .unwrap_or_else(|error| panic!("failed to encode register_strategy_admin args: {error}"));
+    let registered: Result<StrategyTemplate, String> =
+        call_update(&pic, canister_id, "register_strategy_admin", payload);
+    let template = registered.unwrap_or_else(|error| panic!("register failed: {error}"));
+    assert!(
+        matches!(template.status, TemplateStatus::Active),
+        "register_strategy_admin should auto-activate"
     );
-    assert!(abi_ingested.is_ok(), "abi ingest failed: {abi_ingested:?}");
+    assert_eq!(template.key, sample_key());
 
-    let activate_payload = encode_args((sample_key(), Some("activate".to_string())))
-        .unwrap_or_else(|error| {
-            panic!("failed to encode activate_strategy_template_admin args: {error}")
-        });
-    let activation: Result<TemplateActivationState, String> = call_update(
-        &pic,
-        canister_id,
-        "activate_strategy_template_admin",
-        activate_payload,
-    );
-    let activation = activation.unwrap_or_else(|error| panic!("activation failed: {error}"));
-    assert!(activation.enabled, "activation should be enabled");
-
+    // Verify template is listable and active
     let listed: Vec<StrategyTemplate> = call_query(
         &pic,
         canister_id,
@@ -318,9 +242,10 @@ fn strategy_control_plane_lifecycle_and_controller_gating_work_in_pocketic() {
     assert_eq!(listed.len(), 1, "strategy template should be listable");
     assert!(
         matches!(listed[0].status, TemplateStatus::Active),
-        "activate endpoint should promote status to Active"
+        "listed template should be Active"
     );
 
+    // Verify template is fetchable
     let fetched: Option<StrategyTemplate> = call_query(
         &pic,
         canister_id,
@@ -330,6 +255,7 @@ fn strategy_control_plane_lifecycle_and_controller_gating_work_in_pocketic() {
     let fetched = fetched.expect("strategy template should be fetchable");
     assert!(matches!(fetched.status, TemplateStatus::Active));
 
+    // Kill switch works
     let kill_payload =
         encode_args((sample_key(), true, Some("halt".to_string()))).unwrap_or_else(|error| {
             panic!("failed to encode set_strategy_kill_switch_admin args: {error}")
@@ -343,6 +269,7 @@ fn strategy_control_plane_lifecycle_and_controller_gating_work_in_pocketic() {
     let kill_state = kill_state.unwrap_or_else(|error| panic!("kill switch failed: {error}"));
     assert!(kill_state.enabled);
 
+    // Non-controller is rejected
     let outsider = Principal::self_authenticating(b"outsider-pocketic-strategy-controls");
     let outsider_payload = encode_args((sample_key(), false, Some("outsider".to_string())))
         .expect("failed to encode outsider kill-switch args");
@@ -357,5 +284,21 @@ fn strategy_control_plane_lifecycle_and_controller_gating_work_in_pocketic() {
         outsider_result,
         Err("caller is not a controller".to_string()),
         "non-controller should be rejected"
+    );
+
+    // Non-controller is rejected for register_strategy_admin too
+    let outsider_recipe =
+        encode_args((sample_recipe_json(),)).expect("failed to encode outsider recipe args");
+    let outsider_register: Result<StrategyTemplate, String> = call_update_as(
+        &pic,
+        canister_id,
+        outsider,
+        "register_strategy_admin",
+        outsider_recipe,
+    );
+    assert_eq!(
+        outsider_register,
+        Err("caller is not a controller".to_string()),
+        "non-controller should be rejected for register_strategy_admin"
     );
 }

@@ -21,27 +21,25 @@
 /// | `MAX_MEMORY_RECALL_RESULTS`     | 50     |
 /// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
-    AbiArtifactKey, AbiFunctionSpec, ActionSpec, AgentState, ContractRoleBinding, MemoryFact,
-    PromptLayer, StrategyExecutionIntent, StrategyTemplate, StrategyTemplateKey,
-    SurvivalOperationClass, TemplateActivationState, TemplateStatus, ToolCall, ToolCallOutcome,
-    ToolCallRecord,
+    AgentState, MemoryFact, PromptLayer, StrategyExecutionIntent, StrategyTemplateKey,
+    SurvivalOperationClass, ToolCall, ToolCallOutcome, ToolCallRecord, ToolFailureKind,
 };
 use crate::features::canister_call::canister_call_tool;
 use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool};
 use crate::features::evm::{evm_read_tool, send_eth_tool};
 use crate::features::http_fetch::http_fetch_tool;
+use crate::features::inference::canonicalize_tool_name;
 use crate::prompt;
 use crate::sanitize::contains_forbidden_prompt_layer_phrase;
 use crate::storage::{sqlite, stable};
-use crate::strategy::{abi, compiler, learner, registry, validator};
+use crate::strategy::{compiler, learner, registry, validator};
 use crate::timing::current_time_ns;
-use crate::util::normalize_evm_address;
 use alloy_primitives::U256;
 use async_trait::async_trait;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -56,16 +54,11 @@ const MAX_MEMORY_RECALL_RESULTS: usize = 50;
 const MAX_STRATEGY_TEMPLATE_RESULTS: usize = 50;
 /// Maximum number of rows returned by the `sql_query` tool.
 const MAX_SQL_QUERY_ROWS: usize = 100;
-/// Default call-count cap for agent-authored templates.
-const REGISTER_STRATEGY_DEFAULT_MAX_CALLS: usize = 5;
-/// Default per-call value cap for agent-authored templates (0.1 ETH in wei).
-const REGISTER_STRATEGY_DEFAULT_MAX_VALUE_WEI_PER_CALL: &str = "100000000000000000";
-/// Default lifetime template budget cap for agent-authored templates (1 ETH in wei).
-const REGISTER_STRATEGY_DEFAULT_TEMPLATE_BUDGET_WEI: &str = "1000000000000000000";
 /// Maximum character count for content written via `update_prompt_layer`.
 pub const MAX_PROMPT_LAYER_CONTENT_CHARS: usize = 4_000;
 /// Number of consecutive market endpoint failures before requiring re-discovery.
 const MARKET_ENDPOINT_STALE_FAILURE_THRESHOLD: u32 = 2;
+const MARKET_FETCH_RESPONSE_BYTES_DEFAULT: u64 = 64 * 1024;
 
 struct MarketEndpointProvider {
     id: &'static str,
@@ -90,6 +83,66 @@ const MARKET_ENDPOINT_PROVIDERS: &[MarketEndpointProvider] = &[
         hosts: &["api.coingecko.com", "coingecko.com", "www.coingecko.com"],
         default_origin: "https://api.coingecko.com",
         api_path_prefixes: &["/api/"],
+    },
+];
+
+struct MarketFetchEndpointSpec {
+    provider: &'static str,
+    endpoint: &'static str,
+    host: &'static str,
+    path_template: &'static str,
+    required_params: &'static [&'static str],
+    optional_params: &'static [&'static str],
+}
+
+const MARKET_FETCH_ENDPOINTS: &[MarketFetchEndpointSpec] = &[
+    MarketFetchEndpointSpec {
+        provider: "coingecko",
+        endpoint: "simple_price",
+        host: "api.coingecko.com",
+        path_template: "/api/v3/simple/price",
+        required_params: &["ids", "vs_currencies"],
+        optional_params: &["include_24hr_change"],
+    },
+    MarketFetchEndpointSpec {
+        provider: "coingecko",
+        endpoint: "coins_markets",
+        host: "api.coingecko.com",
+        path_template: "/api/v3/coins/markets",
+        required_params: &["vs_currency"],
+        optional_params: &["ids", "order", "per_page", "page"],
+    },
+    MarketFetchEndpointSpec {
+        provider: "coingecko",
+        endpoint: "token_price",
+        host: "api.coingecko.com",
+        path_template: "/api/v3/simple/token_price/{platform_id}",
+        required_params: &["platform_id", "contract_addresses", "vs_currencies"],
+        optional_params: &[],
+    },
+    MarketFetchEndpointSpec {
+        provider: "dexscreener",
+        endpoint: "search_pairs",
+        host: "api.dexscreener.com",
+        path_template: "/latest/dex/search",
+        required_params: &["q"],
+        optional_params: &[],
+    },
+    MarketFetchEndpointSpec {
+        provider: "dexscreener",
+        endpoint: "pair_by_address",
+        host: "api.dexscreener.com",
+        path_template: "/latest/dex/pairs/{chain_id}/{pair_id}",
+        required_params: &["chain_id", "pair_id"],
+        optional_params: &[],
+    },
+    MarketFetchEndpointSpec {
+        provider: "dexscreener",
+        endpoint: "token_pairs",
+        host: "api.dexscreener.com",
+        path_template: "/token-pairs/v1/{chain_id}/{token_address}",
+        required_params: &["chain_id", "token_address"],
+        optional_params: &[],
     },
 ];
 
@@ -157,6 +210,116 @@ fn classify_execute_strategy_action_failure(error: &str) -> SurvivalOperationCla
     SurvivalOperationClass::EvmPoll
 }
 
+fn classify_tool_failure_kind(tool: &str, error: &str) -> ToolFailureKind {
+    let normalized = error.trim().to_ascii_lowercase();
+    match tool {
+        "evm_read" => classify_evm_read_failure_kind(&normalized),
+        "remember" => classify_remember_failure_kind(&normalized),
+        "market_fetch" => classify_market_fetch_failure_kind(&normalized),
+        "http_fetch" => classify_http_fetch_failure_kind(&normalized),
+        "list_strategy_templates" => classify_list_strategy_templates_failure_kind(&normalized),
+        _ => ToolFailureKind::InternalFailure,
+    }
+}
+
+fn classify_evm_read_failure_kind(normalized_error: &str) -> ToolFailureKind {
+    if normalized_error.starts_with("invalid evm_read args json:")
+        || normalized_error.starts_with("invalid evm_read address:")
+        || normalized_error.starts_with("address is required for eth_")
+        || normalized_error == "calldata is required for eth_call"
+        || normalized_error.starts_with("evm_read method must be one of")
+        || normalized_error.starts_with("invalid params_json for eth_")
+        || normalized_error.starts_with("params_json for eth_")
+        || normalized_error.starts_with("params_json[0] for eth_")
+        || normalized_error.starts_with("conflicting address values for eth_")
+        || normalized_error.starts_with("conflicting calldata values for eth_")
+        || normalized_error.starts_with("calldata ")
+    {
+        return ToolFailureKind::MalformedInput;
+    }
+    if normalized_error.contains("rpc")
+        || normalized_error.contains("http ")
+        || normalized_error.contains("outcall")
+        || normalized_error.contains("timed out")
+        || normalized_error.contains("transport")
+        || normalized_error.contains("status ")
+    {
+        return ToolFailureKind::OutcallFailure;
+    }
+    ToolFailureKind::InternalFailure
+}
+
+fn classify_remember_failure_kind(normalized_error: &str) -> ToolFailureKind {
+    if normalized_error.starts_with("invalid remember args json:")
+        || normalized_error.starts_with("missing required field: key")
+        || normalized_error.starts_with("missing required field: value")
+        || normalized_error == "remember value must be a json scalar"
+        || normalized_error.starts_with("key must be 1-")
+        || normalized_error.starts_with("key cannot be empty")
+        || normalized_error.starts_with("key must be at most ")
+        || normalized_error.starts_with("key must not contain control characters")
+        || normalized_error.starts_with("value must be at most ")
+    {
+        return ToolFailureKind::MalformedInput;
+    }
+    ToolFailureKind::InternalFailure
+}
+
+fn classify_market_fetch_failure_kind(normalized_error: &str) -> ToolFailureKind {
+    if normalized_error.starts_with("invalid market_fetch args json:")
+        || normalized_error.starts_with("missing required field:")
+        || normalized_error.starts_with("missing required param:")
+        || normalized_error.starts_with("unsupported market endpoint")
+        || normalized_error.starts_with("unsupported param")
+        || normalized_error.starts_with("invalid param")
+        || normalized_error.starts_with("missing required path param:")
+        || normalized_error.starts_with("invalid market endpoint template:")
+        || normalized_error.starts_with("market endpoint discovery required for provider")
+        || normalized_error.starts_with("invalid market-data url")
+        || normalized_error.contains("domain not in allowlist")
+    {
+        return ToolFailureKind::MalformedInput;
+    }
+    if normalized_error.starts_with("http fetch failed:")
+        || normalized_error.starts_with("http ")
+        || normalized_error.starts_with("json_path extraction failed:")
+        || normalized_error.starts_with("regex extraction failed:")
+    {
+        return ToolFailureKind::OutcallFailure;
+    }
+    ToolFailureKind::InternalFailure
+}
+
+fn classify_http_fetch_failure_kind(normalized_error: &str) -> ToolFailureKind {
+    if normalized_error.starts_with("invalid http_fetch args json:")
+        || normalized_error == "missing required field: url"
+        || normalized_error == "only https urls are allowed"
+        || normalized_error == "could not parse host"
+        || normalized_error == "user info is not allowed in url"
+        || normalized_error == "ipv6 hosts are not supported"
+        || normalized_error == "host is invalid"
+        || normalized_error.contains("domain not in allowlist")
+        || normalized_error.starts_with("invalid market-data url")
+    {
+        return ToolFailureKind::MalformedInput;
+    }
+    if normalized_error.starts_with("http fetch failed:")
+        || normalized_error.starts_with("http ")
+        || normalized_error.starts_with("json_path extraction failed:")
+        || normalized_error.starts_with("regex extraction failed:")
+    {
+        return ToolFailureKind::OutcallFailure;
+    }
+    ToolFailureKind::InternalFailure
+}
+
+fn classify_list_strategy_templates_failure_kind(normalized_error: &str) -> ToolFailureKind {
+    if normalized_error.starts_with("invalid list_strategy_templates args json:") {
+        return ToolFailureKind::MalformedInput;
+    }
+    ToolFailureKind::InternalFailure
+}
+
 /// Read-only tools that are safe to co-schedule inside a contiguous batch.
 ///
 /// `evm_read` and `http_fetch` are included for latency reduction, but each batch
@@ -173,13 +336,14 @@ fn is_parallel_read_only_tool(tool: &str) -> bool {
             | "get_strategy_outcomes"
             | "evm_read"
             | "http_fetch"
+            | "market_fetch"
     )
 }
 
 #[derive(Default)]
 struct ParallelBatchState {
     has_evm_read: bool,
-    has_http_fetch: bool,
+    has_http_like_fetch: bool,
 }
 
 fn can_add_to_parallel_batch(state: &ParallelBatchState, tool: &str) -> bool {
@@ -188,7 +352,7 @@ fn can_add_to_parallel_batch(state: &ParallelBatchState, tool: &str) -> bool {
     }
     match tool {
         "evm_read" => !state.has_evm_read,
-        "http_fetch" => !state.has_http_fetch,
+        "http_fetch" | "market_fetch" => !state.has_http_like_fetch,
         _ => true,
     }
 }
@@ -196,7 +360,7 @@ fn can_add_to_parallel_batch(state: &ParallelBatchState, tool: &str) -> bool {
 fn mark_tool_in_parallel_batch(state: &mut ParallelBatchState, tool: &str) {
     match tool {
         "evm_read" => state.has_evm_read = true,
-        "http_fetch" => state.has_http_fetch = true,
+        "http_fetch" | "market_fetch" => state.has_http_like_fetch = true,
         _ => {}
     }
 }
@@ -380,6 +544,13 @@ impl ToolManager {
         );
         policies.insert(
             "http_fetch".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "market_fetch".to_string(),
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
@@ -574,18 +745,21 @@ impl ToolManager {
         broadcaster: Option<&dyn EvmBroadcastPort>,
         turn_id: &str,
     ) -> ToolCallRecord {
-        let policy = match self.policies.get(&call.tool) {
+        let mut normalized_call = call.clone();
+        normalized_call.tool = canonicalize_tool_name(&normalized_call.tool);
+
+        let policy = match self.policies.get(&normalized_call.tool) {
             Some(policy) => policy,
-            None => return Self::unknown_tool_record(call, turn_id),
+            None => return Self::unknown_tool_record(&normalized_call, turn_id),
         };
         if !policy.enabled || !policy.allowed_states.contains(state) {
-            return Self::blocked_tool_record(call, turn_id);
+            return Self::blocked_tool_record(&normalized_call, turn_id);
         }
 
         let result = self
-            .dispatch_tool_call(call, signer, broadcaster, turn_id)
+            .dispatch_tool_call(&normalized_call, signer, broadcaster, turn_id)
             .await;
-        Self::record_for_result(call, turn_id, result)
+        Self::record_for_result(&normalized_call, turn_id, result)
     }
 
     fn unknown_tool_record(call: &ToolCall, turn_id: &str) -> ToolCallRecord {
@@ -597,6 +771,7 @@ impl ToolManager {
             success: false,
             outcome: ToolCallOutcome::Executed,
             error: Some("unknown tool".to_string()),
+            failure_kind: Some(ToolFailureKind::InternalFailure),
         }
     }
 
@@ -609,6 +784,7 @@ impl ToolManager {
             success: false,
             outcome: ToolCallOutcome::Executed,
             error: Some("tool blocked".to_string()),
+            failure_kind: Some(ToolFailureKind::InternalFailure),
         }
     }
 
@@ -626,16 +802,21 @@ impl ToolManager {
                 success: true,
                 outcome: ToolCallOutcome::Executed,
                 error: None,
+                failure_kind: None,
             },
-            Err(error) => ToolCallRecord {
-                turn_id: turn_id.to_string(),
-                tool: call.tool.clone(),
-                args_json: call.args_json.clone(),
-                output: "tool execution failed".to_string(),
-                success: false,
-                outcome: ToolCallOutcome::Executed,
-                error: Some(error),
-            },
+            Err(error) => {
+                let failure_kind = classify_tool_failure_kind(&call.tool, &error);
+                ToolCallRecord {
+                    turn_id: turn_id.to_string(),
+                    tool: call.tool.clone(),
+                    args_json: call.args_json.clone(),
+                    output: "tool execution failed".to_string(),
+                    success: false,
+                    outcome: ToolCallOutcome::Executed,
+                    error: Some(error),
+                    failure_kind: Some(failure_kind),
+                }
+            }
         }
     }
 
@@ -704,6 +885,22 @@ impl ToolManager {
             "forget" => forget_fact_tool(&call.args_json),
             "http_fetch" => {
                 let prepared = prepare_market_http_fetch_args(&call.args_json)?;
+                let result = http_fetch_tool(&prepared.effective_args_json).await;
+                if result.is_ok() {
+                    if let Some((endpoint_key, endpoint_origin)) = prepared.endpoint_fact {
+                        let _ =
+                            persist_market_endpoint_fact(&endpoint_key, &endpoint_origin, turn_id);
+                    }
+                    if let Some(handshake) = prepared.handshake.as_ref() {
+                        let _ = persist_market_fetch_handshake_success(handshake, turn_id);
+                    }
+                } else if let Some(handshake) = prepared.handshake.as_ref() {
+                    let _ = record_market_fetch_handshake_failure(handshake, turn_id);
+                }
+                result
+            }
+            "market_fetch" => {
+                let prepared = prepare_market_fetch_http_fetch_args(&call.args_json)?;
                 let result = http_fetch_tool(&prepared.effective_args_json).await;
                 if result.is_ok() {
                     if let Some((endpoint_key, endpoint_origin)) = prepared.endpoint_fact {
@@ -801,7 +998,12 @@ impl ToolManager {
                     let result = evm_read_tool(&call.args_json).await;
                     if result.is_ok() {
                         stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
-                    } else {
+                    } else if result
+                        .as_ref()
+                        .err()
+                        .map(|error| classify_tool_failure_kind("evm_read", error))
+                        == Some(ToolFailureKind::OutcallFailure)
+                    {
                         stable::record_survival_operation_failure(
                             &SurvivalOperationClass::EvmPoll,
                             now_ns,
@@ -955,6 +1157,183 @@ fn parse_sign_message_args(args_json: &str) -> Result<String, String> {
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .ok_or_else(|| "missing required field: message_hash".to_string())
+}
+
+fn prepare_market_fetch_http_fetch_args(
+    args_json: &str,
+) -> Result<PreparedMarketHttpFetchArgs, String> {
+    let value: serde_json::Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid market_fetch args json: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "invalid market_fetch args json: expected object".to_string())?;
+
+    let provider = object
+        .get("provider")
+        .and_then(|entry| entry.as_str())
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .ok_or_else(|| "missing required field: provider".to_string())?;
+    let endpoint = object
+        .get("endpoint")
+        .and_then(|entry| entry.as_str())
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .ok_or_else(|| "missing required field: endpoint".to_string())?;
+
+    let spec = MARKET_FETCH_ENDPOINTS
+        .iter()
+        .find(|entry| entry.provider == provider && entry.endpoint == endpoint)
+        .ok_or_else(|| {
+            let mut known = MARKET_FETCH_ENDPOINTS
+                .iter()
+                .map(|entry| format!("{}:{}", entry.provider, entry.endpoint))
+                .collect::<Vec<_>>();
+            known.sort_unstable();
+            known.dedup();
+            format!(
+                "unsupported market endpoint `{provider}:{endpoint}`; expected one of [{}]",
+                known.join(", ")
+            )
+        })?;
+
+    let params = object
+        .get("params")
+        .and_then(|entry| entry.as_object())
+        .ok_or_else(|| "missing required field: params".to_string())?;
+
+    let mut param_values = BTreeMap::<String, String>::new();
+    for (key, value) in params {
+        let normalized_key = resolve_market_fetch_param_alias(&provider, &endpoint, params, key);
+        let normalized = normalize_market_fetch_param_value(normalized_key, value)?;
+        param_values.insert(normalized_key.to_string(), normalized);
+    }
+
+    for required in spec.required_params {
+        if !param_values.contains_key(*required) {
+            return Err(format!("missing required param: {required}"));
+        }
+    }
+    for key in param_values.keys() {
+        let allowed = spec.required_params.contains(&key.as_str())
+            || spec.optional_params.contains(&key.as_str());
+        if !allowed {
+            return Err(format!(
+                "unsupported param `{key}` for {provider}:{endpoint}"
+            ));
+        }
+    }
+
+    let mut suffix = spec.path_template.to_string();
+    for required in spec.required_params {
+        let placeholder = format!("{{{required}}}");
+        if suffix.contains(&placeholder) {
+            let value = param_values
+                .get(*required)
+                .ok_or_else(|| format!("missing required path param: {required}"))?;
+            suffix = suffix.replace(&placeholder, &percent_encode_market_component(value));
+        }
+    }
+    if suffix.contains('{') || suffix.contains('}') {
+        return Err("invalid market endpoint template: unresolved path placeholder".to_string());
+    }
+
+    let query_pairs = param_values
+        .iter()
+        .filter(|(key, _)| !spec.path_template.contains(&format!("{{{key}}}")))
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                percent_encode_market_component(key),
+                percent_encode_market_component(value)
+            )
+        })
+        .collect::<Vec<_>>();
+    let query = if query_pairs.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query_pairs.join("&"))
+    };
+
+    let url = format!("https://{}{}{}", spec.host, suffix, query);
+    let mut http_fetch_args = serde_json::Map::new();
+    http_fetch_args.insert("url".to_string(), serde_json::Value::String(url));
+    if let Some(extract) = object.get("extract") {
+        http_fetch_args.insert("extract".to_string(), extract.clone());
+    }
+    let max_response_bytes = object
+        .get("max_response_bytes")
+        .and_then(|entry| entry.as_u64())
+        .unwrap_or(MARKET_FETCH_RESPONSE_BYTES_DEFAULT)
+        .min(512 * 1024);
+    http_fetch_args.insert(
+        "max_response_bytes".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(max_response_bytes)),
+    );
+
+    let effective_args_json = serde_json::Value::Object(http_fetch_args).to_string();
+    prepare_market_http_fetch_args(&effective_args_json)
+}
+
+fn resolve_market_fetch_param_alias<'a>(
+    provider: &str,
+    endpoint: &str,
+    params: &'a serde_json::Map<String, serde_json::Value>,
+    key: &'a str,
+) -> &'a str {
+    let Some(canonical_key) = market_fetch_param_alias(provider, endpoint, key) else {
+        return key;
+    };
+    if params.contains_key(canonical_key) {
+        return key;
+    }
+    canonical_key
+}
+
+fn market_fetch_param_alias(provider: &str, endpoint: &str, key: &str) -> Option<&'static str> {
+    match (provider, endpoint, key) {
+        ("dexscreener", "search_pairs", "query") => Some("q"),
+        ("dexscreener", _, "chainId") => Some("chain_id"),
+        _ => None,
+    }
+}
+
+fn normalize_market_fetch_param_value(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<String, String> {
+    let raw = match value {
+        serde_json::Value::String(text) => text.trim().to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Bool(boolean) => boolean.to_string(),
+        _ => {
+            return Err(format!(
+                "invalid param `{key}`: expected string/number/bool scalar"
+            ))
+        }
+    };
+    if raw.is_empty() {
+        return Err(format!("invalid param `{key}`: value must not be empty"));
+    }
+    if raw.len() > 256 {
+        return Err(format!("invalid param `{key}`: value exceeds 256 chars"));
+    }
+    Ok(raw)
+}
+
+fn percent_encode_market_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        let is_unreserved =
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        if is_unreserved {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", byte));
+        }
+    }
+    out
 }
 
 struct PreparedMarketHttpFetchArgs {
@@ -1691,47 +2070,7 @@ struct StrategyIntentArgs {
     typed_params: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct StrategyRecipe {
-    protocol: String,
-    primitive: String,
-    chain_id: u64,
-    template_id: String,
-    contracts: Vec<StrategyRecipeContract>,
-    actions: Vec<StrategyRecipeAction>,
-    #[serde(default)]
-    max_value_wei_per_call: Option<String>,
-    #[serde(default)]
-    template_budget_wei: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StrategyRecipeContract {
-    role: String,
-    address: String,
-    abi_json: String,
-    source_ref: String,
-    #[serde(default)]
-    codehash: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StrategyRecipeAction {
-    action_id: String,
-    calls: Vec<StrategyRecipeActionCall>,
-    #[serde(default)]
-    preconditions: Vec<String>,
-    postconditions: Vec<String>,
-    #[serde(default)]
-    risk_checks: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StrategyRecipeActionCall {
-    role: String,
-    #[serde(rename = "function")]
-    function_name: String,
-}
+use crate::strategy::registry::StrategyRecipe;
 
 /// Parse args for `list_strategy_templates`; all fields are optional.
 fn parse_list_strategy_templates_args(
@@ -1803,229 +2142,29 @@ fn list_strategy_templates_tool(args_json: &str) -> Result<String, String> {
         .map_err(|error| format!("failed to serialize templates: {error}"))
 }
 
-struct ResolvedRecipeContract {
-    binding: ContractRoleBinding,
-    functions_by_name: HashMap<String, Vec<AbiFunctionSpec>>,
-}
-
-fn normalize_required_recipe_field(raw: &str, field: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(format!("{field} must be non-empty"));
-    }
-    Ok(trimmed.to_string())
-}
-
-fn normalize_optional_check_list(values: Vec<String>) -> Vec<String> {
-    values
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect()
-}
-
-fn normalize_required_check_list(values: Vec<String>, field: &str) -> Result<Vec<String>, String> {
-    let normalized = normalize_optional_check_list(values);
-    if normalized.is_empty() {
-        return Err(format!("{field} must contain at least one non-empty entry"));
-    }
-    Ok(normalized)
-}
-
-fn normalize_recipe_decimal(raw: &str, field: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    parse_u256_decimal(trimmed)
-        .map_err(|error| format!("{field} must be a decimal string: {error}"))?;
-    Ok(trimmed.to_string())
-}
-
 /// Register an agent-authored strategy recipe, validate via dry-run compile, then activate it.
 fn register_strategy_tool(args_json: &str) -> Result<String, String> {
     let recipe = parse_register_strategy_args(args_json)?;
-    let protocol = normalize_required_recipe_field(&recipe.protocol, "protocol")?;
-    let primitive = normalize_required_recipe_field(&recipe.primitive, "primitive")?;
-    let template_id = normalize_required_recipe_field(&recipe.template_id, "template_id")?;
-    if recipe.chain_id == 0 {
-        return Err("chain_id must be greater than zero".to_string());
-    }
-    if recipe.contracts.is_empty() {
-        return Err("contracts must contain at least one entry".to_string());
-    }
-    if recipe.actions.is_empty() {
-        return Err("actions must contain at least one entry".to_string());
-    }
-
-    let key = StrategyTemplateKey {
-        protocol,
-        primitive,
-        chain_id: recipe.chain_id,
-        template_id,
-    };
-    let now_ns = current_time_ns();
     log!(
         StrategyToolLogPriority::Info,
         "strategy_register_start protocol={} primitive={} template_id={} chain_id={}",
-        key.protocol,
-        key.primitive,
-        key.template_id,
-        key.chain_id
+        recipe.protocol,
+        recipe.primitive,
+        recipe.template_id,
+        recipe.chain_id
     );
-
-    let mut resolved_contracts: HashMap<String, ResolvedRecipeContract> = HashMap::new();
-    for contract in recipe.contracts {
-        let role = normalize_required_recipe_field(&contract.role, "contracts.role")?;
-        if resolved_contracts.contains_key(&role) {
-            return Err(format!("duplicate contract role in recipe: {role}"));
-        }
-        let address = normalize_evm_address(&contract.address)?;
-        let source_ref =
-            normalize_required_recipe_field(&contract.source_ref, "contracts.source_ref")?;
-        let artifact_key = AbiArtifactKey {
-            protocol: key.protocol.clone(),
-            chain_id: key.chain_id,
-            role: role.clone(),
-        };
-        let artifact = abi::normalize_abi_artifact(
-            artifact_key,
-            &contract.abi_json,
-            &source_ref,
-            contract.codehash.clone(),
-            &[],
-            now_ns,
-        )?;
-        let artifact = registry::upsert_abi_artifact(artifact)?;
-        let mut functions_by_name: HashMap<String, Vec<AbiFunctionSpec>> = HashMap::new();
-        for function in artifact.functions {
-            functions_by_name
-                .entry(function.name.clone())
-                .or_default()
-                .push(function);
-        }
-        resolved_contracts.insert(
-            role.clone(),
-            ResolvedRecipeContract {
-                binding: ContractRoleBinding {
-                    role,
-                    address,
-                    source_ref,
-                    codehash: contract.codehash,
-                },
-                functions_by_name,
-            },
-        );
-    }
-
-    let mut actions = Vec::with_capacity(recipe.actions.len());
-    for action in recipe.actions {
-        let action_id = normalize_required_recipe_field(&action.action_id, "actions.action_id")?;
-        if action.calls.is_empty() {
-            return Err(format!(
-                "action `{action_id}` must contain at least one call"
-            ));
-        }
-        let mut call_sequence = Vec::with_capacity(action.calls.len());
-        for call in action.calls {
-            let role = normalize_required_recipe_field(&call.role, "actions.calls.role")?;
-            let function_name =
-                normalize_required_recipe_field(&call.function_name, "actions.calls.function")?;
-            let resolved = resolved_contracts
-                .get(&role)
-                .ok_or_else(|| format!("action `{action_id}` references unknown role `{role}`"))?;
-            let Some(candidates) = resolved.functions_by_name.get(&function_name) else {
-                return Err(format!(
-                    "action `{action_id}` function `{function_name}` not found in ABI for role `{role}`"
-                ));
-            };
-            if candidates.len() > 1 {
-                return Err(format!(
-                    "action `{action_id}` function `{function_name}` is overloaded in role `{role}` ABI; provide a non-overloaded function"
-                ));
-            }
-            let function = candidates
-                .first()
-                .cloned()
-                .ok_or_else(|| "recipe function lookup failed unexpectedly".to_string())?;
-            abi::verify_function_selector(&function).map_err(|error| {
-                format!(
-                    "invalid selector for action `{action_id}` role `{role}` function `{function_name}`: {error}"
-                )
-            })?;
-            call_sequence.push(function);
-        }
-        actions.push(ActionSpec {
-            action_id,
-            call_sequence,
-            preconditions: normalize_optional_check_list(action.preconditions),
-            postconditions: normalize_required_check_list(
-                action.postconditions,
-                "actions.postconditions",
-            )?,
-            risk_checks: normalize_optional_check_list(action.risk_checks),
-        });
-    }
-
-    let mut contract_roles = resolved_contracts
-        .into_values()
-        .map(|resolved| resolved.binding)
-        .collect::<Vec<_>>();
-    contract_roles.sort_by(|left, right| left.role.cmp(&right.role));
-
-    let max_value_wei_per_call = normalize_recipe_decimal(
-        recipe
-            .max_value_wei_per_call
-            .as_deref()
-            .unwrap_or(REGISTER_STRATEGY_DEFAULT_MAX_VALUE_WEI_PER_CALL),
-        "max_value_wei_per_call",
-    )?;
-    let template_budget_wei = normalize_recipe_decimal(
-        recipe
-            .template_budget_wei
-            .as_deref()
-            .unwrap_or(REGISTER_STRATEGY_DEFAULT_TEMPLATE_BUDGET_WEI),
-        "template_budget_wei",
-    )?;
-    let constraints_json = serde_json::json!({
-        "max_calls": REGISTER_STRATEGY_DEFAULT_MAX_CALLS,
-        "max_value_wei_per_call": max_value_wei_per_call,
-        "max_total_value_wei": max_value_wei_per_call,
-        "template_budget_wei": template_budget_wei,
-    })
-    .to_string();
-
-    let stored_draft = registry::upsert_template(StrategyTemplate {
-        key: key.clone(),
-        status: TemplateStatus::Draft,
-        contract_roles,
-        actions,
-        constraints_json,
-        created_at_ns: now_ns,
-        updated_at_ns: now_ns,
-    })?;
-
-    compiler::dry_run_compile(&key)?;
-
-    let activated_template = registry::upsert_template(StrategyTemplate {
-        status: TemplateStatus::Active,
-        updated_at_ns: current_time_ns(),
-        ..stored_draft
-    })?;
-    let activation = registry::set_activation(TemplateActivationState {
-        key,
-        enabled: true,
-        updated_at_ns: current_time_ns(),
-        reason: Some("register_strategy auto-activated after dry-run compile".to_string()),
-    })?;
+    let result = registry::register_from_recipe(recipe)?;
     log!(
         StrategyToolLogPriority::Info,
         "strategy_register_ok protocol={} primitive={} template_id={} chain_id={}",
-        activated_template.key.protocol,
-        activated_template.key.primitive,
-        activated_template.key.template_id,
-        activated_template.key.chain_id
+        result.template.key.protocol,
+        result.template.key.primitive,
+        result.template.key.template_id,
+        result.template.key.chain_id
     );
     serde_json::to_string(&serde_json::json!({
-        "template": activated_template,
-        "activation": activation,
+        "template": result.template,
+        "activation": result.activation,
     }))
     .map_err(|error| format!("failed to serialize register_strategy result: {error}"))
 }
@@ -2310,7 +2449,7 @@ mod tests {
     use crate::domain::types::{
         AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, AgentState,
         ContractRoleBinding, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
-        SurvivalTier, TemplateActivationState, TemplateStatus,
+        SurvivalTier, TemplateActivationState, TemplateStatus, ToolFailureKind,
     };
     use crate::features::cycle_topup::TopUpStage;
     use crate::storage::stable;
@@ -2484,6 +2623,46 @@ mod tests {
     }
 
     #[test]
+    fn tool_manager_dispatch_accepts_whitespace_wrapped_tool_name() {
+        stable::init_storage();
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "  ReCord_Signal  ".to_string(),
+            args_json: "{}".to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success);
+        assert_eq!(records[0].tool, "record_signal");
+        assert_eq!(records[0].output, "recorded");
+    }
+
+    #[test]
+    fn tool_manager_dispatch_still_fails_for_unknown_tool_name() {
+        stable::init_storage();
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "  definitely_unknown_tool  ".to_string(),
+            args_json: "{}".to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert_eq!(records[0].tool, "definitely_unknown_tool");
+        assert_eq!(records[0].error.as_deref(), Some("unknown tool"));
+    }
+
+    #[test]
     fn sign_tool_is_blocked_when_survival_policy_blocks_threshold_sign() {
         let _time_guard = with_fixed_time_ns(1);
         stable::init_storage();
@@ -2618,6 +2797,68 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].success);
         assert!(records[0].output.contains("0x"));
+    }
+
+    #[test]
+    fn evm_read_local_validation_error_does_not_increment_survival_failure() {
+        let _time_guard = with_fixed_time_ns(1_000_000_000);
+        stable::init_storage();
+        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+        stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
+
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "evm_read".to_string(),
+            args_json: r#"{"method":"eth_getBalance"}"#.to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert_eq!(
+            records[0].failure_kind,
+            Some(ToolFailureKind::MalformedInput)
+        );
+        assert_eq!(
+            stable::survival_operation_consecutive_failures(&SurvivalOperationClass::EvmPoll),
+            0
+        );
+    }
+
+    #[test]
+    fn evm_read_rpc_failure_still_increments_survival_failure() {
+        let _time_guard = with_fixed_time_ns(1_000_000_000);
+        stable::init_storage();
+        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+        stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "evm_read".to_string(),
+            args_json: r#"{"method":"eth_getProof","params_json":"[]"}"#.to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert_eq!(
+            records[0].failure_kind,
+            Some(ToolFailureKind::OutcallFailure)
+        );
+        assert_eq!(
+            stable::survival_operation_consecutive_failures(&SurvivalOperationClass::EvmPoll),
+            1
+        );
     }
 
     #[test]
@@ -2839,25 +3080,25 @@ mod tests {
             constraints
                 .get("max_calls")
                 .and_then(|value| value.as_u64()),
-            Some(REGISTER_STRATEGY_DEFAULT_MAX_CALLS as u64)
+            Some(registry::RECIPE_DEFAULT_MAX_CALLS as u64)
         );
         assert_eq!(
             constraints
                 .get("max_value_wei_per_call")
                 .and_then(|value| value.as_str()),
-            Some(REGISTER_STRATEGY_DEFAULT_MAX_VALUE_WEI_PER_CALL)
+            Some(registry::RECIPE_DEFAULT_MAX_VALUE_WEI_PER_CALL)
         );
         assert_eq!(
             constraints
                 .get("max_total_value_wei")
                 .and_then(|value| value.as_str()),
-            Some(REGISTER_STRATEGY_DEFAULT_MAX_VALUE_WEI_PER_CALL)
+            Some(registry::RECIPE_DEFAULT_MAX_VALUE_WEI_PER_CALL)
         );
         assert_eq!(
             constraints
                 .get("template_budget_wei")
                 .and_then(|value| value.as_str()),
-            Some(REGISTER_STRATEGY_DEFAULT_TEMPLATE_BUDGET_WEI)
+            Some(registry::RECIPE_DEFAULT_TEMPLATE_BUDGET_WEI)
         );
     }
 
@@ -3654,6 +3895,106 @@ mod tests {
         assert!(records[1].success);
         assert!(records[2].success);
         assert_eq!(records[2].output, "no facts found");
+    }
+
+    #[test]
+    fn market_fetch_alias_query_maps_to_q_for_search_pairs() {
+        stable::init_storage();
+        let prepared = prepare_market_fetch_http_fetch_args(
+            &serde_json::json!({
+                "provider": "dexscreener",
+                "endpoint": "search_pairs",
+                "params": {
+                    "query": "eth"
+                },
+                "extract": {
+                    "mode": "json_path",
+                    "path": "$.pairs[0]"
+                }
+            })
+            .to_string(),
+        )
+        .expect("query alias should normalize to q");
+
+        let payload: serde_json::Value = serde_json::from_str(&prepared.effective_args_json)
+            .expect("prepared args should be valid json");
+        let url = payload
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("prepared args should include url");
+        assert!(url.contains("/latest/dex/search?q=eth"));
+    }
+
+    #[test]
+    fn market_fetch_alias_chain_id_maps_from_camel_case() {
+        stable::init_storage();
+        let prepared = prepare_market_fetch_http_fetch_args(
+            &serde_json::json!({
+                "provider": "dexscreener",
+                "endpoint": "pair_by_address",
+                "params": {
+                    "chainId": "base",
+                    "pair_id": "0x1234"
+                },
+                "extract": {
+                    "mode": "regex",
+                    "pattern": "stub"
+                }
+            })
+            .to_string(),
+        )
+        .expect("chainId alias should normalize to chain_id");
+
+        let payload: serde_json::Value = serde_json::from_str(&prepared.effective_args_json)
+            .expect("prepared args should be valid json");
+        let url = payload
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("prepared args should include url");
+        assert!(url.contains("/latest/dex/pairs/base/0x1234"));
+    }
+
+    #[test]
+    fn market_fetch_rejects_semantic_non_equivalent_alias_include_24hr_vol() {
+        let result = prepare_market_fetch_http_fetch_args(
+            &serde_json::json!({
+                "provider": "coingecko",
+                "endpoint": "simple_price",
+                "params": {
+                    "ids": "ethereum",
+                    "vs_currencies": "usd",
+                    "include_24hr_vol": true
+                }
+            })
+            .to_string(),
+        );
+        assert!(
+            result.is_err(),
+            "non-equivalent alias should stay unsupported"
+        );
+        let error = result.err().unwrap_or_default();
+        assert!(error.contains("unsupported param `include_24hr_vol`"));
+    }
+
+    #[test]
+    fn market_fetch_rejects_unsupported_param_after_alias_normalization() {
+        let result = prepare_market_fetch_http_fetch_args(
+            &serde_json::json!({
+                "provider": "dexscreener",
+                "endpoint": "search_pairs",
+                "params": {
+                    "query": "eth",
+                    "unexpected": "value"
+                }
+            })
+            .to_string(),
+        );
+        assert!(
+            result.is_err(),
+            "unsupported params should still fail after alias normalization"
+        );
+        let error = result.err().unwrap_or_default();
+        assert!(error.contains("unsupported param `unexpected`"));
     }
 
     #[test]

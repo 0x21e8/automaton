@@ -1,56 +1,40 @@
 # Base Morpho USDC Carry (`base-usdc-carry-cbbtc-01`)
 
-This folder turns a draft strategy into an executable strategy payload bundle.
+Example strategy registered via a single recipe JSON.
 
 ## Files
 
-- `strategy-template.json`
-- `abi-artifact-morpho.json`
-- `activate-template.json`
-- `simulate-enter_supply.json`
-- `simulate-exit_supply.json`
-- `execute-enter_supply.json`
-- `execute-exit_supply.json`
+- `recipe.json` — strategy recipe (register via `register_strategy_admin` or agent `register_strategy` tool)
+- `simulate-enter_supply.json` — simulation payload for `simulate_strategy_action`
+- `simulate-exit_supply.json` — simulation payload for `simulate_strategy_action`
+- `execute-enter_supply.json` — execution payload for `execute_strategy_action`
+- `execute-exit_supply.json` — execution payload for `execute_strategy_action`
 
 ## End-to-End Sequence
 
-1. Ingest template as draft:
-- method: `ingest_strategy_template_admin`
-- args: `strategy-template.json`
+1. Register strategy (one call does everything — ABI ingestion, template creation, dry-run compile, activation):
 
-2. Ingest ABI artifact:
-- method: `ingest_strategy_abi_artifact_admin`
-- args: `abi-artifact-morpho.json`
+```bash
+icp canister call backend register_strategy_admin "$(cat recipe.json)"
+```
 
-3. Activate template (runs canary probe):
-- method: `activate_strategy_template_admin`
-- args: `key`, `version`, `reason` from `activate-template.json`
-
-4. Validate before live txs:
+2. Simulate before live execution:
 - tool: `simulate_strategy_action`
-- args: `simulate-enter_supply.json` and/or `simulate-exit_supply.json`
-- expect: `validation.passed == true`
+- args: `simulate-enter_supply.json` or `simulate-exit_supply.json`
 
-5. Execute when simulation passes:
+3. Execute when simulation passes:
 - tool: `execute_strategy_action`
 - args: `execute-enter_supply.json` or `execute-exit_supply.json`
 
-6. Monitor outcomes:
+4. Monitor outcomes:
 - query: `get_strategy_outcome_stats`
 - tool: `get_strategy_outcomes`
 
-7. Emergency halt (if needed):
+5. Emergency halt (if needed):
 - method: `set_strategy_kill_switch_admin(key, true, reason)`
-
-## Required Runtime Preconditions
-
-- `evm_chain_id` is `8453`
-- `evm_rpc_url` is configured and reachable
-- automaton EVM address is derived (for execution)
-- caller is a canister controller (for admin methods)
 
 ## Notes
 
-- `required_postconditions` are template-wide. Keep them shared across actions.
-- `typed_params.calls[*].args` for tuple ABI inputs must be JSON arrays in exact component order.
 - Replace `0x1111...1111` placeholders in simulate/execute payloads with the automaton EVM address.
+- `typed_params.calls[*].args` for tuple ABI inputs must be JSON arrays in exact component order.
+- `max_value_wei_per_call` and `template_budget_wei` are `"0"` in this recipe because Morpho `supply` and `withdraw` are `nonpayable` (no ETH value sent).

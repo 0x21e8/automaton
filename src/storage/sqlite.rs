@@ -2770,6 +2770,7 @@ mod tests {
                 success: true,
                 outcome: crate::domain::types::ToolCallOutcome::Executed,
                 error: None,
+                failure_kind: None,
             }],
         )
         .expect("tools");
@@ -2839,6 +2840,7 @@ mod tests {
                 success: true,
                 outcome: crate::domain::types::ToolCallOutcome::Executed,
                 error: None,
+                failure_kind: None,
             }],
         )
         .expect("tool calls");

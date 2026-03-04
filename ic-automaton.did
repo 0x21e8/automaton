@@ -412,6 +412,7 @@ type SkillRecord = record {
   allowed_canister_calls : vec CanisterCallPermission;
 };
 type StewardCommand = variant {
+  RegisterStrategy : record { recipe_json : text };
   IngestStrategyAbiArtifact : StrategyAbiIngestArgs;
   IngestStrategyTemplate : record { template : StrategyTemplate };
   SetSchedulerLowCyclesMode : record { enabled : bool };
@@ -682,8 +683,7 @@ type WalletBalanceTelemetryView = record {
   last_synced_block : opt nat64;
 };
 service : (InitArgs) -> {
-  // Transitions a template to `Active`, runs a canary probe to validate it,
-  // and records an activation state entry (controller only).
+  // Deprecated: use register_strategy_admin instead.
   activate_strategy_template_admin : (StrategyTemplateKey, opt text) -> (
       Result,
     );
@@ -752,12 +752,14 @@ service : (InitArgs) -> {
   // Called automatically by the IC boundary nodes when `http_request` signals
   // an upgrade.
   http_request_update : (HttpUpdateRequest) -> (HttpUpdateResponse);
-  // Normalises and stores an ABI artifact, optionally verifying selector hashes
-  // (controller only).
+  // Deprecated: use register_strategy_admin instead.
   ingest_strategy_abi_artifact_admin : (StrategyAbiIngestArgs) -> (Result_3);
-  // Inserts or updates a strategy template (controller only).
-  // Stamps `created_at_ns` on first insert and always updates `updated_at_ns`.
+  // Deprecated: use register_strategy_admin instead.
   ingest_strategy_template_admin : (StrategyTemplate) -> (Result_1);
+  // Register a strategy from a compact recipe JSON (controller only).
+  // Validates ABIs, stores artifacts, creates template, dry-run compiles,
+  // and auto-activates on success.
+  register_strategy_admin : (text) -> (Result_1);
   // Returns summary records for all active conversations (one per sender).
   list_conversations : () -> (vec ConversationSummary) query;
   // Returns up to `limit` inbox messages ordered by arrival time (newest last).
