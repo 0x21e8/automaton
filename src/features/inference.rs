@@ -611,6 +611,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     type_: "string".to_string(),
                     name: "message_hash".to_string(),
                     description: Some("0x-prefixed 32-byte hash to sign".to_string()),
+                    enum_values: None,
                 }]),
                 required: Some(vec!["message_hash".to_string()]),
             }),
@@ -624,6 +625,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     type_: "string".to_string(),
                     name: "signal".to_string(),
                     description: Some("Signal value to record".to_string()),
+                    enum_values: None,
                 }]),
                 required: Some(vec!["signal".to_string()]),
             }),
@@ -631,7 +633,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "evm_read".to_string(),
             description: Some(
-                "Read EVM JSON-RPC state. Supported direct methods: eth_call (address+calldata), eth_getBalance (address), eth_blockNumber (no address), eth_getTransactionCount (address). For other read-only eth_* methods, pass params_json as a JSON array."
+                "Call an EVM JSON-RPC read method. Returns the raw JSON-RPC result value (hex string for balances/counts, object for eth_call).\n\nRequired params per method:\n- eth_getBalance(address): {\"method\":\"eth_getBalance\",\"address\":\"0x...\"}\n- eth_call(address, calldata): {\"method\":\"eth_call\",\"address\":\"0x...\",\"calldata\":\"0x70a08231...\"}\n- eth_getTransactionCount(address): {\"method\":\"eth_getTransactionCount\",\"address\":\"0x...\"}\n- eth_blockNumber(): {\"method\":\"eth_blockNumber\"}\n\nFor other read-only eth_* methods, pass method name + params_json array."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -641,21 +643,30 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "string".to_string(),
                         name: "method".to_string(),
                         description: Some("Method name. Options: eth_call | eth_getBalance | eth_blockNumber | eth_getTransactionCount. Any other read-only eth_* method requires params_json.".to_string()),
+                        enum_values: Some(vec![
+                            "eth_call".to_string(),
+                            "eth_getBalance".to_string(),
+                            "eth_blockNumber".to_string(),
+                            "eth_getTransactionCount".to_string(),
+                        ]),
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "address".to_string(),
-                        description: Some("0x-prefixed 20-byte address. Required for eth_call, eth_getBalance, and eth_getTransactionCount.".to_string()),
+                        description: Some("0x-prefixed, checksummed or lowercase, 20-byte hex address. Required for eth_call, eth_getBalance, eth_getTransactionCount. Example: \"0x1234567890abcdef1234567890abcdef12345678\".".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "calldata".to_string(),
-                        description: Some("0x-prefixed ABI-encoded calldata. Required for eth_call.".to_string()),
+                        description: Some("0x-prefixed hex calldata (4-byte selector + ABI-encoded args). Required for eth_call. Example: \"0x70a08231000000000000000000000000abcd...\" for balanceOf(address).".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "params_json".to_string(),
                         description: Some("JSON array string of positional params for non-listed read-only eth_* methods (e.g., \"[]\", \"[\\\"0xabc...\\\",\\\"latest\\\"]\").".to_string()),
+                        enum_values: None,
                     },
                 ]),
                 required: Some(vec!["method".to_string()]),
@@ -674,11 +685,13 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "string".to_string(),
                         name: "to".to_string(),
                         description: Some("0x-prefixed destination address.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "value_wei".to_string(),
                         description: Some("Amount in wei as decimal string.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
@@ -686,6 +699,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         description: Some(
                             "Optional calldata for contract interaction.".to_string(),
                         ),
+                        enum_values: None,
                     },
                 ]),
                 required: Some(vec!["to".to_string(), "value_wei".to_string()]),
@@ -704,11 +718,13 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "string".to_string(),
                         name: "key".to_string(),
                         description: Some("Memory key identifier.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "value".to_string(),
-                        description: Some("Memory value payload.".to_string()),
+                        description: Some("Memory value. Must be a JSON scalar (string, number, or boolean), not an object or array.".to_string()),
+                        enum_values: None,
                     },
                 ]),
                 required: Some(vec!["key".to_string(), "value".to_string()]),
@@ -727,6 +743,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "string".to_string(),
                         name: "prefix".to_string(),
                         description: Some("Optional key prefix filter.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
@@ -734,6 +751,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         description: Some(
                             "Optional sort order: updated_at (default) or key.".to_string(),
                         ),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "boolean".to_string(),
@@ -742,6 +760,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "When true, return only count metadata instead of fact payloads."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                 ]),
                 required: None,
@@ -768,6 +787,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     type_: "string".to_string(),
                     name: "key".to_string(),
                     description: Some("Memory key identifier.".to_string()),
+                    enum_values: None,
                 }]),
                 required: Some(vec!["key".to_string()]),
             }),
@@ -785,6 +805,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "string".to_string(),
                         name: "url".to_string(),
                         description: Some("HTTPS URL on an allowed domain.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "object".to_string(),
@@ -793,9 +814,63 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Optional extraction config. JSON mode: {\"mode\":\"json_path\",\"path\":\"data.price\"}. Regex mode: {\"mode\":\"regex\",\"pattern\":\"^price:\\\\d+$\"}. Paths use dot notation from the root WITHOUT a leading $ prefix. Examples: \"pairs[0].priceUsd\", \"data.attributes.base_token_price_usd\". Prefer extraction to minimize untrusted content."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                 ]),
                 required: Some(vec!["url".to_string()]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "market_fetch".to_string(),
+            description: Some(
+                "Fetch market/provider data using canonical runtime-managed endpoints (no raw URL construction). Supported providers/endpoints include coingecko:{simple_price,coins_markets,token_price} and dexscreener:{search_pairs,pair_by_address,token_pairs}."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "provider".to_string(),
+                        description: Some("Market data provider. Must be one of: coingecko, dexscreener.".to_string()),
+                        enum_values: Some(vec![
+                            "coingecko".to_string(),
+                            "dexscreener".to_string(),
+                        ]),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "endpoint".to_string(),
+                        description: Some("Endpoint id. coingecko: simple_price | coins_markets | token_price. dexscreener: search_pairs | pair_by_address | token_pairs.".to_string()),
+                        enum_values: Some(vec![
+                            "simple_price".to_string(),
+                            "coins_markets".to_string(),
+                            "token_price".to_string(),
+                            "search_pairs".to_string(),
+                            "pair_by_address".to_string(),
+                            "token_pairs".to_string(),
+                        ]),
+                    },
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "params".to_string(),
+                        description: Some(
+                            "Endpoint parameters. Required params per endpoint:\n- coingecko:simple_price — ids, vs_currencies (opt: include_24hr_change)\n- coingecko:coins_markets — vs_currency (opt: ids, order, per_page, page)\n- coingecko:token_price — platform_id, contract_addresses, vs_currencies\n- dexscreener:search_pairs — q\n- dexscreener:pair_by_address — chain_id, pair_id\n- dexscreener:token_pairs — chain_id, token_address\nOnly listed params are accepted.".to_string(),
+                        ),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "extract".to_string(),
+                        description: Some("Optional extraction config. JSON mode: {\"mode\":\"json_path\",\"path\":\"...\"}. Regex mode: {\"mode\":\"regex\",\"pattern\":\"...\"}.".to_string()),
+                        enum_values: None,
+                    },
+                ]),
+                required: Some(vec![
+                    "provider".to_string(),
+                    "endpoint".to_string(),
+                    "params".to_string(),
+                ]),
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
@@ -812,6 +887,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     description: Some(
                         format!("Welcome message text (max {} chars). Pass an empty string to clear.", crate::storage::stable::MAX_WELCOME_MESSAGE_CHARS),
                     ),
+                    enum_values: None,
                 }]),
                 required: Some(vec!["message".to_string()]),
             }),
@@ -829,11 +905,13 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "integer".to_string(),
                         name: "layer_id".to_string(),
                         description: Some("Mutable layer id, must be between 6 and 9.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "content".to_string(),
                         description: Some("Replacement markdown content.".to_string()),
+                        enum_values: None,
                     },
                 ]),
                 required: Some(vec!["layer_id".to_string(), "content".to_string()]),
@@ -855,6 +933,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Optional template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "integer".to_string(),
@@ -862,6 +941,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         description: Some(
                             "Optional max number of templates to return.".to_string(),
                         ),
+                        enum_values: None,
                     },
                 ]),
                 required: None,
@@ -880,41 +960,49 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "string".to_string(),
                         name: "protocol".to_string(),
                         description: Some("Strategy protocol namespace (e.g. `uniswap-v3`).".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "primitive".to_string(),
                         description: Some("Strategy primitive class (e.g. `swap`).".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "integer".to_string(),
                         name: "chain_id".to_string(),
                         description: Some("Target EVM chain id.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "template_id".to_string(),
                         description: Some("Template identifier unique within protocol+primitive+chain.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "array".to_string(),
                         name: "contracts".to_string(),
                         description: Some("Contract entries: [{\"role\":\"router\",\"address\":\"0x...\",\"abi_json\":\"[...]\",\"source_ref\":\"https://...\"}].".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "array".to_string(),
                         name: "actions".to_string(),
                         description: Some("Action entries: [{\"action_id\":\"...\",\"calls\":[{\"role\":\"router\",\"function\":\"exactInputSingle\"}],\"postconditions\":[\"...\"]}] with optional preconditions and risk_checks.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "max_value_wei_per_call".to_string(),
                         description: Some("Optional decimal wei cap per call (default: 100000000000000000).".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "template_budget_wei".to_string(),
                         description: Some("Optional decimal wei lifetime budget cap (default: 1000000000000000000).".to_string()),
+                        enum_values: None,
                     },
                 ]),
                 required: Some(vec![
@@ -943,11 +1031,13 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "action_id".to_string(),
                         description: Some("Action identifier within the template.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "object".to_string(),
@@ -956,6 +1046,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Inline typed parameter object consumed by the strategy compiler."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
@@ -964,6 +1055,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Alternative to `typed_params`: serialized JSON string of typed parameters."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                 ]),
                 required: Some(vec![
@@ -988,11 +1080,13 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "action_id".to_string(),
                         description: Some("Action identifier within the template.".to_string()),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "object".to_string(),
@@ -1001,6 +1095,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Inline typed parameter object consumed by the strategy compiler."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
@@ -1009,6 +1104,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Alternative to `typed_params`: serialized JSON string of typed parameters."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                 ]),
                 required: Some(vec![
@@ -1033,6 +1129,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                 ]),
                 required: Some(vec!["key".to_string()]),
@@ -1054,6 +1151,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Target canister principal in text format (e.g. \"um5iw-rqaaa-aaaaq-qaaba-cai\")."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
@@ -1062,14 +1160,16 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                             "Method name to call (e.g. \"icrc1_balance_of\")."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "args_candid".to_string(),
                         description: Some(
-                            "Arguments in Candid text format. Use \"()\" for no arguments. Refer to the active skill instructions for the correct type definitions."
+                            "Arguments in Candid text format. Use \"()\" for no arguments. Example: \"(record { owner = principal \\\"aaaaa-aa\\\"; subaccount = null })\". Refer to active skill instructions for correct types."
                                 .to_string(),
                         ),
+                        enum_values: None,
                     },
                 ]),
                 required: Some(vec![
@@ -1135,12 +1235,24 @@ fn ic_llm_parameters_to_openrouter(parameters: IcLlmParameters) -> Value {
 
     let mut openrouter_properties = Map::new();
     for property in parameters.properties.unwrap_or_default() {
+        let IcLlmProperty {
+            type_,
+            name,
+            description,
+            enum_values,
+        } = property;
         let mut openrouter_property = Map::new();
-        openrouter_property.insert("type".to_string(), Value::String(property.type_));
-        if let Some(description) = property.description {
+        openrouter_property.insert("type".to_string(), Value::String(type_));
+        if let Some(description) = description {
             openrouter_property.insert("description".to_string(), Value::String(description));
         }
-        openrouter_properties.insert(property.name, Value::Object(openrouter_property));
+        if let Some(enum_values) = enum_values {
+            openrouter_property.insert(
+                "enum".to_string(),
+                Value::Array(enum_values.into_iter().map(Value::String).collect()),
+            );
+        }
+        openrouter_properties.insert(name, Value::Object(openrouter_property));
     }
     openrouter_parameters.insert(
         "properties".to_string(),
@@ -1264,6 +1376,8 @@ struct IcLlmProperty {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enum_values: Option<Vec<String>>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -2892,6 +3006,116 @@ mod tests {
         assert!(method_description.contains("eth_getBalance"));
         assert!(method_description.contains("eth_blockNumber"));
         assert!(method_description.contains("eth_getTransactionCount"));
+    }
+
+    #[test]
+    fn ic_llm_tools_evm_read_method_has_enum_values() {
+        let evm_read_tool = ic_llm_tools()
+            .into_iter()
+            .find(
+                |tool| matches!(tool, IcLlmTool::Function(function) if function.name == "evm_read"),
+            )
+            .expect("evm_read tool should exist");
+
+        let IcLlmTool::Function(function) = evm_read_tool;
+        let parameters = function.parameters.expect("evm_read schema should exist");
+        let properties = parameters.properties.unwrap_or_default();
+        let method_property = properties
+            .iter()
+            .find(|property| property.name == "method")
+            .expect("method property should be present");
+        assert_eq!(
+            method_property.enum_values.as_ref(),
+            Some(&vec![
+                "eth_call".to_string(),
+                "eth_getBalance".to_string(),
+                "eth_blockNumber".to_string(),
+                "eth_getTransactionCount".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn openrouter_tools_emit_enum_array_for_evm_read_method() {
+        let evm_read_tool = openrouter_tools()
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(|name| name.as_str())
+                    .is_some_and(|name| name == "evm_read")
+            })
+            .expect("openrouter evm_read tool should exist");
+
+        let method_enum = evm_read_tool
+            .get("function")
+            .and_then(|function| function.get("parameters"))
+            .and_then(|parameters| parameters.get("properties"))
+            .and_then(|properties| properties.get("method"))
+            .and_then(|method| method.get("enum"))
+            .and_then(|value| value.as_array())
+            .expect("evm_read method enum should exist");
+
+        let method_enum_values = method_enum
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            method_enum_values,
+            vec![
+                "eth_call",
+                "eth_getBalance",
+                "eth_blockNumber",
+                "eth_getTransactionCount"
+            ]
+        );
+    }
+
+    #[test]
+    fn ic_llm_market_fetch_schema_enumerates_endpoint_params() {
+        let market_fetch_tool = ic_llm_tools()
+            .into_iter()
+            .find(
+                |tool| {
+                    matches!(tool, IcLlmTool::Function(function) if function.name == "market_fetch")
+                },
+            )
+            .expect("market_fetch tool should exist");
+
+        let IcLlmTool::Function(function) = market_fetch_tool;
+        let parameters = function
+            .parameters
+            .expect("market_fetch schema should have parameters");
+        let properties = parameters
+            .properties
+            .expect("market_fetch schema should have properties");
+        let params_property = properties
+            .iter()
+            .find(|property| property.name == "params")
+            .expect("params property should be present");
+        let params_description = params_property.description.as_deref().unwrap_or_default();
+
+        for expected in [
+            "ids",
+            "vs_currencies",
+            "include_24hr_change",
+            "vs_currency",
+            "order",
+            "per_page",
+            "page",
+            "platform_id",
+            "contract_addresses",
+            "q",
+            "chain_id",
+            "pair_id",
+            "token_address",
+        ] {
+            assert!(
+                params_description.contains(expected),
+                "params description must contain {expected}"
+            );
+        }
     }
 
     #[test]
