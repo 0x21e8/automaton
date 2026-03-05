@@ -9,7 +9,7 @@
 /// - **Wallet** — EVM wallet balance snapshots and synchronisation config
 /// - **Inference** — LLM provider configuration and turn I/O
 /// - **Strategy** — templates, execution plans, ABI artefacts, and outcome stats
-/// - **Memory** — persistent key/value knowledge base and rollups
+/// - **Memory** — persistent key/value knowledge base, rollups, and reflection lessons
 /// - **Observability** — snapshots, storage metrics, cycle telemetry, and views
 /// - **Scheduler** — jobs, leases, task configs, and survival tiers
 use crate::timing;
@@ -993,6 +993,38 @@ pub struct MemoryRollup {
     pub source_keys: Vec<String>,
     pub canonical_value: String,
     pub generated_at_ns: u64,
+}
+
+/// High-level source of a persisted reflection-memory lesson.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ReflectionOrigin {
+    #[default]
+    Autonomy,
+    ExternalInput,
+    Maintenance,
+}
+
+/// Durable bounded lesson derived from repeated degraded tool execution.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReflectionMemoryRecord {
+    pub key: String,
+    pub tool: String,
+    pub subject: String,
+    pub error_class: String,
+    pub what_failed: String,
+    #[serde(default)]
+    pub what_worked: Option<String>,
+    pub degraded_turn_count: u32,
+    pub repeat_count: u32,
+    pub last_failed_at_ns: u64,
+    pub last_failed_turn_id: String,
+    #[serde(default)]
+    pub last_worked_at_ns: Option<u64>,
+    #[serde(default)]
+    pub last_worked_turn_id: Option<String>,
+    #[serde(default)]
+    pub last_origin: ReflectionOrigin,
+    pub updated_at_ns: u64,
 }
 
 // ── Strategy types ───────────────────────────────────────────────────────────
@@ -2521,10 +2553,10 @@ fn default_maintenance_interval_secs() -> u64 {
 mod tests {
     use super::{
         InferenceConfigView, InferenceProvider, MemoryRollup, OpenRouterProxyWorkerConfig,
-        OpenRouterReasoningLevel, RecoveryContext, ResponseLimitPolicy, RetentionConfig,
-        RetentionMaintenanceRuntime, RuntimeSnapshot, SessionSummary, TurnWindowSummary,
-        WalletBalanceSnapshot, WalletBalanceStatus, WalletBalanceSyncConfig,
-        WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+        OpenRouterReasoningLevel, RecoveryContext, ReflectionMemoryRecord, ReflectionOrigin,
+        ResponseLimitPolicy, RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot,
+        SessionSummary, TurnWindowSummary, WalletBalanceSnapshot, WalletBalanceStatus,
+        WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
     };
     use candid::Principal;
 
@@ -2790,6 +2822,32 @@ mod tests {
         let decoded_rollup: MemoryRollup =
             serde_json::from_slice(&encoded_rollup).expect("memory rollup should decode");
         assert_eq!(decoded_rollup, rollup);
+    }
+
+    #[test]
+    fn reflection_memory_schema_round_trips_json() {
+        let record = ReflectionMemoryRecord {
+            key: "market_fetch:dexscreener:search_pairs:missing_param".to_string(),
+            tool: "market_fetch".to_string(),
+            subject: "dexscreener:search_pairs".to_string(),
+            error_class: "missing_param".to_string(),
+            what_failed: "market_fetch[dexscreener:search_pairs] failed: missing required param q"
+                .to_string(),
+            what_worked: Some("worked recently with params.q".to_string()),
+            degraded_turn_count: 3,
+            repeat_count: 2,
+            last_failed_at_ns: 700,
+            last_failed_turn_id: "turn-7".to_string(),
+            last_worked_at_ns: Some(800),
+            last_worked_turn_id: Some("turn-8".to_string()),
+            last_origin: ReflectionOrigin::Autonomy,
+            updated_at_ns: 900,
+        };
+
+        let encoded = serde_json::to_vec(&record).expect("reflection memory should encode");
+        let decoded: ReflectionMemoryRecord =
+            serde_json::from_slice(&encoded).expect("reflection memory should decode");
+        assert_eq!(decoded, record);
     }
 }
 

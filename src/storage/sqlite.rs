@@ -5,9 +5,9 @@
 
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, ConversationEntry, ConversationLog, InboxMessage, MemoryFact,
-    OutboxMessage, RuntimeSnapshot, ScheduledJob, SchedulerRuntime, SkillRecord, StrategyTemplate,
-    StrategyTemplateKey, SurvivalOperationClass, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
-    ToolCallRecord, TransitionLogRecord, TurnRecord,
+    OutboxMessage, ReflectionMemoryRecord, RuntimeSnapshot, ScheduledJob, SchedulerRuntime,
+    SkillRecord, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass, TaskKind,
+    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use crate::features::cycle_topup::TopUpStage;
 #[cfg(target_arch = "wasm32")]
@@ -240,10 +240,20 @@ CREATE TABLE IF NOT EXISTS runtime_scalars (
 );
 "#;
 
+const MIGRATION_004_REFLECTION_MEMORY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS reflection_memory (
+    key TEXT PRIMARY KEY,
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reflection_memory_updated_at ON reflection_memory(updated_at_ns);
+"#;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
     use super::{
         MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
+        MIGRATION_004_REFLECTION_MEMORY_SCHEMA,
     };
     use rusqlite::{params, Connection};
     use std::cell::RefCell;
@@ -294,6 +304,8 @@ mod backend {
             .map_err(|err| err.to_string())?;
         conn.execute_batch(MIGRATION_003_REMAINING_SCHEMA)
             .map_err(|err| err.to_string())?;
+        conn.execute_batch(MIGRATION_004_REFLECTION_MEMORY_SCHEMA)
+            .map_err(|err| err.to_string())?;
         let version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -302,7 +314,7 @@ mod backend {
             )
             .map_err(|err| err.to_string())?;
         let now = crate::timing::current_time_ns() as i64;
-        for v in (version + 1)..=3 {
+        for v in (version + 1)..=4 {
             conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
                 params![v, now],
@@ -317,6 +329,7 @@ mod backend {
 mod backend {
     use super::{
         MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
+        MIGRATION_004_REFLECTION_MEMORY_SCHEMA,
     };
 
     pub type SqlResult<T> = Result<T, String>;
@@ -329,6 +342,8 @@ mod backend {
                 .map_err(|err| err.to_string())?;
             conn.execute_batch(MIGRATION_003_REMAINING_SCHEMA)
                 .map_err(|err| err.to_string())?;
+            conn.execute_batch(MIGRATION_004_REFLECTION_MEMORY_SCHEMA)
+                .map_err(|err| err.to_string())?;
             let version: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -337,7 +352,7 @@ mod backend {
                 )
                 .map_err(|err| err.to_string())?;
             let now = crate::timing::current_time_ns() as i64;
-            for v in (version + 1)..=3 {
+            for v in (version + 1)..=4 {
                 conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
                     [v, now],
@@ -2138,6 +2153,116 @@ pub fn prune_memory_facts(
     })
 }
 
+// -- Reflection memory queries --
+
+pub fn upsert_reflection_memory(record: &ReflectionMemoryRecord) -> Result<(), String> {
+    let payload_json = row_payload(record)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO reflection_memory(key, updated_at_ns, payload_json) VALUES(?1, ?2, ?3)",
+            (&record.key, record.updated_at_ns as i64, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn delete_reflection_memory(key: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM reflection_memory WHERE key = ?1", [key])
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn get_reflection_memory(key: &str) -> Result<Option<ReflectionMemoryRecord>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM reflection_memory WHERE key = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([key], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn list_reflection_memory(limit: usize) -> Result<Vec<ReflectionMemoryRecord>, String> {
+    let keep = bounded_limit(limit, 64, 512);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM reflection_memory ORDER BY updated_at_ns DESC, key ASC LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn count_reflection_memory() -> Result<usize, String> {
+    table_count_extended("reflection_memory").map(|count| count as usize)
+}
+
+pub fn prune_reflection_memory(
+    updated_before_ns: u64,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT key FROM reflection_memory WHERE updated_at_ns < ?1 ORDER BY updated_at_ns ASC, key ASC LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map((updated_before_ns as i64, limit as i64), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| err.to_string())?;
+        let keys: Vec<String> = rows
+            .map(|row| row.map_err(|err| err.to_string()))
+            .collect::<Result<_, _>>()?;
+        if !keys.is_empty() {
+            conn.execute(
+                "DELETE FROM reflection_memory WHERE key IN (SELECT key FROM reflection_memory WHERE updated_at_ns < ?1 ORDER BY updated_at_ns ASC, key ASC LIMIT ?2)",
+                (updated_before_ns as i64, limit as i64),
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        Ok(keys)
+    })
+}
+
+pub fn delete_oldest_reflection_memory(keep_max: usize) -> Result<u32, String> {
+    backend::with_connection(|conn| {
+        let deleted = if keep_max == 0 {
+            conn.execute("DELETE FROM reflection_memory", [])
+                .map_err(|err| err.to_string())?
+        } else {
+            conn.execute(
+                "DELETE FROM reflection_memory WHERE key NOT IN (
+                    SELECT key FROM reflection_memory ORDER BY updated_at_ns DESC, key ASC LIMIT ?1
+                )",
+                [keep_max as i64],
+            )
+            .map_err(|err| err.to_string())?
+        };
+        Ok(u32::try_from(deleted).unwrap_or(u32::MAX))
+    })
+}
+
 // -- Extended inbox queries --
 
 pub fn list_pending_inbox(limit: usize) -> Result<Vec<InboxMessage>, String> {
@@ -2564,6 +2689,7 @@ pub fn table_count_extended(table: &str) -> Result<u64, String> {
         | "strategy_outcome_stats"
         | "strategy_budgets"
         | "autonomy_tool_failures"
+        | "reflection_memory"
         | "runtime_scalars" => table,
         _ => return Err(format!("unsupported table: {table}")),
     };
@@ -2581,9 +2707,9 @@ mod tests {
     use super::*;
     use crate::domain::types::{
         ActionSpec, AgentEvent, AgentState, ContractRoleBinding, InboxMessageSource,
-        InboxMessageStatus, JobStatus, RuntimeSnapshot, SchedulerRuntime, SurvivalOperationClass,
-        TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime, TemplateStatus,
-        ToolCallRecord,
+        InboxMessageStatus, JobStatus, ReflectionMemoryRecord, ReflectionOrigin, RuntimeSnapshot,
+        SchedulerRuntime, SurvivalOperationClass, TaskKind, TaskLane, TaskScheduleConfig,
+        TaskScheduleRuntime, TemplateStatus, ToolCallRecord,
     };
     use crate::features::cycle_topup::TopUpStage;
 
@@ -2617,7 +2743,7 @@ mod tests {
     fn migrations_reach_version_one() {
         close_storage().expect("close before migration test");
         init_storage().expect("init sqlite");
-        assert_eq!(schema_version().expect("schema version"), 3);
+        assert_eq!(schema_version().expect("schema version"), 4);
     }
 
     #[test]
@@ -2644,6 +2770,198 @@ mod tests {
         ] {
             assert_eq!(table_count(table).expect("table count"), 0, "table {table}");
         }
+    }
+
+    #[test]
+    fn reflection_memory_schema_is_present() {
+        close_storage().expect("reset sqlite");
+        init_storage().expect("init sqlite");
+        assert_eq!(
+            table_count_extended("reflection_memory").expect("reflection_memory count"),
+            0
+        );
+
+        let has_index = backend::with_connection(|conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(1) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    ["idx_reflection_memory_updated_at"],
+                    |row| row.get(0),
+                )
+                .map_err(|err| err.to_string())?;
+            Ok(count)
+        })
+        .expect("index lookup should succeed");
+        assert_eq!(has_index, 1);
+    }
+
+    #[test]
+    fn reflection_memory_payload_round_trip_uses_typed_record() {
+        close_storage().expect("reset sqlite");
+        init_storage().expect("init sqlite");
+
+        let record = ReflectionMemoryRecord {
+            key: "evm_read:eth_call:missing_calldata".to_string(),
+            tool: "evm_read".to_string(),
+            subject: "eth_call".to_string(),
+            error_class: "missing_calldata".to_string(),
+            what_failed: "evm_read[eth_call] failed: calldata missing; successful calls require address + calldata".to_string(),
+            what_worked: Some("worked recently with address + calldata".to_string()),
+            degraded_turn_count: 2,
+            repeat_count: 2,
+            last_failed_at_ns: 1_000,
+            last_failed_turn_id: "turn-1".to_string(),
+            last_worked_at_ns: Some(2_000),
+            last_worked_turn_id: Some("turn-2".to_string()),
+            last_origin: ReflectionOrigin::Autonomy,
+            updated_at_ns: 2_000,
+        };
+        let payload_json = row_payload(&record).expect("serialize reflection memory");
+
+        backend::with_connection(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO reflection_memory(key, updated_at_ns, payload_json) VALUES(?1, ?2, ?3)",
+                (&record.key, record.updated_at_ns as i64, payload_json),
+            )
+            .map_err(|err| err.to_string())?;
+            Ok(())
+        })
+        .expect("insert reflection memory row");
+
+        let stored: ReflectionMemoryRecord = backend::with_connection(|conn| {
+            let payload_json = conn
+                .query_row(
+                    "SELECT payload_json FROM reflection_memory WHERE key = ?1",
+                    [record.key.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|err| err.to_string())?;
+            from_payload_json(payload_json)
+        })
+        .expect("load reflection memory row");
+
+        assert_eq!(stored, record);
+        assert_eq!(
+            table_count_extended("reflection_memory").expect("reflection_memory count"),
+            1
+        );
+    }
+
+    #[test]
+    fn reflection_memory_crud_helpers_round_trip_and_sort_newest_first() {
+        close_storage().expect("reset sqlite");
+        init_storage().expect("init sqlite");
+
+        let older = ReflectionMemoryRecord {
+            key: "market_fetch:dexscreener:missing_param".to_string(),
+            tool: "market_fetch".to_string(),
+            subject: "dexscreener".to_string(),
+            error_class: "missing_param".to_string(),
+            what_failed: "market_fetch[dexscreener] failed".to_string(),
+            what_worked: None,
+            degraded_turn_count: 1,
+            repeat_count: 1,
+            last_failed_at_ns: 100,
+            last_failed_turn_id: "turn-1".to_string(),
+            last_worked_at_ns: None,
+            last_worked_turn_id: None,
+            last_origin: ReflectionOrigin::Autonomy,
+            updated_at_ns: 100,
+        };
+        let newer = ReflectionMemoryRecord {
+            key: "evm_read:eth_call:missing_calldata".to_string(),
+            tool: "evm_read".to_string(),
+            subject: "eth_call".to_string(),
+            error_class: "missing_calldata".to_string(),
+            what_failed: "evm_read[eth_call] failed".to_string(),
+            what_worked: Some("worked recently with address + calldata".to_string()),
+            degraded_turn_count: 2,
+            repeat_count: 3,
+            last_failed_at_ns: 200,
+            last_failed_turn_id: "turn-2".to_string(),
+            last_worked_at_ns: Some(210),
+            last_worked_turn_id: Some("turn-3".to_string()),
+            last_origin: ReflectionOrigin::Autonomy,
+            updated_at_ns: 210,
+        };
+
+        upsert_reflection_memory(&older).expect("older reflection should persist");
+        upsert_reflection_memory(&newer).expect("newer reflection should persist");
+
+        assert_eq!(count_reflection_memory().expect("reflection count"), 2);
+        assert_eq!(
+            get_reflection_memory(&older.key).expect("load older reflection"),
+            Some(older.clone())
+        );
+
+        let listed = list_reflection_memory(10).expect("list reflections");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0], newer);
+        assert_eq!(listed[1], older);
+
+        delete_reflection_memory("market_fetch:dexscreener:missing_param")
+            .expect("older reflection should delete");
+        assert_eq!(count_reflection_memory().expect("reflection count"), 1);
+    }
+
+    #[test]
+    fn reflection_memory_prune_and_keep_helpers_remove_oldest_records() {
+        close_storage().expect("reset sqlite");
+        init_storage().expect("init sqlite");
+
+        for index in 0..3u64 {
+            let record = ReflectionMemoryRecord {
+                key: format!("tool:{index}:error"),
+                tool: "tool".to_string(),
+                subject: format!("subject-{index}"),
+                error_class: "error".to_string(),
+                what_failed: format!("failed-{index}"),
+                what_worked: None,
+                degraded_turn_count: 1,
+                repeat_count: 1,
+                last_failed_at_ns: index,
+                last_failed_turn_id: format!("turn-{index}"),
+                last_worked_at_ns: None,
+                last_worked_turn_id: None,
+                last_origin: ReflectionOrigin::Autonomy,
+                updated_at_ns: index,
+            };
+            upsert_reflection_memory(&record).expect("reflection should persist");
+        }
+
+        let pruned = prune_reflection_memory(2, 10).expect("stale reflections should prune");
+        assert_eq!(
+            pruned,
+            vec!["tool:0:error".to_string(), "tool:1:error".to_string()]
+        );
+        assert_eq!(count_reflection_memory().expect("reflection count"), 1);
+
+        for index in 3..6u64 {
+            let record = ReflectionMemoryRecord {
+                key: format!("tool:{index}:error"),
+                tool: "tool".to_string(),
+                subject: format!("subject-{index}"),
+                error_class: "error".to_string(),
+                what_failed: format!("failed-{index}"),
+                what_worked: None,
+                degraded_turn_count: 1,
+                repeat_count: 1,
+                last_failed_at_ns: index,
+                last_failed_turn_id: format!("turn-{index}"),
+                last_worked_at_ns: None,
+                last_worked_turn_id: None,
+                last_origin: ReflectionOrigin::Autonomy,
+                updated_at_ns: index,
+            };
+            upsert_reflection_memory(&record).expect("reflection should persist");
+        }
+
+        let deleted = delete_oldest_reflection_memory(2).expect("cap pruning should succeed");
+        assert_eq!(deleted, 2);
+        let listed = list_reflection_memory(10).expect("list reflections");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].key, "tool:5:error");
+        assert_eq!(listed[1].key, "tool:4:error");
     }
 
     #[test]

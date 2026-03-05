@@ -15,16 +15,16 @@ use crate::domain::types::{
     InboxStats, InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
     InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup,
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
-    OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, RetentionConfig,
-    RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease,
-    SchedulerRuntime, SessionSummary, SkillRecord, StewardNonceState, StewardState,
-    StewardStatusView, StorageGrowthMetrics, StoragePressureLevel, StrategyKillSwitchState,
-    StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats, StrategyTemplate,
-    StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind,
-    TaskLane, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
-    TemplateRevocationState, ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary,
-    WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
-    WalletBalanceTelemetryView,
+    OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, ReflectionMemoryRecord,
+    ReflectionOrigin, RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView,
+    ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord, StewardNonceState,
+    StewardState, StewardStatusView, StorageGrowthMetrics, StoragePressureLevel,
+    StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats,
+    StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass,
+    SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
+    TemplateActivationState, TemplateRevocationState, ToolCallRecord, TransitionLogRecord,
+    TurnRecord, TurnWindowSummary, WalletBalanceSnapshot, WalletBalanceSyncConfig,
+    WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 pub use crate::domain::types::{
     AutonomyToolFailureCooldown, MemoryFactSort, MemoryFactStats, RetentionPruneStats,
@@ -114,6 +114,14 @@ const MAX_CONVERSATION_REPLY_CHARS: usize = 500;
 const MAX_EVM_CONFIRMATION_DEPTH: u64 = 100;
 /// Hard cap on the number of memory facts stored in `memory_facts`.
 pub const MAX_MEMORY_FACTS: usize = 500;
+/// Hard cap on the number of reflection lessons stored in `reflection_memory`.
+pub const MAX_REFLECTION_MEMORY_RECORDS: usize = 64;
+/// Reflection lessons expire after seven days without a fresh update.
+pub const REFLECTION_MEMORY_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+/// Maximum reflection lines reserved for Layer 10 context rendering.
+pub const MAX_REFLECTION_MEMORY_LINES: usize = 5;
+/// Maximum characters per rendered reflection line.
+pub const MAX_REFLECTION_MEMORY_LINE_CHARS: usize = 160;
 /// Maximum inbox message body size (in characters) accepted by `post_inbox_message`.
 pub const MAX_INBOX_BODY_CHARS: usize = 4_096;
 /// Character limit for the `inner_dialogue` field of a stored `TurnRecord`.
@@ -606,6 +614,7 @@ pub fn run_retention_maintenance_once(now_ns: u64) -> RetentionPruneStats {
         config.memory_facts_max_age_secs,
         usize::try_from(config.memory_facts_prune_batch_size).unwrap_or(usize::MAX),
     );
+    let _ = prune_reflection_memory(now_ns);
 
     runtime.job_scan_cursor = None;
     runtime.dedupe_scan_cursor = None;
@@ -1965,6 +1974,163 @@ fn prune_stale_non_critical_memory_facts(now_ns: u64, max_age_secs: u64, limit: 
     sqlite::prune_memory_facts(None, Some(cutoff_ns), limit)
         .map(|keys| u32::try_from(keys.len()).unwrap_or(u32::MAX))
         .unwrap_or(0)
+}
+
+fn reflection_memory_key(tool: &str, subject: &str, error_class: &str) -> String {
+    format!("{tool}:{subject}:{error_class}")
+}
+
+fn normalize_reflection_memory_value(value: &str) -> String {
+    truncate_to_chars(value.trim(), MAX_REFLECTION_MEMORY_LINE_CHARS)
+}
+
+fn is_reflection_memory_record_fresh(record: &ReflectionMemoryRecord, cutoff_ns: u64) -> bool {
+    record.updated_at_ns >= cutoff_ns
+}
+
+pub struct ReflectionMemoryDegradedLesson<'a> {
+    pub tool: &'a str,
+    pub subject: &'a str,
+    pub error_class: &'a str,
+    pub what_failed: &'a str,
+    pub latest_repeat_count: Option<u32>,
+    pub turn_id: &'a str,
+    pub origin: ReflectionOrigin,
+    pub now_ns: u64,
+}
+
+pub fn upsert_reflection_memory_degraded_lesson(
+    lesson: ReflectionMemoryDegradedLesson<'_>,
+) -> Result<ReflectionMemoryRecord, String> {
+    let tool = lesson.tool.trim();
+    let subject = lesson.subject.trim();
+    let error_class = lesson.error_class.trim();
+    let turn_id = lesson.turn_id.trim();
+    let what_failed = normalize_reflection_memory_value(lesson.what_failed);
+    if tool.is_empty() || subject.is_empty() || error_class.is_empty() || turn_id.is_empty() {
+        return Err("reflection memory fields cannot be empty".to_string());
+    }
+    if what_failed.is_empty() {
+        return Err("reflection memory what_failed cannot be empty".to_string());
+    }
+
+    let key = reflection_memory_key(tool, subject, error_class);
+    let existing = sqlite::get_reflection_memory(&key)?;
+    let degraded_turn_count = existing
+        .as_ref()
+        .map(|record| record.degraded_turn_count.saturating_add(1))
+        .unwrap_or(1);
+    let repeat_count = lesson
+        .latest_repeat_count
+        .map(|count| count.max(1))
+        .unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|record| record.repeat_count.saturating_add(1).max(1))
+                .unwrap_or(1)
+        });
+
+    let record = ReflectionMemoryRecord {
+        key,
+        tool: tool.to_string(),
+        subject: subject.to_string(),
+        error_class: error_class.to_string(),
+        what_failed,
+        what_worked: existing
+            .as_ref()
+            .and_then(|record| record.what_worked.clone()),
+        degraded_turn_count,
+        repeat_count,
+        last_failed_at_ns: lesson.now_ns,
+        last_failed_turn_id: turn_id.to_string(),
+        last_worked_at_ns: existing
+            .as_ref()
+            .and_then(|record| record.last_worked_at_ns),
+        last_worked_turn_id: existing
+            .as_ref()
+            .and_then(|record| record.last_worked_turn_id.clone()),
+        last_origin: lesson.origin,
+        updated_at_ns: lesson.now_ns,
+    };
+    sqlite::upsert_reflection_memory(&record)?;
+    let _ = prune_reflection_memory(lesson.now_ns);
+    Ok(record)
+}
+
+pub fn update_reflection_memory_what_worked(
+    tool: &str,
+    subject: &str,
+    what_worked: &str,
+    turn_id: &str,
+    now_ns: u64,
+) -> u32 {
+    let tool = tool.trim();
+    let subject = subject.trim();
+    let turn_id = turn_id.trim();
+    let what_worked = normalize_reflection_memory_value(what_worked);
+    if tool.is_empty() || subject.is_empty() || turn_id.is_empty() || what_worked.is_empty() {
+        return 0;
+    }
+
+    let mut updated = 0u32;
+    for mut record in
+        sqlite::list_reflection_memory(MAX_REFLECTION_MEMORY_RECORDS).unwrap_or_default()
+    {
+        if record.tool != tool || record.subject != subject {
+            continue;
+        }
+        record.what_worked = Some(what_worked.clone());
+        record.last_worked_at_ns = Some(now_ns);
+        record.last_worked_turn_id = Some(turn_id.to_string());
+        record.updated_at_ns = now_ns;
+        if sqlite::upsert_reflection_memory(&record).is_ok() {
+            updated = updated.saturating_add(1);
+        }
+    }
+    if updated > 0 {
+        let _ = prune_reflection_memory(now_ns);
+    }
+    updated
+}
+
+pub fn reflection_memory_count() -> usize {
+    sqlite::count_reflection_memory().unwrap_or(0)
+}
+
+pub fn list_reflection_memory(limit: usize) -> Vec<ReflectionMemoryRecord> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut records = sqlite::list_reflection_memory(limit.max(MAX_REFLECTION_MEMORY_RECORDS))
+        .unwrap_or_default();
+    records.truncate(limit.min(MAX_REFLECTION_MEMORY_RECORDS));
+    records
+}
+
+pub fn list_recent_reflection_memory(now_ns: u64, limit: usize) -> Vec<ReflectionMemoryRecord> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let cutoff_ns =
+        now_ns.saturating_sub(REFLECTION_MEMORY_MAX_AGE_SECS.saturating_mul(1_000_000_000));
+    let mut records = list_reflection_memory(limit.max(MAX_REFLECTION_MEMORY_RECORDS))
+        .into_iter()
+        .filter(|record| is_reflection_memory_record_fresh(record, cutoff_ns))
+        .collect::<Vec<_>>();
+    records.truncate(limit.min(MAX_REFLECTION_MEMORY_RECORDS));
+    records
+}
+
+pub fn prune_reflection_memory(now_ns: u64) -> u32 {
+    let cutoff_ns =
+        now_ns.saturating_sub(REFLECTION_MEMORY_MAX_AGE_SECS.saturating_mul(1_000_000_000));
+    let deleted_expired = sqlite::prune_reflection_memory(cutoff_ns, MAX_REFLECTION_MEMORY_RECORDS)
+        .map(|keys| u32::try_from(keys.len()).unwrap_or(u32::MAX))
+        .unwrap_or(0);
+    let deleted_excess =
+        sqlite::delete_oldest_reflection_memory(MAX_REFLECTION_MEMORY_RECORDS).unwrap_or(0);
+    deleted_expired.saturating_add(deleted_excess)
 }
 // ── Shared helper functions ──────────────────────────────────────────────────
 
@@ -4353,6 +4519,211 @@ mod tests {
 
     fn trusted_test_principal() -> Principal {
         Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai").expect("test principal should parse")
+    }
+
+    fn sample_reflection_record(index: usize, updated_at_ns: u64) -> ReflectionMemoryRecord {
+        ReflectionMemoryRecord {
+            key: format!("tool-{index}:subject-{index}:error-{index}"),
+            tool: format!("tool-{index}"),
+            subject: format!("subject-{index}"),
+            error_class: format!("error-{index}"),
+            what_failed: format!("tool-{index}[subject-{index}] failed"),
+            what_worked: None,
+            degraded_turn_count: 1,
+            repeat_count: 1,
+            last_failed_at_ns: updated_at_ns,
+            last_failed_turn_id: format!("turn-{index}"),
+            last_worked_at_ns: None,
+            last_worked_turn_id: None,
+            last_origin: ReflectionOrigin::Autonomy,
+            updated_at_ns,
+        }
+    }
+
+    #[test]
+    fn reflection_memory_upsert_updates_existing_lesson_and_preserves_worked_hint() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        let created = upsert_reflection_memory_degraded_lesson(ReflectionMemoryDegradedLesson {
+            tool: "market_fetch",
+            subject: "dexscreener:search_pairs",
+            error_class: "missing_param",
+            what_failed: "market_fetch[dexscreener:search_pairs] failed: missing q",
+            latest_repeat_count: Some(2),
+            turn_id: "turn-1",
+            origin: ReflectionOrigin::Autonomy,
+            now_ns: 100,
+        })
+        .expect("first reflection lesson should persist");
+        assert_eq!(created.degraded_turn_count, 1);
+        assert_eq!(created.repeat_count, 2);
+
+        let updated_worked = update_reflection_memory_what_worked(
+            "market_fetch",
+            "dexscreener:search_pairs",
+            "worked recently with params.q",
+            "turn-2",
+            150,
+        );
+        assert_eq!(updated_worked, 1);
+
+        let updated = upsert_reflection_memory_degraded_lesson(ReflectionMemoryDegradedLesson {
+            tool: "market_fetch",
+            subject: "dexscreener:search_pairs",
+            error_class: "missing_param",
+            what_failed: "market_fetch[dexscreener:search_pairs] failed: missing q",
+            latest_repeat_count: Some(4),
+            turn_id: "turn-3",
+            origin: ReflectionOrigin::Autonomy,
+            now_ns: 200,
+        })
+        .expect("existing lesson should update");
+        assert_eq!(updated.degraded_turn_count, 2);
+        assert_eq!(updated.repeat_count, 4);
+        assert_eq!(
+            updated.what_worked.as_deref(),
+            Some("worked recently with params.q")
+        );
+        assert_eq!(updated.last_failed_turn_id, "turn-3");
+        assert_eq!(reflection_memory_count(), 1);
+    }
+
+    #[test]
+    fn reflection_memory_success_updates_matching_subject_records_only() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        upsert_reflection_memory_degraded_lesson(ReflectionMemoryDegradedLesson {
+            tool: "evm_read",
+            subject: "eth_call",
+            error_class: "missing_calldata",
+            what_failed: "evm_read[eth_call] failed: calldata missing",
+            latest_repeat_count: None,
+            turn_id: "turn-1",
+            origin: ReflectionOrigin::Autonomy,
+            now_ns: 100,
+        })
+        .expect("first record should persist");
+        upsert_reflection_memory_degraded_lesson(ReflectionMemoryDegradedLesson {
+            tool: "evm_read",
+            subject: "eth_call",
+            error_class: "bad_address",
+            what_failed: "evm_read[eth_call] failed: address invalid",
+            latest_repeat_count: None,
+            turn_id: "turn-2",
+            origin: ReflectionOrigin::Autonomy,
+            now_ns: 110,
+        })
+        .expect("second record should persist");
+        upsert_reflection_memory_degraded_lesson(ReflectionMemoryDegradedLesson {
+            tool: "evm_read",
+            subject: "eth_get_balance",
+            error_class: "bad_address",
+            what_failed: "evm_read[eth_get_balance] failed: address invalid",
+            latest_repeat_count: None,
+            turn_id: "turn-3",
+            origin: ReflectionOrigin::Autonomy,
+            now_ns: 120,
+        })
+        .expect("third record should persist");
+
+        let updated = update_reflection_memory_what_worked(
+            "evm_read",
+            "eth_call",
+            "worked recently with address + calldata",
+            "turn-4",
+            200,
+        );
+        assert_eq!(updated, 2);
+
+        let records = list_reflection_memory(10);
+        let eth_call_records = records
+            .iter()
+            .filter(|record| record.tool == "evm_read" && record.subject == "eth_call")
+            .collect::<Vec<_>>();
+        assert_eq!(eth_call_records.len(), 2);
+        assert!(eth_call_records.iter().all(|record| {
+            record.what_worked.as_deref() == Some("worked recently with address + calldata")
+                && record.last_worked_turn_id.as_deref() == Some("turn-4")
+        }));
+        let other_subject = records
+            .iter()
+            .find(|record| record.subject == "eth_get_balance")
+            .expect("other subject should remain");
+        assert_eq!(other_subject.what_worked, None);
+    }
+
+    #[test]
+    fn reflection_memory_prune_enforces_ttl_and_hard_cap() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        let stale_updated_at_ns = 10;
+        sqlite::upsert_reflection_memory(&sample_reflection_record(0, stale_updated_at_ns))
+            .expect("stale record should persist");
+
+        for index in 1..=MAX_REFLECTION_MEMORY_RECORDS {
+            sqlite::upsert_reflection_memory(&sample_reflection_record(
+                index,
+                1_000 + u64::try_from(index).unwrap_or(0),
+            ))
+            .expect("fresh record should persist");
+        }
+
+        assert_eq!(reflection_memory_count(), MAX_REFLECTION_MEMORY_RECORDS + 1);
+
+        let now_ns =
+            stale_updated_at_ns + REFLECTION_MEMORY_MAX_AGE_SECS.saturating_mul(1_000_000_000) + 1;
+        let deleted = prune_reflection_memory(now_ns);
+        assert!(
+            deleted >= 1,
+            "expected stale reflection lesson to be pruned"
+        );
+
+        let records = list_reflection_memory(MAX_REFLECTION_MEMORY_RECORDS + 5);
+        assert_eq!(records.len(), MAX_REFLECTION_MEMORY_RECORDS);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.updated_at_ns >= 1_001
+                    && record.key != "tool-0:subject-0:error-0"),
+            "stale record must be removed and cap enforced"
+        );
+    }
+
+    #[test]
+    fn reflection_memory_recent_listing_filters_expired_records() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        sqlite::upsert_reflection_memory(&sample_reflection_record(1, 10))
+            .expect("stale reflection should persist");
+        sqlite::upsert_reflection_memory(&sample_reflection_record(2, 20))
+            .expect("fresh reflection should persist");
+
+        let now_ns = 10 + REFLECTION_MEMORY_MAX_AGE_SECS.saturating_mul(1_000_000_000) + 1;
+        let records = list_recent_reflection_memory(now_ns, 10);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, "tool-2:subject-2:error-2");
+    }
+
+    #[test]
+    fn reflection_memory_retention_maintenance_prunes_expired_records() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        sqlite::upsert_reflection_memory(&sample_reflection_record(1, 10))
+            .expect("stale reflection should persist");
+        sqlite::upsert_reflection_memory(&sample_reflection_record(2, 20))
+            .expect("fresh reflection should persist");
+
+        let now_ns = 10 + REFLECTION_MEMORY_MAX_AGE_SECS.saturating_mul(1_000_000_000) + 1;
+        let _ = run_retention_maintenance_once(now_ns);
+
+        let records = list_reflection_memory(10);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, "tool-2:subject-2:error-2");
     }
 
     #[test]
