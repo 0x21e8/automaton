@@ -1295,6 +1295,14 @@ fn ic_llm_parameters_to_openrouter(parameters: IcLlmParameters) -> Value {
         } = property;
         let mut openrouter_property = Map::new();
         openrouter_property.insert("type".to_string(), Value::String(type_));
+        if openrouter_property
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "array")
+        {
+            // Gemini's function declarations require an explicit `items` schema for arrays.
+            openrouter_property.insert("items".to_string(), json!({ "type": "object" }));
+        }
         if let Some(description) = description {
             openrouter_property.insert("description".to_string(), Value::String(description));
         }
@@ -3174,6 +3182,36 @@ mod tests {
                 "eth_getTransactionCount"
             ]
         );
+    }
+
+    #[test]
+    fn openrouter_register_strategy_array_properties_emit_items_schema() {
+        let register_strategy_tool = openrouter_tools()
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(|name| name.as_str())
+                    .is_some_and(|name| name == "register_strategy")
+            })
+            .expect("openrouter register_strategy tool should exist");
+
+        for property_name in ["contracts", "actions"] {
+            let items_type = register_strategy_tool
+                .get("function")
+                .and_then(|function| function.get("parameters"))
+                .and_then(|parameters| parameters.get("properties"))
+                .and_then(|properties| properties.get(property_name))
+                .and_then(|property| property.get("items"))
+                .and_then(|items| items.get("type"))
+                .and_then(Value::as_str);
+            assert_eq!(
+                items_type,
+                Some("object"),
+                "{property_name} array should emit items schema"
+            );
+        }
     }
 
     #[test]
