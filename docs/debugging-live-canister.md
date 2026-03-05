@@ -129,6 +129,25 @@ icp canister call $CANISTER prune_memory_facts_admin '(null, opt (17300000000000
 icp canister call $CANISTER prune_memory_facts_admin '(opt "signal.", opt (1730000000000000000 : nat64), 100 : nat32)' -n ic
 ```
 
+### Reflection memory
+
+```bash
+icp canister call $CANISTER list_reflection_memory '(20 : nat32)' -n ic
+```
+
+Shows the bounded degraded-turn lessons the automaton now carries forward in Layer 10:
+- `tool` / `subject` / `error_class` identify the repeated failure bucket.
+- `what_failed` is the compact deterministic failure lesson.
+- `what_worked` appears only after a later successful matching call.
+- `degraded_turn_count` and `repeat_count` help distinguish one-off noise from stuck loops.
+
+Quick filter for unresolved lessons:
+
+```bash
+icp canister call $CANISTER list_reflection_memory '(20 : nat32)' -n ic \
+  | rg 'what_worked = null|tool =|subject =|error_class ='
+```
+
 ### Scheduler jobs
 
 ```bash

@@ -85,6 +85,7 @@ struct StrategyTemplate {
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[allow(dead_code)]
 struct TemplateActivationState {
     key: StrategyTemplateKey,
     enabled: bool,

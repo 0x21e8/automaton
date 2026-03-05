@@ -10,10 +10,11 @@ use pocket_ic::common::rest::{
     CanisterHttpReply, CanisterHttpRequest, CanisterHttpResponse, MockCanisterHttpResponse,
 };
 use pocket_ic::PocketIc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const WASM_PATHS: &[&str] = &[
+    ".icp/cache/artifacts/backend",
     "target/wasm32-unknown-unknown/release/backend.wasm",
     "target/wasm32-unknown-unknown/release/deps/backend.wasm",
 ];
@@ -48,6 +49,7 @@ struct InitArgs {
 #[derive(CandidType, Clone, Copy, Debug)]
 enum InferenceProvider {
     IcLlm,
+    OpenRouterProxyWorker,
 }
 
 #[allow(dead_code)]
@@ -75,6 +77,82 @@ struct ObservedJob {
     kind: TaskKind,
     status: JobStatus,
     created_at_ns: u64,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+enum ReflectionOrigin {
+    Autonomy,
+    ExternalInput,
+    Maintenance,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+struct ReflectionMemoryRecord {
+    key: String,
+    tool: String,
+    subject: String,
+    error_class: String,
+    what_failed: String,
+    what_worked: Option<String>,
+    degraded_turn_count: u32,
+    repeat_count: u32,
+    last_failed_at_ns: u64,
+    last_failed_turn_id: String,
+    last_worked_at_ns: Option<u64>,
+    last_worked_turn_id: Option<String>,
+    last_origin: ReflectionOrigin,
+    updated_at_ns: u64,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct OpenRouterProxyWorkerConfig {
+    worker_base_url: String,
+    trusted_callback_principal: Option<Principal>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct ToolCall {
+    tool_call_id: Option<String>,
+    tool: String,
+    args_json: String,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct InferenceProxyResultPayload {
+    explanation: Option<String>,
+    tool_calls: Vec<ToolCall>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct SubmitInferenceResultArgs {
+    job_id: String,
+    turn_id: String,
+    completed_at_ns: u64,
+    result: Option<InferenceProxyResultPayload>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProxySubmitCapture {
+    job_id: String,
+    turn_id: String,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct InferenceProxyStatusView {
+    worker_base_url: Option<String>,
+    trusted_callback_principal: Option<String>,
+    pending_jobs: u64,
+    completed_jobs: u64,
+    oldest_pending_age_secs: Option<u64>,
+    submit_accepted: u64,
+    submit_failed: u64,
+    callback_accepted: u64,
+    callback_rejected: u64,
+    callback_duplicates: u64,
+    callback_auth_failures: u64,
+    resumed_callbacks: u64,
+    expired_jobs: u64,
 }
 
 fn assert_wasm_artifact_present() -> Vec<u8> {
@@ -172,11 +250,53 @@ fn set_inference_model(pic: &PocketIc, canister_id: Principal, model: &str) {
     assert!(result.is_ok(), "set_inference_model failed: {result:?}");
 }
 
+fn set_openrouter_api_key(pic: &PocketIc, canister_id: Principal, api_key: Option<String>) {
+    let payload = encode_args((api_key,)).expect("failed to encode set_openrouter_api_key args");
+    let _: String = call_update(pic, canister_id, "set_openrouter_api_key", payload);
+}
+
+fn set_inference_proxy_config(
+    pic: &PocketIc,
+    canister_id: Principal,
+    config: OpenRouterProxyWorkerConfig,
+) {
+    let payload = encode_args((config,)).expect("failed to encode set_inference_proxy_config args");
+    let result: Result<OpenRouterProxyWorkerConfig, String> =
+        call_update(pic, canister_id, "set_inference_proxy_config", payload);
+    assert!(
+        result.is_ok(),
+        "set_inference_proxy_config failed: {result:?}"
+    );
+}
+
 fn set_task_interval_secs(pic: &PocketIc, canister_id: Principal, kind: TaskKind, interval: u64) {
     let payload = encode_args((kind, interval)).expect("failed to encode set_task_interval_secs");
     let result: Result<String, String> =
         call_update(pic, canister_id, "set_task_interval_secs", payload);
     assert!(result.is_ok(), "set_task_interval_secs failed: {result:?}");
+}
+
+fn set_task_enabled(pic: &PocketIc, canister_id: Principal, kind: TaskKind, enabled: bool) {
+    let payload = encode_args((kind, enabled)).expect("failed to encode set_task_enabled args");
+    let _: String = call_update(pic, canister_id, "set_task_enabled", payload);
+}
+
+fn list_reflection_memory(
+    pic: &PocketIc,
+    canister_id: Principal,
+    limit: u32,
+) -> Vec<ReflectionMemoryRecord> {
+    let payload = encode_args((limit,)).expect("failed to encode list_reflection_memory args");
+    call_query(pic, canister_id, "list_reflection_memory", payload)
+}
+
+fn get_inference_proxy_status(pic: &PocketIc, canister_id: Principal) -> InferenceProxyStatusView {
+    call_query(
+        pic,
+        canister_id,
+        "get_inference_proxy_status",
+        encode_args(()).expect("failed to encode get_inference_proxy_status args"),
+    )
 }
 
 fn list_scheduler_jobs(pic: &PocketIc, canister_id: Principal) -> Vec<ObservedJob> {
@@ -186,6 +306,147 @@ fn list_scheduler_jobs(pic: &PocketIc, canister_id: Principal) -> Vec<ObservedJo
         "list_scheduler_jobs",
         encode_args((200u32,)).expect("failed to encode list_scheduler_jobs"),
     )
+}
+
+fn configure_proxy_runtime(pic: &PocketIc, canister_id: Principal) {
+    set_inference_provider(pic, canister_id, InferenceProvider::OpenRouterProxyWorker);
+    set_inference_model(pic, canister_id, "openai/gpt-4o-mini");
+    set_openrouter_api_key(pic, canister_id, Some("sk-or-test".to_string()));
+    set_evm_rpc_url(pic, canister_id, "https://mainnet.base.org");
+    set_inference_proxy_config(
+        pic,
+        canister_id,
+        OpenRouterProxyWorkerConfig {
+            worker_base_url: "https://proxy.example.workers.dev".to_string(),
+            trusted_callback_principal: Some(Principal::anonymous()),
+        },
+    );
+    for kind in [
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::TopUpCycles,
+        TaskKind::Reconcile,
+    ] {
+        set_task_enabled(pic, canister_id, kind, false);
+    }
+    set_task_enabled(pic, canister_id, TaskKind::AgentTurn, true);
+    set_task_interval_secs(pic, canister_id, TaskKind::AgentTurn, 1);
+}
+
+fn respond_with_proxy_submit_ack(
+    pic: &PocketIc,
+    request: CanisterHttpRequest,
+) -> ProxySubmitCapture {
+    let body: Value = serde_json::from_slice(&request.body)
+        .unwrap_or_else(|error| panic!("failed to decode proxy submit body: {error}"));
+    let job_id = body
+        .get("job_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let turn_id = body
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let ack = json!({
+        "job_id": job_id,
+        "accepted_at_ns": 123456789u64,
+        "status": "accepted",
+    });
+    pic.mock_canister_http_response(MockCanisterHttpResponse {
+        subnet_id: request.subnet_id,
+        request_id: request.request_id,
+        response: CanisterHttpResponse::CanisterHttpReply(CanisterHttpReply {
+            status: 202,
+            headers: vec![],
+            body: serde_json::to_vec(&ack).expect("failed to encode proxy ack"),
+        }),
+        additional_responses: vec![],
+    });
+
+    ProxySubmitCapture { job_id, turn_id }
+}
+
+fn drive_until_proxy_submit(pic: &PocketIc, canister_id: Principal) -> ProxySubmitCapture {
+    let _ = canister_id;
+    pic.advance_time(Duration::from_secs(2));
+    for _ in 0..24 {
+        pic.tick();
+        let pending_http = pic.get_canister_http();
+        if pending_http.is_empty() {
+            pic.advance_time(Duration::from_secs(2));
+            continue;
+        }
+        let capture = pending_http
+            .into_iter()
+            .next()
+            .map(|request| respond_with_proxy_submit_ack(pic, request))
+            .expect("proxy submit request should exist");
+        pic.tick();
+        return capture;
+    }
+    panic!("proxy submit was not observed within expected ticks");
+}
+
+fn submit_proxy_callback_result(
+    pic: &PocketIc,
+    canister_id: Principal,
+    capture: &ProxySubmitCapture,
+) {
+    let payload = encode_args((SubmitInferenceResultArgs {
+        job_id: capture.job_id.clone(),
+        turn_id: capture.turn_id.clone(),
+        completed_at_ns: 987654321,
+        result: Some(InferenceProxyResultPayload {
+            explanation: Some("async proxy result".to_string()),
+            tool_calls: vec![ToolCall {
+                tool_call_id: None,
+                tool: "evm_read".to_string(),
+                args_json: json!({
+                    "method": "eth_call",
+                    "address": "0x1111111111111111111111111111111111111111"
+                })
+                .to_string(),
+            }],
+        }),
+        error: None,
+    },))
+    .expect("failed to encode submit_inference_result args");
+    let result: Result<String, String> =
+        call_update(pic, canister_id, "submit_inference_result", payload);
+    assert_eq!(
+        result.expect("proxy callback should succeed"),
+        "inference_proxy_callback_accepted"
+    );
+}
+
+fn wait_for_reflection_record(
+    pic: &PocketIc,
+    canister_id: Principal,
+) -> Vec<ReflectionMemoryRecord> {
+    for _ in 0..24 {
+        let records = list_reflection_memory(pic, canister_id, 10);
+        if !records.is_empty() {
+            return records;
+        }
+        pic.advance_time(Duration::from_secs(2));
+        pic.tick();
+    }
+    panic!("reflection memory record was not observed within expected ticks");
+}
+
+fn wait_for_pending_proxy_job(pic: &PocketIc, canister_id: Principal) {
+    for _ in 0..24 {
+        let status = get_inference_proxy_status(pic, canister_id);
+        if status.submit_accepted >= 1 && status.pending_jobs >= 1 {
+            return;
+        }
+        pic.advance_time(Duration::from_secs(2));
+        pic.tick();
+    }
+    panic!("pending proxy job was not observed within expected ticks");
 }
 
 fn latest_poll_job(jobs: &[ObservedJob]) -> Option<&ObservedJob> {
@@ -764,4 +1025,27 @@ fn inference_config_http_route_is_read_only() {
         switch_json.get("error").and_then(Value::as_str),
         Some("not found")
     );
+}
+
+#[test]
+fn reflection_memory_query_survives_upgrade() {
+    let (pic, canister_id) = with_backend_canister();
+    configure_proxy_runtime(&pic, canister_id);
+
+    let capture = drive_until_proxy_submit(&pic, canister_id);
+    wait_for_pending_proxy_job(&pic, canister_id);
+    submit_proxy_callback_result(&pic, canister_id, &capture);
+    let before_upgrade = wait_for_reflection_record(&pic, canister_id);
+    assert_eq!(before_upgrade.len(), 1);
+    assert_eq!(before_upgrade[0].tool, "evm_read");
+    assert_eq!(before_upgrade[0].subject, "eth_call");
+    assert_eq!(before_upgrade[0].last_origin, ReflectionOrigin::Autonomy);
+
+    let wasm = assert_wasm_artifact_present();
+    let _ = pic.upgrade_canister(canister_id, wasm, vec![], None);
+
+    let after_upgrade = list_reflection_memory(&pic, canister_id, 10);
+    assert_eq!(after_upgrade.len(), 1);
+    assert_eq!(after_upgrade[0].key, before_upgrade[0].key);
+    assert_eq!(after_upgrade[0].what_failed, before_upgrade[0].what_failed);
 }

@@ -36,12 +36,13 @@ use crate::domain::types::{
     ConversationSummary, EvmRouteStateView, EvmStewardProof, InboxMessage, InboxStats,
     InferenceConfigView, InferenceProvider, InferenceProxyStatusView, MemoryFact, MemoryRollup,
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
-    OutboxStats, PromptLayer, PromptLayerView, RetentionConfig, RetentionMaintenanceRuntime,
-    RuntimeView, ScheduledJob, SchedulerRuntime, SessionSummary, SkillRecord, StewardCommand,
-    StewardState, StewardStatusView, StrategyKillSwitchState, StrategyOutcomeStats,
-    StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, TaskKind, TaskScheduleConfig,
-    TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState, TemplateStatus,
-    ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    OutboxStats, PromptLayer, PromptLayerView, ReflectionMemoryRecord, RetentionConfig,
+    RetentionMaintenanceRuntime, RuntimeView, ScheduledJob, SchedulerRuntime, SessionSummary,
+    SkillRecord, StewardCommand, StewardState, StewardStatusView, StrategyKillSwitchState,
+    StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
+    TaskKind, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
+    TemplateRevocationState, TemplateStatus, ToolCallRecord, TurnWindowSummary,
+    WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
@@ -1276,6 +1277,12 @@ fn list_turn_window_summaries(limit: u32) -> Vec<TurnWindowSummary> {
 #[ic_cdk::query]
 fn list_memory_rollups(limit: u32) -> Vec<MemoryRollup> {
     stable::list_memory_rollups(limit as usize)
+}
+
+/// Returns up to `limit` most-recent reflection-memory lessons.
+#[ic_cdk::query]
+fn list_reflection_memory(limit: u32) -> Vec<ReflectionMemoryRecord> {
+    stable::list_reflection_memory(limit as usize)
 }
 
 /// Returns memory facts filtered by key prefix, sorted by `sort`, and bounded by `limit`.
@@ -2825,6 +2832,29 @@ mod tests {
         assert_eq!(sorted.len(), 2);
         assert_eq!(sorted[0].key, "alpha.note");
         assert_eq!(sorted[1].key, "config.rpc_url");
+    }
+
+    #[test]
+    fn list_reflection_memory_query_respects_limit() {
+        stable::init_storage();
+        for idx in 0..3 {
+            stable::upsert_reflection_memory_degraded_lesson(stable::ReflectionMemoryDegradedLesson {
+                tool: "market_fetch",
+                subject: &format!("dexscreener:search_pairs_{idx}"),
+                error_class: "missing_required_extract",
+                what_failed: "market_fetch[dexscreener:search_pairs] failed: missing extract; use canonical provider:endpoint params",
+                latest_repeat_count: Some(u32::try_from(idx + 1).unwrap_or(u32::MAX)),
+                turn_id: &format!("turn-{idx}"),
+                origin: crate::domain::types::ReflectionOrigin::Autonomy,
+                now_ns: 100 + u64::try_from(idx).unwrap_or_default(),
+            })
+            .expect("reflection lesson should persist");
+        }
+
+        let listed = list_reflection_memory(2);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].subject, "dexscreener:search_pairs_2");
+        assert_eq!(listed[1].subject, "dexscreener:search_pairs_1");
     }
 
     #[test]

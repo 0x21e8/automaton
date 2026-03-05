@@ -2122,6 +2122,76 @@ pub fn list_recent_reflection_memory(now_ns: u64, limit: usize) -> Vec<Reflectio
     records
 }
 
+fn reflection_memory_is_unresolved(record: &ReflectionMemoryRecord) -> bool {
+    record
+        .last_worked_at_ns
+        .map(|last_worked_at_ns| last_worked_at_ns < record.last_failed_at_ns)
+        .unwrap_or(true)
+}
+
+fn reflection_memory_failed_detail(record: &ReflectionMemoryRecord) -> &str {
+    let prefix = format!("{}[{}] failed: ", record.tool, record.subject);
+    record
+        .what_failed
+        .strip_prefix(prefix.as_str())
+        .unwrap_or(record.what_failed.as_str())
+}
+
+fn truncate_reflection_context_line(value: &str) -> String {
+    let max_chars = MAX_REFLECTION_MEMORY_LINE_CHARS;
+    let total_chars = value.chars().count();
+    if total_chars <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let mut out = value.chars().take(max_chars - 3).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn render_reflection_memory_context_line(record: &ReflectionMemoryRecord) -> String {
+    let failed_detail = reflection_memory_failed_detail(record);
+    let status = if reflection_memory_is_unresolved(record) {
+        "avoid"
+    } else {
+        "remember"
+    };
+
+    let mut line = format!(
+        "- {status} {}[{}]: {}",
+        record.tool, record.subject, failed_detail
+    );
+    if let Some(what_worked) = record.what_worked.as_deref() {
+        line.push_str("; ");
+        line.push_str(what_worked);
+    }
+    truncate_reflection_context_line(&line)
+}
+
+/// Returns bounded, deterministic reflection-memory lines for Layer 10 context.
+///
+/// Ordering prioritizes unresolved repeated failures first, then more recent
+/// degraded lessons, while remaining stable on key ties.
+pub fn reflection_brief_for_context(now_ns: u64) -> Vec<String> {
+    let mut records = list_recent_reflection_memory(now_ns, MAX_REFLECTION_MEMORY_RECORDS);
+    records.sort_by(|left, right| {
+        reflection_memory_is_unresolved(right)
+            .cmp(&reflection_memory_is_unresolved(left))
+            .then_with(|| right.repeat_count.cmp(&left.repeat_count))
+            .then_with(|| right.degraded_turn_count.cmp(&left.degraded_turn_count))
+            .then_with(|| right.last_failed_at_ns.cmp(&left.last_failed_at_ns))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    records
+        .into_iter()
+        .take(MAX_REFLECTION_MEMORY_LINES)
+        .map(|record| render_reflection_memory_context_line(&record))
+        .collect()
+}
+
 pub fn prune_reflection_memory(now_ns: u64) -> u32 {
     let cutoff_ns =
         now_ns.saturating_sub(REFLECTION_MEMORY_MAX_AGE_SECS.saturating_mul(1_000_000_000));
@@ -4706,6 +4776,75 @@ mod tests {
         let records = list_recent_reflection_memory(now_ns, 10);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].key, "tool-2:subject-2:error-2");
+    }
+
+    #[test]
+    fn reflection_brief_for_context_prioritizes_unresolved_and_caps_lines() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        let resolved = ReflectionMemoryRecord {
+            key: "market_fetch:dexscreener:missing_extract".to_string(),
+            tool: "market_fetch".to_string(),
+            subject: "dexscreener:search_pairs".to_string(),
+            error_class: "missing_required_extract".to_string(),
+            what_failed:
+                "market_fetch[dexscreener:search_pairs] failed: missing extract; use canonical provider:endpoint params"
+                    .to_string(),
+            what_worked: Some("worked recently with params.q + extract".to_string()),
+            degraded_turn_count: 3,
+            repeat_count: 4,
+            last_failed_at_ns: 100,
+            last_failed_turn_id: "turn-resolved".to_string(),
+            last_worked_at_ns: Some(150),
+            last_worked_turn_id: Some("turn-worked".to_string()),
+            last_origin: ReflectionOrigin::Autonomy,
+            updated_at_ns: 150,
+        };
+        sqlite::upsert_reflection_memory(&resolved).expect("resolved reflection should persist");
+
+        for idx in 0..(MAX_REFLECTION_MEMORY_LINES + 2) {
+            let record = ReflectionMemoryRecord {
+                key: format!("evm_read:eth_call_{idx}:missing_{idx}"),
+                tool: "evm_read".to_string(),
+                subject: format!("eth_call_{idx}"),
+                error_class: format!("missing_field_{idx}"),
+                what_failed: format!(
+                    "evm_read[eth_call_{idx}] failed: {}",
+                    "missing required calldata and address details ".repeat(6)
+                ),
+                what_worked: None,
+                degraded_turn_count: u32::try_from(idx + 1).unwrap_or(u32::MAX),
+                repeat_count: u32::try_from(idx + 2).unwrap_or(u32::MAX),
+                last_failed_at_ns: 1_000 + u64::try_from(idx).unwrap_or_default(),
+                last_failed_turn_id: format!("turn-{idx}"),
+                last_worked_at_ns: None,
+                last_worked_turn_id: None,
+                last_origin: ReflectionOrigin::Autonomy,
+                updated_at_ns: 1_000 + u64::try_from(idx).unwrap_or_default(),
+            };
+            sqlite::upsert_reflection_memory(&record)
+                .expect("unresolved reflection should persist");
+        }
+
+        let lines = reflection_brief_for_context(10_000);
+        assert_eq!(lines.len(), MAX_REFLECTION_MEMORY_LINES);
+        assert!(
+            lines[0].contains("avoid evm_read[eth_call_6]"),
+            "highest-repeat unresolved lesson should sort first: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.chars().count() <= MAX_REFLECTION_MEMORY_LINE_CHARS),
+            "reflection lines must respect per-line char cap: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("params.q + extract")),
+            "resolved lessons should fall behind unresolved ones when the cap is hit: {lines:?}"
+        );
     }
 
     #[test]

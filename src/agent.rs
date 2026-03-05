@@ -1738,6 +1738,7 @@ fn build_dynamic_context(
         snapshot.wallet_balance.usdc_balance_raw_hex.as_deref(),
         usize::from(snapshot.wallet_balance.usdc_decimals),
     );
+    let reflection_lines = stable::reflection_brief_for_context(now_ns);
 
     let memory_section = if memory_facts.is_empty() && memory_rollups.is_empty() {
         "### Recent Memory\n- none".to_string()
@@ -1762,8 +1763,16 @@ fn build_dynamic_context(
         }
         lines.join("\n")
     };
+    let reflection_section = if reflection_lines.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "### Reflection Memory\n{}",
+            reflection_lines.join("\n")
+        ))
+    };
 
-    [
+    let mut sections = vec![
         "## Layer 10: Dynamic Context".to_string(),
         "### Current State".to_string(),
         format!("- cycles_balance: {cycles_balance}"),
@@ -1821,9 +1830,12 @@ fn build_dynamic_context(
         build_pending_obligations_section(staged_messages),
         build_conversation_context(staged_messages, conversation_history_limit),
         memory_section,
-        build_available_tools_section(turn_id),
-    ]
-    .join("\n\n")
+    ];
+    if let Some(reflection_section) = reflection_section {
+        sections.push(reflection_section);
+    }
+    sections.push(build_available_tools_section(turn_id));
+    sections.join("\n\n")
 }
 
 /// Persists a `ConversationEntry` for each consumed inbox message so future
@@ -3852,6 +3864,53 @@ mod tests {
         assert!(context.contains("### Recent Memory"));
         assert!(context.contains("- rollup strategy [10..20] sources=3"));
         assert!(context.contains("strategy.a=hold"));
+    }
+
+    #[test]
+    fn reflection_memory_context_renders_after_recent_memory_with_bounds() {
+        reset_runtime(AgentState::Sleeping, true, false, 12);
+        let now_ns = current_time_ns();
+        for idx in 0..(stable::MAX_REFLECTION_MEMORY_LINES + 1) {
+            stable::upsert_reflection_memory_degraded_lesson(stable::ReflectionMemoryDegradedLesson {
+                tool: "market_fetch",
+                subject: &format!("dexscreener:search_pairs_{idx}"),
+                error_class: "missing_required_extract",
+                what_failed: "market_fetch[dexscreener:search_pairs] failed: missing extract; use canonical provider:endpoint params",
+                latest_repeat_count: Some(u32::try_from(idx + 1).unwrap_or(u32::MAX)),
+                turn_id: &format!("turn-{idx}"),
+                origin: ReflectionOrigin::Autonomy,
+                now_ns: now_ns + u64::try_from(idx).unwrap_or_default(),
+            })
+            .expect("reflection lesson should persist");
+        }
+
+        let snapshot = stable::runtime_snapshot();
+        let context = build_dynamic_context(&snapshot, &[], 0, &[], &[], "turn-12", 5);
+        let reflection_idx = context
+            .find("### Reflection Memory")
+            .expect("reflection section should be present");
+        let memory_idx = context
+            .find("### Recent Memory")
+            .expect("recent memory section should be present");
+        let tools_idx = context
+            .find("### Available Tools")
+            .expect("available tools section should be present");
+        assert!(
+            memory_idx < reflection_idx && reflection_idx < tools_idx,
+            "reflection section should render after recent memory and before tools"
+        );
+
+        let reflection_lines = context[reflection_idx..tools_idx]
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .collect::<Vec<_>>();
+        assert_eq!(reflection_lines.len(), stable::MAX_REFLECTION_MEMORY_LINES);
+        assert!(
+            reflection_lines
+                .iter()
+                .all(|line| line.chars().count() <= stable::MAX_REFLECTION_MEMORY_LINE_CHARS),
+            "reflection lines must respect per-line cap: {reflection_lines:?}"
+        );
     }
 
     #[test]

@@ -283,6 +283,23 @@ type PromptLayerView = record {
   updated_by_turn : opt text;
   layer_id : nat8;
 };
+type ReflectionMemoryRecord = record {
+  key : text;
+  what_worked : opt text;
+  subject : text;
+  what_failed : text;
+  repeat_count : nat32;
+  degraded_turn_count : nat32;
+  tool : text;
+  updated_at_ns : nat64;
+  last_worked_turn_id : opt text;
+  last_failed_at_ns : nat64;
+  last_origin : ReflectionOrigin;
+  last_failed_turn_id : text;
+  last_worked_at_ns : opt nat64;
+  error_class : text;
+};
+type ReflectionOrigin = variant { Autonomy; Maintenance; ExternalInput };
 type Result = variant { Ok : TemplateActivationState; Err : text };
 type Result_1 = variant { Ok : StrategyTemplate; Err : text };
 type Result_10 = variant { Ok : RetentionConfig; Err : text };
@@ -412,7 +429,6 @@ type SkillRecord = record {
   allowed_canister_calls : vec CanisterCallPermission;
 };
 type StewardCommand = variant {
-  RegisterStrategy : record { recipe_json : text };
   IngestStrategyAbiArtifact : StrategyAbiIngestArgs;
   IngestStrategyTemplate : record { template : StrategyTemplate };
   SetSchedulerLowCyclesMode : record { enabled : bool };
@@ -430,6 +446,7 @@ type StewardCommand = variant {
   Noop;
   UpsertSkill : record { skill : SkillRecord };
   SetInferenceProxyConfig : record { config : OpenRouterProxyWorkerConfig };
+  RegisterStrategy : record { recipe_json : text };
   DeprecateStrategyTemplate : record {
     key : StrategyTemplateKey;
     reason : opt text;
@@ -619,6 +636,12 @@ type ToolCallRecord = record {
   turn_id : text;
   success : bool;
   outcome : ToolCallOutcome;
+  failure_kind : opt ToolFailureKind;
+};
+type ToolFailureKind = variant {
+  MalformedInput;
+  OutcallFailure;
+  InternalFailure;
 };
 type TransitionLogRecord = record {
   id : text;
@@ -683,7 +706,9 @@ type WalletBalanceTelemetryView = record {
   last_synced_block : opt nat64;
 };
 service : (InitArgs) -> {
-  // Deprecated: use register_strategy_admin instead.
+  // Deprecated: use `register_strategy_admin` instead.
+  // Transitions a template to `Active`, runs a dry-run compile to validate it,
+  // and records an activation state entry (controller only).
   activate_strategy_template_admin : (StrategyTemplateKey, opt text) -> (
       Result,
     );
@@ -752,14 +777,13 @@ service : (InitArgs) -> {
   // Called automatically by the IC boundary nodes when `http_request` signals
   // an upgrade.
   http_request_update : (HttpUpdateRequest) -> (HttpUpdateResponse);
-  // Deprecated: use register_strategy_admin instead.
+  // Deprecated: use `register_strategy_admin` instead.
+  // Normalises and stores an ABI artifact, optionally verifying selector hashes
+  // (controller only).
   ingest_strategy_abi_artifact_admin : (StrategyAbiIngestArgs) -> (Result_3);
-  // Deprecated: use register_strategy_admin instead.
+  // Deprecated: use `register_strategy_admin` instead.
+  // Inserts or updates a strategy template (controller only).
   ingest_strategy_template_admin : (StrategyTemplate) -> (Result_1);
-  // Register a strategy from a compact recipe JSON (controller only).
-  // Validates ABIs, stores artifacts, creates template, dry-run compiles,
-  // and auto-activates on success.
-  register_strategy_admin : (text) -> (Result_1);
   // Returns summary records for all active conversations (one per sender).
   list_conversations : () -> (vec ConversationSummary) query;
   // Returns up to `limit` inbox messages ordered by arrival time (newest last).
@@ -776,6 +800,8 @@ service : (InitArgs) -> {
   list_outbox_messages : (nat32) -> (vec OutboxMessage) query;
   // Returns up to `limit` recent state-transition event records as debug strings.
   list_recent_events : (nat32) -> (vec text) query;
+  // Returns up to `limit` most-recent reflection-memory lessons.
+  list_reflection_memory : (nat32) -> (vec ReflectionMemoryRecord) query;
   // Returns up to `limit` most-recently enqueued scheduler job records.
   list_scheduler_jobs : (nat32) -> (vec ScheduledJob) query;
   // Returns up to `limit` most-recent session summaries.
@@ -804,6 +830,13 @@ service : (InitArgs) -> {
   // - `updated_before_ns`: optional inclusive timestamp cutoff.
   // - `limit`: max number of facts to remove in this call.
   prune_memory_facts_admin : (opt text, opt nat64, nat32) -> (Result_4);
+  // Register a strategy from a compact recipe (controller only).
+  // 
+  // Replaces the previous multi-step workflow (`ingest_strategy_template_admin` +
+  // `ingest_strategy_abi_artifact_admin` + `activate_strategy_template_admin`) with
+  // a single call.  Accepts the same JSON recipe format as the agent's
+  // `register_strategy` tool.
+  register_strategy_admin : (text) -> (Result_1);
   // Hard-revokes a template: sets status to `Revoked`, deactivates it, and
   // records an immutable revocation entry.  Use for security incidents
   // (controller only).
