@@ -29,8 +29,8 @@ use crate::domain::state_machine;
 use crate::domain::types::{
     AgentEvent, AgentState, AutonomySuppressionConfig, ContinuationStopReason, ConversationEntry,
     InboxMessage, InboxProxyWaitState, InferenceInput, InferenceProvider, MemoryFact, MemoryRollup,
-    RuntimeSnapshot, ToolCall, ToolCallOutcome, ToolCallRecord, ToolFailureKind, TurnRecord,
-    WalletBalanceStatus,
+    ReflectionOrigin, RuntimeSnapshot, ToolCall, ToolCallOutcome, ToolCallRecord, ToolFailureKind,
+    TurnRecord, WalletBalanceStatus,
 };
 use crate::features::inference::canonicalize_tool_name;
 #[cfg(target_arch = "wasm32")]
@@ -813,6 +813,335 @@ fn classify_tool_failure_for_degrade_counter(
     let error_class = normalize_tool_failure_class(&tool, &normalized);
     let fingerprint = consecutive_degrade_fingerprint_key(&tool, &error_class);
     Some((fingerprint, tool, error_class))
+}
+
+fn parse_tool_args_json(args_json: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(args_json).ok()
+}
+
+fn reflection_memory_subject(record: &ToolCallRecord) -> String {
+    let tool = canonicalize_tool_name(&record.tool);
+    let args = parse_tool_args_json(&record.args_json);
+
+    match tool.as_str() {
+        "market_fetch" => reflection_market_fetch_subject(args.as_ref()),
+        "http_fetch" => reflection_http_fetch_subject(args.as_ref()),
+        "evm_read" => reflection_evm_read_subject(args.as_ref()),
+        "remember" => reflection_remember_subject(args.as_ref(), record),
+        _ => tool,
+    }
+}
+
+fn reflection_market_fetch_subject(args: Option<&serde_json::Value>) -> String {
+    let Some(object) = args.and_then(|value| value.as_object()) else {
+        return "market_fetch".to_string();
+    };
+    let provider = object
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let endpoint = object
+        .get("endpoint")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    match (provider, endpoint) {
+        (Some(provider), Some(endpoint)) => format!("{provider}:{endpoint}"),
+        _ => "market_fetch".to_string(),
+    }
+}
+
+fn reflection_http_fetch_subject(args: Option<&serde_json::Value>) -> String {
+    let host = args
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("url"))
+        .and_then(|value| value.as_str())
+        .and_then(extract_reflection_http_host);
+
+    match host.as_deref() {
+        Some("api.dexscreener.com" | "dexscreener.com" | "www.dexscreener.com") => {
+            "config.endpoint.dexscreener.latest".to_string()
+        }
+        Some("api.coingecko.com" | "coingecko.com" | "www.coingecko.com") => {
+            "config.endpoint.coingecko.latest".to_string()
+        }
+        Some(host) => host.to_string(),
+        None => "http_fetch".to_string(),
+    }
+}
+
+fn extract_reflection_http_host(raw_url: &str) -> Option<String> {
+    let trimmed = raw_url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .trim()
+        .trim_matches(|ch| ch == '[' || ch == ']')
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+fn reflection_evm_read_subject(args: Option<&serde_json::Value>) -> String {
+    args.and_then(|value| value.as_object())
+        .and_then(|object| object.get("method"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "evm_read".to_string())
+}
+
+fn reflection_remember_subject(
+    args: Option<&serde_json::Value>,
+    record: &ToolCallRecord,
+) -> String {
+    if is_remember_capacity_failure(record) {
+        return "memory_capacity".to_string();
+    }
+
+    let Some(key) = args
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("key"))
+        .and_then(|value| value.as_str())
+    else {
+        return "remember".to_string();
+    };
+
+    crate::tools::canonicalize_memory_key_for_dedupe(key)
+        .ok()
+        .map(|normalized| reflection_memory_key_prefix(&normalized))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "remember".to_string())
+}
+
+fn reflection_memory_key_prefix(key: &str) -> String {
+    let mut segments = key.split('.').filter(|segment| !segment.is_empty());
+    let Some(first) = segments.next() else {
+        return String::new();
+    };
+    match segments.next() {
+        Some(second) => format!("{first}.{second}"),
+        None => first.to_string(),
+    }
+}
+
+fn reflection_failure_summary(error_class: &str) -> String {
+    error_class.replace('_', " ")
+}
+
+fn reflection_failure_hint(tool: &str, subject: &str) -> &'static str {
+    match tool {
+        "market_fetch" => "use canonical provider:endpoint params",
+        "http_fetch" => "verify allowlisted host and extract",
+        "evm_read" if subject == "eth_call" => "use address + calldata",
+        "evm_read" if subject == "eth_getBalance" || subject == "eth_getTransactionCount" => {
+            "use address"
+        }
+        "evm_read" => "use method-specific required fields",
+        "remember" if subject == "memory_capacity" => "avoid remember when memory is at cap",
+        "remember" => "use normalized key + scalar value",
+        _ => "do not retry unchanged args",
+    }
+}
+
+fn reflection_what_failed(tool: &str, subject: &str, error_class: &str) -> String {
+    let summary = reflection_failure_summary(error_class);
+    let hint = reflection_failure_hint(tool, subject);
+    format!("{tool}[{subject}] failed: {summary}; {hint}")
+}
+
+fn reflection_market_fetch_success_hint(args: Option<&serde_json::Value>) -> String {
+    let Some(object) = args.and_then(|value| value.as_object()) else {
+        return "worked recently with provider + endpoint".to_string();
+    };
+    let provider = object
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let endpoint = object
+        .get("endpoint")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut param_keys = object
+        .get("params")
+        .and_then(|value| value.as_object())
+        .map(|params| {
+            let mut keys = params
+                .keys()
+                .map(|key| normalize_market_fetch_param_key(&provider, &endpoint, key))
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            keys.dedup();
+            keys
+        })
+        .unwrap_or_default();
+
+    if param_keys.is_empty() {
+        return "worked recently with provider + endpoint".to_string();
+    }
+    param_keys.truncate(3);
+    let rendered = param_keys
+        .into_iter()
+        .map(|key| format!("params.{key}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    format!("worked recently with {rendered}")
+}
+
+fn normalize_market_fetch_param_key(provider: &str, endpoint: &str, key: &str) -> String {
+    match (provider, endpoint, key) {
+        ("dexscreener", "search_pairs", "query") => "q".to_string(),
+        ("dexscreener", _, "chainId") => "chain_id".to_string(),
+        _ => key.trim().to_ascii_lowercase(),
+    }
+}
+
+fn reflection_http_fetch_success_hint(args: Option<&serde_json::Value>, subject: &str) -> String {
+    let has_extract = args
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("extract"))
+        .is_some();
+    match (subject.starts_with("config.endpoint."), has_extract) {
+        (true, true) => format!("worked recently with {subject} + extract"),
+        (true, false) => format!("worked recently with {subject}"),
+        (false, true) => "worked recently with host + extract".to_string(),
+        (false, false) => "worked recently with allowlisted host".to_string(),
+    }
+}
+
+fn reflection_evm_read_success_hint(args: Option<&serde_json::Value>, subject: &str) -> String {
+    match subject {
+        "eth_call" => "worked recently with address + calldata".to_string(),
+        "eth_getBalance" | "eth_getTransactionCount" => "worked recently with address".to_string(),
+        "eth_blockNumber" => "worked recently with method only".to_string(),
+        _ => {
+            let has_params_json = args
+                .and_then(|value| value.as_object())
+                .and_then(|object| object.get("params_json"))
+                .is_some();
+            if has_params_json {
+                "worked recently with params_json".to_string()
+            } else {
+                "worked recently with method-specific args".to_string()
+            }
+        }
+    }
+}
+
+fn reflection_remember_success_hint(subject: &str) -> Option<String> {
+    if subject == "memory_capacity" {
+        None
+    } else {
+        Some("worked recently with key + scalar value".to_string())
+    }
+}
+
+fn reflection_what_worked(record: &ToolCallRecord, subject: &str) -> Option<String> {
+    let tool = canonicalize_tool_name(&record.tool);
+    let args = parse_tool_args_json(&record.args_json);
+
+    match tool.as_str() {
+        "market_fetch" => Some(reflection_market_fetch_success_hint(args.as_ref())),
+        "http_fetch" => Some(reflection_http_fetch_success_hint(args.as_ref(), subject)),
+        "evm_read" => Some(reflection_evm_read_success_hint(args.as_ref(), subject)),
+        "remember" => reflection_remember_success_hint(subject),
+        _ => Some("worked recently with validated args".to_string()),
+    }
+}
+
+fn persist_reflection_memory_success_for_record(
+    turn_id: &str,
+    record: &ToolCallRecord,
+    now_ns: u64,
+) {
+    if record.outcome != ToolCallOutcome::Executed || !record.success {
+        return;
+    }
+
+    let tool = canonicalize_tool_name(&record.tool);
+    let subject = reflection_memory_subject(record);
+    let Some(what_worked) = reflection_what_worked(record, &subject) else {
+        return;
+    };
+    let updated = stable::update_reflection_memory_what_worked(
+        &tool,
+        &subject,
+        &what_worked,
+        turn_id,
+        now_ns,
+    );
+    if updated > 0 {
+        log!(
+            AgentLogPriority::Info,
+            "turn={} reflection_memory_success_updated tool={} subject={} updated={}",
+            turn_id,
+            tool,
+            subject,
+            updated,
+        );
+    }
+}
+
+fn persist_reflection_memory_degraded_lessons(
+    turn_id: &str,
+    failed_tool_records: &[&ToolCallRecord],
+    now_ns: u64,
+) {
+    let mut lessons = BTreeMap::<(String, String, String), String>::new();
+
+    for record in failed_tool_records {
+        let Some((_, tool, error_class)) = classify_tool_failure_for_degrade_counter(record) else {
+            continue;
+        };
+        let subject = reflection_memory_subject(record);
+        let what_failed = reflection_what_failed(&tool, &subject, &error_class);
+        lessons
+            .entry((tool, subject, error_class))
+            .or_insert(what_failed);
+    }
+
+    for ((tool, subject, error_class), what_failed) in lessons {
+        if let Err(error) = stable::upsert_reflection_memory_degraded_lesson(
+            stable::ReflectionMemoryDegradedLesson {
+                tool: &tool,
+                subject: &subject,
+                error_class: &error_class,
+                what_failed: &what_failed,
+                latest_repeat_count: None,
+                turn_id,
+                origin: ReflectionOrigin::Autonomy,
+                now_ns,
+            },
+        ) {
+            log!(
+                AgentLogPriority::Error,
+                "turn={} reflection_memory_degraded_write_failed tool={} subject={} error_class={} err={}",
+                turn_id,
+                tool,
+                subject,
+                error_class,
+                error,
+            );
+        }
+    }
 }
 
 fn clear_consecutive_degrade_tracking_for_tool(
@@ -2308,6 +2637,14 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 }
             }
 
+            for record in &round_tool_records {
+                persist_reflection_memory_success_for_record(
+                    &turn_id,
+                    record,
+                    execution_completed_ns,
+                );
+            }
+
             if !has_external_input {
                 for record in round_tool_records
                     .iter()
@@ -2342,6 +2679,11 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                         &format!(
                             "autonomy degraded after recoverable tool failure(s):\n- {details}"
                         ),
+                    );
+                    persist_reflection_memory_degraded_lessons(
+                        &turn_id,
+                        &failed_tool_records,
+                        execution_completed_ns,
                     );
                     let newly_capped = bump_consecutive_degrade_counts(
                         &failed_tool_records,
@@ -4133,6 +4475,95 @@ mod tests {
             !outbox[0].body.contains("result: tools"),
             "outbox reply must not expose internal tool execution summaries"
         );
+    }
+
+    #[test]
+    fn reflection_memory_writes_degraded_lesson_for_autonomy_evm_read_failure() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.evm_read_missing_calldata_probe".to_string(),
+            value: "request_evm_read_missing_calldata_probe:true".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok());
+
+        let records = stable::list_reflection_memory(10);
+        assert_eq!(records.len(), 1, "degraded turn should persist one lesson");
+        let record = &records[0];
+        assert_eq!(record.tool, "evm_read");
+        assert_eq!(record.subject, "eth_call");
+        assert_eq!(record.error_class, "calldata_is_required_for_eth_call");
+        assert_eq!(record.degraded_turn_count, 1);
+        assert_eq!(record.repeat_count, 1);
+        assert_eq!(record.last_origin, ReflectionOrigin::Autonomy);
+        assert!(record.what_failed.contains("evm_read[eth_call] failed"));
+        assert!(record.what_failed.contains("use address + calldata"));
+        assert_eq!(record.what_worked, None);
+    }
+
+    #[test]
+    fn reflection_memory_writes_update_matching_success_patterns() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::upsert_reflection_memory_degraded_lesson(stable::ReflectionMemoryDegradedLesson {
+            tool: "evm_read",
+            subject: "eth_call",
+            error_class: "calldata_is_required_for_eth_call",
+            what_failed: "evm_read[eth_call] failed: calldata is required for eth call; use address + calldata",
+            latest_repeat_count: None,
+            turn_id: "turn-degraded",
+            origin: ReflectionOrigin::Autonomy,
+            now_ns: 10,
+        })
+        .expect("seed eth_call reflection lesson");
+        stable::upsert_reflection_memory_degraded_lesson(stable::ReflectionMemoryDegradedLesson {
+            tool: "evm_read",
+            subject: "eth_getBalance",
+            error_class: "address_is_required_for_eth_getbalance",
+            what_failed: "evm_read[eth_getBalance] failed: address is required for eth getbalance; use address",
+            latest_repeat_count: None,
+            turn_id: "turn-degraded",
+            origin: ReflectionOrigin::Autonomy,
+            now_ns: 11,
+        })
+        .expect("seed eth_getBalance reflection lesson");
+
+        let success = ToolCallRecord {
+            turn_id: "turn-success".to_string(),
+            tool: "evm_read".to_string(),
+            args_json:
+                r#"{"method":"eth_call","address":"0x1111111111111111111111111111111111111111","calldata":"0x70a08231"}"#
+                    .to_string(),
+            output: "0x1".to_string(),
+            success: true,
+            outcome: ToolCallOutcome::Executed,
+            error: None,
+            failure_kind: None,
+        };
+
+        persist_reflection_memory_success_for_record("turn-success", &success, 42);
+
+        let records = stable::list_reflection_memory(10);
+        let updated = records
+            .iter()
+            .find(|record| record.tool == "evm_read" && record.subject == "eth_call")
+            .expect("eth_call lesson should remain");
+        assert_eq!(
+            updated.what_worked.as_deref(),
+            Some("worked recently with address + calldata")
+        );
+        assert_eq!(updated.last_worked_at_ns, Some(42));
+        assert_eq!(updated.last_worked_turn_id.as_deref(), Some("turn-success"));
+
+        let untouched = records
+            .iter()
+            .find(|record| record.subject == "eth_getBalance")
+            .expect("other subject should remain");
+        assert_eq!(untouched.what_worked, None);
     }
 
     #[test]
