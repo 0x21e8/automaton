@@ -196,6 +196,7 @@ type InitArgs = record {
   auto_topup_cycle_threshold : opt nat64;
   cycle_topup_enabled : opt bool;
   inbox_contract_address : opt text;
+  search_api_key : opt text;
   evm_bootstrap_lookback_blocks : opt nat64;
   http_allowed_domains : opt vec text;
 };
@@ -301,12 +302,12 @@ type ReflectionMemoryRecord = record {
 };
 type ReflectionOrigin = variant { Autonomy; Maintenance; ExternalInput };
 type Result = variant { Ok : TemplateActivationState; Err : text };
-type Result_1 = variant { Ok : StrategyTemplate; Err : text };
+type Result_1 = variant { Ok : text; Err : text };
 type Result_10 = variant { Ok : RetentionConfig; Err : text };
 type Result_11 = variant { Ok : StewardState; Err : text };
 type Result_12 = variant { Ok : PromptLayer; Err : text };
 type Result_13 = variant { Ok; Err : text };
-type Result_2 = variant { Ok : text; Err : text };
+type Result_2 = variant { Ok : StrategyTemplate; Err : text };
 type Result_3 = variant { Ok : AbiArtifact; Err : text };
 type Result_4 = variant { Ok : vec text; Err : text };
 type Result_5 = variant { Ok : TemplateRevocationState; Err : text };
@@ -409,6 +410,11 @@ type SchedulerRuntime = record {
   paused_reason : opt text;
   low_cycles_mode : bool;
 };
+type SearchConfigArgs = record {
+  api_key : text;
+  max_searches_per_turn : opt nat8;
+  max_searches_per_24h : opt nat16;
+};
 type SessionSummary = record {
   source_count : nat32;
   inbox_message_count : nat32;
@@ -468,6 +474,7 @@ type StewardCommand = variant {
   };
   DeriveAutomatonEvmAddress;
   SetOpenrouterReasoningLevel : record { level : OpenRouterReasoningLevel };
+  ConfigureSearch : SearchConfigArgs;
   SetSchedulerEnabled : record { enabled : bool };
   SetEvmRpcUrl : record { url : text };
   SetOpenrouterBaseUrl : record { base_url : text };
@@ -712,14 +719,16 @@ service : (InitArgs) -> {
   activate_strategy_template_admin : (StrategyTemplateKey, opt text) -> (
       Result,
     );
+  // Stores the web-search API key and optional search budget overrides (controller only).
+  configure_search : (SearchConfigArgs) -> (Result_1);
   // Marks a template as `Deprecated` and deactivates it.  Use this for orderly
   // rotation; the template remains readable (controller only).
   deprecate_strategy_template_admin : (StrategyTemplateKey, opt text) -> (
-      Result_1,
+      Result_2,
     );
   // Derives the canister's threshold-ECDSA EVM address from the configured key
   // and caches it in stable storage (controller only).
-  derive_automaton_evm_address : () -> (Result_2);
+  derive_automaton_evm_address : () -> (Result_1);
   // Returns the automaton's derived EVM address, or `None` before first derivation.
   get_automaton_evm_address : () -> (opt text) query;
   // Returns the current autonomy suppression configuration.
@@ -783,7 +792,7 @@ service : (InitArgs) -> {
   ingest_strategy_abi_artifact_admin : (StrategyAbiIngestArgs) -> (Result_3);
   // Deprecated: use `register_strategy_admin` instead.
   // Inserts or updates a strategy template (controller only).
-  ingest_strategy_template_admin : (StrategyTemplate) -> (Result_1);
+  ingest_strategy_template_admin : (StrategyTemplate) -> (Result_2);
   // Returns summary records for all active conversations (one per sender).
   list_conversations : () -> (vec ConversationSummary) query;
   // Returns up to `limit` inbox messages ordered by arrival time (newest last).
@@ -836,7 +845,7 @@ service : (InitArgs) -> {
   // `ingest_strategy_abi_artifact_admin` + `activate_strategy_template_admin`) with
   // a single call.  Accepts the same JSON recipe format as the agent's
   // `register_strategy` tool.
-  register_strategy_admin : (text) -> (Result_1);
+  register_strategy_admin : (text) -> (Result_2);
   // Hard-revokes a template: sets status to `Revoked`, deactivates it, and
   // records an immutable revocation entry.  Use for security incidents
   // (controller only).
@@ -859,7 +868,7 @@ service : (InitArgs) -> {
   // Caps the maximum response size (bytes) returned by EVM RPC outbound calls (controller only).
   set_evm_rpc_max_response_bytes : (nat64) -> (Result_7);
   // Updates the primary EVM JSON-RPC endpoint (controller only).
-  set_evm_rpc_url : (text) -> (Result_2);
+  set_evm_rpc_url : (text) -> (Result_1);
   // Replaces the HTTP outbound allowlist.  An empty slice disables the allowlist
   // and permits all domains (controller only).
   set_http_allowed_domains : (vec text) -> (Result_4);
@@ -867,7 +876,7 @@ service : (InitArgs) -> {
   set_inbox_contract_address_admin : (opt text) -> (Result_8);
   // Sets the inference model identifier (e.g. `"llama3.1:8b"` or `"openai/gpt-4o-mini"`)
   // (controller only).
-  set_inference_model : (text) -> (Result_2);
+  set_inference_model : (text) -> (Result_1);
   // Sets the active inference backend (`IcLlm`, `OpenRouter`, or `OpenRouterProxyWorker`)
   // (controller only).
   set_inference_provider : (InferenceProvider) -> (text);
@@ -879,7 +888,7 @@ service : (InitArgs) -> {
   // Pass `None` to remove the key (controller only).
   set_openrouter_api_key : (opt text) -> (text);
   // Updates the OpenRouter-compatible base URL used for inference HTTP calls (controller only).
-  set_openrouter_base_url : (text) -> (Result_2);
+  set_openrouter_base_url : (text) -> (Result_1);
   // Sets the OpenRouter reasoning effort level for models that support it (controller only).
   set_openrouter_reasoning_level : (OpenRouterReasoningLevel) -> (text);
   // Replaces the conversation-retention policy (controller only).
@@ -906,18 +915,18 @@ service : (InitArgs) -> {
   set_task_enabled : (TaskKind, bool) -> (text);
   // Overrides the recurrence interval (seconds) for the given task kind
   // (controller only).
-  set_task_interval_secs : (TaskKind, nat64) -> (Result_2);
+  set_task_interval_secs : (TaskKind, nat64) -> (Result_1);
   // Sets a custom welcome message shown in the TUI on boot (controller only).
   // An empty string clears the custom message and restores the default.
-  set_welcome_message : (text) -> (Result_2);
-  steward_execute : (StewardCommand, EvmStewardProof) -> (Result_2);
-  steward_execute_ingress : (StewardCommand) -> (Result_2);
+  set_welcome_message : (text) -> (Result_1);
+  steward_execute : (StewardCommand, EvmStewardProof) -> (Result_1);
+  steward_execute_ingress : (StewardCommand) -> (Result_1);
   // Callback endpoint used by the OpenRouter proxy worker to submit async results.
-  submit_inference_result : (SubmitInferenceResultArgs) -> (Result_2);
+  submit_inference_result : (SubmitInferenceResultArgs) -> (Result_1);
   // Replaces the content of a prompt layer identified by `layer_id` (controller only).
   update_prompt_layer_admin : (nat8, text) -> (Result_12);
   // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
-  update_soul : (text) -> (Result_2);
+  update_soul : (text) -> (Result_1);
   // Inserts or updates a skill record.
   // 
   // Only callable by a canister controller.  This is the runtime management

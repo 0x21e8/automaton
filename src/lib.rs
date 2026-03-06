@@ -137,6 +137,8 @@ struct InitArgs {
     #[serde(default)]
     llm_canister_id: Option<Principal>,
     #[serde(default)]
+    search_api_key: Option<String>,
+    #[serde(default)]
     cycle_topup_enabled: Option<bool>,
     #[serde(default)]
     auto_topup_cycle_threshold: Option<u64>,
@@ -187,6 +189,7 @@ fn steward_command_label(command: &StewardCommand) -> &'static str {
         StewardCommand::SetInferenceModel { .. } => "set_inference_model",
         StewardCommand::SetOpenrouterBaseUrl { .. } => "set_openrouter_base_url",
         StewardCommand::SetOpenrouterApiKey { .. } => "set_openrouter_api_key",
+        StewardCommand::ConfigureSearch { .. } => "configure_search",
         StewardCommand::SetOpenrouterReasoningLevel { .. } => "set_openrouter_reasoning_level",
         StewardCommand::SetInferenceProxyConfig { .. } => "set_inference_proxy_config",
         StewardCommand::SetWelcomeMessage { .. } => "set_welcome_message",
@@ -510,6 +513,14 @@ fn apply_init_args(args: InitArgs) {
         let _ = stable::set_llm_canister_id(llm_canister_id.to_text())
             .unwrap_or_else(|error| ic_cdk::trap(&error));
     }
+    if let Some(search_api_key) = args.search_api_key {
+        let _ = apply_search_config(SearchConfigArgs {
+            api_key: search_api_key,
+            max_searches_per_turn: None,
+            max_searches_per_24h: None,
+        })
+        .unwrap_or_else(|error| ic_cdk::trap(&error));
+    }
 
     let mut snapshot = stable::runtime_snapshot();
     let mut changed = false;
@@ -628,6 +639,10 @@ fn set_openrouter_api_key(api_key: Option<String>) -> String {
 #[ic_cdk::update]
 fn configure_search(config: SearchConfigArgs) -> Result<String, String> {
     ensure_controller()?;
+    apply_search_config(config)
+}
+
+fn apply_search_config(config: SearchConfigArgs) -> Result<String, String> {
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
         return Err("search api key must not be empty".to_string());
@@ -782,6 +797,15 @@ async fn dispatch_steward_command(
             crate::http::init_certification();
             Ok("openrouter_api_key_updated".to_string())
         }
+        StewardCommand::ConfigureSearch {
+            api_key,
+            max_searches_per_turn,
+            max_searches_per_24h,
+        } => apply_search_config(SearchConfigArgs {
+            api_key,
+            max_searches_per_turn,
+            max_searches_per_24h,
+        }),
         StewardCommand::SetOpenrouterReasoningLevel { level } => {
             let stored = stable::set_openrouter_reasoning_level(level);
             crate::http::init_certification();
@@ -2157,6 +2181,7 @@ mod tests {
             evm_bootstrap_lookback_blocks: None,
             http_allowed_domains: Some(vec!["api.coingecko.com".to_string()]),
             llm_canister_id: None,
+            search_api_key: None,
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
         });
@@ -2182,11 +2207,34 @@ mod tests {
                 Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
                     .expect("test principal should parse"),
             ),
+            search_api_key: None,
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
         });
 
         assert_eq!(stable::get_llm_canister_id(), "w36hm-eqaaa-aaaal-qr76a-cai");
+    }
+
+    #[test]
+    fn apply_init_args_can_set_search_api_key() {
+        apply_init_args(InitArgs {
+            ecdsa_key_name: "dfx_test_key".to_string(),
+            inbox_contract_address: None,
+            evm_chain_id: None,
+            evm_rpc_url: None,
+            evm_confirmation_depth: None,
+            evm_bootstrap_lookback_blocks: None,
+            http_allowed_domains: None,
+            llm_canister_id: None,
+            search_api_key: Some("brave-test-key".to_string()),
+            cycle_topup_enabled: None,
+            auto_topup_cycle_threshold: None,
+        });
+
+        assert_eq!(
+            stable::get_search_api_key(),
+            Some("brave-test-key".to_string())
+        );
     }
 
     #[test]
@@ -2200,6 +2248,7 @@ mod tests {
             evm_bootstrap_lookback_blocks: None,
             http_allowed_domains: None,
             llm_canister_id: None,
+            search_api_key: None,
             cycle_topup_enabled: Some(false),
             auto_topup_cycle_threshold: Some(150_000_000_000),
         });
@@ -2223,6 +2272,7 @@ mod tests {
             evm_bootstrap_lookback_blocks: Some(0),
             http_allowed_domains: None,
             llm_canister_id: None,
+            search_api_key: None,
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
         });

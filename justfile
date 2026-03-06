@@ -7,8 +7,7 @@ check-backend-wasi:
   cargo check --target wasm32-wasip1 -p backend
 
 build-backend-wasi:
-  cargo build -p backend --target wasm32-wasip1 --release
-  wasi2ic target/wasm32-wasip1/release/backend.wasm target/wasm32-wasip1/release/backend_nowasi.wasm
+  ./scripts/build-backend-wasm.sh
 
 check-ic-rusqlite-lock:
   rg 'source = "git\+https://github.com/0x21e8/ic-rusqlite' Cargo.lock
@@ -169,11 +168,16 @@ deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_cha
   if [ -z "$inbox_address" ]; then
     inbox_address="$(cat .local/inbox_contract_address)"
   fi
+  search_api_key_arg="null"
+  if [ -n "${BRAVE_SEARCH_API_KEY:-}" ] && [ "${BRAVE_SEARCH_API_KEY}" != "replace-with-your-brave-search-api-key" ]; then
+    search_api_key_escaped="$(escape_candid_text "$BRAVE_SEARCH_API_KEY")"
+    search_api_key_arg="opt \"$search_api_key_escaped\""
+  fi
   icp build backend
   if ! icp canister create backend -e local >/dev/null 2>&1; then
     echo "backend canister already exists on local"
   fi
-  icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt ($evm_chain_id : nat64); evm_rpc_url = opt \"$evm_rpc_url\"; evm_confirmation_depth = opt (0 : nat64); llm_canister_id = opt principal \"$llm_canister_id\" })"
+  icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt ($evm_chain_id : nat64); evm_rpc_url = opt \"$evm_rpc_url\"; evm_confirmation_depth = opt (0 : nat64); llm_canister_id = opt principal \"$llm_canister_id\"; search_api_key = $search_api_key_arg })"
   case "$inference_mode" in
     openrouter)
       model_escaped="$(escape_candid_text "$openrouter_model")"

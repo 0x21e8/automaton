@@ -293,6 +293,11 @@ pub enum StewardCommand {
     SetOpenrouterApiKey {
         api_key: Option<String>,
     },
+    ConfigureSearch {
+        api_key: String,
+        max_searches_per_turn: Option<u8>,
+        max_searches_per_24h: Option<u16>,
+    },
     SetOpenrouterReasoningLevel {
         level: OpenRouterReasoningLevel,
     },
