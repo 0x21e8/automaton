@@ -19,7 +19,7 @@ use crate::util::normalize_selector_hex;
 use alloy_primitives::keccak256;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ── Internal deserialization types ──────────────────────────────────────────
 
@@ -41,6 +41,8 @@ struct RawAbiEntry {
 /// A single parameter (input or output) in a raw ABI entry, before type canonicalisation.
 #[derive(Clone, Debug, Deserialize)]
 struct RawAbiParam {
+    #[serde(default)]
+    name: Option<String>,
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
@@ -85,16 +87,10 @@ pub fn normalize_abi_artifact(
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "function entry must include a non-empty name".to_string())?
             .to_string();
-        let inputs = entry
-            .inputs
-            .iter()
-            .map(normalize_raw_param)
-            .collect::<Result<Vec<_>, _>>()?;
-        let outputs = entry
-            .outputs
-            .iter()
-            .map(normalize_raw_param)
-            .collect::<Result<Vec<_>, _>>()?;
+        let inputs = entry.inputs.as_slice();
+        let inputs = normalize_raw_params(inputs)?;
+        let outputs = entry.outputs.as_slice();
+        let outputs = normalize_raw_params(outputs)?;
         let signature = canonical_signature(&name, &inputs)?;
         let selector_hex = recompute_selector_hex(&signature);
         let spec = AbiFunctionSpec {
@@ -248,23 +244,56 @@ fn decode_abi_entries(abi_json: &str) -> Result<Vec<RawAbiEntry>, String> {
     serde_json::from_value(entries_value).map_err(|error| format!("invalid abi format: {error}"))
 }
 
-fn normalize_raw_param(raw: &RawAbiParam) -> Result<AbiTypeSpec, String> {
+fn normalize_raw_params(raw_params: &[RawAbiParam]) -> Result<Vec<AbiTypeSpec>, String> {
+    let mut used_names = BTreeSet::new();
+    let mut next_fallback_index = 0usize;
+    let mut normalized = Vec::with_capacity(raw_params.len());
+    for raw in raw_params {
+        let name = normalize_param_name(
+            raw.name.as_deref(),
+            &mut used_names,
+            &mut next_fallback_index,
+        );
+        normalized.push(normalize_raw_param(raw, name)?);
+    }
+    Ok(normalized)
+}
+
+fn normalize_param_name(
+    raw_name: Option<&str>,
+    used_names: &mut BTreeSet<String>,
+    next_fallback_index: &mut usize,
+) -> String {
+    if let Some(candidate) = raw_name.map(str::trim).filter(|value| !value.is_empty()) {
+        if used_names.insert(candidate.to_string()) {
+            return candidate.to_string();
+        }
+    }
+
+    loop {
+        let fallback = format!("arg{}", *next_fallback_index);
+        *next_fallback_index = next_fallback_index.saturating_add(1);
+        if used_names.insert(fallback.clone()) {
+            return fallback;
+        }
+    }
+}
+
+fn normalize_raw_param(raw: &RawAbiParam, name: String) -> Result<AbiTypeSpec, String> {
     let normalized_kind = normalize_raw_kind(&raw.kind)?;
     if normalized_kind.starts_with("tuple") {
         if raw.components.is_empty() {
             return Err("tuple parameter must provide components".to_string());
         }
-        let components = raw
-            .components
-            .iter()
-            .map(normalize_raw_param)
-            .collect::<Result<Vec<_>, _>>()?;
+        let components = normalize_raw_params(&raw.components)?;
         Ok(AbiTypeSpec {
+            name,
             kind: normalized_kind,
             components,
         })
     } else {
         Ok(AbiTypeSpec {
+            name,
             kind: normalized_kind,
             components: Vec::new(),
         })
@@ -409,8 +438,73 @@ mod tests {
         let transfer = &artifact.functions[0];
         assert_eq!(transfer.name, "transfer");
         assert_eq!(transfer.selector_hex, "0xa9059cbb");
+        assert_eq!(transfer.inputs[0].name, "to");
+        assert_eq!(transfer.inputs[1].name, "amount");
+        assert_eq!(transfer.outputs[0].name, "arg0");
         assert_eq!(transfer.inputs[1].kind, "uint256");
         assert_eq!(transfer.state_mutability, "nonpayable");
+    }
+
+    #[test]
+    fn abi_normalize_preserves_recursive_param_names() {
+        let abi_json = r#"
+        [
+          {
+            "type": "function",
+            "name": "supply",
+            "stateMutability": "nonpayable",
+            "inputs": [
+              {
+                "name": "marketParams",
+                "type": "tuple",
+                "components": [
+                  {"name": "loanToken", "type": "address"},
+                  {"name": "", "type": "address"},
+                  {"name": "loanToken", "type": "address"},
+                  {"name": "arg0", "type": "uint256"},
+                  {"type": "uint256"}
+                ]
+              },
+              {"name": "receiver", "type": "address"},
+              {"name": "receiver", "type": "uint256"},
+              {"type": "bytes"}
+            ],
+            "outputs": [
+              {"name": "shares", "type": "uint256"},
+              {"name": "shares", "type": "uint256"}
+            ]
+          }
+        ]
+        "#;
+        let artifact = normalize_abi_artifact(
+            AbiArtifactKey {
+                protocol: "morpho".to_string(),
+                chain_id: 8453,
+                role: "vault".to_string(),
+            },
+            abi_json,
+            "https://example.com/morpho",
+            None,
+            &[],
+            42,
+        )
+        .expect("abi artifact should normalize");
+
+        let supply = &artifact.functions[0];
+        assert_eq!(supply.inputs[0].name, "marketParams");
+        assert_eq!(supply.inputs[1].name, "receiver");
+        assert_eq!(supply.inputs[2].name, "arg0");
+        assert_eq!(supply.inputs[3].name, "arg1");
+        assert_eq!(
+            supply.inputs[0]
+                .components
+                .iter()
+                .map(|component| component.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["loanToken", "arg0", "arg1", "arg2", "arg3"]
+        );
+        assert_eq!(supply.outputs[0].name, "shares");
+        assert_eq!(supply.outputs[1].name, "arg0");
     }
 
     #[test]
@@ -462,10 +556,12 @@ mod tests {
             selector_hex: "0xdeadbeef".to_string(),
             inputs: vec![
                 AbiTypeSpec {
+                    name: "recipient".to_string(),
                     kind: "address".to_string(),
                     components: Vec::new(),
                 },
                 AbiTypeSpec {
+                    name: "amountIn".to_string(),
                     kind: "uint256".to_string(),
                     components: Vec::new(),
                 },
@@ -485,13 +581,16 @@ mod tests {
         let signature = canonical_signature(
             "foo",
             &[AbiTypeSpec {
+                name: "items".to_string(),
                 kind: "tuple[]".to_string(),
                 components: vec![
                     AbiTypeSpec {
+                        name: "account".to_string(),
                         kind: "address".to_string(),
                         components: Vec::new(),
                     },
                     AbiTypeSpec {
+                        name: "amount".to_string(),
                         kind: "uint".to_string(),
                         components: Vec::new(),
                     },

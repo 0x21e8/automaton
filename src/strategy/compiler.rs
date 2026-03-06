@@ -275,6 +275,7 @@ fn parse_tuple_values<'a>(value: &'a Value, field: &str) -> Result<&'a [Value], 
 fn synthetic_zero_value(spec: &AbiTypeSpec) -> Result<Value, String> {
     if let Some((element_kind, maybe_len)) = split_array_type(spec.kind.trim()) {
         let element_spec = AbiTypeSpec {
+            name: spec.name.clone(),
             kind: element_kind,
             components: spec.components.clone(),
         };
@@ -335,6 +336,7 @@ fn static_word_size(spec: &AbiTypeSpec) -> Result<Option<usize>, String> {
             return Ok(None);
         };
         let element = AbiTypeSpec {
+            name: spec.name.clone(),
             kind: element_kind,
             components: spec.components.clone(),
         };
@@ -437,6 +439,7 @@ fn encode_abi_static(spec: &AbiTypeSpec, value: &Value, field: &str) -> Result<V
             ));
         }
         let element_spec = AbiTypeSpec {
+            name: spec.name.clone(),
             kind: element_kind,
             components: spec.components.clone(),
         };
@@ -497,6 +500,7 @@ fn encode_abi_dynamic(spec: &AbiTypeSpec, value: &Value, field: &str) -> Result<
             }
         }
         let element_spec = AbiTypeSpec {
+            name: spec.name.clone(),
             kind: element_kind,
             components: spec.components.clone(),
         };
@@ -663,15 +667,18 @@ mod tests {
             selector_hex: "0xa9059cbb".to_string(),
             inputs: vec![
                 AbiTypeSpec {
+                    name: "to".to_string(),
                     kind: "address".to_string(),
                     components: Vec::new(),
                 },
                 AbiTypeSpec {
+                    name: "amount".to_string(),
                     kind: "uint256".to_string(),
                     components: Vec::new(),
                 },
             ],
             outputs: vec![AbiTypeSpec {
+                name: "success".to_string(),
                 kind: "bool".to_string(),
                 components: Vec::new(),
             }],
@@ -821,53 +828,65 @@ mod tests {
             selector_hex: "0xa99aad89".to_string(),
             inputs: vec![
                 AbiTypeSpec {
+                    name: "marketParams".to_string(),
                     kind: "tuple".to_string(),
                     components: vec![
                         AbiTypeSpec {
+                            name: "loanToken".to_string(),
                             kind: "address".to_string(),
                             components: vec![],
                         },
                         AbiTypeSpec {
+                            name: "collateralToken".to_string(),
                             kind: "address".to_string(),
                             components: vec![],
                         },
                         AbiTypeSpec {
+                            name: "oracle".to_string(),
                             kind: "address".to_string(),
                             components: vec![],
                         },
                         AbiTypeSpec {
+                            name: "irm".to_string(),
                             kind: "address".to_string(),
                             components: vec![],
                         },
                         AbiTypeSpec {
+                            name: "lltv".to_string(),
                             kind: "uint256".to_string(),
                             components: vec![],
                         },
                     ],
                 },
                 AbiTypeSpec {
+                    name: "assets".to_string(),
                     kind: "uint256".to_string(),
                     components: vec![],
                 },
                 AbiTypeSpec {
+                    name: "shares".to_string(),
                     kind: "uint256".to_string(),
                     components: vec![],
                 },
                 AbiTypeSpec {
+                    name: "onBehalf".to_string(),
                     kind: "address".to_string(),
                     components: vec![],
                 },
                 AbiTypeSpec {
+                    name: "data".to_string(),
                     kind: "bytes".to_string(),
                     components: vec![],
                 },
             ],
             outputs: vec![
                 AbiTypeSpec {
+                    name: "assetsSupplied".to_string(),
                     kind: "uint256".to_string(),
                     components: vec![],
                 },
                 AbiTypeSpec {
+                    name: "sharesMinted".to_string(),
                     kind: "uint256".to_string(),
                     components: vec![],
                 },

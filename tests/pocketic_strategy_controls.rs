@@ -50,6 +50,7 @@ struct ContractRoleBinding {
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct AbiTypeSpec {
+    name: String,
     kind: String,
     components: Vec<AbiTypeSpec>,
 }
@@ -196,7 +197,7 @@ fn sample_recipe_json() -> String {
             {
                 "role": "token",
                 "address": "0x2222222222222222222222222222222222222222",
-                "abi_json": "[{\"type\":\"function\",\"name\":\"transfer\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"type\":\"address\"},{\"type\":\"uint256\"}],\"outputs\":[{\"type\":\"bool\"}]}]",
+                "abi_json": "[{\"type\":\"function\",\"name\":\"transfer\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"name\":\"to\",\"type\":\"address\"},{\"name\":\"amount\",\"type\":\"uint256\"}],\"outputs\":[{\"name\":\"success\",\"type\":\"bool\"}]}]",
                 "source_ref": "https://example.com/token-abi"
             }
         ],
@@ -211,6 +212,44 @@ fn sample_recipe_json() -> String {
         ],
         "max_value_wei_per_call": "100",
         "template_budget_wei": "100"
+    }"#
+    .to_string()
+}
+
+fn recursive_name_key() -> StrategyTemplateKey {
+    StrategyTemplateKey {
+        protocol: "morpho-v1".to_string(),
+        primitive: "lend_supply".to_string(),
+        chain_id: 8453,
+        template_id: "pocketic-recursive-names".to_string(),
+    }
+}
+
+fn recursive_name_recipe_json() -> String {
+    r#"{
+        "protocol": "morpho-v1",
+        "primitive": "lend_supply",
+        "chain_id": 8453,
+        "template_id": "pocketic-recursive-names",
+        "contracts": [
+            {
+                "role": "morpho",
+                "address": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "abi_json": "[{\"type\":\"function\",\"name\":\"supply\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"name\":\"marketParams\",\"type\":\"tuple\",\"components\":[{\"name\":\"loanToken\",\"type\":\"address\"},{\"type\":\"address\"},{\"name\":\"loanToken\",\"type\":\"address\"},{\"type\":\"uint256\"}]},{\"name\":\"assets\",\"type\":\"uint256\"}],\"outputs\":[{\"name\":\"shares\",\"type\":\"uint256\"}]}]",
+                "source_ref": "https://example.com/morpho-abi"
+            }
+        ],
+        "actions": [
+            {
+                "action_id": "enter_supply",
+                "calls": [{ "role": "morpho", "function": "supply" }],
+                "preconditions": ["market_open"],
+                "postconditions": ["position_increased"],
+                "risk_checks": ["max_notional"]
+            }
+        ],
+        "max_value_wei_per_call": "0",
+        "template_budget_wei": "0"
     }"#
     .to_string()
 }
@@ -255,6 +294,12 @@ fn strategy_register_and_lifecycle_work_in_pocketic() {
     );
     let fetched = fetched.expect("strategy template should be fetchable");
     assert!(matches!(fetched.status, TemplateStatus::Active));
+    assert_eq!(fetched.actions[0].call_sequence[0].inputs[0].name, "to");
+    assert_eq!(fetched.actions[0].call_sequence[0].inputs[1].name, "amount");
+    assert_eq!(
+        fetched.actions[0].call_sequence[0].outputs[0].name,
+        "success"
+    );
 
     // Kill switch works
     let kill_payload =
@@ -301,5 +346,36 @@ fn strategy_register_and_lifecycle_work_in_pocketic() {
         outsider_register,
         Err("caller is not a controller".to_string()),
         "non-controller should be rejected for register_strategy_admin"
+    );
+}
+
+#[test]
+fn strategy_queries_expose_recursive_abi_names_in_pocketic() {
+    let (pic, canister_id) = with_backend_canister();
+
+    let payload = encode_args((recursive_name_recipe_json(),))
+        .expect("failed to encode recursive-name recipe args");
+    let registered: Result<StrategyTemplate, String> =
+        call_update(&pic, canister_id, "register_strategy_admin", payload);
+    let template = registered.unwrap_or_else(|error| panic!("register failed: {error}"));
+    assert_eq!(template.key, recursive_name_key());
+
+    let fetched: Option<StrategyTemplate> = call_query(
+        &pic,
+        canister_id,
+        "get_strategy_template",
+        encode_args((recursive_name_key(),)).expect("failed to encode get_strategy_template args"),
+    );
+    let fetched = fetched.expect("strategy template should be fetchable");
+    let inputs = &fetched.actions[0].call_sequence[0].inputs;
+    assert_eq!(inputs[0].name, "marketParams");
+    assert_eq!(inputs[1].name, "assets");
+    assert_eq!(
+        inputs[0]
+            .components
+            .iter()
+            .map(|component| component.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["loanToken", "arg0", "arg1", "arg2"]
     );
 }

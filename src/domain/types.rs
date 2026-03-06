@@ -1084,6 +1084,8 @@ pub struct ContractRoleBinding {
 /// Recursive ABI type specification (mirrors the JSON ABI format).
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AbiTypeSpec {
+    #[serde(default)]
+    pub name: String,
     pub kind: String,
     #[serde(default)]
     pub components: Vec<AbiTypeSpec>,

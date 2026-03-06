@@ -2787,15 +2787,18 @@ mod tests {
                     selector_hex: "0xa9059cbb".to_string(),
                     inputs: vec![
                         AbiTypeSpec {
+                            name: "to".to_string(),
                             kind: "address".to_string(),
                             components: Vec::new(),
                         },
                         AbiTypeSpec {
+                            name: "amount".to_string(),
                             kind: "uint256".to_string(),
                             components: Vec::new(),
                         },
                     ],
                     outputs: vec![AbiTypeSpec {
+                        name: "success".to_string(),
                         kind: "bool".to_string(),
                         components: Vec::new(),
                     }],
