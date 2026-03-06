@@ -907,6 +907,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
             }),
         }),
         shared_tool_to_ic_llm(evm_read_shared_tool()),
+        web_search_ic_tool(),
         IcLlmTool::Function(IcLlmFunction {
             name: "send_eth".to_string(),
             description: Some(
@@ -1421,6 +1422,59 @@ fn ic_llm_tool_name(tool: &IcLlmTool) -> &str {
     match tool {
         IcLlmTool::Function(function) => function.name.as_str(),
     }
+}
+
+fn web_search_ic_tool() -> IcLlmTool {
+    IcLlmTool::Function(IcLlmFunction {
+        name: "web_search".to_string(),
+        description: Some(
+            "Search the web for current information and return a small ranked result set. Use http_fetch to read a specific returned URL."
+                .to_string(),
+        ),
+        parameters: Some(IcLlmParameters {
+            type_: "object".to_string(),
+            properties: Some(vec![
+                IcLlmProperty {
+                    type_: "string".to_string(),
+                    name: "query".to_string(),
+                    description: Some("Search query. Be specific.".to_string()),
+                    enum_values: None,
+                },
+                IcLlmProperty {
+                    type_: "integer".to_string(),
+                    name: "count".to_string(),
+                    description: Some("Optional result count from 1 to 10. Default 5.".to_string()),
+                    enum_values: None,
+                },
+                IcLlmProperty {
+                    type_: "string".to_string(),
+                    name: "freshness".to_string(),
+                    description: Some("Optional recency filter.".to_string()),
+                    enum_values: Some(vec![
+                        "day".to_string(),
+                        "week".to_string(),
+                        "month".to_string(),
+                        "any".to_string(),
+                    ]),
+                },
+                IcLlmProperty {
+                    type_: "array".to_string(),
+                    name: "include_domains".to_string(),
+                    description: Some(
+                        "Optional domains to prefer or constrain, max 5.".to_string(),
+                    ),
+                    enum_values: None,
+                },
+                IcLlmProperty {
+                    type_: "array".to_string(),
+                    name: "exclude_domains".to_string(),
+                    description: Some("Optional domains to exclude, max 5.".to_string()),
+                    enum_values: None,
+                },
+            ]),
+            required: Some(vec!["query".to_string()]),
+        }),
+    })
 }
 
 fn ic_llm_tools_with_capabilities(evm_tools_enabled: bool) -> Vec<IcLlmTool> {
@@ -3448,6 +3502,7 @@ mod tests {
         assert!(names.contains(&"recall".to_string()));
         assert!(names.contains(&"memory_stats".to_string()));
         assert!(names.contains(&"forget".to_string()));
+        assert!(names.contains(&"web_search".to_string()));
         assert!(names.contains(&"http_fetch".to_string()));
         assert!(names.contains(&"update_prompt_layer".to_string()));
         assert!(names.contains(&"list_strategy_templates".to_string()));
@@ -3769,6 +3824,7 @@ mod tests {
         assert!(names.contains(&"recall"));
         assert!(names.contains(&"memory_stats"));
         assert!(names.contains(&"forget"));
+        assert!(names.contains(&"web_search"));
         assert!(names.contains(&"http_fetch"));
         assert!(names.contains(&"update_prompt_layer"));
         assert!(names.contains(&"list_strategy_templates"));

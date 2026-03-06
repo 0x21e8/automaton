@@ -22,6 +22,7 @@ pub mod inference;
 pub mod signer;
 pub mod skills;
 pub mod threshold_signer;
+pub mod web_search;
 
 pub use evm::{EvmPoller, HttpEvmPoller};
 pub use inference::{

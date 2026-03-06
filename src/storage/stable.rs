@@ -69,10 +69,19 @@ const INBOX_PROXY_WAIT_STATES_KEY: &str = "inference.proxy.inbox_wait_states";
 const INFERENCE_PROXY_CALLBACK_RESULTS_KEY: &str = "inference.proxy.callback_results";
 const INFERENCE_PROXY_COMPLETED_CALLBACK_JOBS_KEY: &str = "inference.proxy.completed_callback_jobs";
 const INFERENCE_PROXY_METRICS_KEY: &str = "inference.proxy.metrics";
+const SEARCH_API_KEY_KEY: &str = "search.api_key";
+const SEARCH_MAX_PER_TURN_KEY: &str = "search.max_per_turn";
+const SEARCH_MAX_PER_24H_KEY: &str = "search.max_per_24h";
+const SEARCH_USAGE_TIMESTAMPS_KEY: &str = "search.usage.timestamps_ns";
+const SEARCH_TURN_USAGE_KEY: &str = "search.usage.turn_counts";
 /// Maximum character count accepted by `set_welcome_message`.
 pub const MAX_WELCOME_MESSAGE_CHARS: usize = 2_000;
 pub const INFERENCE_PROXY_PENDING_JOB_TTL_SECS: u64 = 15 * 60;
 const MAX_COMPLETED_INFERENCE_PROXY_CALLBACK_JOBS: usize = 2_048;
+pub const DEFAULT_SEARCH_MAX_PER_TURN: u8 = 3;
+pub const DEFAULT_SEARCH_MAX_PER_24H: u16 = 20;
+const SEARCH_USAGE_WINDOW_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+const MAX_SEARCH_TURN_USAGE_ENTRIES: usize = 128;
 
 // ── Capacity constants ───────────────────────────────────────────────────────
 
@@ -1758,6 +1767,139 @@ pub fn set_openrouter_api_key(api_key: Option<String>) {
     });
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
+}
+
+#[derive(Deserialize, Serialize, Default)]
+struct SearchTurnUsageEntry {
+    turn_id: String,
+    count: u8,
+}
+
+pub fn set_search_api_key(api_key: Option<String>) {
+    match api_key {
+        Some(key) => {
+            let _ = sqlite::set_runtime_scalar(SEARCH_API_KEY_KEY, &key);
+        }
+        None => {
+            let _ = sqlite::delete_runtime_scalar(SEARCH_API_KEY_KEY);
+        }
+    }
+}
+
+pub fn get_search_api_key() -> Option<String> {
+    sqlite::get_runtime_scalar(SEARCH_API_KEY_KEY)
+        .ok()
+        .flatten()
+}
+
+pub fn set_search_max_per_turn(max_per_turn: Option<u8>) -> Result<(), String> {
+    match max_per_turn {
+        Some(0) => Err("search max_per_turn must be at least 1".to_string()),
+        Some(value) => sqlite::set_runtime_scalar(SEARCH_MAX_PER_TURN_KEY, &value.to_string()),
+        None => sqlite::delete_runtime_scalar(SEARCH_MAX_PER_TURN_KEY),
+    }
+}
+
+pub fn get_search_max_per_turn() -> u8 {
+    sqlite::get_runtime_scalar(SEARCH_MAX_PER_TURN_KEY)
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SEARCH_MAX_PER_TURN)
+}
+
+pub fn set_search_max_per_24h(max_per_24h: Option<u16>) -> Result<(), String> {
+    match max_per_24h {
+        Some(0) => Err("search max_per_24h must be at least 1".to_string()),
+        Some(value) => sqlite::set_runtime_scalar(SEARCH_MAX_PER_24H_KEY, &value.to_string()),
+        None => sqlite::delete_runtime_scalar(SEARCH_MAX_PER_24H_KEY),
+    }
+}
+
+pub fn get_search_max_per_24h() -> u16 {
+    sqlite::get_runtime_scalar(SEARCH_MAX_PER_24H_KEY)
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SEARCH_MAX_PER_24H)
+}
+
+pub fn reserve_web_search_budget(turn_id: &str, now_ns: u64) -> Result<(), String> {
+    let turn_id = turn_id.trim();
+    if turn_id.is_empty() {
+        return Err("web_search budget requires a non-empty turn id".to_string());
+    }
+
+    let mut turn_usage = load_search_turn_usage();
+    let current_turn_count = turn_usage
+        .iter()
+        .find(|entry| entry.turn_id == turn_id)
+        .map(|entry| entry.count)
+        .unwrap_or(0);
+    let max_per_turn = get_search_max_per_turn();
+    if current_turn_count >= max_per_turn {
+        return Err("web_search budget exceeded for this turn".to_string());
+    }
+
+    let mut usage_timestamps = load_search_usage_timestamps();
+    let len_before = usage_timestamps.len();
+    usage_timestamps.retain(|timestamp| now_ns.saturating_sub(*timestamp) <= SEARCH_USAGE_WINDOW_NS);
+    let expired = len_before != usage_timestamps.len();
+    let max_per_24h = usize::from(get_search_max_per_24h());
+    if usage_timestamps.len() >= max_per_24h {
+        if expired {
+            store_search_usage_timestamps(&usage_timestamps);
+        }
+        return Err("web_search budget exceeded for rolling 24h window".to_string());
+    }
+
+    usage_timestamps.push(now_ns);
+    store_search_usage_timestamps(&usage_timestamps);
+
+    if let Some(entry) = turn_usage.iter_mut().find(|entry| entry.turn_id == turn_id) {
+        entry.count = entry.count.saturating_add(1);
+    } else {
+        turn_usage.push(SearchTurnUsageEntry {
+            turn_id: turn_id.to_string(),
+            count: 1,
+        });
+        if turn_usage.len() > MAX_SEARCH_TURN_USAGE_ENTRIES {
+            let excess = turn_usage.len().saturating_sub(MAX_SEARCH_TURN_USAGE_ENTRIES);
+            turn_usage.drain(0..excess);
+        }
+    }
+    store_search_turn_usage(&turn_usage);
+    Ok(())
+}
+
+fn load_search_usage_timestamps() -> Vec<u64> {
+    sqlite::get_runtime_scalar(SEARCH_USAGE_TIMESTAMPS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<Vec<u64>>(&value).ok())
+        .unwrap_or_default()
+}
+
+fn store_search_usage_timestamps(timestamps: &[u64]) {
+    if let Ok(json) = serde_json::to_string(timestamps) {
+        let _ = sqlite::set_runtime_scalar(SEARCH_USAGE_TIMESTAMPS_KEY, &json);
+    }
+}
+
+fn load_search_turn_usage() -> Vec<SearchTurnUsageEntry> {
+    sqlite::get_runtime_scalar(SEARCH_TURN_USAGE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<Vec<SearchTurnUsageEntry>>(&value).ok())
+        .unwrap_or_default()
+}
+
+fn store_search_turn_usage(entries: &[SearchTurnUsageEntry]) {
+    if let Ok(json) = serde_json::to_string(entries) {
+        let _ = sqlite::set_runtime_scalar(SEARCH_TURN_USAGE_KEY, &json);
+    }
 }
 
 pub fn set_openrouter_reasoning_level(level: OpenRouterReasoningLevel) -> OpenRouterReasoningLevel {

@@ -29,6 +29,7 @@ use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool}
 use crate::features::evm::{evm_read_tool, send_eth_tool};
 use crate::features::http_fetch::http_fetch_tool;
 use crate::features::inference::canonicalize_tool_name;
+use crate::features::web_search::web_search_tool;
 use crate::prompt;
 use crate::sanitize::contains_forbidden_prompt_layer_phrase;
 use crate::storage::{sqlite, stable};
@@ -217,6 +218,7 @@ fn classify_tool_failure_kind(tool: &str, error: &str) -> ToolFailureKind {
         "remember" => classify_remember_failure_kind(&normalized),
         "market_fetch" => classify_market_fetch_failure_kind(&normalized),
         "http_fetch" => classify_http_fetch_failure_kind(&normalized),
+        "web_search" => classify_web_search_failure_kind(&normalized),
         "list_strategy_templates" => classify_list_strategy_templates_failure_kind(&normalized),
         _ => ToolFailureKind::InternalFailure,
     }
@@ -313,6 +315,26 @@ fn classify_http_fetch_failure_kind(normalized_error: &str) -> ToolFailureKind {
     ToolFailureKind::InternalFailure
 }
 
+fn classify_web_search_failure_kind(normalized_error: &str) -> ToolFailureKind {
+    if normalized_error.starts_with("invalid web_search args json:")
+        || normalized_error.starts_with("missing required field: query")
+        || normalized_error.contains("must not overlap")
+        || normalized_error.contains("may contain at most")
+        || normalized_error.starts_with("freshness must be one of")
+        || normalized_error.contains("domain filters must not contain empty")
+        || normalized_error.starts_with("invalid domain filter:")
+    {
+        return ToolFailureKind::MalformedInput;
+    }
+    if normalized_error.starts_with("web_search failed")
+        || normalized_error.starts_with("web_search provider returned http")
+        || normalized_error.starts_with("web_search failed to parse provider response")
+    {
+        return ToolFailureKind::OutcallFailure;
+    }
+    ToolFailureKind::InternalFailure
+}
+
 fn classify_list_strategy_templates_failure_kind(normalized_error: &str) -> ToolFailureKind {
     if normalized_error.starts_with("invalid list_strategy_templates args json:") {
         return ToolFailureKind::MalformedInput;
@@ -336,6 +358,7 @@ fn is_parallel_read_only_tool(tool: &str) -> bool {
             | "get_strategy_outcomes"
             | "evm_read"
             | "http_fetch"
+            | "web_search"
             | "market_fetch"
     )
 }
@@ -352,7 +375,7 @@ fn can_add_to_parallel_batch(state: &ParallelBatchState, tool: &str) -> bool {
     }
     match tool {
         "evm_read" => !state.has_evm_read,
-        "http_fetch" | "market_fetch" => !state.has_http_like_fetch,
+        "http_fetch" | "web_search" | "market_fetch" => !state.has_http_like_fetch,
         _ => true,
     }
 }
@@ -360,7 +383,7 @@ fn can_add_to_parallel_batch(state: &ParallelBatchState, tool: &str) -> bool {
 fn mark_tool_in_parallel_batch(state: &mut ParallelBatchState, tool: &str) {
     match tool {
         "evm_read" => state.has_evm_read = true,
-        "http_fetch" | "market_fetch" => state.has_http_like_fetch = true,
+        "http_fetch" | "web_search" | "market_fetch" => state.has_http_like_fetch = true,
         _ => {}
     }
 }
@@ -544,6 +567,13 @@ impl ToolManager {
         );
         policies.insert(
             "http_fetch".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "web_search".to_string(),
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
@@ -898,6 +928,10 @@ impl ToolManager {
                     let _ = record_market_fetch_handshake_failure(handshake, turn_id);
                 }
                 result
+            }
+            "web_search" => {
+                stable::reserve_web_search_budget(turn_id, current_time_ns())?;
+                web_search_tool(&call.args_json).await
             }
             "market_fetch" => {
                 let prepared = prepare_market_fetch_http_fetch_args(&call.args_json)?;

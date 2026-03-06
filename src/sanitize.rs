@@ -40,6 +40,7 @@ pub const SENSITIVE_TOOLS: &[&str] = &[
 /// Tools whose output is attacker-controllable untrusted content.
 pub const UNTRUSTED_OUTPUT_TOOLS: &[&str] = &[
     "http_fetch",
+    "web_search",
     // canister_call responses come from external canisters and are untrusted.
     "canister_call",
 ];
@@ -297,6 +298,17 @@ mod tests {
             .validate_next("register_strategy")
             .expect_err("register_strategy after http_fetch should be blocked");
         assert!(blocked.contains("register_strategy"));
+        assert!(blocked.contains("possible prompt injection"));
+    }
+
+    #[test]
+    fn tool_sequence_validator_blocks_web_search_to_send_eth() {
+        let mut validator = ToolSequenceValidator::new();
+        assert!(validator.validate_next("web_search").is_ok());
+
+        let blocked = validator
+            .validate_next("send_eth")
+            .expect_err("send_eth after web_search should be blocked");
         assert!(blocked.contains("possible prompt injection"));
     }
 

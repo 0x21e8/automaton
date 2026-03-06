@@ -154,6 +154,15 @@ struct StrategyAbiIngestArgs {
     selector_assertions: Vec<AbiSelectorAssertion>,
 }
 
+#[derive(CandidType, Deserialize)]
+struct SearchConfigArgs {
+    api_key: String,
+    #[serde(default)]
+    max_searches_per_turn: Option<u8>,
+    #[serde(default)]
+    max_searches_per_24h: Option<u16>,
+}
+
 /// Sort ordering for `list_memory_facts`.
 #[derive(CandidType, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 enum MemoryFactListSort {
@@ -613,6 +622,21 @@ fn set_openrouter_api_key(api_key: Option<String>) -> String {
     stable::set_openrouter_api_key(api_key);
     crate::http::init_certification();
     "openrouter_api_key_updated".to_string()
+}
+
+/// Stores the web-search API key and optional search budget overrides (controller only).
+#[ic_cdk::update]
+fn configure_search(config: SearchConfigArgs) -> Result<String, String> {
+    ensure_controller()?;
+    let api_key = config.api_key.trim();
+    if api_key.is_empty() {
+        return Err("search api key must not be empty".to_string());
+    }
+    stable::set_search_api_key(Some(api_key.to_string()));
+    stable::set_search_max_per_turn(config.max_searches_per_turn)?;
+    stable::set_search_max_per_24h(config.max_searches_per_24h)?;
+    crate::http::init_certification();
+    Ok("search_configured".to_string())
 }
 
 /// Sets the OpenRouter reasoning effort level for models that support it (controller only).
@@ -2001,6 +2025,7 @@ mod tests {
             ("set_inference_model", "set_inference_model"),
             ("set_openrouter_base_url", "set_openrouter_base_url"),
             ("set_openrouter_api_key", "set_openrouter_api_key"),
+            ("configure_search", "configure_search"),
             (
                 "set_openrouter_reasoning_level",
                 "set_openrouter_reasoning_level",
