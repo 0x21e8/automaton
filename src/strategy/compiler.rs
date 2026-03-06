@@ -807,4 +807,193 @@ mod tests {
             "expected selector mismatch error, got {err}"
         );
     }
+
+    // ── Morpho supply regression ─────────────────────────────────────────
+
+    /// Morpho `supply` function spec matching the recipe ABI.
+    ///
+    /// supply((address,address,address,address,uint256),uint256,uint256,address,bytes)
+    /// selector: 0xa99aad89
+    fn morpho_supply_function(role: &str) -> AbiFunctionSpec {
+        AbiFunctionSpec {
+            role: role.to_string(),
+            name: "supply".to_string(),
+            selector_hex: "0xa99aad89".to_string(),
+            inputs: vec![
+                AbiTypeSpec {
+                    kind: "tuple".to_string(),
+                    components: vec![
+                        AbiTypeSpec {
+                            kind: "address".to_string(),
+                            components: vec![],
+                        },
+                        AbiTypeSpec {
+                            kind: "address".to_string(),
+                            components: vec![],
+                        },
+                        AbiTypeSpec {
+                            kind: "address".to_string(),
+                            components: vec![],
+                        },
+                        AbiTypeSpec {
+                            kind: "address".to_string(),
+                            components: vec![],
+                        },
+                        AbiTypeSpec {
+                            kind: "uint256".to_string(),
+                            components: vec![],
+                        },
+                    ],
+                },
+                AbiTypeSpec {
+                    kind: "uint256".to_string(),
+                    components: vec![],
+                },
+                AbiTypeSpec {
+                    kind: "uint256".to_string(),
+                    components: vec![],
+                },
+                AbiTypeSpec {
+                    kind: "address".to_string(),
+                    components: vec![],
+                },
+                AbiTypeSpec {
+                    kind: "bytes".to_string(),
+                    components: vec![],
+                },
+            ],
+            outputs: vec![
+                AbiTypeSpec {
+                    kind: "uint256".to_string(),
+                    components: vec![],
+                },
+                AbiTypeSpec {
+                    kind: "uint256".to_string(),
+                    components: vec![],
+                },
+            ],
+            state_mutability: "nonpayable".to_string(),
+        }
+    }
+
+    fn store_morpho_template_and_abi(template_id: &str) {
+        let key = StrategyTemplateKey {
+            protocol: "morpho-v1".to_string(),
+            primitive: "lend_supply".to_string(),
+            chain_id: 8453,
+            template_id: template_id.to_string(),
+        };
+        let function = morpho_supply_function("morpho");
+        let action = ActionSpec {
+            action_id: "enter_supply".to_string(),
+            call_sequence: vec![function.clone()],
+            preconditions: vec!["market_supply_apy_gte_0.03".to_string()],
+            postconditions: vec!["morpho_supply_position_increased".to_string()],
+            risk_checks: vec!["lltv_equals_0.86e18".to_string()],
+        };
+        registry::upsert_template(StrategyTemplate {
+            key: key.clone(),
+            status: TemplateStatus::Active,
+            contract_roles: vec![ContractRoleBinding {
+                role: "morpho".to_string(),
+                address: "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb".to_string(),
+                source_ref: "https://docs.morpho.org/get-started/resources/addresses/".to_string(),
+                codehash: None,
+            }],
+            actions: vec![action],
+            constraints_json: "{}".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+        })
+        .expect("morpho template should persist");
+
+        registry::upsert_abi_artifact(AbiArtifact {
+            key: AbiArtifactKey {
+                protocol: "morpho-v1".to_string(),
+                chain_id: 8453,
+                role: "morpho".to_string(),
+            },
+            source_ref: "https://docs.morpho.org/get-started/resources/addresses/".to_string(),
+            codehash: None,
+            abi_json: "[]".to_string(),
+            functions: vec![function],
+            created_at_ns: 1,
+            updated_at_ns: 1,
+        })
+        .expect("morpho abi artifact should persist");
+    }
+
+    #[test]
+    fn compile_morpho_enter_supply_produces_at_least_one_call() {
+        stable::init_storage();
+        let template_id = "morpho-supply-regression";
+        store_morpho_template_and_abi(template_id);
+        let key = StrategyTemplateKey {
+            protocol: "morpho-v1".to_string(),
+            primitive: "lend_supply".to_string(),
+            chain_id: 8453,
+            template_id: template_id.to_string(),
+        };
+
+        let market_params = serde_json::json!([
+            "0x4200000000000000000000000000000000000006",
+            "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+            "0x663E04CBb82e44A8544828C7C3e2f02820085f00",
+            "0x46415998764C29aB2a25CbeA6E5D2F226b40b5f0",
+            "860000000000000000"
+        ]);
+        let on_behalf = "0x1111111111111111111111111111111111111111";
+        let intent = StrategyExecutionIntent {
+            key: key.clone(),
+            action_id: "enter_supply".to_string(),
+            typed_params_json: serde_json::json!({
+                "calls": [{
+                    "args": [
+                        market_params,
+                        "1000000",
+                        "0",
+                        on_behalf,
+                        "0x"
+                    ],
+                    "value_wei": "0"
+                }]
+            })
+            .to_string(),
+        };
+
+        let plan = compile_intent(&intent).expect("morpho enter_supply should compile");
+        assert!(
+            !plan.calls.is_empty(),
+            "enter_supply must produce at least one compiled call"
+        );
+        assert_eq!(plan.calls.len(), 1);
+        assert_eq!(
+            plan.calls[0].to,
+            "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb"
+        );
+        assert!(
+            plan.calls[0].data.starts_with("0xa99aad89"),
+            "calldata must start with supply selector, got {}",
+            &plan.calls[0].data[..std::cmp::min(10, plan.calls[0].data.len())]
+        );
+    }
+
+    #[test]
+    fn dry_run_compile_morpho_enter_supply_succeeds() {
+        stable::init_storage();
+        let template_id = "morpho-dry-run-regression";
+        store_morpho_template_and_abi(template_id);
+        let key = StrategyTemplateKey {
+            protocol: "morpho-v1".to_string(),
+            primitive: "lend_supply".to_string(),
+            chain_id: 8453,
+            template_id: template_id.to_string(),
+        };
+
+        let result = dry_run_compile(&key);
+        assert!(
+            result.is_ok(),
+            "morpho enter_supply dry-run compile should pass: {result:?}"
+        );
+    }
 }

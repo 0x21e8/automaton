@@ -1374,7 +1374,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "canister_call".to_string(),
             description: Some(
-                "Call a method on another Internet Computer canister. The target canister+method pair must be permitted by an active skill (check active skill instructions for permitted calls and correct Candid argument format). Arguments must be in Candid text format, e.g. \"(record { owner = principal \\\"aaaaa-aa\\\"; subaccount = null })\". Response is returned as Candid text."
+                "Call a method on another Internet Computer canister. The target canister+method pair must be permitted by an active skill (check active skill instructions for permitted calls and correct Candid argument format). Arguments must be in Candid text format, e.g. \"(record { owner = principal \\\"aaaaa-aa\\\"; subaccount = null })\". Response is returned as Candid text. IMPORTANT: When a method requires your own principal (e.g. icrc1_balance_of owner), use the exact self_canister_id value from Layer 10 Dynamic Context — never reconstruct or guess it."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -2065,6 +2065,11 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
                     timed_out,
                 );
                 if timed_out {
+                    stable::record_survival_operation_failure(
+                        &SurvivalOperationClass::Inference,
+                        now_ns,
+                        stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE_TRANSPORT,
+                    );
                     log!(
                         InferenceLogPriority::Error,
                         "turn={} provider=openrouter outcall_timeout elapsed_ms={} timeout_ms={}",
@@ -2093,6 +2098,19 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
                         tool_calls: Vec::new(),
                         explanation: "inference skipped due to low cycles".to_string(),
                     });
+                }
+                if is_transport_class_error(&message) {
+                    stable::record_survival_operation_failure(
+                        &SurvivalOperationClass::Inference,
+                        now_ns,
+                        stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE_TRANSPORT,
+                    );
+                    log!(
+                        InferenceLogPriority::Error,
+                        "turn={} provider=openrouter inference_transport_backoff message={}",
+                        input.turn_id,
+                        message,
+                    );
                 }
                 return Err(message);
             }
@@ -2458,6 +2476,19 @@ impl InferenceAdapter for OpenRouterProxyWorkerInferenceAdapter {
                     );
                     return Ok(Self::deferred_output());
                 }
+                if is_transport_class_error(&message) {
+                    stable::record_survival_operation_failure(
+                        &SurvivalOperationClass::Inference,
+                        now_ns,
+                        stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE_TRANSPORT,
+                    );
+                    log!(
+                        InferenceLogPriority::Error,
+                        "turn={} provider=openrouter_proxy_worker inference_transport_backoff message={}",
+                        input.turn_id,
+                        message,
+                    );
+                }
                 stable::record_inference_proxy_submit_failed();
                 return Err(message);
             }
@@ -2479,6 +2510,11 @@ impl InferenceAdapter for OpenRouterProxyWorkerInferenceAdapter {
                 outcall_finished_at_ns,
                 Some(message.as_str()),
                 true,
+            );
+            stable::record_survival_operation_failure(
+                &SurvivalOperationClass::Inference,
+                now_ns,
+                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE_TRANSPORT,
             );
             stable::record_inference_proxy_submit_failed();
             return Err(message);
@@ -2535,6 +2571,18 @@ fn is_insufficient_cycles_error(error: &str) -> bool {
     let indicates_depleted =
         normalized.contains("out of cycles") || normalized.contains("cycles depleted");
     indicates_insufficient_cycles || indicates_depleted
+}
+
+/// Returns `true` when the error message indicates a transport-level failure
+/// (connection reset, refused, unreachable, generic outcall failure) that
+/// should trigger a shorter survival backoff so the canister stops burning
+/// turns against an unavailable provider.
+fn is_transport_class_error(error: &str) -> bool {
+    let normalized = error.to_lowercase();
+    normalized.contains("connection reset")
+        || normalized.contains("connection refused")
+        || normalized.contains("network is unreachable")
+        || (normalized.contains("outcall failed") && !normalized.contains("insufficient cycles"))
 }
 
 // ── Failure classification ───────────────────────────────────────────────────
@@ -4290,5 +4338,40 @@ mod tests {
         let leftover = stable::take_inference_proxy_callback_result("job-other")
             .expect("unrelated callback should still be buffered");
         assert_eq!(leftover.turn_id, "turn-other");
+    }
+
+    #[test]
+    fn is_transport_class_error_matches_connection_reset() {
+        assert!(is_transport_class_error(
+            "openrouter http outcall failed: connection reset by peer"
+        ));
+    }
+
+    #[test]
+    fn is_transport_class_error_matches_connection_refused() {
+        assert!(is_transport_class_error(
+            "openrouter http outcall failed: connection refused"
+        ));
+    }
+
+    #[test]
+    fn is_transport_class_error_matches_generic_outcall_failed() {
+        assert!(is_transport_class_error(
+            "openrouter http outcall failed: something unexpected"
+        ));
+    }
+
+    #[test]
+    fn is_transport_class_error_rejects_insufficient_cycles_outcall() {
+        assert!(!is_transport_class_error(
+            "openrouter http outcall failed: insufficient cycles"
+        ));
+    }
+
+    #[test]
+    fn is_transport_class_error_rejects_unrelated_errors() {
+        assert!(!is_transport_class_error(
+            "openrouter returned status 429: slow down"
+        ));
     }
 }

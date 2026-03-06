@@ -1772,22 +1772,21 @@ fn build_dynamic_context(
         ))
     };
 
+    let self_principal = current_canister_id_text();
+    let self_principal_display = self_principal.as_deref().unwrap_or("unknown");
+    let self_evm_address = snapshot.evm_address.as_deref().unwrap_or("unconfigured");
+
     let mut sections = vec![
         "## Layer 10: Dynamic Context".to_string(),
+        "### Canonical Identity (use these exact values in tool arguments)".to_string(),
+        format!("- self_canister_id: {self_principal_display}"),
+        format!("- self_evm_address: {self_evm_address}"),
         "### Current State".to_string(),
         format!("- cycles_balance: {cycles_balance}"),
         format!("- liquid_cycles_balance: {liquid_cycles_balance}"),
         "- cycles_runway_hours: unknown".to_string(),
-        format!(
-            "- self_canister_id: {}",
-            current_canister_id_text().as_deref().unwrap_or("unknown")
-        ),
         format!("- survival_tier: {survival_tier}"),
         format!("- survival_tier_recovery_checks: {recovery_checks}"),
-        format!(
-            "- base_wallet: {}",
-            snapshot.evm_address.as_deref().unwrap_or("unconfigured")
-        ),
         format!("- eth_balance: {eth_balance}"),
         format!("- eth_balance_eth: {eth_balance_eth}"),
         format!(
@@ -3763,10 +3762,13 @@ mod tests {
 
         let context = build_dynamic_context(&snapshot, &staged, 3, &memory, &[], "turn-12", 5);
         assert!(context.contains("## Layer 10: Dynamic Context"));
+        assert!(
+            context.contains("### Canonical Identity (use these exact values in tool arguments)")
+        );
+        assert!(context.contains("- self_canister_id: unknown"));
+        assert!(context.contains("- self_evm_address: 0x1234567890abcdef1234567890abcdef12345678"));
         assert!(context.contains("### Current State"));
         assert!(context.contains("- survival_tier: LowCycles"));
-        assert!(context.contains("- self_canister_id: unknown"));
-        assert!(context.contains("- base_wallet: 0x1234567890abcdef1234567890abcdef12345678"));
         assert!(context.contains("- eth_balance: 0x42"));
         assert!(context.contains("- eth_balance_eth: 0.000000000000000066"));
         assert!(context.contains("- usdc_balance: 0x2a"));

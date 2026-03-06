@@ -159,7 +159,12 @@ fn normalize_domain(domain: &str) -> Result<String, String> {
         .strip_prefix("https://")
         .or_else(|| trimmed.strip_prefix("http://"))
         .unwrap_or(trimmed);
-    let host = without_scheme.split('/').next().unwrap_or_default().trim().to_ascii_lowercase();
+    let host = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
     if host.is_empty()
         || host.chars().any(char::is_whitespace)
@@ -212,13 +217,9 @@ fn percent_encode_query_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~' => encoded.push(char::from(byte)),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte))
+            }
             b' ' => encoded.push('+'),
             _ => encoded.push_str(&format!("%{byte:02X}")),
         }
@@ -305,7 +306,8 @@ async fn http_get_search(
 
 #[cfg(target_arch = "wasm32")]
 fn nat_to_u16(value: &Nat) -> Result<u16, String> {
-    value.0
+    value
+        .0
         .to_string()
         .parse::<u16>()
         .map_err(|error| format!("invalid HTTP status from provider: {error}"))
@@ -410,8 +412,8 @@ mod tests {
 
     #[test]
     fn parse_web_search_args_rejects_empty_query() {
-        let error = parse_web_search_args(r#"{"query":"   "}"#)
-            .expect_err("empty query should fail");
+        let error =
+            parse_web_search_args(r#"{"query":"   "}"#).expect_err("empty query should fail");
         assert!(error.contains("query"));
     }
 

@@ -181,6 +181,10 @@ const HOST_LIQUID_CYCLES_OVERRIDE_KEY: &str = "host.liquid_cycles";
 pub const SURVIVAL_TIER_RECOVERY_CHECKS_REQUIRED: u32 = 3;
 /// Maximum exponential backoff (seconds) for the `Inference` operation class.
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE: u64 = 120;
+/// Shorter backoff cap for inference transport failures (connection reset, etc.).
+/// Lower than the cycles-related cap so the canister recovers faster when the
+/// provider endpoint comes back online, while still preventing rapid retry loops.
+pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INFERENCE_TRANSPORT: u64 = 30;
 /// Maximum exponential backoff (seconds) for the `EvmPoll` operation class.
 pub const SURVIVAL_OPERATION_MAX_BACKOFF_SECS_EVM_POLL: u64 = 120;
 /// Maximum exponential backoff (seconds) for the `EvmBroadcast` operation class.
@@ -1845,7 +1849,8 @@ pub fn reserve_web_search_budget(turn_id: &str, now_ns: u64) -> Result<(), Strin
 
     let mut usage_timestamps = load_search_usage_timestamps();
     let len_before = usage_timestamps.len();
-    usage_timestamps.retain(|timestamp| now_ns.saturating_sub(*timestamp) <= SEARCH_USAGE_WINDOW_NS);
+    usage_timestamps
+        .retain(|timestamp| now_ns.saturating_sub(*timestamp) <= SEARCH_USAGE_WINDOW_NS);
     let expired = len_before != usage_timestamps.len();
     let max_per_24h = usize::from(get_search_max_per_24h());
     if usage_timestamps.len() >= max_per_24h {
@@ -1866,7 +1871,9 @@ pub fn reserve_web_search_budget(turn_id: &str, now_ns: u64) -> Result<(), Strin
             count: 1,
         });
         if turn_usage.len() > MAX_SEARCH_TURN_USAGE_ENTRIES {
-            let excess = turn_usage.len().saturating_sub(MAX_SEARCH_TURN_USAGE_ENTRIES);
+            let excess = turn_usage
+                .len()
+                .saturating_sub(MAX_SEARCH_TURN_USAGE_ENTRIES);
             turn_usage.drain(0..excess);
         }
     }
