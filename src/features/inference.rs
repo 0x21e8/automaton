@@ -650,6 +650,230 @@ fn inferred_tool_call_id(call: &ToolCall, transcript_index: usize, tool_index: u
         .unwrap_or_else(|| format!("generated-call-{transcript_index}-{tool_index}"))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SharedToolDefinition {
+    name: String,
+    description: Option<String>,
+    parameters: Option<ToolSchema>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ToolSchema {
+    Object(ToolObjectSchema),
+    String(ToolStringSchema),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolObjectSchema {
+    description: Option<String>,
+    properties: Vec<ToolProperty>,
+    required: Vec<String>,
+    one_of: Vec<ToolSchema>,
+    additional_properties: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolProperty {
+    name: String,
+    schema: ToolSchema,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolStringSchema {
+    description: Option<String>,
+    enum_values: Vec<String>,
+    const_value: Option<String>,
+    pattern: Option<String>,
+}
+
+fn tool_property(name: &str, schema: ToolSchema) -> ToolProperty {
+    ToolProperty {
+        name: name.to_string(),
+        schema,
+    }
+}
+
+fn tool_string_schema(description: impl Into<String>) -> ToolSchema {
+    ToolSchema::String(ToolStringSchema {
+        description: Some(description.into()),
+        enum_values: Vec::new(),
+        const_value: None,
+        pattern: None,
+    })
+}
+
+fn tool_string_const_schema(value: &str) -> ToolSchema {
+    ToolSchema::String(ToolStringSchema {
+        description: None,
+        enum_values: Vec::new(),
+        const_value: Some(value.to_string()),
+        pattern: None,
+    })
+}
+
+fn tool_string_pattern_schema(description: impl Into<String>, pattern: &str) -> ToolSchema {
+    ToolSchema::String(ToolStringSchema {
+        description: Some(description.into()),
+        enum_values: Vec::new(),
+        const_value: None,
+        pattern: Some(pattern.to_string()),
+    })
+}
+
+fn tool_object_schema(
+    description: Option<&str>,
+    properties: Vec<ToolProperty>,
+    required: &[&str],
+) -> ToolSchema {
+    ToolSchema::Object(ToolObjectSchema {
+        description: description.map(str::to_string),
+        properties,
+        required: required.iter().map(|value| (*value).to_string()).collect(),
+        one_of: Vec::new(),
+        additional_properties: None,
+    })
+}
+
+fn with_one_of(schema: ToolSchema, one_of: Vec<ToolSchema>) -> ToolSchema {
+    match schema {
+        ToolSchema::Object(mut object) => {
+            object.one_of = one_of;
+            ToolSchema::Object(object)
+        }
+        other => other,
+    }
+}
+
+fn with_additional_properties(schema: ToolSchema, allowed: bool) -> ToolSchema {
+    match schema {
+        ToolSchema::Object(mut object) => {
+            object.additional_properties = Some(allowed);
+            ToolSchema::Object(object)
+        }
+        other => other,
+    }
+}
+
+fn evm_read_tool_description() -> String {
+    "Call an EVM JSON-RPC read method. Returns the raw JSON-RPC result value (hex string for balances/counts, object for eth_call).\n\nRequired params per method:\n- eth_getBalance(address): {\"method\":\"eth_getBalance\",\"address\":\"0x...\"}\n- eth_call(address, calldata): {\"method\":\"eth_call\",\"address\":\"0x...\",\"calldata\":\"0x70a08231...\"}\n- eth_getTransactionCount(address): {\"method\":\"eth_getTransactionCount\",\"address\":\"0x...\"}\n- eth_blockNumber(): {\"method\":\"eth_blockNumber\"}\n- other read-only eth_* methods: {\"method\":\"eth_getCode\",\"params_json\":\"[\\\"0x...\\\",\\\"latest\\\"]\"}\n\nPrefer canonical fields (`address`, `calldata`) instead of compatibility aliases.".to_string()
+}
+
+fn evm_read_shared_tool() -> SharedToolDefinition {
+    let address_description =
+        "0x-prefixed 20-byte hex address. Required for eth_call, eth_getBalance, and eth_getTransactionCount.";
+    let calldata_description = "0x-prefixed hex calldata. Required for eth_call.";
+    let params_json_description =
+        "JSON array string of positional params. Required for read-only eth_* methods outside eth_call, eth_getBalance, eth_blockNumber, and eth_getTransactionCount.";
+
+    let root = tool_object_schema(
+        None,
+        vec![
+            tool_property(
+                "method",
+                tool_string_schema(
+                    "Method name. Use eth_call, eth_getBalance, eth_blockNumber, eth_getTransactionCount, or another read-only eth_* method with params_json.",
+                ),
+            ),
+            tool_property(
+                "address",
+                tool_string_pattern_schema(address_description, "^0x[a-fA-F0-9]{40}$"),
+            ),
+            tool_property(
+                "calldata",
+                tool_string_pattern_schema(calldata_description, "^0x(?:[a-fA-F0-9]{2})*$"),
+            ),
+            tool_property("params_json", tool_string_schema(params_json_description)),
+        ],
+        &["method"],
+    );
+
+    let one_of = vec![
+        with_additional_properties(
+            tool_object_schema(
+                None,
+                vec![
+                    tool_property("method", tool_string_const_schema("eth_getBalance")),
+                    tool_property(
+                        "address",
+                        tool_string_pattern_schema(address_description, "^0x[a-fA-F0-9]{40}$"),
+                    ),
+                ],
+                &["method", "address"],
+            ),
+            false,
+        ),
+        with_additional_properties(
+            tool_object_schema(
+                None,
+                vec![
+                    tool_property(
+                        "method",
+                        tool_string_const_schema("eth_getTransactionCount"),
+                    ),
+                    tool_property(
+                        "address",
+                        tool_string_pattern_schema(address_description, "^0x[a-fA-F0-9]{40}$"),
+                    ),
+                ],
+                &["method", "address"],
+            ),
+            false,
+        ),
+        with_additional_properties(
+            tool_object_schema(
+                None,
+                vec![
+                    tool_property("method", tool_string_const_schema("eth_call")),
+                    tool_property(
+                        "address",
+                        tool_string_pattern_schema(address_description, "^0x[a-fA-F0-9]{40}$"),
+                    ),
+                    tool_property(
+                        "calldata",
+                        tool_string_pattern_schema(calldata_description, "^0x(?:[a-fA-F0-9]{2})*$"),
+                    ),
+                ],
+                &["method", "address", "calldata"],
+            ),
+            false,
+        ),
+        with_additional_properties(
+            tool_object_schema(
+                None,
+                vec![tool_property(
+                    "method",
+                    tool_string_const_schema("eth_blockNumber"),
+                )],
+                &["method"],
+            ),
+            false,
+        ),
+        with_additional_properties(
+            tool_object_schema(
+                None,
+                vec![
+                    tool_property(
+                        "method",
+                        tool_string_pattern_schema(
+                            "Any other read-only eth_* method.",
+                            "^eth_(?!call$|getBalance$|blockNumber$|getTransactionCount$).+",
+                        ),
+                    ),
+                    tool_property("params_json", tool_string_schema(params_json_description)),
+                ],
+                &["method", "params_json"],
+            ),
+            false,
+        ),
+    ];
+
+    SharedToolDefinition {
+        name: "evm_read".to_string(),
+        description: Some(evm_read_tool_description()),
+        parameters: Some(with_additional_properties(with_one_of(root, one_of), false)),
+    }
+}
+
 fn ic_llm_tools() -> Vec<IcLlmTool> {
     vec![
         IcLlmTool::Function(IcLlmFunction {
@@ -682,48 +906,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 required: Some(vec!["signal".to_string()]),
             }),
         }),
-        IcLlmTool::Function(IcLlmFunction {
-            name: "evm_read".to_string(),
-            description: Some(
-                "Call an EVM JSON-RPC read method. Returns the raw JSON-RPC result value (hex string for balances/counts, object for eth_call).\n\nRequired params per method:\n- eth_getBalance(address): {\"method\":\"eth_getBalance\",\"address\":\"0x...\"}\n- eth_call(address, calldata): {\"method\":\"eth_call\",\"address\":\"0x...\",\"calldata\":\"0x70a08231...\"}\n- eth_getTransactionCount(address): {\"method\":\"eth_getTransactionCount\",\"address\":\"0x...\"}\n- eth_blockNumber(): {\"method\":\"eth_blockNumber\"}\n\nFor other read-only eth_* methods, pass method name + params_json array."
-                    .to_string(),
-            ),
-            parameters: Some(IcLlmParameters {
-                type_: "object".to_string(),
-                properties: Some(vec![
-                    IcLlmProperty {
-                        type_: "string".to_string(),
-                        name: "method".to_string(),
-                        description: Some("Method name. Options: eth_call | eth_getBalance | eth_blockNumber | eth_getTransactionCount. Any other read-only eth_* method requires params_json.".to_string()),
-                        enum_values: Some(vec![
-                            "eth_call".to_string(),
-                            "eth_getBalance".to_string(),
-                            "eth_blockNumber".to_string(),
-                            "eth_getTransactionCount".to_string(),
-                        ]),
-                    },
-                    IcLlmProperty {
-                        type_: "string".to_string(),
-                        name: "address".to_string(),
-                        description: Some("0x-prefixed, checksummed or lowercase, 20-byte hex address. Required for eth_call, eth_getBalance, eth_getTransactionCount. Example: \"0x1234567890abcdef1234567890abcdef12345678\".".to_string()),
-                        enum_values: None,
-                    },
-                    IcLlmProperty {
-                        type_: "string".to_string(),
-                        name: "calldata".to_string(),
-                        description: Some("0x-prefixed hex calldata (4-byte selector + ABI-encoded args). Required for eth_call. Example: \"0x70a08231000000000000000000000000abcd...\" for balanceOf(address).".to_string()),
-                        enum_values: None,
-                    },
-                    IcLlmProperty {
-                        type_: "string".to_string(),
-                        name: "params_json".to_string(),
-                        description: Some("JSON array string of positional params for non-listed read-only eth_* methods (e.g., \"[]\", \"[\\\"0xabc...\\\",\\\"latest\\\"]\").".to_string()),
-                        enum_values: None,
-                    },
-                ]),
-                required: Some(vec!["method".to_string()]),
-            }),
-        }),
+        shared_tool_to_ic_llm(evm_read_shared_tool()),
         IcLlmTool::Function(IcLlmFunction {
             name: "send_eth".to_string(),
             description: Some(
@@ -1256,8 +1439,131 @@ fn ic_llm_tools_with_capabilities(evm_tools_enabled: bool) -> Vec<IcLlmTool> {
 fn openrouter_tools() -> Vec<Value> {
     ic_llm_tools()
         .into_iter()
-        .map(ic_llm_tool_to_openrouter)
+        .map(|tool| {
+            if ic_llm_tool_name(&tool) == "evm_read" {
+                shared_tool_to_openrouter(evm_read_shared_tool())
+            } else {
+                ic_llm_tool_to_openrouter(tool)
+            }
+        })
         .collect()
+}
+
+fn shared_tool_to_ic_llm(tool: SharedToolDefinition) -> IcLlmTool {
+    IcLlmTool::Function(IcLlmFunction {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters.and_then(shared_schema_to_ic_llm_parameters),
+    })
+}
+
+fn shared_schema_to_ic_llm_parameters(schema: ToolSchema) -> Option<IcLlmParameters> {
+    let ToolSchema::Object(object) = schema else {
+        return None;
+    };
+
+    let properties = shared_object_schema_to_ic_llm_properties(&object);
+    Some(IcLlmParameters {
+        type_: "object".to_string(),
+        properties: Some(properties),
+        required: (!object.required.is_empty()).then_some(object.required),
+    })
+}
+
+fn shared_object_schema_to_ic_llm_properties(object: &ToolObjectSchema) -> Vec<IcLlmProperty> {
+    let mut properties = Vec::new();
+    for property in &object.properties {
+        upsert_ic_llm_property(
+            &mut properties,
+            shared_schema_property_to_ic_llm(&property.name, &property.schema),
+        );
+    }
+    for branch in &object.one_of {
+        let ToolSchema::Object(branch_object) = branch else {
+            continue;
+        };
+        for property in &branch_object.properties {
+            upsert_ic_llm_property(
+                &mut properties,
+                shared_schema_property_to_ic_llm(&property.name, &property.schema),
+            );
+        }
+    }
+    properties
+}
+
+fn shared_schema_property_to_ic_llm(name: &str, schema: &ToolSchema) -> IcLlmProperty {
+    match schema {
+        ToolSchema::Object(object) => IcLlmProperty {
+            type_: "object".to_string(),
+            name: name.to_string(),
+            description: object.description.clone(),
+            enum_values: None,
+        },
+        ToolSchema::String(string) => {
+            let enum_values = if let Some(value) = string.const_value.as_ref() {
+                Some(vec![value.clone()])
+            } else if string.enum_values.is_empty() {
+                None
+            } else {
+                Some(string.enum_values.clone())
+            };
+            IcLlmProperty {
+                type_: "string".to_string(),
+                name: name.to_string(),
+                description: string.description.clone(),
+                enum_values,
+            }
+        }
+    }
+}
+
+fn upsert_ic_llm_property(properties: &mut Vec<IcLlmProperty>, incoming: IcLlmProperty) {
+    if let Some(existing) = properties
+        .iter_mut()
+        .find(|property| property.name == incoming.name)
+    {
+        merge_ic_llm_property(existing, incoming);
+    } else {
+        properties.push(incoming);
+    }
+}
+
+fn merge_ic_llm_property(existing: &mut IcLlmProperty, incoming: IcLlmProperty) {
+    if existing.description.is_none() {
+        existing.description = incoming.description;
+    }
+
+    match (&mut existing.enum_values, incoming.enum_values) {
+        (Some(existing_values), Some(incoming_values)) => {
+            for value in incoming_values {
+                if !existing_values.contains(&value) {
+                    existing_values.push(value);
+                }
+            }
+        }
+        (None, Some(incoming_values)) => existing.enum_values = Some(incoming_values),
+        _ => {}
+    }
+}
+
+fn shared_tool_to_openrouter(tool: SharedToolDefinition) -> Value {
+    let mut function_json = Map::new();
+    function_json.insert("name".to_string(), Value::String(tool.name));
+    if let Some(description) = tool.description {
+        function_json.insert("description".to_string(), Value::String(description));
+    }
+    if let Some(parameters) = tool.parameters {
+        function_json.insert(
+            "parameters".to_string(),
+            shared_schema_to_openrouter(parameters),
+        );
+    }
+
+    let mut tool_json = Map::new();
+    tool_json.insert("type".to_string(), Value::String("function".to_string()));
+    tool_json.insert("function".to_string(), Value::Object(function_json));
+    Value::Object(tool_json)
 }
 
 fn ic_llm_tool_to_openrouter(tool: IcLlmTool) -> Value {
@@ -1327,6 +1633,70 @@ fn ic_llm_parameters_to_openrouter(parameters: IcLlmParameters) -> Value {
     }
 
     Value::Object(openrouter_parameters)
+}
+
+fn shared_schema_to_openrouter(schema: ToolSchema) -> Value {
+    match schema {
+        ToolSchema::Object(object) => {
+            let mut map = Map::new();
+            map.insert("type".to_string(), Value::String("object".to_string()));
+            if let Some(description) = object.description {
+                map.insert("description".to_string(), Value::String(description));
+            }
+
+            let mut properties = Map::new();
+            for property in object.properties {
+                properties.insert(property.name, shared_schema_to_openrouter(property.schema));
+            }
+            map.insert("properties".to_string(), Value::Object(properties));
+
+            if !object.required.is_empty() {
+                map.insert(
+                    "required".to_string(),
+                    Value::Array(object.required.into_iter().map(Value::String).collect()),
+                );
+            }
+            if !object.one_of.is_empty() {
+                map.insert(
+                    "oneOf".to_string(),
+                    Value::Array(
+                        object
+                            .one_of
+                            .into_iter()
+                            .map(shared_schema_to_openrouter)
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(additional_properties) = object.additional_properties {
+                map.insert(
+                    "additionalProperties".to_string(),
+                    Value::Bool(additional_properties),
+                );
+            }
+            Value::Object(map)
+        }
+        ToolSchema::String(string) => {
+            let mut map = Map::new();
+            map.insert("type".to_string(), Value::String("string".to_string()));
+            if let Some(description) = string.description {
+                map.insert("description".to_string(), Value::String(description));
+            }
+            if !string.enum_values.is_empty() {
+                map.insert(
+                    "enum".to_string(),
+                    Value::Array(string.enum_values.into_iter().map(Value::String).collect()),
+                );
+            }
+            if let Some(const_value) = string.const_value {
+                map.insert("const".to_string(), Value::String(const_value));
+            }
+            if let Some(pattern) = string.pattern {
+                map.insert("pattern".to_string(), Value::String(pattern));
+            }
+            Value::Object(map)
+        }
+    }
 }
 
 pub fn canonicalize_tool_name(name: &str) -> String {
@@ -3102,6 +3472,8 @@ mod tests {
         assert!(description.contains("eth_getBalance"));
         assert!(description.contains("eth_blockNumber"));
         assert!(description.contains("eth_getTransactionCount"));
+        assert!(description.contains("other read-only eth_* methods"));
+        assert!(description.contains("Prefer canonical fields"));
 
         let parameters = function.parameters.expect("evm_read schema should exist");
         assert_eq!(
@@ -3118,6 +3490,7 @@ mod tests {
         assert!(method_description.contains("eth_getBalance"));
         assert!(method_description.contains("eth_blockNumber"));
         assert!(method_description.contains("eth_getTransactionCount"));
+        assert!(method_description.contains("params_json"));
     }
 
     #[test]
@@ -3136,19 +3509,68 @@ mod tests {
             .iter()
             .find(|property| property.name == "method")
             .expect("method property should be present");
+        let mut enum_values = method_property
+            .enum_values
+            .clone()
+            .expect("method enum values should be present");
+        enum_values.sort();
         assert_eq!(
-            method_property.enum_values.as_ref(),
-            Some(&vec![
+            enum_values,
+            vec![
+                "eth_blockNumber".to_string(),
                 "eth_call".to_string(),
                 "eth_getBalance".to_string(),
-                "eth_blockNumber".to_string(),
                 "eth_getTransactionCount".to_string(),
-            ])
+            ]
         );
     }
 
     #[test]
-    fn openrouter_tools_emit_enum_array_for_evm_read_method() {
+    fn ic_llm_evm_read_schema_degrades_method_specific_requirements_to_guidance() {
+        let evm_read_tool = ic_llm_tools()
+            .into_iter()
+            .find(
+                |tool| matches!(tool, IcLlmTool::Function(function) if function.name == "evm_read"),
+            )
+            .expect("evm_read tool should exist");
+
+        let IcLlmTool::Function(function) = evm_read_tool;
+        let parameters = function.parameters.expect("evm_read schema should exist");
+        let properties = parameters.properties.unwrap_or_default();
+
+        let address = properties
+            .iter()
+            .find(|property| property.name == "address")
+            .expect("address property should be present");
+        assert!(address
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Required for eth_call, eth_getBalance, and eth_getTransactionCount"));
+
+        let calldata = properties
+            .iter()
+            .find(|property| property.name == "calldata")
+            .expect("calldata property should be present");
+        assert!(calldata
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Required for eth_call"));
+
+        let params_json = properties
+            .iter()
+            .find(|property| property.name == "params_json")
+            .expect("params_json property should be present");
+        assert!(params_json
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Required for read-only eth_* methods outside"));
+    }
+
+    #[test]
+    fn openrouter_evm_read_schema_uses_method_specific_one_of_branches() {
         let evm_read_tool = openrouter_tools()
             .into_iter()
             .find(|entry| {
@@ -3160,27 +3582,85 @@ mod tests {
             })
             .expect("openrouter evm_read tool should exist");
 
-        let method_enum = evm_read_tool
+        let parameters = evm_read_tool
             .get("function")
             .and_then(|function| function.get("parameters"))
-            .and_then(|parameters| parameters.get("properties"))
-            .and_then(|properties| properties.get("method"))
-            .and_then(|method| method.get("enum"))
-            .and_then(|value| value.as_array())
-            .expect("evm_read method enum should exist");
-
-        let method_enum_values = method_enum
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect::<Vec<_>>();
+            .expect("openrouter evm_read parameters should exist");
         assert_eq!(
-            method_enum_values,
+            parameters
+                .get("additionalProperties")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let method_property = parameters
+            .get("properties")
+            .and_then(|properties| properties.get("method"))
+            .expect("openrouter evm_read method property should exist");
+        assert!(
+            method_property.get("enum").is_none(),
+            "openrouter root method property must stay open for generic eth_* methods"
+        );
+
+        let one_of = parameters
+            .get("oneOf")
+            .and_then(Value::as_array)
+            .expect("openrouter evm_read should define oneOf branches");
+        assert_eq!(one_of.len(), 5);
+
+        let branch_required = |branch: &Value| {
+            branch
+                .get("required")
+                .and_then(Value::as_array)
+                .expect("branch required should exist")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        let eth_call_branch = one_of
+            .iter()
+            .find(|branch| {
+                branch
+                    .get("properties")
+                    .and_then(|properties| properties.get("method"))
+                    .and_then(|method| method.get("const"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == "eth_call")
+            })
+            .expect("eth_call branch should exist");
+        assert_eq!(
+            branch_required(eth_call_branch),
             vec![
-                "eth_call",
-                "eth_getBalance",
-                "eth_blockNumber",
-                "eth_getTransactionCount"
+                "method".to_string(),
+                "address".to_string(),
+                "calldata".to_string()
             ]
+        );
+        assert_eq!(
+            eth_call_branch
+                .get("additionalProperties")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let generic_branch = one_of
+            .iter()
+            .find(|branch| {
+                branch
+                    .get("properties")
+                    .and_then(|properties| properties.get("method"))
+                    .and_then(|method| method.get("pattern"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| {
+                        value == "^eth_(?!call$|getBalance$|blockNumber$|getTransactionCount$).+"
+                    })
+            })
+            .expect("generic eth_* branch should exist");
+        assert_eq!(
+            branch_required(generic_branch),
+            vec!["method".to_string(), "params_json".to_string()]
         );
     }
 
