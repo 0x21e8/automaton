@@ -17,7 +17,7 @@ type AbiFunctionSpec = record {
   state_mutability : text;
 };
 type AbiSelectorAssertion = record { signature : text; selector_hex : text };
-type AbiTypeSpec = record { kind : text; components : Vec };
+type AbiTypeSpec = record { kind : text; name : text; components : Vec };
 type ActionSpec = record {
   postconditions : vec text;
   action_id : text;
@@ -688,7 +688,7 @@ type TurnWindowSummary = record {
   tool_failure_count : nat32;
   tool_call_count : nat32;
 };
-type Vec = vec record { kind : text; components : Vec };
+type Vec = vec record { kind : text; name : text; components : Vec };
 type WalletBalanceStatus = variant { Error; Stale; Fresh; Unknown };
 type WalletBalanceSyncConfigView = record {
   normal_interval_secs : nat64;

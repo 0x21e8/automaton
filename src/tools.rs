@@ -21,7 +21,7 @@
 /// | `MAX_MEMORY_RECALL_RESULTS`     | 50     |
 /// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
-    AgentState, MemoryFact, PromptLayer, StrategyExecutionIntent, StrategyTemplateKey,
+    AbiTypeSpec, AgentState, MemoryFact, PromptLayer, StrategyExecutionIntent, StrategyTemplateKey,
     SurvivalOperationClass, ToolCall, ToolCallOutcome, ToolCallRecord, ToolFailureKind,
 };
 use crate::features::canister_call::canister_call_tool;
@@ -38,7 +38,7 @@ use crate::timing::current_time_ns;
 use alloy_primitives::U256;
 use async_trait::async_trait;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
@@ -220,6 +220,10 @@ fn classify_tool_failure_kind(tool: &str, error: &str) -> ToolFailureKind {
         "http_fetch" => classify_http_fetch_failure_kind(&normalized),
         "web_search" => classify_web_search_failure_kind(&normalized),
         "list_strategy_templates" => classify_list_strategy_templates_failure_kind(&normalized),
+        "describe_strategy_action" => classify_describe_strategy_action_failure_kind(&normalized),
+        "simulate_strategy_action" | "execute_strategy_action" => {
+            classify_strategy_action_failure_kind(&normalized)
+        }
         _ => ToolFailureKind::InternalFailure,
     }
 }
@@ -342,6 +346,70 @@ fn classify_list_strategy_templates_failure_kind(normalized_error: &str) -> Tool
     ToolFailureKind::InternalFailure
 }
 
+fn classify_describe_strategy_action_failure_kind(normalized_error: &str) -> ToolFailureKind {
+    if normalized_error.starts_with("invalid describe_strategy_action args json:") {
+        return ToolFailureKind::MalformedInput;
+    }
+    ToolFailureKind::InternalFailure
+}
+
+fn classify_strategy_action_failure_kind(normalized_error: &str) -> ToolFailureKind {
+    if strategy_action_error_is_outcall_failure(normalized_error) {
+        return ToolFailureKind::OutcallFailure;
+    }
+    if strategy_action_error_is_malformed_input(normalized_error) {
+        return ToolFailureKind::MalformedInput;
+    }
+    ToolFailureKind::InternalFailure
+}
+
+fn strategy_action_error_is_outcall_failure(normalized_error: &str) -> bool {
+    normalized_error.contains("rpc")
+        || normalized_error.contains("http ")
+        || normalized_error.contains("outcall")
+        || normalized_error.contains("timed out")
+        || normalized_error.contains("timeout")
+        || normalized_error.contains("transport")
+        || normalized_error.contains("eth_sendrawtransaction")
+        || normalized_error.contains("send raw transaction")
+        || normalized_error.contains("broadcast")
+}
+
+fn strategy_action_error_is_malformed_input(normalized_error: &str) -> bool {
+    if normalized_error.starts_with("invalid strategy action args json:")
+        || normalized_error.starts_with("invalid typed_params_json:")
+        || normalized_error == "missing required field: typed_params or typed_params_json"
+        || normalized_error.starts_with("call count mismatch for action ")
+        || normalized_error.starts_with("typed params call index ")
+        || normalized_error.starts_with("argument count mismatch for calls[")
+        || normalized_error.starts_with("missing required field: calls[")
+        || normalized_error.starts_with("unknown field: calls[")
+        || normalized_error.starts_with("value_wei cannot be empty")
+        || normalized_error.starts_with("value_wei must be ")
+        || normalized_error.starts_with("failed to parse value_wei")
+    {
+        return true;
+    }
+
+    normalized_error.contains("calls[")
+        && (normalized_error.contains(" must be a json array")
+            || normalized_error.contains(" must be a json object or array")
+            || normalized_error.contains(" must be an array for abi array type")
+            || normalized_error.contains(" must be an array for fixed-size abi array")
+            || normalized_error.contains(" must be a decimal string or hex quantity")
+            || normalized_error.contains(" must be a 0x-prefixed hex string")
+            || normalized_error.contains(" must be a string or unsigned integer")
+            || normalized_error.contains(" must be a string or integer")
+            || normalized_error.contains(" address must be a string")
+            || normalized_error.contains(" bool must be true/false")
+            || normalized_error.contains(" tuple arity mismatch")
+            || normalized_error.contains(" length mismatch")
+            || normalized_error.contains(" fixed bytes must be a hex string")
+            || normalized_error.contains(" fixed bytes width must be in 1..=32")
+            || normalized_error.contains(" failed to parse")
+            || normalized_error.contains(" must be valid hex"))
+}
+
 /// Read-only tools that are safe to co-schedule inside a contiguous batch.
 ///
 /// `evm_read` and `http_fetch` are included for latency reduction, but each batch
@@ -355,6 +423,7 @@ fn is_parallel_read_only_tool(tool: &str) -> bool {
             | "memory_stats"
             | "sql_query"
             | "list_strategy_templates"
+            | "describe_strategy_action"
             | "get_strategy_outcomes"
             | "evm_read"
             | "http_fetch"
@@ -619,6 +688,13 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "describe_strategy_action".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
             },
         );
         policies.insert(
@@ -953,6 +1029,7 @@ impl ToolManager {
             "trigger_top_up" => trigger_top_up_tool(),
             "list_strategy_templates" => list_strategy_templates_tool(&call.args_json),
             "register_strategy" => register_strategy_tool(&call.args_json),
+            "describe_strategy_action" => describe_strategy_action_tool(&call.args_json),
             "simulate_strategy_action" => {
                 let now_ns = current_time_ns();
                 if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns) {
@@ -2095,6 +2172,12 @@ struct StrategyOutcomesArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct DescribeStrategyActionArgs {
+    key: StrategyTemplateKey,
+    action_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct StrategyIntentArgs {
     key: StrategyTemplateKey,
     action_id: String,
@@ -2127,6 +2210,13 @@ fn parse_strategy_outcomes_args(args_json: &str) -> Result<StrategyOutcomesArgs,
 fn parse_register_strategy_args(args_json: &str) -> Result<StrategyRecipe, String> {
     serde_json::from_str(args_json)
         .map_err(|error| format!("invalid register_strategy args json: {error}"))
+}
+
+fn parse_describe_strategy_action_args(
+    args_json: &str,
+) -> Result<DescribeStrategyActionArgs, String> {
+    serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid describe_strategy_action args json: {error}"))
 }
 
 /// Parse strategy action intent args, normalising `typed_params` vs `typed_params_json`.
@@ -2201,6 +2291,202 @@ fn register_strategy_tool(args_json: &str) -> Result<String, String> {
         "activation": result.activation,
     }))
     .map_err(|error| format!("failed to serialize register_strategy result: {error}"))
+}
+
+#[derive(Debug, Serialize)]
+struct DescribeStrategyActionCallSummary {
+    index: usize,
+    role: String,
+    function_name: String,
+    signature: String,
+    state_mutability: String,
+    value_allowed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DescribeStrategyActionCallSchema {
+    index: usize,
+    role: String,
+    function_name: String,
+    signature: String,
+    state_mutability: String,
+    value_allowed: bool,
+    args: Vec<AbiTypeSpec>,
+}
+
+#[derive(Debug, Serialize)]
+struct DescribeStrategyActionResponse {
+    key: StrategyTemplateKey,
+    action_id: String,
+    canonical_calls: Vec<DescribeStrategyActionCallSummary>,
+    named_argument_schema: Vec<DescribeStrategyActionCallSchema>,
+    preferred_typed_params: serde_json::Value,
+    notes: Vec<String>,
+}
+
+fn describe_strategy_action_tool(args_json: &str) -> Result<String, String> {
+    let args = parse_describe_strategy_action_args(args_json)?;
+    let action_id = args.action_id.trim();
+    if action_id.is_empty() {
+        return Err("action_id must be non-empty".to_string());
+    }
+
+    let template = registry::get_template(&args.key).ok_or_else(|| {
+        format!(
+            "strategy template not found for {}:{}:{}:{}",
+            args.key.protocol, args.key.primitive, args.key.chain_id, args.key.template_id
+        )
+    })?;
+    let action = template
+        .actions
+        .iter()
+        .find(|candidate| candidate.action_id == action_id)
+        .ok_or_else(|| format!("strategy action not found: {action_id}"))?;
+    let action_schema = compiler::derive_action_argument_schema(&args.key, action_id)?;
+    if action.call_sequence.len() != action_schema.calls.len() {
+        return Err(format!(
+            "strategy action schema mismatch for {action_id}: expected {} calls got {}",
+            action.call_sequence.len(),
+            action_schema.calls.len()
+        ));
+    }
+
+    let canonical_calls = action
+        .call_sequence
+        .iter()
+        .zip(action_schema.calls.iter())
+        .enumerate()
+        .map(
+            |(index, (function, schema_call))| DescribeStrategyActionCallSummary {
+                index,
+                role: schema_call.role.clone(),
+                function_name: schema_call.function_name.clone(),
+                signature: schema_call.signature.clone(),
+                state_mutability: function.state_mutability.clone(),
+                value_allowed: schema_call.value_allowed,
+            },
+        )
+        .collect::<Vec<_>>();
+    let named_argument_schema = action
+        .call_sequence
+        .iter()
+        .zip(action_schema.calls.iter())
+        .enumerate()
+        .map(
+            |(index, (function, schema_call))| DescribeStrategyActionCallSchema {
+                index,
+                role: schema_call.role.clone(),
+                function_name: schema_call.function_name.clone(),
+                signature: schema_call.signature.clone(),
+                state_mutability: function.state_mutability.clone(),
+                value_allowed: schema_call.value_allowed,
+                args: schema_call.args.clone(),
+            },
+        )
+        .collect::<Vec<_>>();
+    let preferred_typed_params = build_preferred_typed_params_template(&action_schema.calls)?;
+
+    log!(
+        StrategyToolLogPriority::Info,
+        "strategy_describe_ok protocol={} template_id={} action_id={} call_count={}",
+        args.key.protocol,
+        args.key.template_id,
+        action_id,
+        action_schema.calls.len()
+    );
+
+    serde_json::to_string(&DescribeStrategyActionResponse {
+        key: args.key,
+        action_id: action_id.to_string(),
+        canonical_calls,
+        named_argument_schema,
+        preferred_typed_params,
+        notes: vec![
+            "Call describe_strategy_action first for complex actions, then simulate_strategy_action, then execute_strategy_action only after simulation passes."
+                .to_string(),
+            format!(
+                "typed_params.calls must contain exactly {} entries, matching the canonical call order.",
+                action_schema.calls.len()
+            ),
+            "Each value_wei must be a decimal string or 0x-prefixed hex quantity; use \"0\" when no native value is sent."
+                .to_string(),
+        ],
+    })
+    .map_err(|error| format!("failed to serialize describe_strategy_action result: {error}"))
+}
+
+fn build_preferred_typed_params_template(
+    calls: &[crate::strategy::compiler::StrategyActionCallSchema],
+) -> Result<serde_json::Value, String> {
+    let mut typed_calls = Vec::with_capacity(calls.len());
+    for call in calls {
+        let mut args = serde_json::Map::with_capacity(call.args.len());
+        for spec in &call.args {
+            args.insert(spec.name.clone(), preferred_abi_value_template(spec)?);
+        }
+        typed_calls.push(json!({
+            "args": serde_json::Value::Object(args),
+            "value_wei": "0",
+        }));
+    }
+    Ok(json!({ "calls": typed_calls }))
+}
+
+fn preferred_abi_value_template(spec: &AbiTypeSpec) -> Result<serde_json::Value, String> {
+    if let Some((element_kind, maybe_len)) = split_abi_array_type(spec.kind.trim()) {
+        let element_spec = AbiTypeSpec {
+            name: spec.name.clone(),
+            kind: element_kind,
+            components: spec.components.clone(),
+        };
+        let len = maybe_len.unwrap_or(0);
+        let mut values = Vec::with_capacity(len);
+        for _ in 0..len {
+            values.push(preferred_abi_value_template(&element_spec)?);
+        }
+        return Ok(serde_json::Value::Array(values));
+    }
+
+    let kind = spec.kind.trim().to_ascii_lowercase();
+    if kind == "tuple" {
+        let mut object = serde_json::Map::with_capacity(spec.components.len());
+        for component in &spec.components {
+            object.insert(
+                component.name.clone(),
+                preferred_abi_value_template(component)?,
+            );
+        }
+        return Ok(serde_json::Value::Object(object));
+    }
+
+    match kind.as_str() {
+        "address" => Ok(serde_json::Value::String(
+            "0x0000000000000000000000000000000000000000".to_string(),
+        )),
+        "bool" => Ok(serde_json::Value::Bool(false)),
+        "string" => Ok(serde_json::Value::String(String::new())),
+        "bytes" => Ok(serde_json::Value::String("0x".to_string())),
+        _ if kind.starts_with("uint") => Ok(serde_json::Value::String("0".to_string())),
+        _ if kind.starts_with("int") => Ok(serde_json::Value::String("0".to_string())),
+        _ if kind.starts_with("bytes") => Ok(serde_json::Value::String("0x".to_string())),
+        _ => Err(format!(
+            "unsupported abi type for preferred payload template: {}",
+            spec.kind
+        )),
+    }
+}
+
+fn split_abi_array_type(kind: &str) -> Option<(String, Option<usize>)> {
+    if !kind.ends_with(']') {
+        return None;
+    }
+    let start = kind.rfind('[')?;
+    let base = kind[..start].to_string();
+    let len_raw = &kind[start + 1..kind.len().saturating_sub(1)];
+    if len_raw.is_empty() {
+        return Some((base, None));
+    }
+    len_raw.parse::<usize>().ok().map(|len| (base, Some(len)))
 }
 
 /// Compile and validate a strategy intent without submitting any transactions.
@@ -2623,6 +2909,125 @@ mod tests {
         .expect("activation should persist");
     }
 
+    fn sample_morpho_strategy_key() -> StrategyTemplateKey {
+        StrategyTemplateKey {
+            protocol: "morpho-v1".to_string(),
+            primitive: "lend_supply".to_string(),
+            chain_id: 8453,
+            template_id: "tool-morpho-supply".to_string(),
+        }
+    }
+
+    fn seed_morpho_strategy_template_and_artifact() {
+        let key = sample_morpho_strategy_key();
+        let function = AbiFunctionSpec {
+            role: "morpho".to_string(),
+            name: "supply".to_string(),
+            selector_hex: "0xa99aad89".to_string(),
+            inputs: vec![
+                AbiTypeSpec {
+                    name: "marketParams".to_string(),
+                    kind: "tuple".to_string(),
+                    components: vec![
+                        AbiTypeSpec {
+                            name: "loanToken".to_string(),
+                            kind: "address".to_string(),
+                            components: Vec::new(),
+                        },
+                        AbiTypeSpec {
+                            name: "collateralToken".to_string(),
+                            kind: "address".to_string(),
+                            components: Vec::new(),
+                        },
+                        AbiTypeSpec {
+                            name: "oracle".to_string(),
+                            kind: "address".to_string(),
+                            components: Vec::new(),
+                        },
+                        AbiTypeSpec {
+                            name: "irm".to_string(),
+                            kind: "address".to_string(),
+                            components: Vec::new(),
+                        },
+                        AbiTypeSpec {
+                            name: "lltv".to_string(),
+                            kind: "uint256".to_string(),
+                            components: Vec::new(),
+                        },
+                    ],
+                },
+                AbiTypeSpec {
+                    name: "assets".to_string(),
+                    kind: "uint256".to_string(),
+                    components: Vec::new(),
+                },
+                AbiTypeSpec {
+                    name: "shares".to_string(),
+                    kind: "uint256".to_string(),
+                    components: Vec::new(),
+                },
+                AbiTypeSpec {
+                    name: "onBehalf".to_string(),
+                    kind: "address".to_string(),
+                    components: Vec::new(),
+                },
+                AbiTypeSpec {
+                    name: "data".to_string(),
+                    kind: "bytes".to_string(),
+                    components: Vec::new(),
+                },
+            ],
+            outputs: vec![AbiTypeSpec {
+                name: "suppliedAssets".to_string(),
+                kind: "uint256".to_string(),
+                components: Vec::new(),
+            }],
+            state_mutability: "nonpayable".to_string(),
+        };
+        crate::strategy::registry::upsert_template(StrategyTemplate {
+            key: key.clone(),
+            status: TemplateStatus::Active,
+            contract_roles: vec![ContractRoleBinding {
+                role: "morpho".to_string(),
+                address: "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb".to_string(),
+                source_ref: "https://docs.morpho.org/get-started/resources/addresses/".to_string(),
+                codehash: None,
+            }],
+            actions: vec![ActionSpec {
+                action_id: "enter_supply".to_string(),
+                call_sequence: vec![function.clone()],
+                preconditions: vec!["allowance_ok".to_string()],
+                postconditions: vec!["position_opened".to_string()],
+                risk_checks: vec!["max_notional".to_string()],
+            }],
+            constraints_json: "{}".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+        })
+        .expect("morpho strategy template should persist");
+        crate::strategy::registry::upsert_abi_artifact(AbiArtifact {
+            key: AbiArtifactKey {
+                protocol: key.protocol.clone(),
+                chain_id: key.chain_id,
+                role: "morpho".to_string(),
+            },
+            source_ref: "https://docs.morpho.org/get-started/resources/addresses/".to_string(),
+            codehash: None,
+            abi_json: "[]".to_string(),
+            functions: vec![function],
+            created_at_ns: 1,
+            updated_at_ns: 1,
+        })
+        .expect("morpho abi artifact should persist");
+        crate::strategy::registry::set_activation(TemplateActivationState {
+            key,
+            enabled: true,
+            updated_at_ns: 1,
+            reason: Some("seed".to_string()),
+        })
+        .expect("morpho activation should persist");
+    }
+
     fn call(tool: &str, args_json: &str) -> ToolCall {
         ToolCall {
             tool_call_id: None,
@@ -3003,6 +3408,83 @@ mod tests {
         .expect("partial key args should degrade to deterministic filtered listing");
         assert!(out.contains("\"template_id\":\"tool-transfer\""));
         assert!(out.contains("\"template_id\":\"tool-transfer-alt\""));
+    }
+
+    #[test]
+    fn describe_strategy_action_tool_returns_named_payload_template() {
+        stable::init_storage();
+        seed_morpho_strategy_template_and_artifact();
+
+        let output = describe_strategy_action_tool(
+            &serde_json::json!({
+                "key": sample_morpho_strategy_key(),
+                "action_id": "enter_supply"
+            })
+            .to_string(),
+        )
+        .expect("describe_strategy_action should succeed");
+        let payload: serde_json::Value =
+            serde_json::from_str(&output).expect("describe output should be valid json");
+
+        assert_eq!(
+            payload
+                .get("canonical_calls")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            payload
+                .get("canonical_calls")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|calls| calls.first())
+                .and_then(|call| call.get("signature"))
+                .and_then(serde_json::Value::as_str),
+            Some("supply((address,address,address,address,uint256),uint256,uint256,address,bytes)")
+        );
+        assert_eq!(
+            payload
+                .get("named_argument_schema")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|calls| calls.first())
+                .and_then(|call| call.get("args"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|args| args.first())
+                .and_then(|arg| arg.get("name"))
+                .and_then(serde_json::Value::as_str),
+            Some("marketParams")
+        );
+        assert_eq!(
+            payload
+                .get("preferred_typed_params")
+                .and_then(|value| value.get("calls"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|calls| calls.first())
+                .and_then(|call| call.get("args"))
+                .and_then(|args| args.get("marketParams"))
+                .and_then(|market_params| market_params.get("oracle"))
+                .and_then(serde_json::Value::as_str),
+            Some("0x0000000000000000000000000000000000000000")
+        );
+        assert_eq!(
+            payload
+                .get("preferred_typed_params")
+                .and_then(|value| value.get("calls"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|calls| calls.first())
+                .and_then(|call| call.get("args"))
+                .and_then(|args| args.get("assets"))
+                .and_then(serde_json::Value::as_str),
+            Some("0")
+        );
+        let notes = payload
+            .get("notes")
+            .and_then(serde_json::Value::as_array)
+            .expect("notes should be present");
+        assert!(notes.iter().any(|note| {
+            note.as_str()
+                .is_some_and(|value| value.contains("simulate_strategy_action"))
+        }));
     }
 
     #[test]
@@ -3450,6 +3932,61 @@ mod tests {
             classify_execute_strategy_action_failure("strategy validation failed: bad call"),
             SurvivalOperationClass::EvmPoll
         );
+    }
+
+    #[test]
+    fn strategy_action_malformed_input_is_classified_as_malformed() {
+        stable::init_storage();
+        stable::set_evm_chain_id(8453).expect("chain id should be configurable");
+        seed_morpho_strategy_template_and_artifact();
+
+        let state = AgentState::Inferring;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "simulate_strategy_action".to_string(),
+            args_json: serde_json::json!({
+                "key": sample_morpho_strategy_key(),
+                "action_id": "enter_supply",
+                "typed_params": {
+                    "calls": [{
+                        "value_wei": "0",
+                        "args": {
+                            "marketParams": {
+                                "loanToken": "0x4200000000000000000000000000000000000006",
+                                "collateralToken": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+                                "irm": "0x46415998764C29aB2a25CbeA6E5D2F226b40b5f0",
+                                "lltv": "860000000000000000"
+                            },
+                            "assets": "1000000",
+                            "shares": "0",
+                            "onBehalf": "0x1111111111111111111111111111111111111111",
+                            "data": "0x"
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        }];
+
+        let records = block_on_with_spin(manager.execute_actions(
+            &state,
+            &calls,
+            &signer,
+            "turn-strategy-malformed",
+        ));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert_eq!(
+            records[0].failure_kind,
+            Some(ToolFailureKind::MalformedInput)
+        );
+        assert!(records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing required field: calls[0].args.marketParams.oracle"));
     }
 
     #[test]

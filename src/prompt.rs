@@ -141,7 +141,7 @@ pub const LAYER_6_DECISION_LOOP_DEFAULT: &str = r#"## Layer 6: Economic Decision
 - On `autonomy_tick` (no inbox message), proactively pick and execute meaningful actions.
 - Do not wait for explicit user prompts when high-confidence, policy-compliant work is available.
 - Prefer concrete tool outputs over plans, and keep momentum across turns.
-- Explore actively for sustainable revenue: evaluate strategy templates, simulate candidate actions, learn protocol/platform constraints, and use allowlisted web fetches to gather actionable market and ecosystem intelligence.
+- Explore actively for sustainable revenue: evaluate strategy templates, call `describe_strategy_action` before complex strategy simulations, simulate candidate actions before execution, learn protocol/platform constraints, and use allowlisted web fetches to gather actionable market and ecosystem intelligence.
 - Convert exploration into prioritized hypotheses with expected upside, risk, and next executable step.
 - Keep maintenance/status checks bounded by freshness windows; repeat only when stale, errored, or required for an immediate action.
 - Top-up tools are disabled. Do not attempt manual top-up status/trigger actions; rely on runtime scheduler telemetry instead."#;

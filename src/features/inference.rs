@@ -1252,9 +1252,37 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
+            name: "describe_strategy_action".to_string(),
+            description: Some(
+                "Describe a registered strategy action. Call this first for complex actions to get the canonical call list, named argument tree, preferred typed_params template, and workflow notes before simulating or executing."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "object".to_string(),
+                        name: "key".to_string(),
+                        description: Some(
+                            "Template key object: {\"protocol\":\"...\",\"primitive\":\"...\",\"chain_id\":31337,\"template_id\":\"...\"}."
+                                .to_string(),
+                        ),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "action_id".to_string(),
+                        description: Some("Action identifier within the template.".to_string()),
+                        enum_values: None,
+                    },
+                ]),
+                required: Some(vec!["key".to_string(), "action_id".to_string()]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
             name: "simulate_strategy_action".to_string(),
             description: Some(
-                "Compile and validate a strategy action without broadcasting transactions. Requires `key`, `action_id`, and one of `typed_params` or `typed_params_json`."
+                "Compile and validate a strategy action without broadcasting transactions. Call describe_strategy_action first for complex actions, then provide named-object args in typed_params.calls[*].args. Requires `key`, `action_id`, and one of `typed_params` or `typed_params_json`."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -1279,7 +1307,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "object".to_string(),
                         name: "typed_params".to_string(),
                         description: Some(
-                            "Inline typed parameter object consumed by the strategy compiler."
+                            "Inline typed parameter object consumed by the strategy compiler. Prefer named objects for calls[*].args using the schema returned by describe_strategy_action."
                                 .to_string(),
                         ),
                         enum_values: None,
@@ -1288,7 +1316,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "string".to_string(),
                         name: "typed_params_json".to_string(),
                         description: Some(
-                            "Alternative to `typed_params`: serialized JSON string of typed parameters."
+                            "Alternative to `typed_params`: serialized JSON string of the same named-object-first typed parameters."
                                 .to_string(),
                         ),
                         enum_values: None,
@@ -1303,7 +1331,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "execute_strategy_action".to_string(),
             description: Some(
-                "Compile, validate, and execute a strategy action (broadcasts real transactions). Requires `key`, `action_id`, and one of `typed_params` or `typed_params_json`."
+                "Compile, validate, and execute a strategy action (broadcasts real transactions). Call describe_strategy_action first, simulate_strategy_action second, and execute only after the simulation passes. Prefer named-object args in typed_params.calls[*].args."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -1328,7 +1356,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "object".to_string(),
                         name: "typed_params".to_string(),
                         description: Some(
-                            "Inline typed parameter object consumed by the strategy compiler."
+                            "Inline typed parameter object consumed by the strategy compiler. Prefer named objects for calls[*].args using the schema returned by describe_strategy_action."
                                 .to_string(),
                         ),
                         enum_values: None,
@@ -1337,7 +1365,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                         type_: "string".to_string(),
                         name: "typed_params_json".to_string(),
                         description: Some(
-                            "Alternative to `typed_params`: serialized JSON string of typed parameters."
+                            "Alternative to `typed_params`: serialized JSON string of the same named-object-first typed parameters."
                                 .to_string(),
                         ),
                         enum_values: None,
@@ -3555,6 +3583,7 @@ mod tests {
         assert!(names.contains(&"update_prompt_layer".to_string()));
         assert!(names.contains(&"list_strategy_templates".to_string()));
         assert!(names.contains(&"register_strategy".to_string()));
+        assert!(names.contains(&"describe_strategy_action".to_string()));
         assert!(names.contains(&"simulate_strategy_action".to_string()));
         assert!(names.contains(&"execute_strategy_action".to_string()));
         assert!(names.contains(&"get_strategy_outcomes".to_string()));
@@ -3877,6 +3906,7 @@ mod tests {
         assert!(names.contains(&"update_prompt_layer"));
         assert!(names.contains(&"list_strategy_templates"));
         assert!(names.contains(&"register_strategy"));
+        assert!(names.contains(&"describe_strategy_action"));
         assert!(names.contains(&"simulate_strategy_action"));
         assert!(names.contains(&"execute_strategy_action"));
         assert!(names.contains(&"get_strategy_outcomes"));
@@ -4007,6 +4037,7 @@ mod tests {
         assert!(names.contains(&"remember".to_string()));
         assert!(names.contains(&"list_strategy_templates".to_string()));
         assert!(names.contains(&"register_strategy".to_string()));
+        assert!(names.contains(&"describe_strategy_action".to_string()));
         assert!(names.contains(&"memory_stats".to_string()));
         assert!(names.contains(&"simulate_strategy_action".to_string()));
         assert!(names.contains(&"get_strategy_outcomes".to_string()));
@@ -4046,6 +4077,7 @@ mod tests {
         assert!(names.contains(&"remember"));
         assert!(names.contains(&"list_strategy_templates"));
         assert!(names.contains(&"register_strategy"));
+        assert!(names.contains(&"describe_strategy_action"));
         assert!(names.contains(&"memory_stats"));
         assert!(names.contains(&"simulate_strategy_action"));
         assert!(names.contains(&"get_strategy_outcomes"));

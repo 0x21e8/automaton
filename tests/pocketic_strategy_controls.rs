@@ -7,6 +7,8 @@ use pocket_ic::PocketIc;
 use serde::{Deserialize, Serialize};
 
 const WASM_PATHS: &[&str] = &[
+    "target/wasm32-wasip1/release/backend_nowasi.wasm",
+    "target/wasm32-wasip1/release/backend.wasm",
     "target/wasm32-unknown-unknown/release/backend.wasm",
     "target/wasm32-unknown-unknown/release/deps/backend.wasm",
 ];

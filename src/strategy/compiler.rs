@@ -24,15 +24,15 @@
 /// [`StrategyTemplate`]: crate::domain::types::StrategyTemplate
 /// [`AbiArtifact`]: crate::domain::types::AbiArtifact
 use crate::domain::types::{
-    AbiArtifactKey, AbiTypeSpec, ExecutionPlan, StrategyExecutionCall, StrategyExecutionIntent,
-    StrategyTemplateKey,
+    AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, ExecutionPlan, StrategyExecutionCall,
+    StrategyExecutionIntent, StrategyTemplateKey,
 };
 use crate::strategy::{abi, registry};
 use crate::util::{normalize_evm_address, normalize_hex_blob, normalize_selector_hex};
 use alloy_primitives::U256;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 // ── Internal deserialization types ──────────────────────────────────────────
@@ -47,10 +47,25 @@ struct IntentTypedParams {
 /// Per-call arguments supplied by the caller inside `typed_params_json`.
 #[derive(Clone, Debug, Deserialize, Default)]
 struct IntentTypedCall {
-    #[serde(default)]
-    args: Vec<Value>,
+    #[serde(default = "default_call_args")]
+    args: Value,
     #[serde(default)]
     value_wei: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StrategyActionArgumentSchema {
+    pub action_id: String,
+    pub calls: Vec<StrategyActionCallSchema>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StrategyActionCallSchema {
+    pub role: String,
+    pub function_name: String,
+    pub signature: String,
+    pub value_allowed: bool,
+    pub args: Vec<AbiTypeSpec>,
 }
 
 // ── Public surface ───────────────────────────────────────────────────────────
@@ -62,17 +77,9 @@ struct IntentTypedCall {
 /// surface to callers and is used by the learner to classify failure determinism.
 pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan, String> {
     let action_id = normalize_non_empty(&intent.action_id, "action_id")?;
-    let template = registry::get_template(&intent.key).ok_or_else(|| {
-        format!(
-            "strategy template not found for {}:{}:{}:{}",
-            intent.key.protocol, intent.key.primitive, intent.key.chain_id, intent.key.template_id
-        )
-    })?;
-    let action = template
-        .actions
-        .iter()
-        .find(|candidate| candidate.action_id == action_id)
-        .ok_or_else(|| format!("strategy action not found: {action_id}"))?;
+    let template = load_template(&intent.key)?;
+    let action = resolve_action(&template.actions, &action_id)?;
+    let action_schema = derive_action_argument_schema_from_action(action)?;
     if action.call_sequence.is_empty() {
         return Err(format!(
             "strategy action {action_id} has an empty call_sequence"
@@ -82,10 +89,10 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
     // Each element of `typed.calls` must correspond 1:1 with `action.call_sequence`.
     let typed: IntentTypedParams = serde_json::from_str(&intent.typed_params_json)
         .map_err(|error| format!("invalid typed_params_json: {error}"))?;
-    if typed.calls.len() != action.call_sequence.len() {
+    if typed.calls.len() != action_schema.calls.len() {
         return Err(format!(
             "call count mismatch for action {action_id}: expected {} got {}",
-            action.call_sequence.len(),
+            action_schema.calls.len(),
             typed.calls.len()
         ));
     }
@@ -103,8 +110,13 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
         .collect::<Result<BTreeMap<_, _>, String>>()?;
 
     let mut calls = Vec::with_capacity(action.call_sequence.len());
-    for (index, function) in action.call_sequence.iter().enumerate() {
-        let signature = abi::verify_function_selector(function)?;
+    for (index, (function, call_schema)) in action
+        .call_sequence
+        .iter()
+        .zip(action_schema.calls.iter())
+        .enumerate()
+    {
+        let signature = &call_schema.signature;
         let normalized_selector = normalize_selector_hex(&function.selector_hex)?;
         let role = normalize_non_empty(&function.role, "call role")?;
         let binding = role_bindings
@@ -145,20 +157,17 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
         let typed_call = typed.calls.get(index).ok_or_else(|| {
             format!("typed params call index {index} is missing for action {action_id}")
         })?;
-        if typed_call.args.len() != function.inputs.len() {
-            return Err(format!(
-                "argument count mismatch for call {index} ({signature}): expected {} got {}",
-                function.inputs.len(),
-                typed_call.args.len()
-            ));
-        }
-
         let value_wei = parse_u256_from_decimal_or_hex(
             typed_call.value_wei.as_deref().unwrap_or("0"),
             "value_wei",
         )?
         .to_string();
-        let encoded_args = encode_abi_params(&function.inputs, &typed_call.args)?;
+        let lowered_args = lower_call_args(
+            &typed_call.args,
+            &call_schema.args,
+            &format!("calls[{index}].args"),
+        )?;
+        let encoded_args = encode_abi_params(&call_schema.args, &lowered_args)?;
         // Calldata = 4-byte selector || ABI-encoded arguments (no length prefix).
         let data = format!(
             "0x{}{}",
@@ -183,22 +192,28 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
     })
 }
 
+pub(crate) fn derive_action_argument_schema(
+    key: &StrategyTemplateKey,
+    action_id: &str,
+) -> Result<StrategyActionArgumentSchema, String> {
+    let normalized_action_id = normalize_non_empty(action_id, "action_id")?;
+    let template = load_template(key)?;
+    let action = resolve_action(&template.actions, &normalized_action_id)?;
+    derive_action_argument_schema_from_action(action)
+}
+
 /// Run a full compile-path validation for a template by compiling a synthetic intent.
 ///
 /// The dry-run uses the template's first action and injects zero-value arguments for every
 /// ABI input so `compile_intent` exercises template lookup, role binding, artifact checks,
 /// selector verification, and ABI encoding end-to-end.
 pub fn dry_run_compile(key: &StrategyTemplateKey) -> Result<(), String> {
-    let template = registry::get_template(key).ok_or_else(|| {
-        format!(
-            "strategy template not found for {}:{}:{}:{}",
-            key.protocol, key.primitive, key.chain_id, key.template_id
-        )
-    })?;
+    let template = load_template(key)?;
     let first_action = template
         .actions
         .first()
         .ok_or_else(|| "template has no actions".to_string())?;
+    let action_schema = derive_action_argument_schema_from_action(first_action)?;
     if first_action.call_sequence.is_empty() {
         return Err(format!(
             "template action {} has an empty call_sequence",
@@ -206,14 +221,14 @@ pub fn dry_run_compile(key: &StrategyTemplateKey) -> Result<(), String> {
         ));
     }
 
-    let mut calls = Vec::with_capacity(first_action.call_sequence.len());
-    for function in &first_action.call_sequence {
-        let mut args = Vec::with_capacity(function.inputs.len());
-        for input in &function.inputs {
-            args.push(synthetic_zero_value(input)?);
+    let mut calls = Vec::with_capacity(action_schema.calls.len());
+    for call_schema in &action_schema.calls {
+        let mut args = serde_json::Map::with_capacity(call_schema.args.len());
+        for input in &call_schema.args {
+            args.insert(input.name.clone(), synthetic_zero_value(input)?);
         }
         calls.push(json!({
-            "args": args,
+            "args": Value::Object(args),
             "value_wei": "0",
         }));
     }
@@ -239,6 +254,92 @@ fn normalize_non_empty(raw: &str, field: &str) -> Result<String, String> {
         return Err(format!("{field} must be non-empty"));
     }
     Ok(trimmed.to_string())
+}
+
+fn default_call_args() -> Value {
+    Value::Array(Vec::new())
+}
+
+fn load_template(
+    key: &StrategyTemplateKey,
+) -> Result<crate::domain::types::StrategyTemplate, String> {
+    registry::get_template(key).ok_or_else(|| {
+        format!(
+            "strategy template not found for {}:{}:{}:{}",
+            key.protocol, key.primitive, key.chain_id, key.template_id
+        )
+    })
+}
+
+fn resolve_action<'a>(
+    actions: &'a [ActionSpec],
+    action_id: &str,
+) -> Result<&'a ActionSpec, String> {
+    actions
+        .iter()
+        .find(|candidate| candidate.action_id == action_id)
+        .ok_or_else(|| format!("strategy action not found: {action_id}"))
+}
+
+fn derive_action_argument_schema_from_action(
+    action: &ActionSpec,
+) -> Result<StrategyActionArgumentSchema, String> {
+    derive_action_argument_schema_from_functions(&action.action_id, &action.call_sequence)
+}
+
+fn derive_action_argument_schema_from_functions(
+    action_id: &str,
+    functions: &[AbiFunctionSpec],
+) -> Result<StrategyActionArgumentSchema, String> {
+    let mut calls = Vec::with_capacity(functions.len());
+    for function in functions {
+        calls.push(StrategyActionCallSchema {
+            role: normalize_non_empty(&function.role, "call role")?,
+            function_name: normalize_non_empty(&function.name, "function name")?,
+            signature: abi::verify_function_selector(function)?,
+            value_allowed: function.state_mutability.eq_ignore_ascii_case("payable"),
+            args: normalize_named_specs(&function.inputs),
+        });
+    }
+    Ok(StrategyActionArgumentSchema {
+        action_id: normalize_non_empty(action_id, "action_id")?,
+        calls,
+    })
+}
+
+fn normalize_named_specs(specs: &[AbiTypeSpec]) -> Vec<AbiTypeSpec> {
+    let mut used_names = BTreeSet::new();
+    let mut next_fallback_index = 0usize;
+    let mut normalized = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let name =
+            normalize_schema_param_name(&spec.name, &mut used_names, &mut next_fallback_index);
+        normalized.push(AbiTypeSpec {
+            name,
+            kind: spec.kind.clone(),
+            components: normalize_named_specs(&spec.components),
+        });
+    }
+    normalized
+}
+
+fn normalize_schema_param_name(
+    raw_name: &str,
+    used_names: &mut BTreeSet<String>,
+    next_fallback_index: &mut usize,
+) -> String {
+    let candidate = raw_name.trim();
+    if !candidate.is_empty() && used_names.insert(candidate.to_string()) {
+        return candidate.to_string();
+    }
+
+    loop {
+        let fallback = format!("arg{}", *next_fallback_index);
+        *next_fallback_index = next_fallback_index.saturating_add(1);
+        if used_names.insert(fallback.clone()) {
+            return fallback;
+        }
+    }
 }
 
 fn parse_u256_from_decimal_or_hex(raw: &str, field: &str) -> Result<U256, String> {
@@ -272,6 +373,142 @@ fn parse_tuple_values<'a>(value: &'a Value, field: &str) -> Result<&'a [Value], 
         .ok_or_else(|| format!("{field} must be a JSON array"))
 }
 
+fn lower_call_args(args: &Value, specs: &[AbiTypeSpec], field: &str) -> Result<Vec<Value>, String> {
+    match args {
+        Value::Array(values) => {
+            if values.len() != specs.len() {
+                return Err(format!(
+                    "argument count mismatch for {field}: expected {} got {}",
+                    specs.len(),
+                    values.len()
+                ));
+            }
+            values
+                .iter()
+                .zip(specs.iter())
+                .map(|(value, spec)| {
+                    lower_value_to_canonical_shape(spec, value, &format!("{field}.{}", spec.name))
+                })
+                .collect()
+        }
+        Value::Object(object) => {
+            reject_unknown_object_fields(object, specs, field)?;
+            let mut lowered = Vec::with_capacity(specs.len());
+            for spec in specs {
+                let child_field = format!("{field}.{}", spec.name);
+                let value = object
+                    .get(&spec.name)
+                    .ok_or_else(|| format!("missing required field: {child_field}"))?;
+                lowered.push(lower_value_to_canonical_shape(spec, value, &child_field)?);
+            }
+            Ok(lowered)
+        }
+        _ => Err(format!("{field} must be a JSON object or array")),
+    }
+}
+
+fn lower_value_to_canonical_shape(
+    spec: &AbiTypeSpec,
+    value: &Value,
+    field: &str,
+) -> Result<Value, String> {
+    if let Some((element_kind, maybe_len)) = split_array_type(spec.kind.trim()) {
+        let values = value
+            .as_array()
+            .ok_or_else(|| format!("{field} must be a JSON array"))?;
+        if let Some(expected_len) = maybe_len {
+            if values.len() != expected_len {
+                return Err(format!(
+                    "{field} length mismatch: expected {expected_len} got {}",
+                    values.len()
+                ));
+            }
+        }
+        let element_spec = AbiTypeSpec {
+            name: spec.name.clone(),
+            kind: element_kind,
+            components: spec.components.clone(),
+        };
+        let mut lowered = Vec::with_capacity(values.len());
+        for (index, element) in values.iter().enumerate() {
+            lowered.push(lower_value_to_canonical_shape(
+                &element_spec,
+                element,
+                &format!("{field}[{index}]"),
+            )?);
+        }
+        return Ok(Value::Array(lowered));
+    }
+
+    let kind = spec.kind.trim().to_ascii_lowercase();
+    if kind == "tuple" {
+        return lower_tuple_value(spec, value, field);
+    }
+
+    Ok(value.clone())
+}
+
+fn lower_tuple_value(spec: &AbiTypeSpec, value: &Value, field: &str) -> Result<Value, String> {
+    match value {
+        Value::Array(values) => {
+            if values.len() != spec.components.len() {
+                return Err(format!(
+                    "{field} tuple arity mismatch: expected {} got {}",
+                    spec.components.len(),
+                    values.len()
+                ));
+            }
+            let mut lowered = Vec::with_capacity(spec.components.len());
+            for (component, component_value) in spec.components.iter().zip(values.iter()) {
+                lowered.push(lower_value_to_canonical_shape(
+                    component,
+                    component_value,
+                    &format!("{field}.{}", component.name),
+                )?);
+            }
+            Ok(Value::Array(lowered))
+        }
+        Value::Object(object) => {
+            reject_unknown_object_fields(object, &spec.components, field)?;
+            let mut lowered = Vec::with_capacity(spec.components.len());
+            for component in &spec.components {
+                let child_field = format!("{field}.{}", component.name);
+                let component_value = object
+                    .get(&component.name)
+                    .ok_or_else(|| format!("missing required field: {child_field}"))?;
+                lowered.push(lower_value_to_canonical_shape(
+                    component,
+                    component_value,
+                    &child_field,
+                )?);
+            }
+            Ok(Value::Array(lowered))
+        }
+        _ => Err(format!("{field} must be a JSON object or array")),
+    }
+}
+
+fn reject_unknown_object_fields(
+    object: &serde_json::Map<String, Value>,
+    specs: &[AbiTypeSpec],
+    field: &str,
+) -> Result<(), String> {
+    let expected_fields = specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut unknown_fields = object
+        .keys()
+        .filter(|key| !expected_fields.contains(key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unknown_fields.sort();
+    if let Some(first_unknown) = unknown_fields.first() {
+        return Err(format!("unknown field: {field}.{first_unknown}"));
+    }
+    Ok(())
+}
+
 fn synthetic_zero_value(spec: &AbiTypeSpec) -> Result<Value, String> {
     if let Some((element_kind, maybe_len)) = split_array_type(spec.kind.trim()) {
         let element_spec = AbiTypeSpec {
@@ -289,11 +526,11 @@ fn synthetic_zero_value(spec: &AbiTypeSpec) -> Result<Value, String> {
 
     let kind = spec.kind.trim().to_ascii_lowercase();
     if kind == "tuple" {
-        let mut values = Vec::with_capacity(spec.components.len());
+        let mut values = serde_json::Map::with_capacity(spec.components.len());
         for component in &spec.components {
-            values.push(synthetic_zero_value(component)?);
+            values.insert(component.name.clone(), synthetic_zero_value(component)?);
         }
-        return Ok(Value::Array(values));
+        return Ok(Value::Object(values));
     }
 
     match kind.as_str() {
@@ -942,6 +1179,22 @@ mod tests {
         .expect("morpho abi artifact should persist");
     }
 
+    fn morpho_supply_named_args_json() -> serde_json::Value {
+        serde_json::json!({
+            "marketParams": {
+                "loanToken": "0x4200000000000000000000000000000000000006",
+                "collateralToken": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+                "oracle": "0x663E04CBb82e44A8544828C7C3e2f02820085f00",
+                "irm": "0x46415998764C29aB2a25CbeA6E5D2F226b40b5f0",
+                "lltv": "860000000000000000"
+            },
+            "assets": "1000000",
+            "shares": "0",
+            "onBehalf": "0x1111111111111111111111111111111111111111",
+            "data": "0x"
+        })
+    }
+
     #[test]
     fn compile_morpho_enter_supply_produces_at_least_one_call() {
         stable::init_storage();
@@ -995,6 +1248,95 @@ mod tests {
             "calldata must start with supply selector, got {}",
             &plan.calls[0].data[..std::cmp::min(10, plan.calls[0].data.len())]
         );
+    }
+
+    #[test]
+    fn compile_intent_accepts_named_object_args_for_morpho_supply() {
+        stable::init_storage();
+        let template_id = "morpho-named-object-args";
+        store_morpho_template_and_abi(template_id);
+        let key = StrategyTemplateKey {
+            protocol: "morpho-v1".to_string(),
+            primitive: "lend_supply".to_string(),
+            chain_id: 8453,
+            template_id: template_id.to_string(),
+        };
+
+        let intent = StrategyExecutionIntent {
+            key: key.clone(),
+            action_id: "enter_supply".to_string(),
+            typed_params_json: serde_json::json!({
+                "calls": [{
+                    "args": morpho_supply_named_args_json(),
+                    "value_wei": "0"
+                }]
+            })
+            .to_string(),
+        };
+
+        let plan = compile_intent(&intent).expect("named-object morpho args should compile");
+        assert_eq!(plan.key, key);
+        assert_eq!(plan.calls.len(), 1);
+        assert!(
+            plan.calls[0].data.starts_with("0xa99aad89"),
+            "calldata must start with supply selector, got {}",
+            &plan.calls[0].data[..std::cmp::min(10, plan.calls[0].data.len())]
+        );
+    }
+
+    #[test]
+    fn compile_intent_named_and_positional_args_match_for_morpho_supply() {
+        stable::init_storage();
+        let template_id = "morpho-named-positional-parity";
+        store_morpho_template_and_abi(template_id);
+        let key = StrategyTemplateKey {
+            protocol: "morpho-v1".to_string(),
+            primitive: "lend_supply".to_string(),
+            chain_id: 8453,
+            template_id: template_id.to_string(),
+        };
+
+        let positional_intent = StrategyExecutionIntent {
+            key: key.clone(),
+            action_id: "enter_supply".to_string(),
+            typed_params_json: serde_json::json!({
+                "calls": [{
+                    "args": [
+                        [
+                            "0x4200000000000000000000000000000000000006",
+                            "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+                            "0x663E04CBb82e44A8544828C7C3e2f02820085f00",
+                            "0x46415998764C29aB2a25CbeA6E5D2F226b40b5f0",
+                            "860000000000000000"
+                        ],
+                        "1000000",
+                        "0",
+                        "0x1111111111111111111111111111111111111111",
+                        "0x"
+                    ],
+                    "value_wei": "0"
+                }]
+            })
+            .to_string(),
+        };
+        let named_intent = StrategyExecutionIntent {
+            key,
+            action_id: "enter_supply".to_string(),
+            typed_params_json: serde_json::json!({
+                "calls": [{
+                    "args": morpho_supply_named_args_json(),
+                    "value_wei": "0"
+                }]
+            })
+            .to_string(),
+        };
+
+        let positional_plan = compile_intent(&positional_intent)
+            .expect("legacy positional morpho args should still compile");
+        let named_plan =
+            compile_intent(&named_intent).expect("named-object morpho args should compile");
+
+        assert_eq!(named_plan.calls, positional_plan.calls);
     }
 
     #[test]

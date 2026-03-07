@@ -96,6 +96,30 @@ Key properties:
 
 ## Execution payloads
 
+### `describe_strategy_action`
+
+For complex actions, start here so the runtime tells you the exact named
+argument tree for a registered template action.
+
+```json
+{
+  "key": {
+    "protocol": "erc20",
+    "primitive": "transfer",
+    "chain_id": 8453,
+    "template_id": "agent-generated-transfer"
+  },
+  "action_id": "transfer"
+}
+```
+
+`describe_strategy_action` returns:
+
+- the canonical `calls[]` order for the action
+- the recursive named argument schema
+- a preferred `typed_params` payload template
+- workflow notes for describe -> simulate -> execute
+
 ### `simulate_strategy_action` / `execute_strategy_action`
 
 ```json
@@ -111,21 +135,27 @@ Key properties:
     "calls": [
       {
         "value_wei": "0",
-        "args": [
-          "0x3333333333333333333333333333333333333333",
-          "1000000"
-        ]
+        "args": {
+          "to": "0x3333333333333333333333333333333333333333",
+          "amount": "1000000"
+        }
       }
     ]
   }
 }
 ```
 
+The field names inside `args` come from the registered ABI and should be taken
+from `describe_strategy_action`; this example uses illustrative names.
+
 `typed_params` rules:
 
 - one `calls[]` entry per function in `action.call_sequence` (same order)
-- `args[]` count must match ABI input count
-- tuple inputs must be JSON arrays in ABI component order
+- call `describe_strategy_action` first for complex actions and copy its `preferred_typed_params`
+- `calls[*].args` should be a JSON object keyed by normalized ABI parameter names
+- tuple inputs should be nested JSON objects keyed by normalized component names
+- arrays remain JSON arrays; arrays of tuples may contain tuple objects
+- legacy positional arrays are still accepted temporarily, but docs and examples use named objects
 - `value_wei` must be decimal or hex quantity string
 
 ### `get_strategy_outcomes`
@@ -161,6 +191,7 @@ For `list_strategy_templates` tool calls, `limit` defaults to `20` and is capped
 
 ## Best practices
 
+- For complex actions: describe first, simulate second, execute last.
 - Simulate before every live execute.
 - Keep `postconditions` explicit and action-specific.
 - Keep budget limits strict.
@@ -178,6 +209,7 @@ For `list_strategy_templates` tool calls, `limit` defaults to `20` and is capped
 | `strategy template activation is disabled` | Enable activation or disable kill switch. |
 | `strategy kill switch is enabled` | Clear with `set_strategy_kill_switch_admin(..., false, ...)`. |
 | `call count mismatch ... expected N got M` | Make `typed_params.calls` length match `action.call_sequence`. |
+| `calls[0].args.... missing/unknown/...` | Re-run `describe_strategy_action` and match the returned named schema exactly. |
 | `function ... is overloaded` | Use a non-overloaded ABI function in the recipe. |
 | `template_budget_exceeded` | Increase budget or reduce execution value/volume. |
 
