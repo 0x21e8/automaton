@@ -178,7 +178,6 @@ fn render_layer_5_operations() -> String {
         .filter(|skill| skill.enabled)
         .collect::<Vec<_>>();
     if active_skills.is_empty() {
-        section.push_str("\n- none active");
         return section;
     }
 

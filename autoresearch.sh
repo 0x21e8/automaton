@@ -28,7 +28,7 @@ if not sep_match:
 sep = bytes(sep_match.group(1), 'utf-8').decode('unicode_escape')
 dynamic = "## Layer 10: Dynamic Context\n- benchmark: yes"
 layer3 = consts['LAYER_3_IDENTITY'].replace('{soul}', 'benchmark-soul')
-layer5 = consts['LAYER_5_OPERATIONS'] + "\n- none active"
+layer5 = consts['LAYER_5_OPERATIONS']
 full = sep.join([
     consts['LAYER_0_INTERPRETATION'],
     consts['LAYER_1_CONSTITUTION'],
