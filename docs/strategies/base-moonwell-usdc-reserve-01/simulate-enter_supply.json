@@ -1,0 +1,19 @@
+{
+  "key": {
+    "protocol": "moonwell-v2",
+    "primitive": "lend_supply",
+    "chain_id": 8453,
+    "template_id": "base-moonwell-usdc-reserve-01"
+  },
+  "action_id": "enter_supply",
+  "typed_params": {
+    "calls": [
+      {
+        "value_wei": "0",
+        "args": {
+          "mintAmount": "1000000"
+        }
+      }
+    ]
+  }
+}

@@ -23,6 +23,7 @@ bootstrap_eth_wei := "500000000000000"
 bootstrap_wallet_usdc_amount := "100000000"
 bootstrap_wallet_eth_wei := "1000000000000000000"
 bootstrap_secondary_evm_address := "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca"
+bootstrap_backend_cycles := "50t"
 automaton_wait_timeout_secs := "180"
 automaton_wait_poll_secs := "2"
 local_url := "http://127.0.0.1:8000"
@@ -118,6 +119,22 @@ anvil-start mode="local" fork_url="" fork_block="":
     exit 1
   fi
 
+require-openrouter-api-key:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ -z "${OPENROUTER_API_KEY:-}" ] || [ "${OPENROUTER_API_KEY}" = "replace-with-your-openrouter-api-key" ]; then
+    echo "OPENROUTER_API_KEY must be set to a valid OpenRouter API key." >&2
+    exit 1
+  fi
+
+require-brave-search-api-key:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ -z "${BRAVE_SEARCH_API_KEY:-}" ] || [ "${BRAVE_SEARCH_API_KEY}" = "replace-with-your-brave-search-api-key" ]; then
+    echo "BRAVE_SEARCH_API_KEY must be set to a valid Brave Search API key." >&2
+    exit 1
+  fi
+
 anvil-stop:
   #!/usr/bin/env bash
   set -euo pipefail
@@ -153,7 +170,7 @@ deploy-inbox:
   echo "MockUSDC: $mock_usdc_address"
   echo "Inbox:    $inbox_address"
 
-deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_chain_id=anvil_chain_id evm_rpc_url=anvil_rpc_url inference_mode="openrouter" openrouter_model=openrouter_default_model:
+deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_chain_id=anvil_chain_id evm_rpc_url=anvil_rpc_url inference_mode="openrouter" openrouter_model=openrouter_default_model backend_topup_cycles=bootstrap_backend_cycles:
   #!/usr/bin/env bash
   set -euo pipefail
   escape_candid_text() {
@@ -168,16 +185,21 @@ deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_cha
   if [ -z "$inbox_address" ]; then
     inbox_address="$(cat .local/inbox_contract_address)"
   fi
-  search_api_key_arg="null"
-  if [ -n "${BRAVE_SEARCH_API_KEY:-}" ] && [ "${BRAVE_SEARCH_API_KEY}" != "replace-with-your-brave-search-api-key" ]; then
-    search_api_key_escaped="$(escape_candid_text "$BRAVE_SEARCH_API_KEY")"
-    search_api_key_arg="opt \"$search_api_key_escaped\""
+  if [ -z "${BRAVE_SEARCH_API_KEY:-}" ] || [ "${BRAVE_SEARCH_API_KEY}" = "replace-with-your-brave-search-api-key" ]; then
+    echo "BRAVE_SEARCH_API_KEY must be set to a valid Brave Search API key." >&2
+    exit 1
   fi
+  search_api_key_arg="null"
+  search_api_key_escaped="$(escape_candid_text "$BRAVE_SEARCH_API_KEY")"
+  search_api_key_arg="opt \"$search_api_key_escaped\""
+  backend_topup_cycles="$(printf '%s' "{{backend_topup_cycles}}" | tr '[:upper:]' '[:lower:]')"
   icp build backend
   if ! icp canister create backend -e local >/dev/null 2>&1; then
     echo "backend canister already exists on local"
   fi
   icp canister install backend -e local --mode reinstall --args "(record { ecdsa_key_name = \"dfx_test_key\"; inbox_contract_address = opt \"$inbox_address\"; evm_chain_id = opt ($evm_chain_id : nat64); evm_rpc_url = opt \"$evm_rpc_url\"; evm_confirmation_depth = opt (0 : nat64); llm_canister_id = opt principal \"$llm_canister_id\"; search_api_key = $search_api_key_arg })"
+  icp canister top-up --amount "$backend_topup_cycles" backend -e local
+  icp canister call backend configure_search "(record { api_key = \"$search_api_key_escaped\"; max_searches_per_turn = null; max_searches_per_24h = null })" -e local >/dev/null
   case "$inference_mode" in
     openrouter)
       model_escaped="$(escape_candid_text "$openrouter_model")"
@@ -203,8 +225,49 @@ deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_cha
       ;;
   esac
   canister_id="$(icp canister status backend -e local | awk '/Canister Id:/ { print $3 }')"
+  case "$inference_mode" in
+    openrouter)
+      verified=0
+      for _ in $(seq 1 20); do
+        if curl -fsS "http://$canister_id.localhost:8000/api/inference/config" \
+          | jq -e '.openrouter_has_api_key == true' >/dev/null 2>&1; then
+          verified=1
+          break
+        fi
+        sleep 0.5
+      done
+      if [ "$verified" -ne 1 ]; then
+        echo "OpenRouter API key verification failed after canister install." >&2
+        exit 1
+      fi
+      ;;
+    icllm|ic-llm|ollama)
+      ;;
+  esac
   echo "Canister ID: $canister_id"
   echo "UI URL: http://$canister_id.localhost:8000/"
+
+register-strategies:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  register_recipe() {
+    local recipe_path="$1"
+    local protocol="$2"
+    local primitive="$3"
+    local chain_id="$4"
+    local template_id="$5"
+    local recipe_text
+    recipe_text="$(jq -Rs . < "$recipe_path")"
+    icp canister call backend register_strategy_admin "(${recipe_text})" -e local >/dev/null
+    icp canister call backend get_strategy_template "(record { protocol = \"$protocol\"; primitive = \"$primitive\"; chain_id = ($chain_id : nat64); template_id = \"$template_id\" })" -e local \
+      | grep -q 'opt record' || {
+        echo "failed to verify strategy registration for $template_id" >&2
+        exit 1
+      }
+    echo "Registered strategy: $template_id"
+  }
+  register_recipe "docs/strategies/base-aave-usdc-reserve-01/recipe.json" "aave-v3" "lend_supply" "8453" "base-aave-usdc-reserve-01"
+  register_recipe "docs/strategies/base-moonwell-usdc-reserve-01/recipe.json" "moonwell-v2" "lend_supply" "8453" "base-moonwell-usdc-reserve-01"
 
 deploy-llm:
   #!/usr/bin/env bash
@@ -218,6 +281,15 @@ deploy-llm:
   mkdir -p .local
   printf '%s\n' "$llm_canister_id" > .local/llm_canister_id
   echo "LLM canister ID: $llm_canister_id"
+
+topup cycles="50t":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cycles="{{cycles}}"
+  if [ -z "$cycles" ]; then
+    cycles="50t"
+  fi
+  icp canister top-up --amount "$(printf '%s' "$cycles" | tr '[:upper:]' '[:lower:]')" backend -e local
 
 automaton-evm-address timeout_secs=automaton_wait_timeout_secs poll_secs=automaton_wait_poll_secs:
   #!/usr/bin/env bash
@@ -469,6 +541,18 @@ bootstrap mode="openrouter" openrouter_model="" ic_llm_model="" evm_mode="local"
   if [ -z "$ic_llm_model" ]; then
     ic_llm_model="${IC_LLM_MODEL:-{{ic_llm_default_model}}}"
   fi
+  just require-brave-search-api-key
+  case "$mode" in
+    openrouter)
+      just require-openrouter-api-key
+      ;;
+    icllm|ic-llm|ollama)
+      ;;
+    *)
+      echo "unsupported mode=$mode (supported: openrouter, icllm)" >&2
+      exit 1
+      ;;
+  esac
   just ic-start
   case "$evm_mode" in
     local)
@@ -515,6 +599,7 @@ bootstrap mode="openrouter" openrouter_model="" ic_llm_model="" evm_mode="local"
       exit 1
       ;;
   esac
+  just register-strategies
 
 down mode="all":
   #!/usr/bin/env bash

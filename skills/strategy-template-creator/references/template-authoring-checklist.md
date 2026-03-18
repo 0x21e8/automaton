@@ -1,46 +1,34 @@
-# Strategy Template Authoring Checklist
+# Strategy Recipe Authoring Checklist
 
 ## Required Fields
 
-- `key.protocol`
-- `key.primitive`
-- `key.chain_id`
-- `key.template_id`
-- `version.major`
-- `version.minor`
-- `version.patch`
-- `status`
-- `contract_roles[]` with `role`, `address`, `source_ref`
-- `actions[]` with `action_id`, `call_sequence`, `preconditions`, `postconditions`, `risk_checks`
-- `constraints_json`
+- `protocol`
+- `primitive`
+- `chain_id`
+- `template_id`
+- `contracts[]` with `role`, `address`, `abi_json`, `source_ref`
+- `actions[]` with `action_id`, `calls`, `postconditions`
+
+Optional but normally expected:
+
+- `actions[].preconditions`
+- `actions[].risk_checks`
+- `contracts[].codehash`
+- `max_value_wei_per_call`
+- `template_budget_wei`
 
 ## Defaults
 
 - `chain_id`: `8453` (Base)
-- `version`: `1.0.0`
-- `status`: `Draft`
-
-## `constraints_json` Keys
-
-Use only:
-
-- `max_calls`
-- `max_total_value_wei`
-- `max_notional_wei`
-- `max_value_wei_per_call`
-- `template_budget_wei`
-- `required_postconditions`
+- If `max_value_wei_per_call` is omitted, the runtime default is `100000000000000000`
+- If `template_budget_wei` is omitted, the runtime default is `1000000000000000000`
 
 Example:
 
 ```json
 {
-  "max_calls": 2,
-  "max_total_value_wei": "0",
-  "max_notional_wei": "0",
   "max_value_wei_per_call": "0",
-  "template_budget_wei": "0",
-  "required_postconditions": ["wallet_usdc_delta_positive_expected"]
+  "template_budget_wei": "0"
 }
 ```
 
@@ -49,11 +37,10 @@ Example:
 ```json
 {
   "action_id": "enter",
-  "call_sequence": [
+  "calls": [
     {
       "role": "router",
-      "name": "exactInputSingle",
-      "selector_hex": "0x414bf389"
+      "function": "swapExactTokensForTokens"
     }
   ],
   "preconditions": ["liquidity_ok"],
@@ -62,10 +49,27 @@ Example:
 }
 ```
 
-## Quality Gates Before Activation
+## Minimal Contract Shape
 
-- Every `contract_roles` address has a trusted `source_ref`.
-- `call_sequence` function selectors match canonical signatures.
+```json
+{
+  "role": "router",
+  "address": "0x0000000000000000000000000000000000000000",
+  "abi_json": "[{\"type\":\"function\",\"name\":\"swapExactTokensForTokens\",...}]",
+  "source_ref": "https://example.com/deployments"
+}
+```
+
+## Quality Gates Before Registration
+
+- Every `contracts[]` address has a trusted `source_ref`.
+- Every `contracts[]` entry includes raw `abi_json`; do not hand-author selectors.
+- Every `actions[].calls[*]` references a valid contract `role` and ABI function `name`.
 - `preconditions`/`postconditions` are concrete and testable.
-- `required_postconditions` are present in plan postconditions.
-- Template remains `Draft` until preflight simulation passes.
+- Every action has at least one postcondition.
+- Recipe remains non-deployable until the callable surface and addresses are source-backed.
+
+## Deprecated Path
+
+- Full `StrategyTemplate` output with `key`, `version`, `status`, `contract_roles`, `call_sequence`, and `constraints_json` is legacy-only.
+- Use it only if the user explicitly asks for the deprecated direct-ingestion path.

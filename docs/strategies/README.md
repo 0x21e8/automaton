@@ -216,3 +216,5 @@ For `list_strategy_templates` tool calls, `limit` defaults to `20` and is capped
 ## Examples
 
 - Recipe-based example: `docs/strategies/base-usdc-carry-cbbtc-01/`
+- Base reserve strategy: `docs/strategies/base-aave-usdc-reserve-01/`
+- Base reserve strategy: `docs/strategies/base-moonwell-usdc-reserve-01/`

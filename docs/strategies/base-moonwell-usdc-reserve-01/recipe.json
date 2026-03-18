@@ -1,0 +1,83 @@
+{
+  "protocol": "moonwell-v2",
+  "primitive": "lend_supply",
+  "chain_id": 8453,
+  "template_id": "base-moonwell-usdc-reserve-01",
+  "contracts": [
+    {
+      "role": "usdc",
+      "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "abi_json": "[{\"type\":\"function\",\"name\":\"approve\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"name\":\"spender\",\"type\":\"address\"},{\"name\":\"value\",\"type\":\"uint256\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\"}]}]",
+      "source_ref": "https://raw.githubusercontent.com/moonwell-fi/moonwell-contracts-v2/main/chains/8453.json"
+    },
+    {
+      "role": "m_usdc",
+      "address": "0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22",
+      "abi_json": "[{\"type\":\"function\",\"name\":\"mint\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"name\":\"mintAmount\",\"type\":\"uint256\"}],\"outputs\":[{\"name\":\"\",\"type\":\"uint256\"}]},{\"type\":\"function\",\"name\":\"redeemUnderlying\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"name\":\"redeemAmount\",\"type\":\"uint256\"}],\"outputs\":[{\"name\":\"\",\"type\":\"uint256\"}]}]",
+      "source_ref": "https://raw.githubusercontent.com/moonwell-fi/moonwell-contracts-v2/main/chains/8453.json"
+    }
+  ],
+  "actions": [
+    {
+      "action_id": "approve_usdc",
+      "calls": [
+        {
+          "role": "usdc",
+          "function": "approve"
+        }
+      ],
+      "preconditions": [
+        "wallet_usdc_balance_gte_requested_approval_amount"
+      ],
+      "postconditions": [
+        "usdc_allowance_for_moonwell_market_gte_requested_amount"
+      ],
+      "risk_checks": [
+        "spender_equals_moonwell_usdc_market",
+        "asset_equals_base_usdc"
+      ]
+    },
+    {
+      "action_id": "enter_supply",
+      "calls": [
+        {
+          "role": "m_usdc",
+          "function": "mint"
+        }
+      ],
+      "preconditions": [
+        "wallet_usdc_reserve_after_trade_gte_survival_floor",
+        "moonwell_usdc_market_not_paused"
+      ],
+      "postconditions": [
+        "moonwell_usdc_position_increased",
+        "survival_floor_preserved"
+      ],
+      "risk_checks": [
+        "asset_equals_base_usdc",
+        "market_equals_moonwell_usdc"
+      ]
+    },
+    {
+      "action_id": "exit_supply",
+      "calls": [
+        {
+          "role": "m_usdc",
+          "function": "redeemUnderlying"
+        }
+      ],
+      "preconditions": [
+        "moonwell_usdc_position_gte_requested_exit_amount"
+      ],
+      "postconditions": [
+        "wallet_usdc_delta_positive_expected",
+        "survival_floor_preserved"
+      ],
+      "risk_checks": [
+        "market_equals_moonwell_usdc"
+      ]
+    }
+  ],
+  "max_value_wei_per_call": "0",
+  "template_budget_wei": "0"
+}
