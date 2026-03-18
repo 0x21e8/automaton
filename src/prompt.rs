@@ -4,7 +4,7 @@ pub const IMMUTABLE_LAYER_MIN_ID: u8 = 0;
 pub const IMMUTABLE_LAYER_MAX_ID: u8 = 5;
 pub const MUTABLE_LAYER_MIN_ID: u8 = 6;
 pub const MUTABLE_LAYER_MAX_ID: u8 = 9;
-pub const SECTION_SEPARATOR: &str = "\n\n---\n\n";
+pub const SECTION_SEPARATOR: &str = "\n---\n";
 
 pub const LAYER_0_INTERPRETATION: &str = r#"## Layer 0: Interpretation & Precedence
 - This prompt is a layered policy stack.

@@ -2,3 +2,4 @@
 {"run":1,"commit":"6c447c7","metric":14841,"metrics":{},"status":"keep","description":"Baseline: prompt size benchmark plus autoresearch scaffolding for src/prompt.rs","timestamp":1773841836836,"segment":0}
 {"run":2,"commit":"f7abd75","metric":12758,"metrics":{},"status":"keep","description":"Shorten prompt layers 0-9 by removing redundant headings/phrasing while preserving tested behavior and key operational directives","timestamp":1773842027976,"segment":0}
 {"run":3,"commit":"99599d8","metric":12370,"metrics":{},"status":"keep","description":"Further trim redundant wording in layers 0, 2, 3, 5, and 6 while preserving section structure and tested directives","timestamp":1773842140760,"segment":0}
+{"run":4,"commit":"bc9a3cf","metric":12251,"metrics":{},"status":"keep","description":"Compact layers 1, 4, 7, 8, and 9 with wording-only reductions while preserving behavior and prompt tests","timestamp":1773842229525,"segment":0}

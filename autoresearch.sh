@@ -22,7 +22,10 @@ required = [
 missing = [name for name in required if name not in consts]
 if missing:
     raise SystemExit(f'missing prompt constants: {missing}')
-sep = "\n\n---\n\n"
+sep_match = re.search(r'pub const SECTION_SEPARATOR: &str = "(.*?)";', text)
+if not sep_match:
+    raise SystemExit('missing SECTION_SEPARATOR')
+sep = bytes(sep_match.group(1), 'utf-8').decode('unicode_escape')
 dynamic = "## Layer 10: Dynamic Context\n- benchmark: yes"
 layer3 = consts['LAYER_3_IDENTITY'].replace('{soul}', 'benchmark-soul')
 layer5 = consts['LAYER_5_OPERATIONS'] + "\n- none active"
