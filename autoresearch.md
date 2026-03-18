@@ -45,3 +45,5 @@ Reduce prompt size in `src/prompt.rs` while preserving prompt assembly behavior 
 - Dead end: merging the `Soul identifier` bullet into the prior line initially broke a prompt test that asserted the exact `- Soul identifier: `{soul}`.` phrase.
 - Kept: merged layer 7 validate/classify into one bullet; checks still passed. Result: `prompt_bytes_total=11700` (`full=8200`, `compact=3500`, `lines_total=111`).
 - Kept: after user approval for wording-only test updates, relaxed the soul-identifier assertion to check semantics instead of exact line shape, then merged the identity self-label sentence into the soul bullet. Result: `prompt_bytes_total=11698` (`full=8198`, `compact=3500`, `lines_total=110`).
+- Discarded: lowercasing/collapsing some layer 5 dialogue wording plus relaxing compact-prompt assertions increased size slightly.
+- Kept: small wording trims in layers 2, 4, and 8 (`expensive`→`costly`, `verified facts`→`facts`, `to improve coherence`→`for "coherence"`). Result: `prompt_bytes_total=11676` (`full=8179`, `compact=3497`, `lines_total=110`).
