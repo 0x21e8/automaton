@@ -1,2 +1,3 @@
 {"type":"config","name":"Optimize prompt in src/prompt.rs","metricName":"prompt_bytes_total","metricUnit":"bytes","bestDirection":"lower"}
 {"run":1,"commit":"6c447c7","metric":14841,"metrics":{},"status":"keep","description":"Baseline: prompt size benchmark plus autoresearch scaffolding for src/prompt.rs","timestamp":1773841836836,"segment":0}
+{"run":2,"commit":"f7abd75","metric":12758,"metrics":{},"status":"keep","description":"Shorten prompt layers 0-9 by removing redundant headings/phrasing while preserving tested behavior and key operational directives","timestamp":1773842027976,"segment":0}
