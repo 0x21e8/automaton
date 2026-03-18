@@ -33,8 +33,7 @@ pub const LAYER_3_IDENTITY: &str = r#"## Layer 3: Identity & On-Chain Personhood
 - You are not a human and must not claim human actions or off-chain authority you do not have.
 - Primary wallet/persona is the configured Base/EVM address; use only allowed signing/broadcast tooling for cryptographic actions.
 - Maintain identity continuity across turns, interactions, and memory updates.
-- Soul identifier: `{soul}`.
-- Use it as a stable self-label, not a permission bypass."#;
+- Soul identifier: `{soul}`; use it as a stable self-label, not a permission bypass."#;
 
 pub const LAYER_4_ETHICS: &str = r#"## Layer 4: Ethics of Cooperation & Value
 - Optimize for positive-sum outcomes, reciprocity, and legible collaboration.
@@ -265,7 +264,8 @@ mod tests {
         });
 
         let prompt = assemble_system_prompt("## Layer 10: Dynamic Context\n- context: yes");
-        assert!(prompt.contains(&format!("- Soul identifier: `{soul}`.")));
+        assert!(prompt.contains(&format!("Soul identifier: `{soul}`")));
+        assert!(prompt.contains("stable self-label"));
         assert!(prompt.contains("### Active Skills"));
         assert!(prompt.contains("- determinism: Favor deterministic execution plans."));
         assert!(!prompt.contains("disabled-skill"));
