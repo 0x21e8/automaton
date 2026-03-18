@@ -9,10 +9,11 @@ use super::sqlite::SurvivalOperationRuntimeRecord;
 /// Public function signatures are intentionally identical to the original so
 /// that callers require no changes.
 use crate::domain::types::{
-    AbiArtifact, AbiArtifactKey, AgentEvent, AgentState, AutonomySuppressionConfig,
-    ConversationEntry, ConversationLog, ConversationSummary, CycleTelemetry, EvmPollCursor,
-    EvmRouteStateView, InboxMessage, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState,
-    InboxStats, InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
+    AbiArtifact, AbiArtifactKey, ActiveExposure, AgentEvent, AgentState, AutonomyPolicy,
+    AutonomySuppressionConfig, ConversationEntry, ConversationLog, ConversationSummary,
+    CycleTelemetry, DecisionRecord, EvmPollCursor, EvmRouteStateView, ExposureReconciliationStatus,
+    InboxMessage, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState, InboxStats,
+    InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
     InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup,
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
     OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, ReflectionMemoryRecord,
@@ -20,11 +21,11 @@ use crate::domain::types::{
     ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord, StewardNonceState,
     StewardState, StewardStatusView, StorageGrowthMetrics, StoragePressureLevel,
     StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats,
-    StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass,
-    SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
-    TemplateActivationState, TemplateRevocationState, ToolCallRecord, TransitionLogRecord,
-    TurnRecord, TurnWindowSummary, WalletBalanceSnapshot, WalletBalanceSyncConfig,
-    WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
+    SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig,
+    TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState, ToolCallRecord,
+    TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
+    WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 pub use crate::domain::types::{
     AutonomyToolFailureCooldown, MemoryFactSort, MemoryFactStats, RetentionPruneStats,
@@ -125,6 +126,8 @@ const MAX_EVM_CONFIRMATION_DEPTH: u64 = 100;
 pub const MAX_MEMORY_FACTS: usize = 500;
 /// Hard cap on the number of reflection lessons stored in `reflection_memory`.
 pub const MAX_REFLECTION_MEMORY_RECORDS: usize = 64;
+/// Hard cap on the number of recent autonomy decision records retained.
+pub const MAX_DECISION_RECORDS: usize = 200;
 /// Reflection lessons expire after seven days without a fresh update.
 pub const REFLECTION_MEMORY_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 /// Maximum reflection lines reserved for Layer 10 context rendering.
@@ -1372,6 +1375,81 @@ pub fn set_autonomy_suppression_config(
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
     Ok(config)
+}
+
+pub fn autonomy_policy() -> Option<AutonomyPolicy> {
+    sqlite::read_autonomy_policy().ok().flatten()
+}
+
+pub fn set_autonomy_policy(policy: AutonomyPolicy) -> Result<AutonomyPolicy, String> {
+    validate_autonomy_policy(&policy)?;
+    sqlite::write_autonomy_policy(&policy)?;
+    Ok(policy)
+}
+
+pub fn active_exposure(strategy_id: &str) -> Option<ActiveExposure> {
+    sqlite::get_active_exposure(strategy_id).ok().flatten()
+}
+
+pub fn set_active_exposure(exposure: ActiveExposure) -> Result<ActiveExposure, String> {
+    validate_active_exposure(&exposure)?;
+    sqlite::upsert_active_exposure(&exposure)?;
+    Ok(exposure)
+}
+
+pub fn remove_active_exposure(strategy_id: &str) -> bool {
+    sqlite::delete_active_exposure(strategy_id).is_ok()
+}
+
+pub fn list_active_exposures() -> Vec<ActiveExposure> {
+    sqlite::list_active_exposures(1_000).unwrap_or_default()
+}
+
+pub fn strategy_quarantine(strategy_id: &str) -> Option<StrategyQuarantine> {
+    sqlite::get_strategy_quarantine(strategy_id).ok().flatten()
+}
+
+pub fn set_strategy_quarantine(
+    quarantine: StrategyQuarantine,
+) -> Result<StrategyQuarantine, String> {
+    validate_strategy_quarantine(&quarantine)?;
+    sqlite::upsert_strategy_quarantine(&quarantine)?;
+    Ok(quarantine)
+}
+
+pub fn clear_strategy_quarantine(strategy_id: &str) -> bool {
+    sqlite::delete_strategy_quarantine(strategy_id).is_ok()
+}
+
+pub fn list_strategy_quarantines() -> Vec<StrategyQuarantine> {
+    sqlite::list_strategy_quarantines(1_000).unwrap_or_default()
+}
+
+pub fn append_decision_record(record: DecisionRecord) -> Result<DecisionRecord, String> {
+    validate_decision_record(&record)?;
+    sqlite::append_decision_record(&record, MAX_DECISION_RECORDS)?;
+    Ok(record)
+}
+
+pub fn list_recent_decisions(limit: usize) -> Vec<DecisionRecord> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    sqlite::list_recent_decision_records(limit.min(MAX_DECISION_RECORDS)).unwrap_or_default()
+}
+
+pub fn exposure_reconciliation_status() -> ExposureReconciliationStatus {
+    sqlite::read_exposure_reconciliation_status()
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+pub fn set_exposure_reconciliation_status(
+    status: ExposureReconciliationStatus,
+) -> Result<ExposureReconciliationStatus, String> {
+    sqlite::write_exposure_reconciliation_status(&status)?;
+    Ok(status)
 }
 
 #[allow(dead_code)]
@@ -3947,6 +4025,46 @@ fn validate_autonomy_suppression_config(config: &AutonomySuppressionConfig) -> R
     Ok(())
 }
 
+fn validate_autonomy_policy(policy: &AutonomyPolicy) -> Result<(), String> {
+    if policy.version == 0 {
+        return Err("autonomy policy version must be greater than zero".to_string());
+    }
+    Ok(())
+}
+
+fn validate_active_exposure(exposure: &ActiveExposure) -> Result<(), String> {
+    if exposure.strategy_id.trim().is_empty() {
+        return Err("active exposure strategy_id must be non-empty".to_string());
+    }
+    if exposure.protocol.trim().is_empty() {
+        return Err("active exposure protocol must be non-empty".to_string());
+    }
+    if exposure.chain_id == 0 {
+        return Err("active exposure chain_id must be greater than zero".to_string());
+    }
+    if exposure.asset_symbol.trim().is_empty() {
+        return Err("active exposure asset_symbol must be non-empty".to_string());
+    }
+    Ok(())
+}
+
+fn validate_strategy_quarantine(quarantine: &StrategyQuarantine) -> Result<(), String> {
+    if quarantine.strategy_id.trim().is_empty() {
+        return Err("strategy quarantine strategy_id must be non-empty".to_string());
+    }
+    if quarantine.reason.trim().is_empty() {
+        return Err("strategy quarantine reason must be non-empty".to_string());
+    }
+    Ok(())
+}
+
+fn validate_decision_record(record: &DecisionRecord) -> Result<(), String> {
+    if record.turn_id.trim().is_empty() {
+        return Err("decision record turn_id must be non-empty".to_string());
+    }
+    Ok(())
+}
+
 // ── Skills ────────────────────────────────────────────────────────────────────
 
 pub fn upsert_skill(skill: &SkillRecord) {
@@ -5012,6 +5130,85 @@ mod tests {
         let records = list_reflection_memory(10);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].key, "tool-2:subject-2:error-2");
+    }
+
+    #[test]
+    fn autonomy_policy_and_decision_records_roundtrip() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        let policy = set_autonomy_policy(AutonomyPolicy::conservative_default(1_000))
+            .expect("policy should store");
+        assert_eq!(autonomy_policy(), Some(policy.clone()));
+
+        let exposure = set_active_exposure(ActiveExposure {
+            strategy_id: "moonwell-enter".to_string(),
+            protocol: "moonwell".to_string(),
+            chain_id: 8453,
+            asset_symbol: "USDC".to_string(),
+            notional_wei: Some(50_000_000_000_000_000),
+            updated_at_ns: 1_100,
+        })
+        .expect("exposure should store");
+        assert_eq!(
+            active_exposure(&exposure.strategy_id),
+            Some(exposure.clone())
+        );
+        assert_eq!(list_active_exposures(), vec![exposure.clone()]);
+
+        let quarantine = set_strategy_quarantine(StrategyQuarantine {
+            strategy_id: exposure.strategy_id.clone(),
+            reason: "repeated_failure".to_string(),
+            failure_count: 3,
+            quarantined_at_ns: 1_200,
+            release_after_ns: Some(1_500),
+        })
+        .expect("quarantine should store");
+        assert_eq!(
+            strategy_quarantine(&quarantine.strategy_id),
+            Some(quarantine.clone())
+        );
+        assert_eq!(list_strategy_quarantines(), vec![quarantine.clone()]);
+
+        for index in 0..205u64 {
+            append_decision_record(DecisionRecord {
+                turn_id: format!("turn-{index:03}"),
+                timestamp_ns: 2_000 + index,
+                trigger: crate::domain::types::DecisionTrigger::ScheduledReview,
+                outcome: crate::domain::types::DecisionOutcome::NoOp {
+                    reason: format!("reason-{index}"),
+                },
+                policy_version: policy.version,
+                candidates_summary: format!("candidate-{index}"),
+                explanation: format!("explanation-{index}"),
+            })
+            .expect("decision should store");
+        }
+
+        let recent = list_recent_decisions(250);
+        assert_eq!(recent.len(), MAX_DECISION_RECORDS);
+        assert_eq!(recent[0].turn_id, "turn-204");
+        assert_eq!(
+            recent.last().map(|record| record.turn_id.as_str()),
+            Some("turn-005")
+        );
+
+        let status = set_exposure_reconciliation_status(ExposureReconciliationStatus {
+            last_attempted_at_ns: Some(3_000),
+            last_succeeded_at_ns: Some(3_010),
+            repaired_exposures: 1,
+            recreated_exposures: 0,
+            closed_exposures: 1,
+            drift_reason: Some("rebuilt_missing_local_state".to_string()),
+            last_error: None,
+        })
+        .expect("status should store");
+        assert_eq!(exposure_reconciliation_status(), status);
+
+        assert!(clear_strategy_quarantine(&quarantine.strategy_id));
+        assert!(remove_active_exposure(&exposure.strategy_id));
+        assert_eq!(strategy_quarantine(&quarantine.strategy_id), None);
+        assert_eq!(active_exposure(&exposure.strategy_id), None);
     }
 
     #[test]

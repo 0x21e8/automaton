@@ -4,10 +4,12 @@
 //! collections into SQLite for parity checks and backfill validation.
 
 use crate::domain::types::{
-    AbiArtifact, AbiArtifactKey, ConversationEntry, ConversationLog, InboxMessage, MemoryFact,
+    AbiArtifact, AbiArtifactKey, ActiveExposure, AutonomyPolicy, ConversationEntry,
+    ConversationLog, DecisionRecord, ExposureReconciliationStatus, InboxMessage, MemoryFact,
     OutboxMessage, ReflectionMemoryRecord, RuntimeSnapshot, ScheduledJob, SchedulerRuntime,
-    SkillRecord, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass, TaskKind,
-    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    SkillRecord, StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
+    TaskKind, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord,
+    TurnRecord,
 };
 use crate::features::cycle_topup::TopUpStage;
 #[cfg(target_arch = "wasm32")]
@@ -249,11 +251,51 @@ CREATE TABLE IF NOT EXISTS reflection_memory (
 CREATE INDEX IF NOT EXISTS idx_reflection_memory_updated_at ON reflection_memory(updated_at_ns);
 "#;
 
+const MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS autonomy_policy (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS active_exposures (
+    strategy_id TEXT PRIMARY KEY,
+    protocol TEXT NOT NULL,
+    chain_id INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_active_exposures_protocol ON active_exposures(protocol);
+CREATE INDEX IF NOT EXISTS idx_active_exposures_updated_at ON active_exposures(updated_at_ns);
+
+CREATE TABLE IF NOT EXISTS strategy_quarantines (
+    strategy_id TEXT PRIMARY KEY,
+    quarantined_at_ns INTEGER NOT NULL,
+    release_after_ns INTEGER,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_quarantines_quarantined_at
+    ON strategy_quarantines(quarantined_at_ns);
+
+CREATE TABLE IF NOT EXISTS decision_records (
+    turn_id TEXT PRIMARY KEY,
+    timestamp_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_decision_records_timestamp ON decision_records(timestamp_ns);
+
+CREATE TABLE IF NOT EXISTS exposure_reconciliation_status (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    last_attempted_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+"#;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
     use super::{
         MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
-        MIGRATION_004_REFLECTION_MEMORY_SCHEMA,
+        MIGRATION_004_REFLECTION_MEMORY_SCHEMA, MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA,
     };
     use rusqlite::{params, Connection};
     use std::cell::RefCell;
@@ -306,6 +348,8 @@ mod backend {
             .map_err(|err| err.to_string())?;
         conn.execute_batch(MIGRATION_004_REFLECTION_MEMORY_SCHEMA)
             .map_err(|err| err.to_string())?;
+        conn.execute_batch(MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA)
+            .map_err(|err| err.to_string())?;
         let version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -314,7 +358,7 @@ mod backend {
             )
             .map_err(|err| err.to_string())?;
         let now = crate::timing::current_time_ns() as i64;
-        for v in (version + 1)..=4 {
+        for v in (version + 1)..=5 {
             conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
                 params![v, now],
@@ -329,7 +373,7 @@ mod backend {
 mod backend {
     use super::{
         MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
-        MIGRATION_004_REFLECTION_MEMORY_SCHEMA,
+        MIGRATION_004_REFLECTION_MEMORY_SCHEMA, MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA,
     };
 
     pub type SqlResult<T> = Result<T, String>;
@@ -344,6 +388,8 @@ mod backend {
                 .map_err(|err| err.to_string())?;
             conn.execute_batch(MIGRATION_004_REFLECTION_MEMORY_SCHEMA)
                 .map_err(|err| err.to_string())?;
+            conn.execute_batch(MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA)
+                .map_err(|err| err.to_string())?;
             let version: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -352,7 +398,7 @@ mod backend {
                 )
                 .map_err(|err| err.to_string())?;
             let now = crate::timing::current_time_ns() as i64;
-            for v in (version + 1)..=4 {
+            for v in (version + 1)..=5 {
                 conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
                     [v, now],
@@ -2263,6 +2309,281 @@ pub fn delete_oldest_reflection_memory(keep_max: usize) -> Result<u32, String> {
     })
 }
 
+// -- Autonomy runtime queries --
+
+pub fn read_autonomy_policy() -> Result<Option<AutonomyPolicy>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM autonomy_policy WHERE singleton_id = 1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt.query([]).map_err(|err| err.to_string())?;
+        match rows.next().map_err(|err| err.to_string())? {
+            Some(row) => {
+                from_payload_json(row.get::<_, String>(0).map_err(|err| err.to_string())?).map(Some)
+            }
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn write_autonomy_policy(policy: &AutonomyPolicy) -> Result<(), String> {
+    let payload_json = row_payload(policy)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO autonomy_policy(singleton_id, updated_at_ns, payload_json)
+             VALUES(1, ?1, ?2)",
+            (policy.updated_at_ns as i64, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn get_active_exposure(strategy_id: &str) -> Result<Option<ActiveExposure>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM active_exposures WHERE strategy_id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([strategy_id], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn upsert_active_exposure(exposure: &ActiveExposure) -> Result<(), String> {
+    let payload_json = row_payload(exposure)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO active_exposures(strategy_id, protocol, chain_id, updated_at_ns, payload_json)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            (
+                &exposure.strategy_id,
+                &exposure.protocol,
+                exposure.chain_id as i64,
+                exposure.updated_at_ns as i64,
+                payload_json,
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn delete_active_exposure(strategy_id: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute(
+            "DELETE FROM active_exposures WHERE strategy_id = ?1",
+            [strategy_id],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn list_active_exposures(limit: usize) -> Result<Vec<ActiveExposure>, String> {
+    let keep = bounded_limit(limit, 100, 1_000);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM active_exposures
+                 ORDER BY updated_at_ns DESC, strategy_id ASC LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn count_active_exposures() -> Result<usize, String> {
+    table_count_extended("active_exposures").map(|count| count as usize)
+}
+
+pub fn get_strategy_quarantine(strategy_id: &str) -> Result<Option<StrategyQuarantine>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM strategy_quarantines WHERE strategy_id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([strategy_id], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn upsert_strategy_quarantine(quarantine: &StrategyQuarantine) -> Result<(), String> {
+    let payload_json = row_payload(quarantine)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO strategy_quarantines(strategy_id, quarantined_at_ns, release_after_ns, payload_json)
+             VALUES(?1, ?2, ?3, ?4)",
+            (
+                &quarantine.strategy_id,
+                quarantine.quarantined_at_ns as i64,
+                quarantine.release_after_ns.map(|value| value as i64),
+                payload_json,
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn delete_strategy_quarantine(strategy_id: &str) -> Result<(), String> {
+    backend::with_connection(|conn| {
+        conn.execute(
+            "DELETE FROM strategy_quarantines WHERE strategy_id = ?1",
+            [strategy_id],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn list_strategy_quarantines(limit: usize) -> Result<Vec<StrategyQuarantine>, String> {
+    let keep = bounded_limit(limit, 100, 1_000);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM strategy_quarantines
+                 ORDER BY quarantined_at_ns DESC, strategy_id ASC LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn count_strategy_quarantines() -> Result<usize, String> {
+    table_count_extended("strategy_quarantines").map(|count| count as usize)
+}
+
+pub fn append_decision_record(record: &DecisionRecord, keep_max: usize) -> Result<(), String> {
+    let payload_json = row_payload(record)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO decision_records(turn_id, timestamp_ns, payload_json)
+             VALUES(?1, ?2, ?3)",
+            (&record.turn_id, record.timestamp_ns as i64, payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+
+        let keep_max = keep_max.min(i64::MAX as usize) as i64;
+        let total: i64 = conn
+            .query_row("SELECT COUNT(1) FROM decision_records", [], |row| {
+                row.get(0)
+            })
+            .map_err(|err| err.to_string())?;
+        if total > keep_max {
+            let delete_count = total - keep_max;
+            conn.execute(
+                "DELETE FROM decision_records
+                 WHERE turn_id IN (
+                     SELECT turn_id FROM decision_records
+                     ORDER BY timestamp_ns ASC, turn_id ASC
+                     LIMIT ?1
+                 )",
+                [delete_count],
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    })
+}
+
+pub fn get_decision_record(turn_id: &str) -> Result<Option<DecisionRecord>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM decision_records WHERE turn_id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([turn_id], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn list_recent_decision_records(limit: usize) -> Result<Vec<DecisionRecord>, String> {
+    let keep = bounded_limit(limit, 25, 200);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM decision_records
+                 ORDER BY timestamp_ns DESC, turn_id DESC LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn count_decision_records() -> Result<usize, String> {
+    table_count_extended("decision_records").map(|count| count as usize)
+}
+
+pub fn read_exposure_reconciliation_status() -> Result<Option<ExposureReconciliationStatus>, String>
+{
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM exposure_reconciliation_status WHERE singleton_id = 1",
+            )
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt.query([]).map_err(|err| err.to_string())?;
+        match rows.next().map_err(|err| err.to_string())? {
+            Some(row) => {
+                from_payload_json(row.get::<_, String>(0).map_err(|err| err.to_string())?).map(Some)
+            }
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn write_exposure_reconciliation_status(
+    status: &ExposureReconciliationStatus,
+) -> Result<(), String> {
+    let payload_json = row_payload(status)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO exposure_reconciliation_status(singleton_id, last_attempted_at_ns, payload_json)
+             VALUES(1, ?1, ?2)",
+            (
+                status.last_attempted_at_ns.unwrap_or_default() as i64,
+                payload_json,
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
 // -- Extended inbox queries --
 
 pub fn list_pending_inbox(limit: usize) -> Result<Vec<InboxMessage>, String> {
@@ -2690,6 +3011,11 @@ pub fn table_count_extended(table: &str) -> Result<u64, String> {
         | "strategy_budgets"
         | "autonomy_tool_failures"
         | "reflection_memory"
+        | "autonomy_policy"
+        | "active_exposures"
+        | "strategy_quarantines"
+        | "decision_records"
+        | "exposure_reconciliation_status"
         | "runtime_scalars" => table,
         _ => return Err(format!("unsupported table: {table}")),
     };
@@ -2706,10 +3032,12 @@ pub fn table_count_extended(table: &str) -> Result<u64, String> {
 mod tests {
     use super::*;
     use crate::domain::types::{
-        ActionSpec, AgentEvent, AgentState, ContractRoleBinding, InboxMessageSource,
-        InboxMessageStatus, JobStatus, ReflectionMemoryRecord, ReflectionOrigin, RuntimeSnapshot,
-        SchedulerRuntime, SurvivalOperationClass, TaskKind, TaskLane, TaskScheduleConfig,
-        TaskScheduleRuntime, TemplateStatus, ToolCallRecord,
+        ActionSpec, ActiveExposure, AgentEvent, AgentState, AutonomyPolicy, ContractRoleBinding,
+        DecisionOutcome, DecisionRecord, DecisionTrigger, ExposureReconciliationStatus,
+        InboxMessageSource, InboxMessageStatus, JobStatus, ReflectionMemoryRecord,
+        ReflectionOrigin, RuntimeSnapshot, SchedulerRuntime, StrategyQuarantine,
+        SurvivalOperationClass, TaskKind, TaskLane, TaskScheduleConfig, TaskScheduleRuntime,
+        TemplateStatus, ToolCallRecord,
     };
     use crate::features::cycle_topup::TopUpStage;
 
@@ -2743,7 +3071,7 @@ mod tests {
     fn migrations_reach_version_one() {
         close_storage().expect("close before migration test");
         init_storage().expect("init sqlite");
-        assert_eq!(schema_version().expect("schema version"), 4);
+        assert_eq!(schema_version().expect("schema version"), 5);
     }
 
     #[test]
@@ -2793,6 +3121,26 @@ mod tests {
         })
         .expect("index lookup should succeed");
         assert_eq!(has_index, 1);
+    }
+
+    #[test]
+    fn autonomy_runtime_schema_is_present() {
+        close_storage().expect("reset sqlite");
+        init_storage().expect("init sqlite");
+
+        for table in [
+            "autonomy_policy",
+            "active_exposures",
+            "strategy_quarantines",
+            "decision_records",
+            "exposure_reconciliation_status",
+        ] {
+            assert_eq!(
+                table_count_extended(table).expect("autonomy runtime table count"),
+                0,
+                "table {table}"
+            );
+        }
     }
 
     #[test]
@@ -2962,6 +3310,112 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].key, "tool:5:error");
         assert_eq!(listed[1].key, "tool:4:error");
+    }
+
+    #[test]
+    fn autonomy_runtime_helpers_round_trip_and_bound_decision_fifo() {
+        close_storage().expect("reset sqlite");
+        init_storage().expect("init sqlite");
+
+        let policy = AutonomyPolicy::conservative_default(42);
+        write_autonomy_policy(&policy).expect("policy should persist");
+        assert_eq!(
+            read_autonomy_policy().expect("policy should load"),
+            Some(policy.clone())
+        );
+
+        let exposure = ActiveExposure {
+            strategy_id: "aave-enter".to_string(),
+            protocol: "aave".to_string(),
+            chain_id: 8453,
+            asset_symbol: "USDC".to_string(),
+            notional_wei: Some(123_000_000_000_000_000),
+            updated_at_ns: 100,
+        };
+        upsert_active_exposure(&exposure).expect("exposure should persist");
+        assert_eq!(
+            get_active_exposure(&exposure.strategy_id).expect("exposure should load"),
+            Some(exposure.clone())
+        );
+        assert_eq!(count_active_exposures().expect("exposure count"), 1);
+
+        let quarantine = StrategyQuarantine {
+            strategy_id: exposure.strategy_id.clone(),
+            reason: "repeated_failure".to_string(),
+            failure_count: 3,
+            quarantined_at_ns: 120,
+            release_after_ns: Some(200),
+        };
+        upsert_strategy_quarantine(&quarantine).expect("quarantine should persist");
+        assert_eq!(
+            get_strategy_quarantine(&quarantine.strategy_id).expect("quarantine should load"),
+            Some(quarantine.clone())
+        );
+        assert_eq!(count_strategy_quarantines().expect("quarantine count"), 1);
+
+        for index in 0..205u64 {
+            let record = DecisionRecord {
+                turn_id: format!("turn-{index:03}"),
+                timestamp_ns: 1_000 + index,
+                trigger: DecisionTrigger::ScheduledReview,
+                outcome: DecisionOutcome::NoOp {
+                    reason: format!("reason-{index}"),
+                },
+                policy_version: 1,
+                candidates_summary: format!("candidate-{index}"),
+                explanation: format!("explanation-{index}"),
+            };
+            append_decision_record(&record, 200).expect("decision record should persist");
+        }
+
+        assert_eq!(count_decision_records().expect("decision count"), 200);
+        assert!(
+            get_decision_record("turn-000")
+                .expect("decision lookup should succeed")
+                .is_none(),
+            "oldest decision should be evicted"
+        );
+        assert!(
+            get_decision_record("turn-004")
+                .expect("decision lookup should succeed")
+                .is_none(),
+            "fifo cap should evict five oldest records"
+        );
+        assert_eq!(
+            get_decision_record("turn-005").expect("decision lookup should succeed"),
+            Some(DecisionRecord {
+                turn_id: "turn-005".to_string(),
+                timestamp_ns: 1_005,
+                trigger: DecisionTrigger::ScheduledReview,
+                outcome: DecisionOutcome::NoOp {
+                    reason: "reason-5".to_string(),
+                },
+                policy_version: 1,
+                candidates_summary: "candidate-5".to_string(),
+                explanation: "explanation-5".to_string(),
+            })
+        );
+        let listed = list_recent_decision_records(3).expect("recent decisions should list");
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].turn_id, "turn-204");
+        assert_eq!(listed[1].turn_id, "turn-203");
+        assert_eq!(listed[2].turn_id, "turn-202");
+
+        let reconciliation = ExposureReconciliationStatus {
+            last_attempted_at_ns: Some(500),
+            last_succeeded_at_ns: Some(510),
+            repaired_exposures: 1,
+            recreated_exposures: 2,
+            closed_exposures: 3,
+            drift_reason: Some("execution_repair".to_string()),
+            last_error: None,
+        };
+        write_exposure_reconciliation_status(&reconciliation)
+            .expect("reconciliation status should persist");
+        assert_eq!(
+            read_exposure_reconciliation_status().expect("reconciliation status should load"),
+            Some(reconciliation)
+        );
     }
 
     #[test]
