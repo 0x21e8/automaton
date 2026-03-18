@@ -16,6 +16,7 @@ anvil_host := "127.0.0.1"
 anvil_port := "18545"
 anvil_chain_id := "31337"
 base_chain_id := "8453"
+base_usdc_address := "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 anvil_rpc_url := "http://" + anvil_host + ":" + anvil_port
 anvil_private_key := "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 bootstrap_usdc_amount := "1000000000"
@@ -146,28 +147,59 @@ anvil-stop:
     echo "No tracked Anvil PID in .local/anvil.pid"
   fi
 
-deploy-inbox:
+deploy-inbox evm_mode="local" usdc_token_address="":
   #!/usr/bin/env bash
   set -euo pipefail
+  evm_mode="{{evm_mode}}"
+  usdc_token_address="{{usdc_token_address}}"
   cd evm
-  mock_usdc_address="$(
-    forge create src/mocks/MockUSDC.sol:MockUSDC \
-      --rpc-url {{anvil_rpc_url}} \
-      --private-key {{anvil_private_key}} \
-      --broadcast | awk '/Deployed to:/ { print $3 }'
-  )"
+  case "$evm_mode" in
+    local)
+      usdc_label="MockUSDC"
+      usdc_token_address="$(
+        forge create src/mocks/MockUSDC.sol:MockUSDC \
+          --rpc-url {{anvil_rpc_url}} \
+          --private-key {{anvil_private_key}} \
+          --broadcast | awk '/Deployed to:/ { print $3 }'
+      )"
+      ;;
+    base-fork)
+      usdc_label="BaseUSDC"
+      if [ -z "$usdc_token_address" ]; then
+        usdc_token_address="{{base_usdc_address}}"
+      fi
+      deployed_bytecode="$(forge inspect src/mocks/MockUSDC.sol:MockUSDC deployedBytecode | tr -d '\n')"
+      if [ -z "$deployed_bytecode" ]; then
+        echo "failed to inspect MockUSDC deployed bytecode" >&2
+        exit 1
+      fi
+      case "$deployed_bytecode" in
+        0x*) ;;
+        *) deployed_bytecode="0x$deployed_bytecode" ;;
+      esac
+      cast rpc anvil_setCode \
+        "$usdc_token_address" \
+        "$deployed_bytecode" \
+        --rpc-url {{anvil_rpc_url}} >/dev/null
+      ;;
+    *)
+      echo "unsupported evm_mode=$evm_mode (supported: local, base-fork)" >&2
+      exit 1
+      ;;
+  esac
   inbox_address="$(
     forge create src/Inbox.sol:Inbox \
       --rpc-url {{anvil_rpc_url}} \
       --private-key {{anvil_private_key}} \
       --broadcast \
-      --constructor-args "$mock_usdc_address" | awk '/Deployed to:/ { print $3 }'
+      --constructor-args "$usdc_token_address" | awk '/Deployed to:/ { print $3 }'
   )"
   cd ..
   mkdir -p .local
-  printf '%s\n' "$mock_usdc_address" > .local/mock_usdc_address
+  printf '%s\n' "$usdc_token_address" > .local/usdc_token_address
+  printf '%s\n' "$usdc_token_address" > .local/mock_usdc_address
   printf '%s\n' "$inbox_address" > .local/inbox_contract_address
-  echo "MockUSDC: $mock_usdc_address"
+  echo "$usdc_label: $usdc_token_address"
   echo "Inbox:    $inbox_address"
 
 deploy-canister inbox_address="" llm_canister_id=llm_default_canister_id evm_chain_id=anvil_chain_id evm_rpc_url=anvil_rpc_url inference_mode="openrouter" openrouter_model=openrouter_default_model backend_topup_cycles=bootstrap_backend_cycles:
@@ -325,36 +357,44 @@ automaton-evm-address timeout_secs=automaton_wait_timeout_secs poll_secs=automat
 seed-bootstrap-payer:
   #!/usr/bin/env bash
   set -euo pipefail
-  if [ ! -f .local/mock_usdc_address ] || [ ! -f .local/inbox_contract_address ]; then
+  usdc_token_path=".local/usdc_token_address"
+  if [ ! -f "$usdc_token_path" ] && [ -f .local/mock_usdc_address ]; then
+    usdc_token_path=".local/mock_usdc_address"
+  fi
+  if [ ! -f "$usdc_token_path" ] || [ ! -f .local/inbox_contract_address ]; then
     echo "Missing inbox deployment artifacts in .local; run just deploy-inbox first" >&2
     exit 1
   fi
 
   sender_address="$(cast wallet address --private-key {{anvil_private_key}})"
-  mock_usdc_address="$(cat .local/mock_usdc_address)"
+  usdc_token_address="$(cat "$usdc_token_path")"
   inbox_address="$(cat .local/inbox_contract_address)"
 
-  cast send "$mock_usdc_address" \
+  cast send "$usdc_token_address" \
     "mint(address,uint256)" \
     "$sender_address" \
     {{bootstrap_usdc_amount}} \
     --rpc-url {{anvil_rpc_url}} \
     --private-key {{anvil_private_key}} >/dev/null
 
-  cast send "$mock_usdc_address" \
+  cast send "$usdc_token_address" \
     "approve(address,uint256)" \
     "$inbox_address" \
     {{bootstrap_usdc_amount}} \
     --rpc-url {{anvil_rpc_url}} \
     --private-key {{anvil_private_key}} >/dev/null
 
-  echo "Seeded payer $sender_address with {{bootstrap_usdc_amount}} mock USDC and approved inbox"
+  echo "Seeded payer $sender_address with {{bootstrap_usdc_amount}} USDC and approved inbox"
 
 seed-bootstrap-wallets automaton_address="" recipient_address=bootstrap_secondary_evm_address:
   #!/usr/bin/env bash
   set -euo pipefail
-  if [ ! -f .local/mock_usdc_address ]; then
-    echo "Missing mock USDC address in .local; run just deploy-inbox first" >&2
+  usdc_token_path=".local/usdc_token_address"
+  if [ ! -f "$usdc_token_path" ] && [ -f .local/mock_usdc_address ]; then
+    usdc_token_path=".local/mock_usdc_address"
+  fi
+  if [ ! -f "$usdc_token_path" ]; then
+    echo "Missing USDC token address in .local; run just deploy-inbox first" >&2
     exit 1
   fi
 
@@ -371,9 +411,9 @@ seed-bootstrap-wallets automaton_address="" recipient_address=bootstrap_secondar
     fi
   done
 
-  mock_usdc_address="$(cat .local/mock_usdc_address)"
+  usdc_token_address="$(cat "$usdc_token_path")"
 
-  cast send "$mock_usdc_address" \
+  cast send "$usdc_token_address" \
     "transfer(address,uint256)" \
     "$automaton_address" \
     {{bootstrap_wallet_usdc_amount}} \
@@ -384,7 +424,7 @@ seed-bootstrap-wallets automaton_address="" recipient_address=bootstrap_secondar
     --rpc-url {{anvil_rpc_url}} \
     --private-key {{anvil_private_key}} >/dev/null
 
-  cast send "$mock_usdc_address" \
+  cast send "$usdc_token_address" \
     "transfer(address,uint256)" \
     "$recipient_address" \
     {{bootstrap_wallet_usdc_amount}} \
@@ -395,7 +435,7 @@ seed-bootstrap-wallets automaton_address="" recipient_address=bootstrap_secondar
     --rpc-url {{anvil_rpc_url}} \
     --private-key {{anvil_private_key}} >/dev/null
 
-  echo "Seeded $automaton_address and $recipient_address with {{bootstrap_wallet_usdc_amount}} mock USDC and {{bootstrap_wallet_eth_wei}} wei"
+  echo "Seeded $automaton_address and $recipient_address with {{bootstrap_wallet_usdc_amount}} USDC and {{bootstrap_wallet_eth_wei}} wei"
 
 configure-inference-openrouter model="":
   #!/usr/bin/env bash
@@ -567,7 +607,7 @@ bootstrap mode="openrouter" openrouter_model="" ic_llm_model="" evm_mode="local"
       exit 1
       ;;
   esac
-  just deploy-inbox
+  just deploy-inbox "$evm_mode"
   case "$mode" in
     openrouter)
       ;;

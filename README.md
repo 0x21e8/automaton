@@ -230,6 +230,10 @@ just bootstrap icllm
 # Optional: fork Base mainnet instead of using a blank local chain
 just bootstrap openrouter base-fork "" "$BASE_MAINNET_RPC_URL"
 
+# In base-fork mode, bootstrap rewires the forked Base USDC address to local
+# mock ERC-20 bytecode so the automaton and payer can be funded at the
+# canonical Base USDC address used by the strategy templates.
+
 # Optional model defaults can be configured in .env:
 # OPENROUTER_MODEL (default: google/gemini-3-flash-preview)
 # IC_LLM_MODEL (default: llama3.1:8b)
