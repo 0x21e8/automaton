@@ -226,6 +226,122 @@ struct ProxySubmitCapture {
     system_prompt: String,
 }
 
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ReservePolicy {
+    min_cycles_runway_hours: u64,
+    min_inference_usdc_6dp: Option<u64>,
+    min_gas_wei: Option<u128>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct RiskLimits {
+    max_total_exposure_bps: u16,
+    max_single_action_bps: u16,
+    max_protocol_concentration_bps: u16,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ExecutionAuthority {
+    autonomous_execution_enabled: bool,
+    require_simulation_first: bool,
+    per_action_value_limit_wei: Option<u128>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct EscalationRules {
+    escalate_on_missing_policy: bool,
+    escalate_on_authority_exceeded: bool,
+    escalate_on_repeated_failure: bool,
+    failure_quarantine_threshold: u32,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct AutonomyPolicy {
+    version: u32,
+    reserve_policy: ReservePolicy,
+    risk_limits: RiskLimits,
+    execution_authority: ExecutionAuthority,
+    escalation_rules: EscalationRules,
+    updated_at_ns: u64,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum DecisionTrigger {
+    ScheduledReview,
+    InboxMessage,
+    LowRunway,
+    PositionMaintenance,
+    RecoveryFollowUp,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum EscalationClass {
+    MissingPolicy { what: String },
+    OutOfAuthority { what: String },
+    CapabilityGap { what: String },
+    SafetyConflict { what: String },
+    RepeatedFailure { strategy: String, failure_count: u32 },
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum DecisionOutcome {
+    Executed { action_summary: String },
+    Simulated { action_summary: String },
+    NoOp { reason: String },
+    Deferred { reason: String },
+    Escalated { gap: EscalationClass },
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct DecisionRecord {
+    turn_id: String,
+    timestamp_ns: u64,
+    trigger: DecisionTrigger,
+    outcome: DecisionOutcome,
+    policy_version: u32,
+    candidates_summary: String,
+    explanation: String,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ActiveExposure {
+    strategy_id: String,
+    protocol: String,
+    chain_id: u64,
+    asset_symbol: String,
+    notional_wei: Option<u128>,
+    updated_at_ns: u64,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct StrategyQuarantine {
+    strategy_id: String,
+    reason: String,
+    failure_count: u32,
+    quarantined_at_ns: u64,
+    release_after_ns: Option<u64>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+struct ExposureReconciliationStatus {
+    last_attempted_at_ns: Option<u64>,
+    last_succeeded_at_ns: Option<u64>,
+    repaired_exposures: u32,
+    recreated_exposures: u32,
+    closed_exposures: u32,
+    drift_reason: Option<String>,
+    last_error: Option<String>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct PromptLayer {
+    layer_id: u8,
+    content: String,
+    updated_at_ns: u64,
+    updated_by_turn: String,
+    version: u32,
+}
+
 fn assert_wasm_artifact_present() -> Vec<u8> {
     for path in WASM_PATHS {
         if Path::new(path).exists() {
@@ -299,6 +415,82 @@ where
         .unwrap_or_else(|error| panic!("query call {method} failed: {error:?}"));
     decode_one(&response)
         .unwrap_or_else(|error| panic!("failed decoding {method} response: {error:?}"))
+}
+
+fn get_autonomy_policy(pic: &PocketIc, canister_id: Principal) -> AutonomyPolicy {
+    call_query(
+        pic,
+        canister_id,
+        "get_autonomy_policy",
+        encode_args(()).expect("failed to encode get_autonomy_policy args"),
+    )
+}
+
+fn update_autonomy_policy(
+    pic: &PocketIc,
+    canister_id: Principal,
+    policy: AutonomyPolicy,
+) -> Result<AutonomyPolicy, String> {
+    call_update(
+        pic,
+        canister_id,
+        "update_autonomy_policy",
+        encode_args((policy,)).expect("failed to encode update_autonomy_policy args"),
+    )
+}
+
+fn get_recent_decisions(pic: &PocketIc, canister_id: Principal) -> Vec<DecisionRecord> {
+    call_query(
+        pic,
+        canister_id,
+        "get_recent_decisions",
+        encode_args(()).expect("failed to encode get_recent_decisions args"),
+    )
+}
+
+fn get_active_exposures(pic: &PocketIc, canister_id: Principal) -> Vec<ActiveExposure> {
+    call_query(
+        pic,
+        canister_id,
+        "get_active_exposures",
+        encode_args(()).expect("failed to encode get_active_exposures args"),
+    )
+}
+
+fn get_strategy_quarantines(pic: &PocketIc, canister_id: Principal) -> Vec<StrategyQuarantine> {
+    call_query(
+        pic,
+        canister_id,
+        "get_strategy_quarantines",
+        encode_args(()).expect("failed to encode get_strategy_quarantines args"),
+    )
+}
+
+fn get_exposure_reconciliation_status(
+    pic: &PocketIc,
+    canister_id: Principal,
+) -> ExposureReconciliationStatus {
+    call_query(
+        pic,
+        canister_id,
+        "get_exposure_reconciliation_status",
+        encode_args(()).expect("failed to encode get_exposure_reconciliation_status args"),
+    )
+}
+
+fn update_prompt_layer_admin(
+    pic: &PocketIc,
+    canister_id: Principal,
+    layer_id: u8,
+    content: &str,
+) -> Result<PromptLayer, String> {
+    call_update(
+        pic,
+        canister_id,
+        "update_prompt_layer_admin",
+        encode_args((layer_id, content.to_string()))
+            .expect("failed to encode update_prompt_layer_admin args"),
+    )
 }
 
 fn set_task_enabled(pic: &PocketIc, canister_id: Principal, kind: TaskKind, enabled: bool) {
@@ -820,7 +1012,7 @@ fn wait_for_pending_proxy_job(pic: &PocketIc, canister_id: Principal) {
 }
 
 fn wait_for_turn_counter(pic: &PocketIc, canister_id: Principal, minimum_turn_counter: u64) {
-    for _ in 0..24 {
+    for _ in 0..48 {
         if get_runtime_view(pic, canister_id).turn_counter >= minimum_turn_counter {
             return;
         }
@@ -1212,6 +1404,128 @@ fn agent_continues_after_tool_results_and_posts_final_reply_continuation() {
         "expected one materialized agent-turn job"
     );
     assert_eq!(agent_turn_jobs[0].status, JobStatus::Succeeded);
+}
+
+#[test]
+fn autonomy_turn_round_trips_policy_and_persists_executed_decision() {
+    let (pic, canister_id) = with_backend_canister();
+    configure_only_agent_turn(&pic, canister_id, 60);
+
+    let policy = AutonomyPolicy {
+        version: 7,
+        reserve_policy: ReservePolicy {
+            min_cycles_runway_hours: 96,
+            min_inference_usdc_6dp: Some(250_000),
+            min_gas_wei: Some(42),
+        },
+        risk_limits: RiskLimits {
+            max_total_exposure_bps: 900,
+            max_single_action_bps: 250,
+            max_protocol_concentration_bps: 333,
+        },
+        execution_authority: ExecutionAuthority {
+            autonomous_execution_enabled: true,
+            require_simulation_first: true,
+            per_action_value_limit_wei: Some(999),
+        },
+        escalation_rules: EscalationRules {
+            escalate_on_missing_policy: true,
+            escalate_on_authority_exceeded: true,
+            escalate_on_repeated_failure: true,
+            failure_quarantine_threshold: 4,
+        },
+        updated_at_ns: 123_456_789,
+    };
+    let stored = update_autonomy_policy(&pic, canister_id, policy.clone())
+        .expect("policy update should succeed");
+    assert_eq!(stored, policy);
+    assert_eq!(get_autonomy_policy(&pic, canister_id), policy);
+
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    let decisions = get_recent_decisions(&pic, canister_id);
+    assert_eq!(decisions.len(), 1);
+    let decision = &decisions[0];
+    assert_eq!(decision.policy_version, 7);
+    assert_eq!(decision.trigger, DecisionTrigger::ScheduledReview);
+    assert_eq!(
+        decision.outcome,
+        DecisionOutcome::Executed {
+            action_summary: "record_signal(tick)".to_string(),
+        }
+    );
+    assert_eq!(decision.candidates_summary, "policy-bounded autonomy turn");
+    assert!(
+        decision
+            .explanation
+            .contains("deterministic autonomy decision envelope"),
+        "decision explanation should come from the deterministic retry path"
+    );
+
+    assert!(get_active_exposures(&pic, canister_id).is_empty());
+    assert!(get_strategy_quarantines(&pic, canister_id).is_empty());
+    assert_eq!(
+        get_exposure_reconciliation_status(&pic, canister_id),
+        ExposureReconciliationStatus::default()
+    );
+
+    let turns = list_turns(&pic, canister_id, 5);
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.contains("inference_round_count: 3")),
+        "scheduled autonomy turn should retry through the tool and decision-envelope phases before persisting"
+    );
+}
+
+#[test]
+fn invalid_autonomy_decision_envelope_falls_back_to_noop_in_pocketic() {
+    let (pic, canister_id) = with_backend_canister();
+    configure_only_agent_turn(&pic, canister_id, 60);
+
+    let updated = update_prompt_layer_admin(
+        &pic,
+        canister_id,
+        6,
+        "## Layer 6: Economic Decision Loop\n- request_autonomy_decision_invalid_persistent:true",
+    )
+    .expect("prompt layer update should succeed");
+    assert_eq!(updated.layer_id, 6);
+    assert!(updated.content.contains("request_autonomy_decision_invalid_persistent:true"));
+
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    let decisions = get_recent_decisions(&pic, canister_id);
+    assert_eq!(decisions.len(), 1);
+    let decision = &decisions[0];
+    assert_eq!(decision.policy_version, 1);
+    assert_eq!(decision.trigger, DecisionTrigger::ScheduledReview);
+    assert_eq!(
+        decision.outcome,
+        DecisionOutcome::NoOp {
+            reason: "invalid_decision_shape".to_string(),
+        }
+    );
+    assert!(
+        decision.explanation.contains("decision envelope invalid"),
+        "turn should preserve the invalid-envelope explanation for auditability"
+    );
+
+    let turns = list_turns(&pic, canister_id, 5);
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.contains("inference_round_count: 2")),
+        "invalid autonomy envelopes should be retried once before falling back to NoOp"
+    );
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.contains("decision envelope invalid")),
+        "turn log should preserve the invalid-envelope retry trace"
+    );
 }
 
 #[test]

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const WASM_PATHS: &[&str] = &[
+    ".icp/cache/artifacts/backend",
     "target/wasm32-unknown-unknown/release/backend.wasm",
     "target/wasm32-unknown-unknown/release/deps/backend.wasm",
 ];
@@ -93,6 +94,17 @@ struct SchedulerRuntime {
     last_tick_started_ns: u64,
     last_tick_finished_ns: u64,
     last_tick_error: Option<String>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+struct ExposureReconciliationStatus {
+    last_attempted_at_ns: Option<u64>,
+    last_succeeded_at_ns: Option<u64>,
+    repaired_exposures: u32,
+    recreated_exposures: u32,
+    closed_exposures: u32,
+    drift_reason: Option<String>,
+    last_error: Option<String>,
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
@@ -288,6 +300,18 @@ fn get_scheduler_view(pic: &PocketIc, canister_id: Principal) -> SchedulerRuntim
         pic,
         canister_id,
         "get_scheduler_view",
+        encode_args(()).expect("failed to encode empty args"),
+    )
+}
+
+fn get_exposure_reconciliation_status(
+    pic: &PocketIc,
+    canister_id: Principal,
+) -> ExposureReconciliationStatus {
+    call_query(
+        pic,
+        canister_id,
+        "get_exposure_reconciliation_status",
         encode_args(()).expect("failed to encode empty args"),
     )
 }
@@ -802,4 +826,57 @@ fn high_volume_poll_inbox_history_stays_bounded_with_active_retention() {
         }),
         "scheduler should continue reaching terminal job states while retention runs"
     );
+}
+
+#[test]
+fn reconcile_job_updates_exposure_reconciliation_status_visibility() {
+    let (pic, canister_id) = with_backend_canister();
+
+    for kind in [
+        TaskKind::AgentTurn,
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::TopUpCycles,
+    ] {
+        set_task_enabled(&pic, canister_id, kind, false);
+        set_task_interval_secs(&pic, canister_id, kind, 60);
+    }
+    set_task_enabled(&pic, canister_id, TaskKind::Reconcile, true);
+    set_task_interval_secs(&pic, canister_id, TaskKind::Reconcile, 1);
+
+    let before = get_exposure_reconciliation_status(&pic, canister_id);
+    assert_eq!(before, ExposureReconciliationStatus::default());
+
+    for _ in 0..24 {
+        pic.advance_time(Duration::from_secs(2));
+        pic.tick();
+        let status = get_exposure_reconciliation_status(&pic, canister_id);
+        if status.last_attempted_at_ns.is_some() {
+            assert_eq!(status.last_attempted_at_ns, status.last_succeeded_at_ns);
+            assert_eq!(status.repaired_exposures, 0);
+            assert_eq!(status.recreated_exposures, 0);
+            assert_eq!(status.closed_exposures, 0);
+            assert!(status.drift_reason.is_none());
+            assert!(status.last_error.is_none());
+
+            let jobs = list_scheduler_jobs(&pic, canister_id);
+            let reconcile_jobs = jobs
+                .iter()
+                .filter(|job| job.kind == TaskKind::Reconcile)
+                .collect::<Vec<_>>();
+            assert!(
+                !reconcile_jobs.is_empty(),
+                "reconcile job should be materialized by the scheduler"
+            );
+            assert!(
+                reconcile_jobs
+                    .iter()
+                    .any(|job| job.status == JobStatus::Succeeded),
+                "reconcile job should complete successfully"
+            );
+            return;
+        }
+    }
+
+    panic!("reconcile job did not update exposure reconciliation status");
 }

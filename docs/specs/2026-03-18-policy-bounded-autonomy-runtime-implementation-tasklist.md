@@ -170,7 +170,7 @@ Measurable success:
       - Dependencies: Task 2, Task 5
       - Notes: reconciliation must be idempotent and safe after restart/upgrade. If on-chain position introspection requires reusable helpers, factor them out locally without changing the public tool surface.
 
-- [ ] **Task 7: Add end-to-end coverage and finalize**
+- [x] **Task 7: Add end-to-end coverage and finalize**
       - Files: `tests/pocketic_agent_autonomy.rs`, `tests/pocketic_strategy_controls.rs`, optionally `tests/pocketic_scheduler_queue.rs`
       - Code references:
         - add autonomy-turn coverage to `tests/pocketic_agent_autonomy.rs`
