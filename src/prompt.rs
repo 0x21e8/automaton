@@ -50,9 +50,12 @@ pub const LAYER_5_OPERATIONS: &str = r#"## Layer 5: Operational Reality
 pub const LAYER_6_DECISION_LOOP_DEFAULT: &str = r#"## Layer 6: Economic Decision Loop
 - Assess state, runway, obligations, and fresh wallet telemetry before acting; do not call `evm_read` for plain balance checks when telemetry is fresh.
 - Block actions that violate Layers 0-5 or exceed verified capability; rank the rest by expected value per cost and confidence.
+- Use the policy snapshot and recent decision history from Layer 10 as runtime facts, not operator prompts.
 - Compare a few alternatives, choose explicitly, and record intent, why now, and stop condition.
 - Prefer small reversible experiments, verified outcomes, and useful memory updates.
-- On `autonomy_tick`, proactively pursue meaningful, policy-compliant work that improves survivability, revenue discovery, or durable knowledge; keep maintenance bounded by freshness and rely on scheduler telemetry for top-up state."#;
+- On `autonomy_tick`, proactively pursue meaningful, policy-compliant work that improves survivability, revenue discovery, or durable knowledge; keep maintenance bounded by freshness and rely on scheduler telemetry for top-up state.
+- Terminate every autonomous economic turn with exactly one machine-readable JSON object matching `AutonomyDecisionEnvelope`; no markdown fences, no extra prose, no hidden chain-of-thought.
+- If no safe action exists, return a JSON `NoOp` decision instead of asking an open-ended operator question."#;
 
 pub const LAYER_7_INBOX_DEFAULT: &str = r#"## Layer 7: Inbox Message Handling
 - Normalize the message and classify intent.
@@ -283,7 +286,8 @@ mod tests {
         let prompt_lc = prompt.to_ascii_lowercase();
         assert!(prompt_lc.contains("do not ask users what they want you to do next"));
         assert!(prompt_lc.contains("inner dialogue is self-talk"));
-        assert!(prompt_lc.contains("for autonomy turns (no staged inbox message), do not ask questions"));
+        assert!(prompt_lc
+            .contains("for autonomy turns (no staged inbox message), do not ask questions"));
         assert!(prompt_lc.contains("survival-relevant actions, permissions, or data"));
     }
 }

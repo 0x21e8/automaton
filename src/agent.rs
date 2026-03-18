@@ -27,10 +27,11 @@
 ///    back-to-back ticks.
 use crate::domain::state_machine;
 use crate::domain::types::{
-    AgentEvent, AgentState, AutonomySuppressionConfig, ContinuationStopReason, ConversationEntry,
-    InboxMessage, InboxProxyWaitState, InferenceInput, InferenceProvider, MemoryFact, MemoryRollup,
-    ReflectionOrigin, RuntimeSnapshot, ToolCall, ToolCallOutcome, ToolCallRecord, ToolFailureKind,
-    TurnRecord, WalletBalanceStatus,
+    AgentEvent, AgentState, AutonomyDecisionEnvelope, AutonomyPolicy, AutonomySuppressionConfig,
+    ContinuationStopReason, ConversationEntry, DecisionEnvelopeOutcome, DecisionOutcome,
+    DecisionRecord, DecisionTrigger, InboxMessage, InboxProxyWaitState, InferenceInput,
+    InferenceProvider, MemoryFact, MemoryRollup, ReflectionOrigin, RuntimeSnapshot, ToolCall,
+    ToolCallOutcome, ToolCallRecord, ToolFailureKind, TurnRecord, WalletBalanceStatus,
 };
 use crate::features::inference::canonicalize_tool_name;
 #[cfg(target_arch = "wasm32")]
@@ -1690,6 +1691,213 @@ fn conversation_history_limit_for_provider(provider: &InferenceProvider) -> usiz
     }
 }
 
+fn render_autonomy_policy_section(policy: &AutonomyPolicy) -> String {
+    let reserve_min_inference_usdc = policy
+        .reserve_policy
+        .min_inference_usdc_6dp
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let reserve_min_gas_wei = policy
+        .reserve_policy
+        .min_gas_wei
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let per_action_value_limit_wei = policy
+        .execution_authority
+        .per_action_value_limit_wei
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+
+    [
+        "### Autonomy Policy".to_string(),
+        format!("- version: {}", policy.version),
+        format!(
+            "- reserve_min_cycles_runway_hours: {}",
+            policy.reserve_policy.min_cycles_runway_hours
+        ),
+        format!("- reserve_min_inference_usdc_6dp: {reserve_min_inference_usdc}"),
+        format!("- reserve_min_gas_wei: {reserve_min_gas_wei}"),
+        format!(
+            "- max_total_exposure_bps: {}",
+            policy.risk_limits.max_total_exposure_bps
+        ),
+        format!(
+            "- max_single_action_bps: {}",
+            policy.risk_limits.max_single_action_bps
+        ),
+        format!(
+            "- max_protocol_concentration_bps: {}",
+            policy.risk_limits.max_protocol_concentration_bps
+        ),
+        format!(
+            "- autonomous_execution_enabled: {}",
+            policy.execution_authority.autonomous_execution_enabled
+        ),
+        format!(
+            "- require_simulation_first: {}",
+            policy.execution_authority.require_simulation_first
+        ),
+        format!("- per_action_value_limit_wei: {per_action_value_limit_wei}"),
+        format!(
+            "- failure_quarantine_threshold: {}",
+            policy.escalation_rules.failure_quarantine_threshold
+        ),
+        format!(
+            "- escalate_on_missing_policy: {}",
+            policy.escalation_rules.escalate_on_missing_policy
+        ),
+        format!(
+            "- escalate_on_authority_exceeded: {}",
+            policy.escalation_rules.escalate_on_authority_exceeded
+        ),
+        format!(
+            "- escalate_on_repeated_failure: {}",
+            policy.escalation_rules.escalate_on_repeated_failure
+        ),
+        format!("- updated_at_ns: {}", policy.updated_at_ns),
+    ]
+    .join("\n")
+}
+
+fn render_recent_decisions_section(decisions: &[DecisionRecord]) -> String {
+    if decisions.is_empty() {
+        return "### Recent Decisions\n- none".to_string();
+    }
+
+    let mut lines = vec!["### Recent Decisions".to_string()];
+    for decision in decisions {
+        let summary = match &decision.outcome {
+            DecisionOutcome::Executed { action_summary } => {
+                format!("executed {}", sanitize_preview(action_summary, 120))
+            }
+            DecisionOutcome::Simulated { action_summary } => {
+                format!("simulated {}", sanitize_preview(action_summary, 120))
+            }
+            DecisionOutcome::NoOp { reason } => {
+                format!("noop {}", sanitize_preview(reason, 120))
+            }
+            DecisionOutcome::Deferred { reason } => {
+                format!("deferred {}", sanitize_preview(reason, 120))
+            }
+            DecisionOutcome::Escalated { gap } => format!("escalated {:?}", gap),
+        };
+        lines.push(format!(
+            "- turn={} trigger={:?} policy_version={} outcome={} candidates={} explanation={}",
+            decision.turn_id,
+            decision.trigger,
+            decision.policy_version,
+            summary,
+            sanitize_preview(&decision.candidates_summary, 120),
+            sanitize_preview(&decision.explanation, 120),
+        ));
+    }
+    lines.join("\n")
+}
+
+fn decision_trigger_for_turn(
+    trigger: ScheduledTurnTrigger,
+    has_external_input: bool,
+) -> DecisionTrigger {
+    if has_external_input {
+        return DecisionTrigger::InboxMessage;
+    }
+
+    match trigger {
+        ScheduledTurnTrigger::Periodic => DecisionTrigger::ScheduledReview,
+        ScheduledTurnTrigger::InferenceProxyResume => DecisionTrigger::RecoveryFollowUp,
+    }
+}
+
+fn render_decision_envelope_error_context(error: &str) -> String {
+    format!(
+        "decision envelope invalid: {}",
+        sanitize_preview(error, 200)
+    )
+}
+
+fn validate_decision_envelope(
+    envelope: &AutonomyDecisionEnvelope,
+    expected_trigger: &DecisionTrigger,
+) -> Result<(), String> {
+    if &envelope.trigger != expected_trigger {
+        return Err(format!(
+            "decision envelope trigger mismatch: expected {:?} got {:?}",
+            expected_trigger, envelope.trigger
+        ));
+    }
+    if envelope.candidates_summary.trim().is_empty() {
+        return Err("decision envelope candidates_summary must be non-empty".to_string());
+    }
+    if envelope.explanation.trim().is_empty() {
+        return Err("decision envelope explanation must be non-empty".to_string());
+    }
+    match &envelope.outcome {
+        DecisionEnvelopeOutcome::Executed { action_summary }
+        | DecisionEnvelopeOutcome::Simulated { action_summary } => {
+            if action_summary.trim().is_empty() {
+                return Err("decision envelope action_summary must be non-empty".to_string());
+            }
+        }
+        DecisionEnvelopeOutcome::NoOp { reason } | DecisionEnvelopeOutcome::Deferred { reason } => {
+            if reason.trim().is_empty() {
+                return Err("decision envelope reason must be non-empty".to_string());
+            }
+        }
+        DecisionEnvelopeOutcome::Escalated { gap } => match gap {
+            crate::domain::types::EscalationClass::MissingPolicy { what }
+            | crate::domain::types::EscalationClass::OutOfAuthority { what }
+            | crate::domain::types::EscalationClass::CapabilityGap { what }
+            | crate::domain::types::EscalationClass::SafetyConflict { what } => {
+                if what.trim().is_empty() {
+                    return Err("decision envelope escalation detail must be non-empty".to_string());
+                }
+            }
+            crate::domain::types::EscalationClass::RepeatedFailure {
+                strategy,
+                failure_count: _,
+            } => {
+                if strategy.trim().is_empty() {
+                    return Err(
+                        "decision envelope escalation strategy must be non-empty".to_string()
+                    );
+                }
+            }
+        },
+    }
+    Ok(())
+}
+
+fn parse_autonomy_decision_envelope(
+    raw: &str,
+    expected_trigger: &DecisionTrigger,
+) -> Result<AutonomyDecisionEnvelope, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("decision envelope output was empty".to_string());
+    }
+    let envelope: AutonomyDecisionEnvelope = serde_json::from_str(trimmed)
+        .map_err(|error| format!("decision envelope parse failed: {error}"))?;
+    validate_decision_envelope(&envelope, expected_trigger)?;
+    Ok(envelope)
+}
+
+fn decision_record_from_envelope(
+    turn_id: &str,
+    timestamp_ns: u64,
+    policy_version: u32,
+    envelope: AutonomyDecisionEnvelope,
+) -> DecisionRecord {
+    DecisionRecord {
+        turn_id: turn_id.to_string(),
+        timestamp_ns,
+        trigger: envelope.trigger,
+        outcome: DecisionOutcome::from(envelope.outcome),
+        policy_version,
+        candidates_summary: sanitize_preview(&envelope.candidates_summary, 280),
+        explanation: sanitize_preview(&envelope.explanation, 280),
+    }
+}
+
 /// Assembles the full `## Layer 10: Dynamic Context` section injected into
 /// every turn prompt: current state, wallet balances, survival tier, pending
 /// inbox obligations, conversation history, memory facts/rollups, and tool usage.
@@ -1738,6 +1946,11 @@ fn build_dynamic_context(
         snapshot.wallet_balance.usdc_balance_raw_hex.as_deref(),
         usize::from(snapshot.wallet_balance.usdc_decimals),
     );
+    let autonomy_policy =
+        stable::autonomy_policy().unwrap_or_else(|| AutonomyPolicy::conservative_default(now_ns));
+    let recent_decisions = stable::list_recent_decisions(5);
+    let autonomy_policy_section = render_autonomy_policy_section(&autonomy_policy);
+    let recent_decisions_section = render_recent_decisions_section(&recent_decisions);
     let reflection_lines = stable::reflection_brief_for_context(now_ns);
 
     let memory_section = if memory_facts.is_empty() && memory_rollups.is_empty() {
@@ -1826,6 +2039,8 @@ fn build_dynamic_context(
         format!("- timestamp_ns: {now_ns}"),
         format!("- state: {:?}", snapshot.state),
         format!("- evm_events: {evm_events}"),
+        autonomy_policy_section,
+        recent_decisions_section,
         build_pending_obligations_section(staged_messages),
         build_conversation_context(staged_messages, conversation_history_limit),
         memory_section,
@@ -1995,6 +2210,8 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     } else {
         None
     };
+    let proxy_callback_buffered_turn = snapshot.inference_provider == InferenceProvider::OpenRouterProxyWorker
+        && stable::inference_proxy_callback_results_count() > 0;
     let should_infer = true;
 
     if let Err(reason) = advance_state(
@@ -2764,6 +2981,99 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             }
         }
 
+        let should_finalize_autonomy_decision =
+            !has_external_input && !proxy_callback_buffered_turn;
+
+        if last_error.is_none() && should_finalize_autonomy_decision {
+            let decision_trigger = decision_trigger_for_turn(trigger, has_external_input);
+            let policy = stable::autonomy_policy()
+                .unwrap_or_else(|| AutonomyPolicy::conservative_default(current_time_ns()));
+            let mut decision_envelope = assistant_reply
+                .as_deref()
+                .and_then(|reply| parse_autonomy_decision_envelope(reply, &decision_trigger).ok());
+
+            if decision_envelope.is_none() {
+                let parse_error = assistant_reply
+                    .as_deref()
+                    .map(|reply| {
+                        parse_autonomy_decision_envelope(reply, &decision_trigger)
+                            .err()
+                            .unwrap_or_else(|| "decision envelope parse failed".to_string())
+                    })
+                    .unwrap_or_else(|| "decision envelope output was empty".to_string());
+                append_inner_dialogue(
+                    &mut inner_dialogue,
+                    &render_decision_envelope_error_context(&parse_error),
+                );
+
+                let mut retry_input = input.clone();
+                if !retry_input
+                    .context_snippet
+                    .contains("request_autonomy_decision_retry:true")
+                {
+                    if !retry_input.context_snippet.is_empty() {
+                        retry_input.context_snippet.push('\n');
+                    }
+                    retry_input
+                        .context_snippet
+                        .push_str("request_autonomy_decision_retry:true");
+                }
+
+                match infer_with_provider_transcript(&snapshot, &retry_input, &transcript).await {
+                    Ok(retry_output) => {
+                        inference_round_count = inference_round_count.saturating_add(1);
+                        let retry_reply = retry_output.explanation.trim().to_string();
+                        match parse_autonomy_decision_envelope(&retry_reply, &decision_trigger) {
+                            Ok(envelope) => {
+                                decision_envelope = Some(envelope);
+                            }
+                            Err(retry_error) => {
+                                append_inner_dialogue(
+                                    &mut inner_dialogue,
+                                    &render_decision_envelope_error_context(&retry_error),
+                                );
+                                decision_envelope = Some(AutonomyDecisionEnvelope {
+                                    trigger: decision_trigger.clone(),
+                                    candidates_summary:
+                                        "invalid decision envelope after two attempts".to_string(),
+                                    outcome: DecisionEnvelopeOutcome::NoOp {
+                                        reason: "invalid_decision_shape".to_string(),
+                                    },
+                                    explanation: format!(
+                                        "decision envelope invalid after two attempts: {}",
+                                        sanitize_preview(&retry_error, 180)
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                    }
+                }
+            }
+
+            if last_error.is_none() {
+                let envelope = decision_envelope.unwrap_or_else(|| AutonomyDecisionEnvelope {
+                    trigger: decision_trigger.clone(),
+                    candidates_summary: "autonomy tick completed".to_string(),
+                    outcome: DecisionEnvelopeOutcome::NoOp {
+                        reason: "invalid_decision_shape".to_string(),
+                    },
+                    explanation: "missing autonomy decision envelope".to_string(),
+                });
+                let decision_record = decision_record_from_envelope(
+                    &turn_id,
+                    current_time_ns(),
+                    policy.version,
+                    envelope,
+                );
+                if let Err(error) = stable::append_decision_record(decision_record) {
+                    last_error = Some(error);
+                }
+            }
+        }
+
         if last_error.is_none() {
             if let Err(reason) = advance_state(&mut state, &AgentEvent::PersistCompleted, &turn_id)
             {
@@ -2887,10 +3197,11 @@ fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> R
 mod tests {
     use super::*;
     use crate::domain::types::{
-        ContinuationStopReason, EvmPollCursor, InboxMessageSource, InboxMessageStatus,
-        InboxProxyWaitState, InferenceProxyResultPayload, MemoryFact, MemoryRollup,
-        PendingInferenceProxyJob, RuntimeSnapshot, SubmitInferenceResultArgs, SurvivalTier,
-        ToolCall, ToolCallRecord, ToolFailureKind,
+        AutonomyPolicy, ContinuationStopReason, DecisionOutcome, DecisionRecord, DecisionTrigger,
+        EvmPollCursor, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState,
+        InferenceProxyResultPayload, MemoryFact, MemoryRollup, PendingInferenceProxyJob,
+        PromptLayer, RuntimeSnapshot, SubmitInferenceResultArgs, SurvivalTier, ToolCall,
+        ToolCallRecord, ToolFailureKind,
     };
     use crate::util::block_on_with_spin;
 
@@ -2926,6 +3237,17 @@ mod tests {
             staged_at_ns: Some(1),
             consumed_at_ns: None,
         }
+    }
+
+    fn seed_prompt_layer_6(content: &str) {
+        stable::save_prompt_layer(&PromptLayer {
+            layer_id: 6,
+            content: content.to_string(),
+            updated_at_ns: 1,
+            updated_by_turn: "test".to_string(),
+            version: 1,
+        })
+        .expect("prompt layer 6 should store");
     }
 
     #[test]
@@ -3820,6 +4142,91 @@ mod tests {
         assert!(context.contains("- usdc_balance_tokens: 0.000032"));
         assert!(context.contains("- wallet_balance_is_stale: false"));
         assert!(context.contains("- wallet_balance_status: Fresh"));
+    }
+
+    #[test]
+    fn autonomy_context_includes_policy_and_recent_decisions() {
+        reset_runtime(AgentState::Sleeping, true, false, 7);
+        let mut policy = AutonomyPolicy::conservative_default(123_456);
+        policy.version = 9;
+        policy.reserve_policy.min_cycles_runway_hours = 48;
+        policy.reserve_policy.min_inference_usdc_6dp = Some(250_000);
+        policy.reserve_policy.min_gas_wei = Some(42);
+        policy.risk_limits.max_total_exposure_bps = 750;
+        policy.risk_limits.max_single_action_bps = 125;
+        policy.risk_limits.max_protocol_concentration_bps = 333;
+        policy.execution_authority.autonomous_execution_enabled = false;
+        policy.execution_authority.require_simulation_first = true;
+        policy.execution_authority.per_action_value_limit_wei = Some(999);
+        policy.escalation_rules.failure_quarantine_threshold = 4;
+        stable::set_autonomy_policy(policy.clone()).expect("policy should store");
+
+        stable::append_decision_record(DecisionRecord {
+            turn_id: "turn-7".to_string(),
+            timestamp_ns: 123_500,
+            trigger: DecisionTrigger::ScheduledReview,
+            outcome: DecisionOutcome::NoOp {
+                reason: "watchful".to_string(),
+            },
+            policy_version: policy.version,
+            candidates_summary: "no capital-touching candidates".to_string(),
+            explanation: "waiting for stronger signal".to_string(),
+        })
+        .expect("decision should store");
+
+        let snapshot = stable::runtime_snapshot();
+        let context = build_dynamic_context(&snapshot, &[], 0, &[], &[], "turn-7", 5);
+
+        assert!(context.contains("### Autonomy Policy"));
+        assert!(context.contains("- version: 9"));
+        assert!(context.contains("- reserve_min_cycles_runway_hours: 48"));
+        assert!(context.contains("- autonomous_execution_enabled: false"));
+        assert!(context.contains("### Recent Decisions"));
+        assert!(context.contains("turn=turn-7"));
+        assert!(context.contains("trigger=ScheduledReview"));
+        assert!(context.contains("policy_version=9"));
+        assert!(context.contains("candidates=no capital-touching candidates"));
+        assert!(context.contains("explanation=waiting for stronger signal"));
+    }
+
+    #[test]
+    fn invalid_autonomy_decision_shape_retries_then_noops() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be set");
+        seed_prompt_layer_6(
+            "## Layer 6: Economic Decision Loop\n- request_autonomy_decision_invalid_persistent:true",
+        );
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "invalid autonomy decision envelopes should fall back to a no-op"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.tool_call_count, 0);
+        assert_eq!(turn.inference_round_count, 2);
+        assert!(
+            turn.inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("decision envelope invalid"),
+            "turn dialogue should record the invalid envelope retry path"
+        );
+
+        let decisions = stable::list_recent_decisions(1);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].trigger, DecisionTrigger::ScheduledReview);
+        assert_eq!(
+            decisions[0].outcome,
+            DecisionOutcome::NoOp {
+                reason: "invalid_decision_shape".to_string()
+            }
+        );
+        assert_eq!(decisions[0].policy_version, 1);
     }
 
     #[test]

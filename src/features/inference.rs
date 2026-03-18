@@ -261,10 +261,75 @@ fn run_deterministic_inference(
         || input
             .context_snippet
             .contains("request_continuation_error:true");
+    let assembled_prompt = prompt::assemble_system_prompt(&input.context_snippet);
+    let autonomy_decision_invalid_request = input
+        .input
+        .contains("request_autonomy_decision_invalid:true")
+        || input
+            .context_snippet
+            .contains("request_autonomy_decision_invalid:true")
+        || assembled_prompt.contains("request_autonomy_decision_invalid:true");
+    let autonomy_decision_invalid_persistent_request = input
+        .input
+        .contains("request_autonomy_decision_invalid_persistent:true")
+        || input
+            .context_snippet
+            .contains("request_autonomy_decision_invalid_persistent:true")
+        || assembled_prompt.contains("request_autonomy_decision_invalid_persistent:true");
+    let autonomy_decision_retry_request =
+        input.input.contains("request_autonomy_decision_retry:true")
+            || input
+                .context_snippet
+                .contains("request_autonomy_decision_retry:true")
+            || assembled_prompt.contains("request_autonomy_decision_retry:true");
+    let autonomy_decision_envelope_request = input
+        .input
+        .contains("request_autonomy_decision_envelope:true")
+        || input
+            .context_snippet
+            .contains("request_autonomy_decision_envelope:true")
+        || assembled_prompt.contains("request_autonomy_decision_envelope:true");
 
     let has_tool_transcript = transcript
         .iter()
         .any(|entry| matches!(entry, InferenceTranscriptMessage::Tool { .. }));
+
+    if autonomy_decision_invalid_persistent_request
+        || (autonomy_decision_invalid_request && !autonomy_decision_retry_request)
+    {
+        return Ok(InferenceOutput {
+            tool_calls: Vec::new(),
+            explanation: serde_json::json!({
+                "trigger": "ScheduledReview",
+                "candidates_summary": "policy-bounded autonomy turn",
+                "outcome": {
+                    "NoOp": {
+                        "reason": "invalid_shape"
+                    }
+                }
+            })
+            .to_string(),
+        });
+    }
+
+    if autonomy_decision_envelope_request
+        || autonomy_decision_retry_request
+    {
+        return Ok(InferenceOutput {
+            tool_calls: Vec::new(),
+            explanation: serde_json::json!({
+                "trigger": "ScheduledReview",
+                "candidates_summary": "policy-bounded autonomy turn",
+                "outcome": {
+                    "Executed": {
+                        "action_summary": "record_signal(tick)"
+                    }
+                },
+                "explanation": "deterministic autonomy decision envelope"
+            })
+            .to_string(),
+        });
+    }
 
     if continuation_error_request && has_tool_transcript {
         return Err("deterministic continuation inference failed after tool execution".to_string());
