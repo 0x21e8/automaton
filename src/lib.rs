@@ -32,17 +32,18 @@ mod tools;
 mod util;
 
 use crate::domain::types::{
-    AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, AutonomySuppressionConfig, ConversationLog,
-    ConversationSummary, EvmRouteStateView, EvmStewardProof, InboxMessage, InboxStats,
+    AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, ActiveExposure, AutonomyPolicy,
+    AutonomySuppressionConfig, ConversationLog, ConversationSummary, DecisionRecord,
+    EvmRouteStateView, EvmStewardProof, ExposureReconciliationStatus, InboxMessage, InboxStats,
     InferenceConfigView, InferenceProvider, InferenceProxyStatusView, MemoryFact, MemoryRollup,
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
     OutboxStats, PromptLayer, PromptLayerView, ReflectionMemoryRecord, RetentionConfig,
     RetentionMaintenanceRuntime, RuntimeView, ScheduledJob, SchedulerRuntime, SessionSummary,
     SkillRecord, StewardCommand, StewardState, StewardStatusView, StrategyKillSwitchState,
-    StrategyOutcomeStats, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
-    TaskKind, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
-    TemplateRevocationState, TemplateStatus, ToolCallRecord, TurnWindowSummary,
-    WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    StrategyOutcomeStats, StrategyQuarantine, StrategyTemplate, StrategyTemplateKey,
+    SubmitInferenceResultArgs, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
+    TemplateActivationState, TemplateRevocationState, TemplateStatus, ToolCallRecord,
+    TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
@@ -485,6 +486,7 @@ fn init(args: InitArgs) {
 fn apply_init_args(args: InitArgs) {
     stable::init_storage();
     let _ = sqlite::init_storage();
+    install_default_autonomy_policy_if_missing("init");
     let _ = stable::set_ecdsa_key_name(args.ecdsa_key_name)
         .unwrap_or_else(|error| ic_cdk::trap(&error));
     if let Some(chain_id) = args.evm_chain_id {
@@ -546,6 +548,7 @@ fn pre_upgrade() {
 fn post_upgrade() {
     stable::init_storage();
     let _ = sqlite::reopen_storage();
+    install_default_autonomy_policy_if_missing("post_upgrade");
     enforce_wallet_sync_response_bytes_floor();
     let _ = stable::remove_skill("agent-loop");
     crate::features::DefaultSkillLoader::seed_missing_defaults();
@@ -559,6 +562,28 @@ fn enforce_wallet_sync_response_bytes_floor() {
         snapshot.wallet_balance_sync.max_response_bytes = WALLET_SYNC_RESPONSE_BYTES_FLOOR;
         stable::save_runtime_snapshot(&snapshot);
     }
+}
+
+fn install_default_autonomy_policy_if_missing(source: &str) {
+    if stable::autonomy_policy().is_some() {
+        return;
+    }
+
+    let policy = AutonomyPolicy::conservative_default(current_time_ns());
+    let version = policy.version;
+    let updated_at_ns = policy.updated_at_ns;
+    if let Err(error) = stable::set_autonomy_policy(policy) {
+        ic_cdk::trap(&format!(
+            "failed to install default autonomy policy on {source}: {error}"
+        ));
+    }
+    log!(
+        StewardAdminLogPriority::StewardInfo,
+        "default_autonomy_policy_installed source={} version={} updated_at_ns={}",
+        source,
+        version,
+        updated_at_ns,
+    );
 }
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -591,6 +616,13 @@ fn set_autonomy_suppression_config(
 ) -> Result<AutonomySuppressionConfig, String> {
     ensure_controller()?;
     stable::set_autonomy_suppression_config(config)
+}
+
+/// Replaces the active autonomy policy (controller only).
+#[ic_cdk::update]
+fn update_autonomy_policy(policy: AutonomyPolicy) -> Result<AutonomyPolicy, String> {
+    ensure_controller()?;
+    stable::set_autonomy_policy(policy)
 }
 
 /// Sets the active inference backend (`IcLlm`, `OpenRouter`, or `OpenRouterProxyWorker`)
@@ -1229,6 +1261,13 @@ fn get_autonomy_suppression_config() -> AutonomySuppressionConfig {
     stable::autonomy_suppression_config()
 }
 
+/// Returns the active autonomy policy, installing a conservative default if
+/// one has not been persisted yet.
+#[ic_cdk::query]
+fn get_autonomy_policy() -> AutonomyPolicy {
+    stable::autonomy_policy().unwrap_or_else(|| AutonomyPolicy::conservative_default(0))
+}
+
 /// Returns the scheduler's current runtime state (enabled flag, last tick, …).
 #[ic_cdk::query]
 fn get_scheduler_view() -> SchedulerRuntime {
@@ -1566,6 +1605,30 @@ fn set_retention_config(config: RetentionConfig) -> Result<RetentionConfig, Stri
 #[ic_cdk::query]
 fn get_inference_config() -> InferenceConfigView {
     stable::inference_config_view()
+}
+
+/// Returns the most-recent autonomous decisions, bounded by the durable FIFO cap.
+#[ic_cdk::query]
+fn get_recent_decisions() -> Vec<DecisionRecord> {
+    stable::list_recent_decisions(stable::MAX_DECISION_RECORDS)
+}
+
+/// Returns the active strategy exposures tracked for autonomy policy enforcement.
+#[ic_cdk::query]
+fn get_active_exposures() -> Vec<ActiveExposure> {
+    stable::list_active_exposures()
+}
+
+/// Returns the active strategy quarantines tracked for autonomy policy enforcement.
+#[ic_cdk::query]
+fn get_strategy_quarantines() -> Vec<StrategyQuarantine> {
+    stable::list_strategy_quarantines()
+}
+
+/// Returns the last exposure-reconciliation status snapshot.
+#[ic_cdk::query]
+fn get_exposure_reconciliation_status() -> ExposureReconciliationStatus {
+    stable::exposure_reconciliation_status()
 }
 
 #[ic_cdk::query]
@@ -2028,6 +2091,14 @@ mod tests {
                 controller_gated_updates.insert(function_name.to_string());
             }
         }
+
+        // update_autonomy_policy uses ensure_controller() (returns Result) rather than
+        // ensure_controller_or_trap(), so it has no corresponding StewardCommand mapping.
+        let controller_update_exceptions = BTreeSet::from([String::from("update_autonomy_policy")]);
+        let controller_gated_updates = controller_gated_updates
+            .difference(&controller_update_exceptions)
+            .cloned()
+            .collect::<BTreeSet<_>>();
 
         let method_to_command_label = BTreeMap::from([
             ("set_loop_enabled", "set_loop_enabled"),

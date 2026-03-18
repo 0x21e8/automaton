@@ -312,9 +312,7 @@ fn run_deterministic_inference(
         });
     }
 
-    if autonomy_decision_envelope_request
-        || autonomy_decision_retry_request
-    {
+    if autonomy_decision_envelope_request || autonomy_decision_retry_request {
         return Ok(InferenceOutput {
             tool_calls: Vec::new(),
             explanation: serde_json::json!({

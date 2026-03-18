@@ -25,6 +25,14 @@ type ActionSpec = record {
   preconditions : vec text;
   call_sequence : vec AbiFunctionSpec;
 };
+type ActiveExposure = record {
+  protocol : text;
+  updated_at_ns : nat64;
+  strategy_id : text;
+  chain_id : nat64;
+  notional_wei : opt nat;
+  asset_symbol : text;
+};
 type AgentState = variant {
   Idle;
   Bootstrapping;
@@ -34,6 +42,14 @@ type AgentState = variant {
   Faulted;
   Sleeping;
   Persisting;
+};
+type AutonomyPolicy = record {
+  escalation_rules : EscalationRules;
+  execution_authority : ExecutionAuthority;
+  risk_limits : RiskLimits;
+  updated_at_ns : nat64;
+  reserve_policy : ReservePolicy;
+  version : nat32;
 };
 type AutonomySuppressionConfig = record {
   failure_repeat_threshold : nat32;
@@ -94,6 +110,42 @@ type CycleTelemetry = record {
   moving_window_seconds : nat64;
   liquid_cycles : nat;
 };
+type DecisionOutcome = variant {
+  NoOp : record { reason : text };
+  Executed : record { action_summary : text };
+  Simulated : record { action_summary : text };
+  Deferred : record { reason : text };
+  Escalated : record { gap : EscalationClass };
+};
+type DecisionRecord = record {
+  timestamp_ns : nat64;
+  trigger : DecisionTrigger;
+  candidates_summary : text;
+  explanation : text;
+  turn_id : text;
+  policy_version : nat32;
+  outcome : DecisionOutcome;
+};
+type DecisionTrigger = variant {
+  ScheduledReview;
+  LowRunway;
+  InboxMessage;
+  PositionMaintenance;
+  RecoveryFollowUp;
+};
+type EscalationClass = variant {
+  MissingPolicy : record { what : text };
+  CapabilityGap : record { what : text };
+  RepeatedFailure : record { failure_count : nat32; strategy : text };
+  SafetyConflict : record { what : text };
+  OutOfAuthority : record { what : text };
+};
+type EscalationRules = record {
+  escalate_on_repeated_failure : bool;
+  escalate_on_missing_policy : bool;
+  escalate_on_authority_exceeded : bool;
+  failure_quarantine_threshold : nat32;
+};
 type EvmRouteStateView = record {
   next_block : nat64;
   automaton_address_topic : opt text;
@@ -113,6 +165,20 @@ type EvmStewardProof = record {
   address : text;
   nonce : nat64;
   expires_at_ns : nat64;
+};
+type ExecutionAuthority = record {
+  autonomous_execution_enabled : bool;
+  require_simulation_first : bool;
+  per_action_value_limit_wei : opt nat;
+};
+type ExposureReconciliationStatus = record {
+  last_error : opt text;
+  repaired_exposures : nat32;
+  drift_reason : opt text;
+  last_attempted_at_ns : opt nat64;
+  closed_exposures : nat32;
+  recreated_exposures : nat32;
+  last_succeeded_at_ns : opt nat64;
 };
 type HttpRequest = record {
   url : text;
@@ -301,12 +367,18 @@ type ReflectionMemoryRecord = record {
   error_class : text;
 };
 type ReflectionOrigin = variant { Autonomy; Maintenance; ExternalInput };
+type ReservePolicy = record {
+  min_gas_wei : opt nat;
+  min_cycles_runway_hours : nat64;
+  min_inference_usdc_6dp : opt nat64;
+};
 type Result = variant { Ok : TemplateActivationState; Err : text };
 type Result_1 = variant { Ok : text; Err : text };
 type Result_10 = variant { Ok : RetentionConfig; Err : text };
 type Result_11 = variant { Ok : StewardState; Err : text };
-type Result_12 = variant { Ok : PromptLayer; Err : text };
-type Result_13 = variant { Ok; Err : text };
+type Result_12 = variant { Ok : AutonomyPolicy; Err : text };
+type Result_13 = variant { Ok : PromptLayer; Err : text };
+type Result_14 = variant { Ok; Err : text };
 type Result_2 = variant { Ok : StrategyTemplate; Err : text };
 type Result_3 = variant { Ok : AbiArtifact; Err : text };
 type Result_4 = variant { Ok : vec text; Err : text };
@@ -353,6 +425,11 @@ type RetentionMaintenanceRuntime = record {
   next_run_after_ns : nat64;
   summarization_progress_percent : nat8;
   last_generated_memory_rollups : nat32;
+};
+type RiskLimits = record {
+  max_protocol_concentration_bps : nat16;
+  max_total_exposure_bps : nat16;
+  max_single_action_bps : nat16;
 };
 type RuntimeTimingTelemetry = record {
   last_turn_duration_ms : opt nat64;
@@ -561,6 +638,13 @@ type StrategyOutcomeStats = record {
   last_observed_at_ns : opt nat64;
   deterministic_failures : nat64;
 };
+type StrategyQuarantine = record {
+  release_after_ns : opt nat64;
+  failure_count : nat32;
+  strategy_id : text;
+  quarantined_at_ns : nat64;
+  reason : text;
+};
 type StrategyTemplate = record {
   key : StrategyTemplateKey;
   status : TemplateStatus;
@@ -728,8 +812,13 @@ service : (InitArgs) -> {
   // Derives the canister's threshold-ECDSA EVM address from the configured key
   // and caches it in stable storage (controller only).
   derive_automaton_evm_address : () -> (Result_1);
+  // Returns the active strategy exposures tracked for autonomy policy enforcement.
+  get_active_exposures : () -> (vec ActiveExposure) query;
   // Returns the automaton's derived EVM address, or `None` before first derivation.
   get_automaton_evm_address : () -> (opt text) query;
+  // Returns the active autonomy policy, installing a conservative default if
+  // one has not been persisted yet.
+  get_autonomy_policy : () -> (AutonomyPolicy) query;
   // Returns the current autonomy suppression configuration.
   get_autonomy_suppression_config : () -> (AutonomySuppressionConfig) query;
   // Returns the full conversation log for the given sender address, or `None`
@@ -737,6 +826,10 @@ service : (InitArgs) -> {
   get_conversation : (text) -> (opt ConversationLog) query;
   // Returns the current EVM route state (chain ID, RPC URL, addresses, …).
   get_evm_route_state_view : () -> (EvmRouteStateView) query;
+  // Returns the last exposure-reconciliation status snapshot.
+  get_exposure_reconciliation_status : () -> (
+      ExposureReconciliationStatus,
+    ) query;
   // Returns aggregate inbox statistics (total messages, pending count, …).
   get_inbox_stats : () -> (InboxStats) query;
   // Returns the current inference configuration (provider, model, key presence flag).
@@ -749,6 +842,8 @@ service : (InitArgs) -> {
   get_outbox_stats : () -> (OutboxStats) query;
   // Returns all prompt layers ordered by layer ID.
   get_prompt_layers : () -> (vec PromptLayerView) query;
+  // Returns the most-recent autonomous decisions, bounded by the durable FIFO cap.
+  get_recent_decisions : () -> (vec DecisionRecord) query;
   // Returns the current conversation-retention configuration.
   get_retention_config : () -> (RetentionConfig) query;
   // Returns runtime statistics from the last retention-maintenance pass.
@@ -769,6 +864,8 @@ service : (InitArgs) -> {
   get_strategy_outcome_stats : (StrategyTemplateKey) -> (
       opt StrategyOutcomeStats,
     ) query;
+  // Returns the active strategy quarantines tracked for autonomy policy enforcement.
+  get_strategy_quarantines : () -> (vec StrategyQuarantine) query;
   // Returns a single strategy template by key, or `None` if absent.
   get_strategy_template : (StrategyTemplateKey) -> (opt StrategyTemplate) query;
   // Returns all tool call records associated with the given turn ID.
@@ -922,13 +1019,15 @@ service : (InitArgs) -> {
   steward_execute_ingress : (StewardCommand) -> (Result_1);
   // Callback endpoint used by the OpenRouter proxy worker to submit async results.
   submit_inference_result : (SubmitInferenceResultArgs) -> (Result_1);
+  // Replaces the active autonomy policy (controller only).
+  update_autonomy_policy : (AutonomyPolicy) -> (Result_12);
   // Replaces the content of a prompt layer identified by `layer_id` (controller only).
-  update_prompt_layer_admin : (nat8, text) -> (Result_12);
+  update_prompt_layer_admin : (nat8, text) -> (Result_13);
   // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
   update_soul : (text) -> (Result_1);
   // Inserts or updates a skill record.
   // 
   // Only callable by a canister controller.  This is the runtime management
   // endpoint for adding new inter-canister call skills or modifying existing ones.
-  upsert_skill : (SkillRecord) -> (Result_13);
+  upsert_skill : (SkillRecord) -> (Result_14);
 }

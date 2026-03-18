@@ -20,6 +20,7 @@
 /// [`ExecutionPlan`]: crate::domain::types::ExecutionPlan
 pub mod abi;
 pub mod compiler;
+pub mod exposure_reconciliation;
 pub mod learner;
 pub mod registry;
 pub mod validator;

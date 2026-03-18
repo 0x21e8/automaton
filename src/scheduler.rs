@@ -343,7 +343,6 @@ fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
             SchedulerLogPriority::Info,
             "scheduler_reconcile_strategy empty=true"
         );
-        return Ok(());
     }
 
     let mut stale_disabled = 0u32;
@@ -410,6 +409,19 @@ fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
         stale_disabled,
         provenance_disabled,
         dry_run_activated
+    );
+
+    let exposure_status =
+        crate::strategy::exposure_reconciliation::reconcile_active_exposures_from_recent_executions(
+            now_ns,
+        )?;
+    log!(
+        SchedulerLogPriority::Info,
+        "scheduler_reconcile_exposure_state repaired={} recreated={} closed={} drift_reason={:?}",
+        exposure_status.repaired_exposures,
+        exposure_status.recreated_exposures,
+        exposure_status.closed_exposures,
+        exposure_status.drift_reason
     );
 
     Ok(())
@@ -2331,6 +2343,86 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("provenance_or_dry_run_failed"));
+    }
+
+    #[test]
+    fn exposure_reconciliation_repairs_missing_state_after_execution() {
+        let _ = crate::storage::sqlite::close_storage();
+        stable::init_storage();
+        stable::init_scheduler_defaults(0);
+        for kind in TaskKind::all() {
+            stable::set_task_enabled(kind, false);
+        }
+
+        let strategy_id = "morpho-v1:supply:8453:morpho-enter-supply".to_string();
+        let turn = crate::domain::types::TurnRecord {
+            id: "turn-enter".to_string(),
+            created_at_ns: 1_000,
+            finished_at_ns: Some(1_001),
+            duration_ms: Some(1),
+            state_from: crate::domain::types::AgentState::Inferring,
+            state_to: crate::domain::types::AgentState::ExecutingActions,
+            source_events: 1,
+            tool_call_count: 1,
+            input_summary: "enter supply".to_string(),
+            inner_dialogue: None,
+            inference_round_count: 1,
+            continuation_stop_reason: Default::default(),
+            error: None,
+        };
+        let tool_call = crate::domain::types::ToolCallRecord {
+            turn_id: turn.id.clone(),
+            tool: "execute_strategy_action".to_string(),
+            args_json: json!({
+                "key": {
+                    "protocol": "morpho-v1",
+                    "primitive": "supply",
+                    "chain_id": 8453,
+                    "template_id": "morpho-enter-supply"
+                },
+                "action_id": "enter_supply",
+                "typed_params": {
+                    "calls": [{
+                        "value_wei": "50000000000000000",
+                        "args": {
+                            "marketParams": {
+                                "collateralToken": "USDC"
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+            output: r#"{"tx_hashes":["0xabc"]}"#.to_string(),
+            success: true,
+            outcome: Default::default(),
+            error: None,
+            failure_kind: None,
+        };
+        stable::append_turn_record(&turn, &[tool_call]);
+        assert!(
+            stable::active_exposure(&strategy_id).is_none(),
+            "test setup should start without local exposure"
+        );
+
+        run_reconcile_job(current_time_ns()).expect("reconcile job should succeed");
+
+        let exposure = stable::active_exposure(&strategy_id)
+            .expect("reconcile job should rebuild the missing exposure");
+        assert_eq!(exposure.protocol, "morpho-v1");
+        assert_eq!(exposure.chain_id, 8453);
+        assert_eq!(exposure.asset_symbol, "USDC");
+        assert_eq!(exposure.notional_wei, Some(50_000_000_000_000_000));
+
+        let status = stable::exposure_reconciliation_status();
+        assert_eq!(status.recreated_exposures, 1);
+        assert_eq!(status.repaired_exposures, 0);
+        assert_eq!(status.closed_exposures, 0);
+        assert!(status
+            .drift_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("recreated_missing_exposure"));
     }
 
     #[test]

@@ -2210,7 +2210,8 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     } else {
         None
     };
-    let proxy_callback_buffered_turn = snapshot.inference_provider == InferenceProvider::OpenRouterProxyWorker
+    let proxy_callback_buffered_turn = snapshot.inference_provider
+        == InferenceProvider::OpenRouterProxyWorker
         && stable::inference_proxy_callback_results_count() > 0;
     let should_infer = true;
 
