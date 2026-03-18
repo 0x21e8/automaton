@@ -29,4 +29,5 @@ Reduce prompt size in `src/prompt.rs` while preserving prompt assembly behavior 
 - Checks must pass before a result can be kept.
 
 ## What's Been Tried
-- Baseline pending.
+- Baseline: `prompt_bytes_total=14841` (`full=10223`, `compact=4618`, `lines_total=281`).
+- Kept: shortened layers 0-7 and collapsed layers 8-9 headings into direct bullets while preserving tested phrases and section order. Result: `prompt_bytes_total=12758` (`full=8884`, `compact=3874`, `lines_total=227`).

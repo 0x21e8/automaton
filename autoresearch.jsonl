@@ -1,1 +1,2 @@
 {"type":"config","name":"Optimize prompt in src/prompt.rs","metricName":"prompt_bytes_total","metricUnit":"bytes","bestDirection":"lower"}
+{"run":1,"commit":"6c447c7","metric":14841,"metrics":{},"status":"keep","description":"Baseline: prompt size benchmark plus autoresearch scaffolding for src/prompt.rs","timestamp":1773841836836,"segment":0}
