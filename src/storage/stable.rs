@@ -72,16 +72,12 @@ const INFERENCE_PROXY_COMPLETED_CALLBACK_JOBS_KEY: &str = "inference.proxy.compl
 const INFERENCE_PROXY_METRICS_KEY: &str = "inference.proxy.metrics";
 const SEARCH_API_KEY_KEY: &str = "search.api_key";
 const SEARCH_MAX_PER_TURN_KEY: &str = "search.max_per_turn";
-const SEARCH_MAX_PER_24H_KEY: &str = "search.max_per_24h";
-const SEARCH_USAGE_TIMESTAMPS_KEY: &str = "search.usage.timestamps_ns";
 const SEARCH_TURN_USAGE_KEY: &str = "search.usage.turn_counts";
 /// Maximum character count accepted by `set_welcome_message`.
 pub const MAX_WELCOME_MESSAGE_CHARS: usize = 2_000;
 pub const INFERENCE_PROXY_PENDING_JOB_TTL_SECS: u64 = 15 * 60;
 const MAX_COMPLETED_INFERENCE_PROXY_CALLBACK_JOBS: usize = 2_048;
 pub const DEFAULT_SEARCH_MAX_PER_TURN: u8 = 3;
-pub const DEFAULT_SEARCH_MAX_PER_24H: u16 = 20;
-const SEARCH_USAGE_WINDOW_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 const MAX_SEARCH_TURN_USAGE_ENTRIES: usize = 128;
 
 // ── Capacity constants ───────────────────────────────────────────────────────
@@ -1891,24 +1887,7 @@ pub fn get_search_max_per_turn() -> u8 {
         .unwrap_or(DEFAULT_SEARCH_MAX_PER_TURN)
 }
 
-pub fn set_search_max_per_24h(max_per_24h: Option<u16>) -> Result<(), String> {
-    match max_per_24h {
-        Some(0) => Err("search max_per_24h must be at least 1".to_string()),
-        Some(value) => sqlite::set_runtime_scalar(SEARCH_MAX_PER_24H_KEY, &value.to_string()),
-        None => sqlite::delete_runtime_scalar(SEARCH_MAX_PER_24H_KEY),
-    }
-}
-
-pub fn get_search_max_per_24h() -> u16 {
-    sqlite::get_runtime_scalar(SEARCH_MAX_PER_24H_KEY)
-        .ok()
-        .flatten()
-        .and_then(|value| value.parse::<u16>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_SEARCH_MAX_PER_24H)
-}
-
-pub fn reserve_web_search_budget(turn_id: &str, now_ns: u64) -> Result<(), String> {
+pub fn reserve_web_search_budget(turn_id: &str) -> Result<(), String> {
     let turn_id = turn_id.trim();
     if turn_id.is_empty() {
         return Err("web_search budget requires a non-empty turn id".to_string());
@@ -1924,22 +1903,6 @@ pub fn reserve_web_search_budget(turn_id: &str, now_ns: u64) -> Result<(), Strin
     if current_turn_count >= max_per_turn {
         return Err("web_search budget exceeded for this turn".to_string());
     }
-
-    let mut usage_timestamps = load_search_usage_timestamps();
-    let len_before = usage_timestamps.len();
-    usage_timestamps
-        .retain(|timestamp| now_ns.saturating_sub(*timestamp) <= SEARCH_USAGE_WINDOW_NS);
-    let expired = len_before != usage_timestamps.len();
-    let max_per_24h = usize::from(get_search_max_per_24h());
-    if usage_timestamps.len() >= max_per_24h {
-        if expired {
-            store_search_usage_timestamps(&usage_timestamps);
-        }
-        return Err("web_search budget exceeded for rolling 24h window".to_string());
-    }
-
-    usage_timestamps.push(now_ns);
-    store_search_usage_timestamps(&usage_timestamps);
 
     if let Some(entry) = turn_usage.iter_mut().find(|entry| entry.turn_id == turn_id) {
         entry.count = entry.count.saturating_add(1);
@@ -1957,20 +1920,6 @@ pub fn reserve_web_search_budget(turn_id: &str, now_ns: u64) -> Result<(), Strin
     }
     store_search_turn_usage(&turn_usage);
     Ok(())
-}
-
-fn load_search_usage_timestamps() -> Vec<u64> {
-    sqlite::get_runtime_scalar(SEARCH_USAGE_TIMESTAMPS_KEY)
-        .ok()
-        .flatten()
-        .and_then(|value| serde_json::from_str::<Vec<u64>>(&value).ok())
-        .unwrap_or_default()
-}
-
-fn store_search_usage_timestamps(timestamps: &[u64]) {
-    if let Ok(json) = serde_json::to_string(timestamps) {
-        let _ = sqlite::set_runtime_scalar(SEARCH_USAGE_TIMESTAMPS_KEY, &json);
-    }
 }
 
 fn load_search_turn_usage() -> Vec<SearchTurnUsageEntry> {
@@ -4865,6 +4814,34 @@ mod tests {
 
     fn trusted_test_principal() -> Principal {
         Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai").expect("test principal should parse")
+    }
+
+    #[test]
+    fn web_search_budget_still_enforces_per_turn_limit() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        set_search_max_per_turn(Some(2)).expect("per-turn budget should persist");
+
+        assert!(reserve_web_search_budget("turn-1").is_ok());
+        assert!(reserve_web_search_budget("turn-1").is_ok());
+        assert_eq!(
+            reserve_web_search_budget("turn-1").expect_err("third search should fail"),
+            "web_search budget exceeded for this turn"
+        );
+    }
+
+    #[test]
+    fn web_search_budget_no_longer_enforces_a_24h_quota() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        set_search_max_per_turn(Some(1)).expect("per-turn budget should persist");
+
+        for index in 0..32 {
+            reserve_web_search_budget(&format!("turn-{index}"))
+                .unwrap_or_else(|error| panic!("search {index} should succeed: {error}"));
+        }
     }
 
     fn sample_reflection_record(index: usize, updated_at_ns: u64) -> ReflectionMemoryRecord {

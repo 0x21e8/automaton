@@ -161,8 +161,6 @@ struct SearchConfigArgs {
     api_key: String,
     #[serde(default)]
     max_searches_per_turn: Option<u8>,
-    #[serde(default)]
-    max_searches_per_24h: Option<u16>,
 }
 
 /// Sort ordering for `list_memory_facts`.
@@ -517,7 +515,6 @@ fn apply_init_args(args: InitArgs) {
         let _ = apply_search_config(SearchConfigArgs {
             api_key: search_api_key,
             max_searches_per_turn: None,
-            max_searches_per_24h: None,
         })
         .unwrap_or_else(|error| ic_cdk::trap(&error));
     }
@@ -635,7 +632,7 @@ fn set_openrouter_api_key(api_key: Option<String>) -> String {
     "openrouter_api_key_updated".to_string()
 }
 
-/// Stores the web-search API key and optional search budget overrides (controller only).
+/// Stores the web-search API key and optional per-turn search budget override (controller only).
 #[ic_cdk::update]
 fn configure_search(config: SearchConfigArgs) -> Result<String, String> {
     ensure_controller()?;
@@ -649,7 +646,6 @@ fn apply_search_config(config: SearchConfigArgs) -> Result<String, String> {
     }
     stable::set_search_api_key(Some(api_key.to_string()));
     stable::set_search_max_per_turn(config.max_searches_per_turn)?;
-    stable::set_search_max_per_24h(config.max_searches_per_24h)?;
     crate::http::init_certification();
     Ok("search_configured".to_string())
 }
@@ -800,11 +796,9 @@ async fn dispatch_steward_command(
         StewardCommand::ConfigureSearch {
             api_key,
             max_searches_per_turn,
-            max_searches_per_24h,
         } => apply_search_config(SearchConfigArgs {
             api_key,
             max_searches_per_turn,
-            max_searches_per_24h,
         }),
         StewardCommand::SetOpenrouterReasoningLevel { level } => {
             let stored = stable::set_openrouter_reasoning_level(level);

@@ -413,7 +413,6 @@ type SchedulerRuntime = record {
 type SearchConfigArgs = record {
   api_key : text;
   max_searches_per_turn : opt nat8;
-  max_searches_per_24h : opt nat16;
 };
 type SessionSummary = record {
   source_count : nat32;

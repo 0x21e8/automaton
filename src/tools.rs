@@ -1019,7 +1019,7 @@ impl ToolManager {
                 result
             }
             "web_search" => {
-                stable::reserve_web_search_budget(turn_id, current_time_ns())?;
+                stable::reserve_web_search_budget(turn_id)?;
                 web_search_tool(&call.args_json).await
             }
             "market_fetch" => {
