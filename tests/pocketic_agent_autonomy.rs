@@ -530,10 +530,11 @@ fn drive_poll_inbox_with_http_mocks(
     latest_block: u64,
     logs: &[Value],
 ) {
-    let before_poll_jobs = list_scheduler_jobs(pic, canister_id)
+    let before_latest_poll_job_id = list_scheduler_jobs(pic, canister_id)
         .into_iter()
         .filter(|job| job.kind == TaskKind::PollInbox)
-        .count();
+        .max_by_key(|job| job.created_at_ns)
+        .map(|job| job.id);
 
     pic.tick();
 
@@ -557,18 +558,18 @@ fn drive_poll_inbox_with_http_mocks(
 
         pic.tick();
         let jobs = list_scheduler_jobs(pic, canister_id);
-        let poll_jobs = jobs
-            .iter()
-            .filter(|job| job.kind == TaskKind::PollInbox)
-            .count();
         let pending_after_tick = pic.get_canister_http();
-        let terminal = jobs
+        let latest_job = jobs
             .iter()
             .filter(|job| job.kind == TaskKind::PollInbox)
-            .max_by_key(|job| job.created_at_ns)
+            .max_by_key(|job| job.created_at_ns);
+        let terminal = latest_job
             .map(|job| matches!(job.status, JobStatus::Succeeded | JobStatus::Failed))
             .unwrap_or(false);
-        if poll_jobs > before_poll_jobs && terminal && pending_after_tick.is_empty() {
+        let saw_new_poll_job = latest_job
+            .map(|job| before_latest_poll_job_id.as_deref() != Some(job.id.as_str()))
+            .unwrap_or(false);
+        if saw_new_poll_job && terminal && pending_after_tick.is_empty() {
             return;
         }
     }
@@ -1349,8 +1350,8 @@ fn high_volume_agent_turn_flow_keeps_forward_progress_with_retention_enabled() {
 
     let stats = get_inbox_stats(&pic, canister_id);
     assert!(
-        stats.consumed_count >= 8,
-        "agent should consume a meaningful portion of high-volume staged inbox traffic"
+        stats.staged_count <= (burst_messages.len() as u64).saturating_sub(8),
+        "agent should drain a meaningful portion of the staged inbox backlog even when consumed rows are pruned"
     );
 
     let retained_outbox = list_outbox_messages(&pic, canister_id, 200);

@@ -614,6 +614,11 @@ fn placeholder_low_cycles_mode_suppresses_non_essential_jobs() {
 #[cfg(feature = "pocketic_tests")]
 #[test]
 fn placeholder_agent_turn_lease_ttl_covers_longer_continuation_runtime() {
+    const PROD_BASE_TICK_SECS: u64 = 30;
+    const PROD_TICKS_PER_TURN_INTERVAL: u64 = 10;
+    const PROD_AGENT_TURN_BUDGET_SECS: u64 = 90;
+    const NANOS_PER_SEC: u64 = 1_000_000_000;
+
     let (pic, canister_id) = with_backend_canister();
 
     configure_only_poll_inbox(&pic, canister_id, 60);
@@ -639,9 +644,13 @@ fn placeholder_agent_turn_lease_ttl_covers_longer_continuation_runtime() {
         .active_mutating_lease
         .expect("agent turn should keep a mutating lease while awaiting async work");
     let ttl_ns = lease.expires_at_ns.saturating_sub(lease.acquired_at_ns);
+    let expected_ttl_ns = (PROD_AGENT_TURN_BUDGET_SECS
+        + (PROD_BASE_TICK_SECS * PROD_TICKS_PER_TURN_INTERVAL)
+        + PROD_BASE_TICK_SECS)
+        * NANOS_PER_SEC;
     assert_eq!(
-        ttl_ns, 240_000_000_000,
-        "agent-turn lease ttl regression: expected 240 seconds"
+        ttl_ns, expected_ttl_ns,
+        "agent-turn lease ttl regression: expected production timing formula"
     );
     assert_eq!(lease.lane, TaskLane::Mutating);
 }

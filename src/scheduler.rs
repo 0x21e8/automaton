@@ -1370,6 +1370,18 @@ mod tests {
         crate::test_support::with_locked_host_env(vars, f);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn with_clean_host_stub_env(f: impl FnOnce()) {
+        with_host_stub_env(
+            &[
+                ("IC_AUTOMATON_EVM_RPC_STUB_FORCE_STATUS", None),
+                ("IC_AUTOMATON_EVM_RPC_STUB_FORCE_BODY", None),
+                ("IC_AUTOMATON_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN", None),
+            ],
+            f,
+        );
+    }
+
     fn init_scheduler_scope() {
         stable::init_scheduler_defaults(0);
         let target_kind = TaskKind::PollInbox;
@@ -2641,35 +2653,37 @@ mod tests {
 
     #[test]
     fn poll_inbox_job_syncs_wallet_balances_and_clears_bootstrap_pending() {
-        stable::init_storage();
-        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
-            .expect("rpc url should be configurable");
-        stable::set_evm_address(Some(
-            "0x1111111111111111111111111111111111111111".to_string(),
-        ))
-        .expect("evm address should be configurable");
-        stable::set_inbox_contract_address(Some(
-            "0x2222222222222222222222222222222222222222".to_string(),
-        ))
-        .expect("inbox contract should be configurable");
-        stable::set_wallet_balance_bootstrap_pending(true);
+        with_clean_host_stub_env(|| {
+            stable::init_storage();
+            stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+                .expect("rpc url should be configurable");
+            stable::set_evm_address(Some(
+                "0x1111111111111111111111111111111111111111".to_string(),
+            ))
+            .expect("evm address should be configurable");
+            stable::set_inbox_contract_address(Some(
+                "0x2222222222222222222222222222222222222222".to_string(),
+            ))
+            .expect("inbox contract should be configurable");
+            stable::set_wallet_balance_bootstrap_pending(true);
 
-        let now_ns = 123_000_000_000u64;
-        block_on_with_spin(run_poll_inbox_job(now_ns)).expect("poll job should not fail");
+            let now_ns = 123_000_000_000u64;
+            block_on_with_spin(run_poll_inbox_job(now_ns)).expect("poll job should not fail");
 
-        let balance = stable::wallet_balance_snapshot();
-        assert_eq!(balance.eth_balance_wei_hex.as_deref(), Some("0x1"));
-        assert_eq!(balance.usdc_balance_raw_hex.as_deref(), Some("0x2a"));
-        assert_eq!(
-            balance.usdc_contract_address.as_deref(),
-            Some("0x3333333333333333333333333333333333333333")
-        );
-        assert_eq!(balance.last_synced_at_ns, Some(now_ns));
-        assert!(balance.last_error.is_none());
-        assert!(
-            !stable::wallet_balance_bootstrap_pending(),
-            "successful first sync should clear bootstrap gate"
-        );
+            let balance = stable::wallet_balance_snapshot();
+            assert_eq!(balance.eth_balance_wei_hex.as_deref(), Some("0x1"));
+            assert_eq!(balance.usdc_balance_raw_hex.as_deref(), Some("0x2a"));
+            assert_eq!(
+                balance.usdc_contract_address.as_deref(),
+                Some("0x3333333333333333333333333333333333333333")
+            );
+            assert_eq!(balance.last_synced_at_ns, Some(now_ns));
+            assert!(balance.last_error.is_none());
+            assert!(
+                !stable::wallet_balance_bootstrap_pending(),
+                "successful first sync should clear bootstrap gate"
+            );
+        });
     }
 
     #[test]
@@ -2719,101 +2733,107 @@ mod tests {
 
     #[test]
     fn poll_inbox_job_wallet_sync_uses_tier_aware_due_windows_after_bootstrap() {
-        stable::init_storage();
-        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
-            .expect("rpc url should be configurable");
-        stable::set_evm_address(Some(
-            "0x1111111111111111111111111111111111111111".to_string(),
-        ))
-        .expect("evm address should be configurable");
-        stable::set_inbox_contract_address(Some(
-            "0x2222222222222222222222222222222222222222".to_string(),
-        ))
-        .expect("inbox contract should be configurable");
-        stable::set_wallet_balance_sync_config(WalletBalanceSyncConfig {
-            normal_interval_secs: 300,
-            low_cycles_interval_secs: 900,
-            ..WalletBalanceSyncConfig::default()
-        })
-        .expect("wallet sync config should persist");
-        stable::set_wallet_balance_snapshot(WalletBalanceSnapshot {
-            eth_balance_wei_hex: Some("0xaaaa".to_string()),
-            usdc_balance_raw_hex: Some("0xbbbb".to_string()),
-            usdc_decimals: 6,
-            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
-            last_synced_at_ns: Some(1_000_000_000_000),
-            last_synced_block: None,
-            last_error: None,
+        with_clean_host_stub_env(|| {
+            stable::init_storage();
+            stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+                .expect("rpc url should be configurable");
+            stable::set_evm_address(Some(
+                "0x1111111111111111111111111111111111111111".to_string(),
+            ))
+            .expect("evm address should be configurable");
+            stable::set_inbox_contract_address(Some(
+                "0x2222222222222222222222222222222222222222".to_string(),
+            ))
+            .expect("inbox contract should be configurable");
+            stable::set_wallet_balance_sync_config(WalletBalanceSyncConfig {
+                normal_interval_secs: 300,
+                low_cycles_interval_secs: 900,
+                ..WalletBalanceSyncConfig::default()
+            })
+            .expect("wallet sync config should persist");
+            stable::set_wallet_balance_snapshot(WalletBalanceSnapshot {
+                eth_balance_wei_hex: Some("0xaaaa".to_string()),
+                usdc_balance_raw_hex: Some("0xbbbb".to_string()),
+                usdc_decimals: 6,
+                usdc_contract_address: Some(
+                    "0x3333333333333333333333333333333333333333".to_string(),
+                ),
+                last_synced_at_ns: Some(1_000_000_000_000),
+                last_synced_block: None,
+                last_error: None,
+            });
+            stable::set_wallet_balance_bootstrap_pending(false);
+
+            stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+            block_on_with_spin(run_poll_inbox_job(1_250_000_000_000))
+                .expect("normal-tier pre-due poll should succeed");
+            let after_normal_skip = stable::wallet_balance_snapshot();
+            assert_eq!(
+                after_normal_skip.eth_balance_wei_hex.as_deref(),
+                Some("0xaaaa")
+            );
+            assert_eq!(after_normal_skip.last_synced_at_ns, Some(1_000_000_000_000));
+
+            stable::set_scheduler_survival_tier(SurvivalTier::LowCycles);
+            block_on_with_spin(run_poll_inbox_job(1_600_000_000_000))
+                .expect("low-tier pre-due poll should succeed");
+            let after_low_skip = stable::wallet_balance_snapshot();
+            assert_eq!(
+                after_low_skip.eth_balance_wei_hex.as_deref(),
+                Some("0xaaaa")
+            );
+            assert_eq!(after_low_skip.last_synced_at_ns, Some(1_000_000_000_000));
+
+            block_on_with_spin(run_poll_inbox_job(1_901_000_000_000))
+                .expect("low-tier due poll should succeed");
+            let after_due = stable::wallet_balance_snapshot();
+            assert_eq!(after_due.eth_balance_wei_hex.as_deref(), Some("0x1"));
+            assert_eq!(after_due.usdc_balance_raw_hex.as_deref(), Some("0x2a"));
+            assert_eq!(after_due.last_synced_at_ns, Some(1_901_000_000_000));
         });
-        stable::set_wallet_balance_bootstrap_pending(false);
-
-        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
-        block_on_with_spin(run_poll_inbox_job(1_250_000_000_000))
-            .expect("normal-tier pre-due poll should succeed");
-        let after_normal_skip = stable::wallet_balance_snapshot();
-        assert_eq!(
-            after_normal_skip.eth_balance_wei_hex.as_deref(),
-            Some("0xaaaa")
-        );
-        assert_eq!(after_normal_skip.last_synced_at_ns, Some(1_000_000_000_000));
-
-        stable::set_scheduler_survival_tier(SurvivalTier::LowCycles);
-        block_on_with_spin(run_poll_inbox_job(1_600_000_000_000))
-            .expect("low-tier pre-due poll should succeed");
-        let after_low_skip = stable::wallet_balance_snapshot();
-        assert_eq!(
-            after_low_skip.eth_balance_wei_hex.as_deref(),
-            Some("0xaaaa")
-        );
-        assert_eq!(after_low_skip.last_synced_at_ns, Some(1_000_000_000_000));
-
-        block_on_with_spin(run_poll_inbox_job(1_901_000_000_000))
-            .expect("low-tier due poll should succeed");
-        let after_due = stable::wallet_balance_snapshot();
-        assert_eq!(after_due.eth_balance_wei_hex.as_deref(), Some("0x1"));
-        assert_eq!(after_due.usdc_balance_raw_hex.as_deref(), Some("0x2a"));
-        assert_eq!(after_due.last_synced_at_ns, Some(1_901_000_000_000));
     }
 
     #[test]
     fn poll_inbox_job_wallet_sync_failure_is_non_fatal_and_preserves_last_good_snapshot() {
-        stable::init_storage();
-        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
-            .expect("rpc url should be configurable");
-        stable::set_evm_address(Some(
-            "0x1111111111111111111111111111111111111111".to_string(),
-        ))
-        .expect("evm address should be configurable");
-        stable::set_wallet_balance_sync_config(WalletBalanceSyncConfig {
-            discover_usdc_via_inbox: false,
-            ..WalletBalanceSyncConfig::default()
-        })
-        .expect("wallet sync config should persist");
-        stable::set_wallet_balance_snapshot(WalletBalanceSnapshot {
-            eth_balance_wei_hex: Some("0x9999".to_string()),
-            usdc_balance_raw_hex: Some("0x8888".to_string()),
-            usdc_decimals: 6,
-            usdc_contract_address: None,
-            last_synced_at_ns: Some(55),
-            last_synced_block: Some(7),
-            last_error: None,
+        with_clean_host_stub_env(|| {
+            stable::init_storage();
+            stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+                .expect("rpc url should be configurable");
+            stable::set_evm_address(Some(
+                "0x1111111111111111111111111111111111111111".to_string(),
+            ))
+            .expect("evm address should be configurable");
+            stable::set_wallet_balance_sync_config(WalletBalanceSyncConfig {
+                discover_usdc_via_inbox: false,
+                ..WalletBalanceSyncConfig::default()
+            })
+            .expect("wallet sync config should persist");
+            stable::set_wallet_balance_snapshot(WalletBalanceSnapshot {
+                eth_balance_wei_hex: Some("0x9999".to_string()),
+                usdc_balance_raw_hex: Some("0x8888".to_string()),
+                usdc_decimals: 6,
+                usdc_contract_address: None,
+                last_synced_at_ns: Some(55),
+                last_synced_block: Some(7),
+                last_error: None,
+            });
+            stable::set_wallet_balance_bootstrap_pending(true);
+
+            block_on_with_spin(run_poll_inbox_job(777)).expect("poll job should not fail");
+
+            let balance = stable::wallet_balance_snapshot();
+            assert_eq!(balance.eth_balance_wei_hex.as_deref(), Some("0x9999"));
+            assert_eq!(balance.usdc_balance_raw_hex.as_deref(), Some("0x8888"));
+            assert_eq!(balance.last_synced_at_ns, Some(55));
+            assert_eq!(balance.last_synced_block, Some(7));
+            assert_eq!(
+                balance.last_error.as_deref(),
+                Some("usdc contract address is not configured")
+            );
+            assert!(
+                stable::wallet_balance_bootstrap_pending(),
+                "bootstrap gate must remain set until a successful sync occurs"
+            );
         });
-        stable::set_wallet_balance_bootstrap_pending(true);
-
-        block_on_with_spin(run_poll_inbox_job(777)).expect("poll job should not fail");
-
-        let balance = stable::wallet_balance_snapshot();
-        assert_eq!(balance.eth_balance_wei_hex.as_deref(), Some("0x9999"));
-        assert_eq!(balance.usdc_balance_raw_hex.as_deref(), Some("0x8888"));
-        assert_eq!(balance.last_synced_at_ns, Some(55));
-        assert_eq!(balance.last_synced_block, Some(7));
-        assert_eq!(
-            balance.last_error.as_deref(),
-            Some("usdc contract address is not configured")
-        );
-        assert!(
-            stable::wallet_balance_bootstrap_pending(),
-            "bootstrap gate must remain set until a successful sync occurs"
-        );
     }
 }
