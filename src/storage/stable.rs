@@ -3619,6 +3619,15 @@ pub fn wallet_balance_sync_config_view() -> WalletBalanceSyncConfigView {
     WalletBalanceSyncConfigView::from(&runtime_snapshot().wallet_balance_sync)
 }
 
+/// Returns the current cycle telemetry without mutating observability samples.
+pub fn cycle_telemetry() -> CycleTelemetry {
+    let now_ns = now_ns();
+    let total_cycles = current_total_cycle_balance();
+    let liquid_cycles = current_liquid_cycle_balance(total_cycles);
+    let samples = load_cycle_balance_samples();
+    derive_cycle_telemetry(now_ns, total_cycles, liquid_cycles, &samples)
+}
+
 fn inbox_usdc_discovery_blocked(snapshot: &RuntimeSnapshot) -> bool {
     snapshot
         .wallet_balance

@@ -21,7 +21,8 @@
 /// | `MAX_MEMORY_RECALL_RESULTS`     | 50     |
 /// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
-    AbiTypeSpec, AgentState, MemoryFact, PromptLayer, StrategyExecutionIntent, StrategyTemplateKey,
+    AbiTypeSpec, ActiveExposure, AgentState, AutonomyPolicy, ExecutionPlan, MemoryFact,
+    PromptLayer, StrategyExecutionIntent, StrategyQuarantine, StrategyTemplateKey,
     SurvivalOperationClass, ToolCall, ToolCallOutcome, ToolCallRecord, ToolFailureKind,
 };
 use crate::features::canister_call::canister_call_tool;
@@ -39,7 +40,7 @@ use alloy_primitives::U256;
 use async_trait::async_trait;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
@@ -803,14 +804,16 @@ impl ToolManager {
                                 &calls[batch_index],
                                 signer,
                                 broadcaster,
-                                turn_id
+                                turn_id,
+                                &records
                             ),
                             self.execute_single_call_record(
                                 state,
                                 &calls[batch_index + 1],
                                 signer,
                                 broadcaster,
-                                turn_id
+                                turn_id,
+                                &records
                             ),
                         );
                         records.push(first);
@@ -824,6 +827,7 @@ impl ToolManager {
                                 signer,
                                 broadcaster,
                                 turn_id,
+                                &records,
                             )
                             .await,
                         );
@@ -835,8 +839,15 @@ impl ToolManager {
             }
 
             records.push(
-                self.execute_single_call_record(state, &calls[index], signer, broadcaster, turn_id)
-                    .await,
+                self.execute_single_call_record(
+                    state,
+                    &calls[index],
+                    signer,
+                    broadcaster,
+                    turn_id,
+                    &records,
+                )
+                .await,
             );
             index += 1;
         }
@@ -850,6 +861,7 @@ impl ToolManager {
         signer: &dyn SignerPort,
         broadcaster: Option<&dyn EvmBroadcastPort>,
         turn_id: &str,
+        history: &[ToolCallRecord],
     ) -> ToolCallRecord {
         let mut normalized_call = call.clone();
         normalized_call.tool = canonicalize_tool_name(&normalized_call.tool);
@@ -863,7 +875,7 @@ impl ToolManager {
         }
 
         let result = self
-            .dispatch_tool_call(&normalized_call, signer, broadcaster, turn_id)
+            .dispatch_tool_call(&normalized_call, signer, broadcaster, turn_id, history)
             .await;
         Self::record_for_result(&normalized_call, turn_id, result)
     }
@@ -932,6 +944,7 @@ impl ToolManager {
         signer: &dyn SignerPort,
         broadcaster: Option<&dyn EvmBroadcastPort>,
         turn_id: &str,
+        history: &[ToolCallRecord],
     ) -> Result<String, String> {
         match call.tool.as_str() {
             "sign_message" => {
@@ -1075,7 +1088,8 @@ impl ToolManager {
                             .to_string(),
                     )
                 } else {
-                    let result = execute_strategy_action_tool(&call.args_json, signer).await;
+                    let result =
+                        execute_strategy_action_tool(&call.args_json, signer, history).await;
                     if let Err(error) = &result {
                         let failed_class = classify_execute_strategy_action_failure(error);
                         record_survival_operation_failure_for_class(&failed_class, now_ns);
@@ -2534,8 +2548,13 @@ fn simulate_strategy_action_tool(args_json: &str) -> Result<String, String> {
 async fn execute_strategy_action_tool(
     args_json: &str,
     signer: &dyn SignerPort,
+    history: &[ToolCallRecord],
 ) -> Result<String, String> {
     let intent = parse_strategy_intent_args(args_json)?;
+    let now_ns = current_time_ns();
+    let policy = current_autonomy_policy(now_ns);
+    let strategy_id = strategy_id_from_key(&intent.key);
+
     log!(
         StrategyToolLogPriority::Info,
         "strategy_compile_start mode=execute protocol={} primitive={} template_id={} action_id={}",
@@ -2544,7 +2563,34 @@ async fn execute_strategy_action_tool(
         intent.key.template_id,
         intent.action_id
     );
-    let plan = compiler::compile_intent(&intent)?;
+
+    if !policy.execution_authority.autonomous_execution_enabled {
+        return Err("execute_strategy_action blocked: autonomous_execution_disabled".to_string());
+    }
+    if let Some(quarantine) = active_strategy_quarantine(&strategy_id, now_ns) {
+        return Err(format!(
+            "execute_strategy_action blocked: strategy_quarantined:{}",
+            quarantine.reason
+        ));
+    }
+
+    let plan = match compiler::compile_intent(&intent) {
+        Ok(plan) => plan,
+        Err(error) => {
+            record_strategy_failure(
+                &ExecutionPlan {
+                    key: intent.key.clone(),
+                    action_id: intent.action_id.clone(),
+                    calls: Vec::new(),
+                    preconditions: Vec::new(),
+                    postconditions: Vec::new(),
+                },
+                &error,
+                now_ns,
+            );
+            return Err(error);
+        }
+    };
     log!(
         StrategyToolLogPriority::Info,
         "strategy_compile_ok mode=execute protocol={} template_id={} action_id={} call_count={}",
@@ -2578,8 +2624,16 @@ async fn execute_strategy_action_tool(
             plan.action_id,
             error
         );
+        record_strategy_failure(&plan, &error, now_ns);
         return Err(format!("strategy validation failed: {error}"));
     }
+
+    enforce_strategy_execution_policy(
+        &policy,
+        &plan,
+        history,
+        args_json,
+    )?;
 
     log!(
         StrategyToolLogPriority::Info,
@@ -2589,7 +2643,24 @@ async fn execute_strategy_action_tool(
         plan.action_id,
         plan.calls.len()
     );
-    let tx_hashes = crate::features::evm::execute_strategy_plan(&plan, signer).await?;
+    let tx_hashes = match crate::features::evm::execute_strategy_plan(&plan, signer).await {
+        Ok(tx_hashes) => tx_hashes,
+        Err(error) => {
+            record_strategy_failure(&plan, &error, now_ns);
+            return Err(error);
+        }
+    };
+    if let Err(error) = record_strategy_success(&plan, args_json, now_ns) {
+        log!(
+            StrategyToolLogPriority::Error,
+            "strategy_bookkeeping_failed protocol={} template_id={} action_id={} error={}",
+            plan.key.protocol,
+            plan.key.template_id,
+            plan.action_id,
+            error
+        );
+        return Err(format!("strategy execution bookkeeping failed: {error}"));
+    }
     if let Err(error) = record_strategy_budget_spend(&plan) {
         log!(
             StrategyToolLogPriority::Error,
@@ -2599,6 +2670,7 @@ async fn execute_strategy_action_tool(
             plan.action_id,
             error
         );
+        record_strategy_failure(&plan, &error, now_ns);
         return Err(format!(
             "strategy execution budget bookkeeping failed: {error}"
         ));
@@ -2617,6 +2689,418 @@ async fn execute_strategy_action_tool(
         "tx_hashes": tx_hashes
     }))
     .map_err(|error| format!("failed to serialize execution result: {error}"))
+}
+
+fn enforce_strategy_execution_policy(
+    policy: &AutonomyPolicy,
+    plan: &ExecutionPlan,
+    history: &[ToolCallRecord],
+    args_json: &str,
+) -> Result<(), String> {
+    if !policy.execution_authority.require_simulation_first {
+        return Ok(());
+    }
+    if !strategy_simulation_succeeded(history, plan) {
+        return Err("execute_strategy_action blocked: simulation_first_required".to_string());
+    }
+
+    let current_value_wei = plan_total_value_wei(plan)?;
+    if let Some(limit_wei) = policy.execution_authority.per_action_value_limit_wei {
+        if current_value_wei > U256::from(limit_wei) {
+            return Err(format!(
+                "execute_strategy_action blocked: per_action_value_limit_exceeded:{}",
+                current_value_wei
+            ));
+        }
+    }
+
+    enforce_reserve_floors(policy)?;
+
+    if is_enter_or_exit_action(&plan.action_id) {
+        enforce_concentration_gate(policy, plan, args_json)?;
+    }
+
+    Ok(())
+}
+
+fn enforce_reserve_floors(policy: &AutonomyPolicy) -> Result<(), String> {
+    let cycles = stable::cycle_telemetry();
+    let min_cycles_runway_secs = u128::from(policy.reserve_policy.min_cycles_runway_hours)
+        .saturating_mul(3_600);
+    if cycles.total_cycles > 0 && cycles.liquid_cycles > 0 {
+        if let Some(estimated_seconds) = cycles.estimated_seconds_until_freezing_threshold {
+            if u128::from(estimated_seconds) < min_cycles_runway_secs {
+                return Err(format!(
+                    "execute_strategy_action blocked: reserve_cycles_runway_below_floor:{}",
+                    min_cycles_runway_secs
+                ));
+            }
+        } else if let Some(burn_rate_cycles_per_hour) = cycles.burn_rate_cycles_per_hour {
+            if burn_rate_cycles_per_hour > 0 {
+                let estimated_seconds = cycles
+                    .liquid_cycles
+                    .saturating_mul(3_600)
+                    .saturating_div(burn_rate_cycles_per_hour);
+                if estimated_seconds < min_cycles_runway_secs {
+                    return Err(format!(
+                        "execute_strategy_action blocked: reserve_cycles_runway_below_floor:{}",
+                        min_cycles_runway_secs
+                    ));
+                }
+            }
+        }
+    }
+
+    let snapshot = stable::wallet_balance_snapshot();
+    if let Some(min_gas_wei) = policy.reserve_policy.min_gas_wei {
+        if let Some(eth_balance_wei) = parse_optional_hex_u128(snapshot.eth_balance_wei_hex.as_deref()) {
+            if eth_balance_wei < min_gas_wei {
+                return Err(format!(
+                    "execute_strategy_action blocked: reserve_gas_floor_below_min:{}",
+                    min_gas_wei
+                ));
+            }
+        }
+    }
+
+    if let Some(min_inference_usdc_6dp) = policy.reserve_policy.min_inference_usdc_6dp {
+        if let Some(usdc_balance_raw) = parse_optional_hex_u128(snapshot.usdc_balance_raw_hex.as_deref()) {
+            if usdc_balance_raw < u128::from(min_inference_usdc_6dp) {
+                return Err(format!(
+                    "execute_strategy_action blocked: reserve_usdc_floor_below_min:{}",
+                    min_inference_usdc_6dp
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn enforce_concentration_gate(
+    policy: &AutonomyPolicy,
+    plan: &ExecutionPlan,
+    args_json: &str,
+) -> Result<(), String> {
+    let Some(deployable_capital_wei) = deployable_capital_wei(policy) else {
+        return Ok(());
+    };
+    if deployable_capital_wei == U256::ZERO {
+        return Err("execute_strategy_action blocked: deployable_capital_zero".to_string());
+    }
+
+    let existing_exposures = stable::list_active_exposures();
+    let protocol = plan.key.protocol.trim().to_string();
+    let enter_like = plan.action_id.starts_with("enter_");
+    if !enter_like {
+        return Ok(());
+    }
+
+    let mut total_exposure = U256::ZERO;
+    let mut protocol_exposure = U256::ZERO;
+    for exposure in existing_exposures {
+        let exposure_value = exposure
+            .notional_wei
+            .map(U256::from)
+            .unwrap_or(deployable_capital_wei);
+        total_exposure = total_exposure.saturating_add(exposure_value);
+        if exposure.protocol == protocol {
+            protocol_exposure = protocol_exposure.saturating_add(exposure_value);
+        }
+    }
+
+    let current_notional = parse_strategy_notional_wei(args_json)
+        .map(U256::from)
+        .unwrap_or(deployable_capital_wei);
+    if enter_like {
+        let current_exposure = current_notional;
+        total_exposure = total_exposure.saturating_add(current_exposure);
+        protocol_exposure = protocol_exposure.saturating_add(current_exposure);
+    }
+
+    let total_bps = exposure_bps(total_exposure, deployable_capital_wei);
+    if total_bps > u128::from(policy.risk_limits.max_total_exposure_bps) {
+        return Err(format!(
+            "execute_strategy_action blocked: total_exposure_bps_exceeded:{}",
+            total_bps
+        ));
+    }
+    let protocol_bps = exposure_bps(protocol_exposure, deployable_capital_wei);
+    if protocol_bps > u128::from(policy.risk_limits.max_protocol_concentration_bps) {
+        return Err(format!(
+            "execute_strategy_action blocked: protocol_concentration_bps_exceeded:{}",
+            protocol_bps
+        ));
+    }
+    Ok(())
+}
+
+fn deployable_capital_wei(policy: &AutonomyPolicy) -> Option<U256> {
+    let snapshot = stable::wallet_balance_snapshot();
+    let eth_balance_wei = parse_optional_hex_u128(snapshot.eth_balance_wei_hex.as_deref())?;
+    let gas_floor = policy.reserve_policy.min_gas_wei.unwrap_or_default();
+    let deployable = U256::from(eth_balance_wei).saturating_sub(U256::from(gas_floor));
+    Some(deployable)
+}
+
+fn exposure_bps(exposure: U256, deployable: U256) -> u128 {
+    if deployable == U256::ZERO {
+        return u128::MAX;
+    }
+    exposure
+        .saturating_mul(U256::from(10_000u128))
+        .checked_div(deployable)
+        .unwrap_or(U256::from(u128::MAX))
+        .try_into()
+        .unwrap_or(u128::MAX)
+}
+
+fn plan_total_value_wei(plan: &ExecutionPlan) -> Result<U256, String> {
+    plan.calls.iter().try_fold(U256::ZERO, |acc, call| {
+        parse_u256_decimal(&call.value_wei)
+            .map(|value| acc.saturating_add(value))
+            .map_err(|error| format!("invalid plan value_wei: {error}"))
+    })
+}
+
+fn strategy_simulation_succeeded(history: &[ToolCallRecord], plan: &ExecutionPlan) -> bool {
+    history.iter().any(|record| {
+        if !record.success || record.tool != "simulate_strategy_action" {
+            return false;
+        }
+        parse_strategy_intent_args(&record.args_json)
+            .ok()
+            .map(|intent| {
+                intent.key == plan.key && intent.action_id == plan.action_id
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn strategy_id_from_key(key: &StrategyTemplateKey) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        key.protocol, key.primitive, key.chain_id, key.template_id
+    )
+}
+
+fn current_autonomy_policy(now_ns: u64) -> AutonomyPolicy {
+    stable::autonomy_policy().unwrap_or_else(|| AutonomyPolicy::conservative_default(now_ns))
+}
+
+fn active_strategy_quarantine(strategy_id: &str, now_ns: u64) -> Option<StrategyQuarantine> {
+    let quarantine = stable::strategy_quarantine(strategy_id)?;
+    let policy = current_autonomy_policy(now_ns);
+    if quarantine.failure_count < policy.escalation_rules.failure_quarantine_threshold
+        && quarantine
+            .release_after_ns
+            .is_none_or(|release_after_ns| release_after_ns <= now_ns)
+    {
+        return None;
+    }
+    Some(quarantine)
+}
+
+fn record_strategy_failure(plan: &ExecutionPlan, reason: &str, now_ns: u64) {
+    let strategy_id = strategy_id_from_key(&plan.key);
+    let mut quarantine = stable::strategy_quarantine(&strategy_id).unwrap_or_else(|| StrategyQuarantine {
+        strategy_id: strategy_id.clone(),
+        reason: reason.to_string(),
+        failure_count: 0,
+        quarantined_at_ns: now_ns,
+        release_after_ns: None,
+    });
+    quarantine.failure_count = quarantine.failure_count.saturating_add(1);
+    quarantine.reason = reason.to_string();
+    if quarantine.quarantined_at_ns == 0 {
+        quarantine.quarantined_at_ns = now_ns;
+    }
+    let policy = current_autonomy_policy(now_ns);
+    if quarantine.failure_count >= policy.escalation_rules.failure_quarantine_threshold {
+        quarantine.release_after_ns = Some(
+            now_ns.saturating_add(
+                stable::autonomy_suppression_config().failure_cooldown_secs
+                    .saturating_mul(1_000_000_000),
+            ),
+        );
+    }
+    let _ = stable::set_strategy_quarantine(quarantine);
+}
+
+fn record_strategy_success(plan: &ExecutionPlan, args_json: &str, now_ns: u64) -> Result<(), String> {
+    let strategy_id = strategy_id_from_key(&plan.key);
+    if is_enter_or_exit_action(&plan.action_id) {
+        let updated = match plan.action_id.starts_with("exit_") {
+            true => update_exposure_after_exit(&strategy_id, &plan.key, args_json, now_ns),
+            false => update_exposure_after_enter(&strategy_id, &plan.key, args_json, now_ns),
+        };
+        if plan.action_id.starts_with("exit_") {
+            if let Some(exposure) = updated {
+                stable::set_active_exposure(exposure)?;
+            } else {
+                let _ = stable::remove_active_exposure(&strategy_id);
+            }
+        } else if let Some(exposure) = updated {
+            stable::set_active_exposure(exposure)?;
+        }
+    }
+    let _ = stable::clear_strategy_quarantine(&strategy_id);
+    Ok(())
+}
+
+fn update_exposure_after_enter(
+    strategy_id: &str,
+    key: &StrategyTemplateKey,
+    args_json: &str,
+    now_ns: u64,
+) -> Option<ActiveExposure> {
+    let notional_wei = parse_strategy_notional_wei(args_json);
+    let asset_symbol = parse_strategy_asset_symbol(args_json, &key.template_id);
+    let existing = stable::active_exposure(strategy_id);
+    let next_notional = match (existing.as_ref().and_then(|exposure| exposure.notional_wei), notional_wei)
+    {
+        (Some(current), Some(delta)) => Some(current.saturating_add(delta)),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    };
+
+    Some(ActiveExposure {
+        strategy_id: strategy_id.to_string(),
+        protocol: key.protocol.clone(),
+        chain_id: key.chain_id,
+        asset_symbol,
+        notional_wei: next_notional,
+        updated_at_ns: now_ns,
+    })
+}
+
+fn update_exposure_after_exit(
+    strategy_id: &str,
+    key: &StrategyTemplateKey,
+    args_json: &str,
+    now_ns: u64,
+) -> Option<ActiveExposure> {
+    let existing = stable::active_exposure(strategy_id)?;
+    let current_notional = parse_strategy_notional_wei(args_json);
+    let asset_symbol = parse_strategy_asset_symbol(args_json, &existing.asset_symbol);
+    let next_notional = match (existing.notional_wei, current_notional) {
+        (Some(existing_value), Some(exit_value)) => existing_value.checked_sub(exit_value),
+        (Some(_), None) => None,
+        (None, _) => None,
+    };
+
+    next_notional.and_then(|value| {
+        if value == 0 {
+            return None;
+        }
+        Some(ActiveExposure {
+            strategy_id: strategy_id.to_string(),
+            protocol: key.protocol.clone(),
+            chain_id: key.chain_id,
+            asset_symbol,
+            notional_wei: Some(value),
+            updated_at_ns: now_ns,
+        })
+    })
+}
+
+fn is_enter_or_exit_action(action_id: &str) -> bool {
+    action_id.starts_with("enter_") || action_id.starts_with("exit_")
+}
+
+fn parse_strategy_notional_wei(args_json: &str) -> Option<u128> {
+    let value: Value = serde_json::from_str(args_json).ok()?;
+    for candidate in [
+        "notional_wei",
+        "amount_wei",
+        "assets",
+        "amount",
+        "value_wei",
+    ] {
+        if let Some(found) = find_scalar_value(&value, candidate) {
+            if let Some(parsed) = parse_u128_value(found) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn parse_strategy_asset_symbol(args_json: &str, fallback: &str) -> String {
+    let value: Value = match serde_json::from_str(args_json) {
+        Ok(value) => value,
+        Err(_) => return fallback.to_string(),
+    };
+    for candidate in ["asset_symbol", "assetSymbol", "symbol"] {
+        if let Some(found) = find_scalar_value(&value, candidate) {
+            if let Some(text) = found.as_str() {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+    fallback.to_string()
+}
+
+fn find_scalar_value<'a>(value: &'a Value, dotted_key: &str) -> Option<&'a Value> {
+    let segments = dotted_key.split('.').collect::<Vec<_>>();
+    find_scalar_value_recursive(value, &segments)
+}
+
+fn find_scalar_value_recursive<'a>(value: &'a Value, segments: &[&str]) -> Option<&'a Value> {
+    if segments.is_empty() {
+        return Some(value);
+    }
+    match value {
+        Value::Object(map) => {
+            let head = segments[0];
+            if let Some(next) = map.get(head) {
+                if let Some(found) = find_scalar_value_recursive(next, &segments[1..]) {
+                    return Some(found);
+                }
+            }
+            for child in map.values() {
+                if let Some(found) = find_scalar_value_recursive(child, segments) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(entries) => entries
+            .iter()
+            .find_map(|entry| find_scalar_value_recursive(entry, segments)),
+        _ => None,
+    }
+}
+
+fn parse_u128_value(value: &Value) -> Option<u128> {
+    match value {
+        Value::Number(number) => number.as_u64().map(u128::from),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if let Some(hex) = trimmed.strip_prefix("0x") {
+                u128::from_str_radix(hex, 16).ok()
+            } else {
+                trimmed.parse::<u128>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_optional_hex_u128(raw: Option<&str>) -> Option<u128> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(hex) = raw.strip_prefix("0x") {
+        u128::from_str_radix(hex, 16).ok()
+    } else {
+        raw.parse::<u128>().ok()
+    }
 }
 
 /// Query the learner's outcome statistics for a strategy template.
@@ -2993,13 +3477,22 @@ mod tests {
                 source_ref: "https://docs.morpho.org/get-started/resources/addresses/".to_string(),
                 codehash: None,
             }],
-            actions: vec![ActionSpec {
-                action_id: "enter_supply".to_string(),
-                call_sequence: vec![function.clone()],
-                preconditions: vec!["allowance_ok".to_string()],
-                postconditions: vec!["position_opened".to_string()],
-                risk_checks: vec!["max_notional".to_string()],
-            }],
+            actions: vec![
+                ActionSpec {
+                    action_id: "enter_supply".to_string(),
+                    call_sequence: vec![function.clone()],
+                    preconditions: vec!["allowance_ok".to_string()],
+                    postconditions: vec!["position_opened".to_string()],
+                    risk_checks: vec!["max_notional".to_string()],
+                },
+                ActionSpec {
+                    action_id: "exit_supply".to_string(),
+                    call_sequence: vec![function.clone()],
+                    preconditions: vec!["position_opened".to_string()],
+                    postconditions: vec!["position_closed".to_string()],
+                    risk_checks: vec!["max_notional".to_string()],
+                },
+            ],
             constraints_json: "{}".to_string(),
             created_at_ns: 1,
             updated_at_ns: 1,
@@ -3713,6 +4206,26 @@ mod tests {
         let calls = vec![
             ToolCall {
                 tool_call_id: None,
+                tool: "simulate_strategy_action".to_string(),
+                args_json: serde_json::json!({
+                    "key": sample_strategy_key(),
+                    "action_id": "transfer",
+                    "typed_params": {
+                        "calls": [
+                            {
+                                "value_wei": "1",
+                                "args": [
+                                    "0x3333333333333333333333333333333333333333",
+                                    "1"
+                                ]
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            },
+            ToolCall {
+                tool_call_id: None,
                 tool: "execute_strategy_action".to_string(),
                 args_json: serde_json::json!({
                     "key": sample_strategy_key(),
@@ -3743,20 +4256,25 @@ mod tests {
 
         let records =
             block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-exec"));
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 3);
         assert!(
             records[0].success,
-            "execution should pass: {:?}",
+            "simulation should pass: {:?}",
             records[0]
         );
-        assert!(records[0].output.contains("\"tx_hashes\""));
         assert!(
             records[1].success,
-            "outcomes should query: {:?}",
+            "execution should pass: {:?}",
             records[1]
         );
-        assert!(records[1].output.contains("\"total_runs\":1"));
-        assert!(records[1].output.contains("\"summary\""));
+        assert!(records[1].output.contains("\"tx_hashes\""));
+        assert!(
+            records[2].success,
+            "outcomes should query: {:?}",
+            records[2]
+        );
+        assert!(records[2].output.contains("\"total_runs\":1"));
+        assert!(records[2].output.contains("\"summary\""));
         assert_eq!(
             stable::strategy_template_budget_spent_wei(&sample_strategy_key()).as_deref(),
             Some("1")
@@ -3804,34 +4322,61 @@ mod tests {
         let state = AgentState::ExecutingActions;
         let signer = HexSigner;
         let mut manager = ToolManager::new();
-        let calls = vec![ToolCall {
-            tool_call_id: None,
-            tool: "execute_strategy_action".to_string(),
-            args_json: serde_json::json!({
-                "key": sample_strategy_key(),
-                "action_id": "transfer",
-                "typed_params": {
-                    "calls": [
-                        {
-                            "value_wei": "1",
-                            "args": [
-                                "0x3333333333333333333333333333333333333333",
-                                "1"
-                            ]
-                        }
-                    ]
-                }
-            })
-            .to_string(),
-        }];
+        let calls = vec![
+            ToolCall {
+                tool_call_id: None,
+                tool: "simulate_strategy_action".to_string(),
+                args_json: serde_json::json!({
+                    "key": sample_strategy_key(),
+                    "action_id": "transfer",
+                    "typed_params": {
+                        "calls": [
+                            {
+                                "value_wei": "1",
+                                "args": [
+                                    "0x3333333333333333333333333333333333333333",
+                                    "1"
+                                ]
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "execute_strategy_action".to_string(),
+                args_json: serde_json::json!({
+                    "key": sample_strategy_key(),
+                    "action_id": "transfer",
+                    "typed_params": {
+                        "calls": [
+                            {
+                                "value_wei": "1",
+                                "args": [
+                                    "0x3333333333333333333333333333333333333333",
+                                    "1"
+                                ]
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            },
+        ];
 
         let records =
             block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-clear"));
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         assert!(
             records[0].success,
-            "execution should pass: {:?}",
+            "simulation should pass: {:?}",
             records[0]
+        );
+        assert!(
+            records[1].success,
+            "execution should pass: {:?}",
+            records[1]
         );
 
         for class in [
@@ -3869,32 +4414,55 @@ mod tests {
         let state = AgentState::ExecutingActions;
         let signer = SigningFailureSigner;
         let mut manager = ToolManager::new();
-        let calls = vec![ToolCall {
-            tool_call_id: None,
-            tool: "execute_strategy_action".to_string(),
-            args_json: serde_json::json!({
-                "key": sample_strategy_key(),
-                "action_id": "transfer",
-                "typed_params": {
-                    "calls": [
-                        {
-                            "value_wei": "1",
-                            "args": [
-                                "0x3333333333333333333333333333333333333333",
-                                "1"
-                            ]
-                        }
-                    ]
-                }
-            })
-            .to_string(),
-        }];
+        let calls = vec![
+            ToolCall {
+                tool_call_id: None,
+                tool: "simulate_strategy_action".to_string(),
+                args_json: serde_json::json!({
+                    "key": sample_strategy_key(),
+                    "action_id": "transfer",
+                    "typed_params": {
+                        "calls": [
+                            {
+                                "value_wei": "1",
+                                "args": [
+                                    "0x3333333333333333333333333333333333333333",
+                                    "1"
+                                ]
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "execute_strategy_action".to_string(),
+                args_json: serde_json::json!({
+                    "key": sample_strategy_key(),
+                    "action_id": "transfer",
+                    "typed_params": {
+                        "calls": [
+                            {
+                                "value_wei": "1",
+                                "args": [
+                                    "0x3333333333333333333333333333333333333333",
+                                    "1"
+                                ]
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            },
+        ];
 
         let records =
             block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-sign-fail"));
-        assert_eq!(records.len(), 1);
-        assert!(!records[0].success);
-        assert!(records[0]
+        assert_eq!(records.len(), 2);
+        assert!(records[0].success);
+        assert!(!records[1].success);
+        assert!(records[1]
             .error
             .as_deref()
             .unwrap_or_default()
@@ -4015,36 +4583,303 @@ mod tests {
         let state = AgentState::ExecutingActions;
         let signer = HexSigner;
         let mut manager = ToolManager::new();
-        let calls = vec![ToolCall {
-            tool_call_id: None,
-            tool: "execute_strategy_action".to_string(),
-            args_json: serde_json::json!({
-                "key": sample_strategy_key(),
-                "action_id": "transfer",
-                "typed_params": {
-                    "calls": [
-                        {
-                            "value_wei": "1",
-                            "args": [
-                                "0x3333333333333333333333333333333333333333",
-                                "1"
-                            ]
-                        }
-                    ]
-                }
-            })
-            .to_string(),
-        }];
+        let calls = vec![
+            ToolCall {
+                tool_call_id: None,
+                tool: "simulate_strategy_action".to_string(),
+                args_json: serde_json::json!({
+                    "key": sample_strategy_key(),
+                    "action_id": "transfer",
+                    "typed_params": {
+                        "calls": [
+                            {
+                                "value_wei": "1",
+                                "args": [
+                                    "0x3333333333333333333333333333333333333333",
+                                    "1"
+                                ]
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "execute_strategy_action".to_string(),
+                args_json: serde_json::json!({
+                    "key": sample_strategy_key(),
+                    "action_id": "transfer",
+                    "typed_params": {
+                        "calls": [
+                            {
+                                "value_wei": "1",
+                                "args": [
+                                    "0x3333333333333333333333333333333333333333",
+                                    "1"
+                                ]
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            },
+        ];
 
         let records =
             block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-budget"));
-        assert_eq!(records.len(), 1);
-        assert!(!records[0].success);
-        assert!(records[0]
+        assert_eq!(records.len(), 2);
+        assert!(records[0].success);
+        assert!(!records[1].success);
+        assert!(records[1]
             .error
             .as_deref()
             .unwrap_or_default()
             .contains("template_budget_exceeded"));
+    }
+
+    #[test]
+    fn strategy_execution_blocked_by_autonomy_policy_gates() {
+        let _time_guard = with_fixed_time_ns(20_000_000_000);
+        stable::init_storage();
+        stable::set_evm_chain_id(8453).expect("chain id should be configurable");
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).expect("key name should set");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should set");
+        seed_strategy_template_and_artifact();
+        seed_morpho_strategy_template_and_artifact();
+        for class in [
+            SurvivalOperationClass::ThresholdSign,
+            SurvivalOperationClass::EvmBroadcast,
+            SurvivalOperationClass::EvmPoll,
+        ] {
+            stable::record_survival_operation_success(&class);
+        }
+        stable::set_strategy_template_budget_spent_wei(&sample_strategy_key(), "0".to_string())
+            .expect("budget should reset");
+
+        struct HexSigner;
+        #[async_trait(?Send)]
+        impl SignerPort for HexSigner {
+            async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+                Ok(format!("0x{}", "11".repeat(64)))
+            }
+        }
+        let signer = HexSigner;
+
+        let transfer_args = serde_json::json!({
+            "key": sample_strategy_key(),
+            "action_id": "transfer",
+            "typed_params": {
+                "calls": [{
+                    "value_wei": "1",
+                    "args": [
+                        "0x3333333333333333333333333333333333333333",
+                        "1"
+                    ]
+                }]
+            }
+        })
+        .to_string();
+        let transfer_strategy_id = format!(
+            "{}:{}:{}:{}",
+            sample_strategy_key().protocol,
+            sample_strategy_key().primitive,
+            sample_strategy_key().chain_id,
+            sample_strategy_key().template_id
+        );
+        let morpho_strategy_id = format!(
+            "{}:{}:{}:{}",
+            sample_morpho_strategy_key().protocol,
+            sample_morpho_strategy_key().primitive,
+            sample_morpho_strategy_key().chain_id,
+            sample_morpho_strategy_key().template_id
+        );
+        let _ = stable::remove_active_exposure(&transfer_strategy_id);
+        let _ = stable::clear_strategy_quarantine(&transfer_strategy_id);
+        let _ = stable::remove_active_exposure(&morpho_strategy_id);
+        let _ = stable::clear_strategy_quarantine(&morpho_strategy_id);
+
+        let mut policy = AutonomyPolicy::conservative_default(20_000_000_000);
+        policy.execution_authority.autonomous_execution_enabled = false;
+        policy.execution_authority.require_simulation_first = true;
+        policy.execution_authority.per_action_value_limit_wei = Some(1_000_000);
+        stable::set_autonomy_policy(policy.clone()).expect("policy should store");
+
+        let mut manager = ToolManager::new();
+        let disabled_calls = vec![
+            ToolCall {
+                tool_call_id: None,
+                tool: "simulate_strategy_action".to_string(),
+                args_json: transfer_args.clone(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "execute_strategy_action".to_string(),
+                args_json: transfer_args.clone(),
+            },
+        ];
+        let disabled_records = block_on_with_spin(manager.execute_actions(
+            &AgentState::ExecutingActions,
+            &disabled_calls,
+            &signer,
+            "turn-policy-disabled",
+        ));
+        assert_eq!(disabled_records.len(), 2);
+        assert!(disabled_records[0].success);
+        assert!(!disabled_records[1].success);
+        assert!(disabled_records[1]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("autonomous_execution_disabled"));
+        for class in [
+            SurvivalOperationClass::ThresholdSign,
+            SurvivalOperationClass::EvmBroadcast,
+            SurvivalOperationClass::EvmPoll,
+        ] {
+            stable::record_survival_operation_success(&class);
+        }
+
+        policy.execution_authority.autonomous_execution_enabled = true;
+        policy.execution_authority.per_action_value_limit_wei = Some(0);
+        stable::set_autonomy_policy(policy.clone()).expect("policy should store");
+
+        let limited_calls = vec![
+            ToolCall {
+                tool_call_id: None,
+                tool: "simulate_strategy_action".to_string(),
+                args_json: transfer_args.clone(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "execute_strategy_action".to_string(),
+                args_json: transfer_args.clone(),
+            },
+        ];
+        let limited_records = block_on_with_spin(manager.execute_actions(
+            &AgentState::ExecutingActions,
+            &limited_calls,
+            &signer,
+            "turn-value-limit",
+        ));
+        assert_eq!(limited_records.len(), 2);
+        assert!(limited_records[0].success);
+        assert!(!limited_records[1].success);
+        assert!(limited_records[1]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("per_action_value_limit_exceeded"));
+        for class in [
+            SurvivalOperationClass::ThresholdSign,
+            SurvivalOperationClass::EvmBroadcast,
+            SurvivalOperationClass::EvmPoll,
+        ] {
+            stable::record_survival_operation_success(&class);
+        }
+
+        policy.execution_authority.per_action_value_limit_wei = Some(1_000_000);
+        stable::set_autonomy_policy(policy.clone()).expect("policy should store");
+        stable::set_strategy_quarantine(StrategyQuarantine {
+            strategy_id: transfer_strategy_id.clone(),
+            reason: "repeated_failure".to_string(),
+            failure_count: policy.escalation_rules.failure_quarantine_threshold,
+            quarantined_at_ns: 20_000_000_000,
+            release_after_ns: Some(21_000_000_000),
+        })
+        .expect("quarantine should store");
+
+        let quarantined_calls = vec![
+            ToolCall {
+                tool_call_id: None,
+                tool: "simulate_strategy_action".to_string(),
+                args_json: transfer_args.clone(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "execute_strategy_action".to_string(),
+                args_json: transfer_args.clone(),
+            },
+        ];
+        let quarantined_records = block_on_with_spin(manager.execute_actions(
+            &AgentState::ExecutingActions,
+            &quarantined_calls,
+            &signer,
+            "turn-quarantined",
+        ));
+        assert_eq!(quarantined_records.len(), 2);
+        assert!(quarantined_records[0].success);
+        assert!(!quarantined_records[1].success);
+        assert!(quarantined_records[1]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("strategy_quarantined"));
+        for class in [
+            SurvivalOperationClass::ThresholdSign,
+            SurvivalOperationClass::EvmBroadcast,
+            SurvivalOperationClass::EvmPoll,
+        ] {
+            stable::record_survival_operation_success(&class);
+        }
+
+        assert!(stable::clear_strategy_quarantine(&transfer_strategy_id));
+
+        let morpho_enter_args = serde_json::json!({
+            "key": sample_morpho_strategy_key(),
+            "action_id": "enter_supply",
+            "typed_params": {
+                "calls": [{
+                    "value_wei": "0",
+                    "args": {
+                        "marketParams": {
+                            "loanToken": "0x4200000000000000000000000000000000000006",
+                            "collateralToken": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+                            "oracle": "0x7777777777777777777777777777777777777777",
+                            "irm": "0x46415998764C29aB2a25CbeA6E5D2F226b40b5f0",
+                            "lltv": "860000000000000000"
+                        },
+                        "assets": "1000000",
+                        "shares": "0",
+                        "onBehalf": "0x1111111111111111111111111111111111111111",
+                        "data": "0x"
+                    }
+                }]
+            }
+        })
+        .to_string();
+        let morpho_calls = vec![
+            ToolCall {
+                tool_call_id: None,
+                tool: "simulate_strategy_action".to_string(),
+                args_json: morpho_enter_args.clone(),
+            },
+            ToolCall {
+                tool_call_id: None,
+                tool: "execute_strategy_action".to_string(),
+                args_json: morpho_enter_args.clone(),
+            },
+        ];
+        let morpho_records = block_on_with_spin(manager.execute_actions(
+            &AgentState::ExecutingActions,
+            &morpho_calls,
+            &signer,
+            "turn-enter-exposure",
+        ));
+        assert_eq!(morpho_records.len(), 2);
+        assert!(morpho_records[0].success);
+        assert!(morpho_records[1].success);
+        let exposure = stable::active_exposure(&morpho_strategy_id)
+            .expect("enter execution should persist exposure");
+        assert_eq!(exposure.protocol, sample_morpho_strategy_key().protocol);
+        assert_eq!(exposure.chain_id, sample_morpho_strategy_key().chain_id);
+        assert_eq!(exposure.notional_wei, Some(1_000_000));
+        assert!(!exposure.asset_symbol.trim().is_empty());
     }
 
     #[test]

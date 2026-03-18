@@ -148,7 +148,7 @@ Measurable success:
       - Dependencies: Task 1, Task 2
       - Notes: the decision envelope is an internal runtime contract. The agent should keep using existing inference plumbing, but autonomous economic turns must parse a final JSON object and persist a decision outcome even when the model output is malformed twice in a row.
 
-- [ ] **Task 5: Add autonomy hard gates, exposure bookkeeping, and quarantine accounting**
+- [x] **Task 5: Add autonomy hard gates, exposure bookkeeping, and quarantine accounting**
       - Files: `src/tools.rs`, `src/storage/stable.rs`, `src/strategy/learner.rs`
       - Code references:
         - gate live execution in the `execute_strategy_action` branch of `ToolManager::execute_actions`
@@ -160,7 +160,7 @@ Measurable success:
       - Dependencies: Task 1, Task 2, Task 4
       - Notes: treat `enter_*` and `exit_*` as the first covered action family. For now, derive protocol concentration from active exposures keyed by `protocol`.
 
-- [ ] **Task 6: Add exposure reconciliation in the existing reconcile job**
+- [x] **Task 6: Add exposure reconciliation in the existing reconcile job**
       - Files: `src/scheduler.rs`, `src/storage/stable.rs`, `src/tools.rs` or a small new helper module under `src/strategy/`
       - Code references:
         - extend `run_reconcile_job(now_ns)` instead of inventing a new task kind
