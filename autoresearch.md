@@ -41,3 +41,4 @@ Reduce prompt size in `src/prompt.rs` while preserving prompt assembly behavior 
 - Kept: collapsed layer 5 into four labeled bullets (`Capability`, `Constraints`, `Dialogue`, `Memory`) while preserving all tested directives. Result: `prompt_bytes_total=11762` (`full=8238`, `compact=3524`, `lines_total=128`).
 - Kept: further collapsed layers 0, 2, 3, 4, and 8 by merging related bullets and removing extra line overhead. Result: `prompt_bytes_total=11718` (`full=8213`, `compact=3505`, `lines_total=120`).
 - Kept: merged adjacent safety/self-mod bullets in layers 1 and 9 for small additional savings without changing behavior. Result: `prompt_bytes_total=11712` (`full=8209`, `compact=3503`, `lines_total=117`).
+- Kept: removed a blank line in layer 1, merged layer 6 risk/value into one bullet, and compressed the static Active Skills guidance into one line. Result: `prompt_bytes_total=11703` (`full=8203`, `compact=3500`, `lines_total=112`).
