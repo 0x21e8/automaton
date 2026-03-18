@@ -1,0 +1,1 @@
+{"type":"config","name":"Optimize prompt in src/prompt.rs","metricName":"prompt_bytes_total","metricUnit":"bytes","bestDirection":"lower"}
