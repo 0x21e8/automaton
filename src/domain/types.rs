@@ -642,6 +642,129 @@ impl Default for AutonomySuppressionConfig {
     }
 }
 
+/// Durable governance policy that bounds autonomous economic behavior.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AutonomyPolicy {
+    #[serde(default = "default_autonomy_policy_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub reserve_policy: ReservePolicy,
+    #[serde(default)]
+    pub risk_limits: RiskLimits,
+    #[serde(default)]
+    pub execution_authority: ExecutionAuthority,
+    #[serde(default)]
+    pub escalation_rules: EscalationRules,
+    #[serde(default)]
+    pub updated_at_ns: u64,
+}
+
+impl AutonomyPolicy {
+    pub fn conservative_default(now_ns: u64) -> Self {
+        Self {
+            version: default_autonomy_policy_version(),
+            reserve_policy: ReservePolicy::default(),
+            risk_limits: RiskLimits::default(),
+            execution_authority: ExecutionAuthority::default(),
+            escalation_rules: EscalationRules::default(),
+            updated_at_ns: now_ns,
+        }
+    }
+}
+
+impl Default for AutonomyPolicy {
+    fn default() -> Self {
+        Self::conservative_default(0)
+    }
+}
+
+/// Protected-balance floors the automaton must preserve before deploying capital.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReservePolicy {
+    #[serde(default = "default_min_cycles_runway_hours")]
+    pub min_cycles_runway_hours: u64,
+    #[serde(default = "default_min_inference_usdc_6dp")]
+    pub min_inference_usdc_6dp: Option<u64>,
+    #[serde(default = "default_min_gas_wei")]
+    pub min_gas_wei: Option<u128>,
+}
+
+impl Default for ReservePolicy {
+    fn default() -> Self {
+        Self {
+            min_cycles_runway_hours: default_min_cycles_runway_hours(),
+            min_inference_usdc_6dp: default_min_inference_usdc_6dp(),
+            min_gas_wei: default_min_gas_wei(),
+        }
+    }
+}
+
+/// Exposure and concentration bounds for autonomous execution.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RiskLimits {
+    #[serde(default = "default_max_total_exposure_bps")]
+    pub max_total_exposure_bps: u16,
+    #[serde(default = "default_max_single_action_bps")]
+    pub max_single_action_bps: u16,
+    #[serde(default = "default_max_protocol_concentration_bps")]
+    pub max_protocol_concentration_bps: u16,
+}
+
+impl Default for RiskLimits {
+    fn default() -> Self {
+        Self {
+            max_total_exposure_bps: default_max_total_exposure_bps(),
+            max_single_action_bps: default_max_single_action_bps(),
+            max_protocol_concentration_bps: default_max_protocol_concentration_bps(),
+        }
+    }
+}
+
+/// Hard execution authority limits for autonomous capital-touching actions.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionAuthority {
+    #[serde(default = "default_autonomous_execution_enabled")]
+    pub autonomous_execution_enabled: bool,
+    #[serde(default = "default_require_simulation_first")]
+    pub require_simulation_first: bool,
+    #[serde(default = "default_per_action_value_limit_wei")]
+    pub per_action_value_limit_wei: Option<u128>,
+}
+
+impl Default for ExecutionAuthority {
+    fn default() -> Self {
+        Self {
+            autonomous_execution_enabled: default_autonomous_execution_enabled(),
+            require_simulation_first: default_require_simulation_first(),
+            per_action_value_limit_wei: default_per_action_value_limit_wei(),
+        }
+    }
+}
+
+/// Rules for escalating or quarantining autonomous execution decisions.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct EscalationRules {
+    #[serde(default = "default_escalate_on_missing_policy")]
+    pub escalate_on_missing_policy: bool,
+    #[serde(default = "default_escalate_on_authority_exceeded")]
+    pub escalate_on_authority_exceeded: bool,
+    #[serde(default = "default_escalate_on_repeated_failure")]
+    pub escalate_on_repeated_failure: bool,
+    #[serde(default = "default_failure_quarantine_threshold")]
+    pub failure_quarantine_threshold: u32,
+}
+
+impl Default for EscalationRules {
+    fn default() -> Self {
+        Self {
+            escalate_on_missing_policy: default_escalate_on_missing_policy(),
+            escalate_on_authority_exceeded: default_escalate_on_authority_exceeded(),
+            escalate_on_repeated_failure: default_escalate_on_repeated_failure(),
+            failure_quarantine_threshold: default_failure_quarantine_threshold(),
+        }
+    }
+}
+
 /// Configuration for the automatic cycle top-up feature.
 ///
 /// When the canister's cycle balance drops below `auto_topup_cycle_threshold`,
@@ -860,6 +983,136 @@ pub struct TurnRecord {
     #[serde(default)]
     pub continuation_stop_reason: ContinuationStopReason,
     pub error: Option<String>,
+}
+
+/// Durable exposure record used for protocol concentration and reconciliation.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ActiveExposure {
+    pub strategy_id: String,
+    pub protocol: String,
+    pub chain_id: u64,
+    pub asset_symbol: String,
+    #[serde(default)]
+    pub notional_wei: Option<u128>,
+    pub updated_at_ns: u64,
+}
+
+/// Durable quarantine record for strategies blocked after repeated failures.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyQuarantine {
+    pub strategy_id: String,
+    pub reason: String,
+    pub failure_count: u32,
+    pub quarantined_at_ns: u64,
+    #[serde(default)]
+    pub release_after_ns: Option<u64>,
+}
+
+/// Trigger that caused an autonomous economic decision turn.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum DecisionTrigger {
+    ScheduledReview,
+    InboxMessage,
+    LowRunway,
+    PositionMaintenance,
+    RecoveryFollowUp,
+}
+
+/// Escalation category emitted when the automaton cannot proceed autonomously.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum EscalationClass {
+    MissingPolicy {
+        what: String,
+    },
+    OutOfAuthority {
+        what: String,
+    },
+    CapabilityGap {
+        what: String,
+    },
+    SafetyConflict {
+        what: String,
+    },
+    RepeatedFailure {
+        strategy: String,
+        failure_count: u32,
+    },
+}
+
+/// Terminal persisted decision outcome for an autonomous economic turn.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum DecisionOutcome {
+    Executed { action_summary: String },
+    Simulated { action_summary: String },
+    NoOp { reason: String },
+    Deferred { reason: String },
+    Escalated { gap: EscalationClass },
+}
+
+/// Durable audit record for recent autonomous economic decisions.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DecisionRecord {
+    pub turn_id: String,
+    pub timestamp_ns: u64,
+    pub trigger: DecisionTrigger,
+    pub outcome: DecisionOutcome,
+    pub policy_version: u32,
+    pub candidates_summary: String,
+    pub explanation: String,
+}
+
+/// Machine-readable terminal outcome required from autonomous economic turns.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum DecisionEnvelopeOutcome {
+    Executed { action_summary: String },
+    Simulated { action_summary: String },
+    NoOp { reason: String },
+    Deferred { reason: String },
+    Escalated { gap: EscalationClass },
+}
+
+impl From<DecisionEnvelopeOutcome> for DecisionOutcome {
+    fn from(outcome: DecisionEnvelopeOutcome) -> Self {
+        match outcome {
+            DecisionEnvelopeOutcome::Executed { action_summary } => {
+                Self::Executed { action_summary }
+            }
+            DecisionEnvelopeOutcome::Simulated { action_summary } => {
+                Self::Simulated { action_summary }
+            }
+            DecisionEnvelopeOutcome::NoOp { reason } => Self::NoOp { reason },
+            DecisionEnvelopeOutcome::Deferred { reason } => Self::Deferred { reason },
+            DecisionEnvelopeOutcome::Escalated { gap } => Self::Escalated { gap },
+        }
+    }
+}
+
+/// Final JSON contract for autonomous economic turns.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AutonomyDecisionEnvelope {
+    pub trigger: DecisionTrigger,
+    pub candidates_summary: String,
+    pub outcome: DecisionEnvelopeOutcome,
+    pub explanation: String,
+}
+
+/// Small operator-facing view of the last exposure reconciliation run.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ExposureReconciliationStatus {
+    #[serde(default)]
+    pub last_attempted_at_ns: Option<u64>,
+    #[serde(default)]
+    pub last_succeeded_at_ns: Option<u64>,
+    #[serde(default)]
+    pub repaired_exposures: u32,
+    #[serde(default)]
+    pub recreated_exposures: u32,
+    #[serde(default)]
+    pub closed_exposures: u32,
+    #[serde(default)]
+    pub drift_reason: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 /// Whether an inter-canister call is a query (read-only) or update (state-mutating).
@@ -2421,8 +2674,64 @@ fn default_wallet_balance_bootstrap_pending() -> bool {
     true
 }
 
+fn default_autonomy_policy_version() -> u32 {
+    1
+}
+
 fn default_autonomy_tool_dedupe_enabled() -> bool {
     true
+}
+
+fn default_min_cycles_runway_hours() -> u64 {
+    72
+}
+
+fn default_min_inference_usdc_6dp() -> Option<u64> {
+    Some(10_000_000)
+}
+
+fn default_min_gas_wei() -> Option<u128> {
+    Some(3_000_000_000_000_000)
+}
+
+fn default_max_total_exposure_bps() -> u16 {
+    3_000
+}
+
+fn default_max_single_action_bps() -> u16 {
+    1_000
+}
+
+fn default_max_protocol_concentration_bps() -> u16 {
+    1_500
+}
+
+fn default_autonomous_execution_enabled() -> bool {
+    true
+}
+
+fn default_require_simulation_first() -> bool {
+    true
+}
+
+fn default_per_action_value_limit_wei() -> Option<u128> {
+    Some(50_000_000_000_000_000)
+}
+
+fn default_escalate_on_missing_policy() -> bool {
+    true
+}
+
+fn default_escalate_on_authority_exceeded() -> bool {
+    true
+}
+
+fn default_escalate_on_repeated_failure() -> bool {
+    true
+}
+
+fn default_failure_quarantine_threshold() -> u32 {
+    3
 }
 
 fn default_autonomy_dedupe_window_secs() -> u64 {
@@ -2559,13 +2868,56 @@ fn default_maintenance_interval_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        InferenceConfigView, InferenceProvider, MemoryRollup, OpenRouterProxyWorkerConfig,
-        OpenRouterReasoningLevel, RecoveryContext, ReflectionMemoryRecord, ReflectionOrigin,
-        ResponseLimitPolicy, RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot,
-        SessionSummary, TurnWindowSummary, WalletBalanceSnapshot, WalletBalanceStatus,
-        WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+        AutonomyPolicy, InferenceConfigView, InferenceProvider, MemoryRollup,
+        OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, RecoveryContext,
+        ReflectionMemoryRecord, ReflectionOrigin, ResponseLimitPolicy, RetentionConfig,
+        RetentionMaintenanceRuntime, RuntimeSnapshot, SessionSummary, TurnWindowSummary,
+        WalletBalanceSnapshot, WalletBalanceStatus, WalletBalanceSyncConfig,
+        WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
     };
     use candid::Principal;
+
+    #[test]
+    fn autonomy_policy_defaults_are_conservative() {
+        let now_ns = 123_456_789;
+        let policy = AutonomyPolicy::conservative_default(now_ns);
+
+        assert_eq!(policy.version, 1);
+        assert_eq!(policy.updated_at_ns, now_ns);
+        assert_eq!(policy.reserve_policy.min_cycles_runway_hours, 72);
+        assert_eq!(
+            policy.reserve_policy.min_inference_usdc_6dp,
+            Some(10_000_000)
+        );
+        assert_eq!(
+            policy.reserve_policy.min_gas_wei,
+            Some(3_000_000_000_000_000)
+        );
+        assert_eq!(policy.risk_limits.max_total_exposure_bps, 3_000);
+        assert_eq!(policy.risk_limits.max_single_action_bps, 1_000);
+        assert_eq!(policy.risk_limits.max_protocol_concentration_bps, 1_500);
+        assert!(policy.execution_authority.autonomous_execution_enabled);
+        assert!(policy.execution_authority.require_simulation_first);
+        assert_eq!(
+            policy.execution_authority.per_action_value_limit_wei,
+            Some(50_000_000_000_000_000)
+        );
+        assert!(policy.escalation_rules.escalate_on_missing_policy);
+        assert!(policy.escalation_rules.escalate_on_authority_exceeded);
+        assert!(policy.escalation_rules.escalate_on_repeated_failure);
+        assert_eq!(policy.escalation_rules.failure_quarantine_threshold, 3);
+
+        let default_policy = AutonomyPolicy::default();
+        assert_eq!(default_policy.version, policy.version);
+        assert_eq!(default_policy.updated_at_ns, 0);
+        assert_eq!(default_policy.reserve_policy, policy.reserve_policy);
+        assert_eq!(default_policy.risk_limits, policy.risk_limits);
+        assert_eq!(
+            default_policy.execution_authority,
+            policy.execution_authority
+        );
+        assert_eq!(default_policy.escalation_rules, policy.escalation_rules);
+    }
 
     #[test]
     fn wallet_balance_defaults_match_locked_spec() {
