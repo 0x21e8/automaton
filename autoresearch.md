@@ -35,3 +35,4 @@ Reduce prompt size in `src/prompt.rs` while preserving prompt assembly behavior 
 - Kept: further compacted layers 1, 4, 7, 8, and 9 with smaller wording-only edits. Result: `prompt_bytes_total=12251` (`full=8599`, `compact=3652`, `lines_total=227`).
 - Kept: shortened `SECTION_SEPARATOR` from blank-line padded form to `\n---\n` and made the benchmark read the separator from source. Result: `prompt_bytes_total=12223` (`full=8579`, `compact=3644`, `lines_total=199`).
 - Kept: removed the explicit `- none active` line from the no-active-skills case in layer 5 rendering; the heading alone is enough. Result: `prompt_bytes_total=12195` (`full=8565`, `compact=3630`, `lines_total=197`).
+- Kept: condensed high-volume wording in layers 5-7 (especially layer 6 section labels and repeated phrasing) without changing tested directives or prompt structure. Result: `prompt_bytes_total=11944` (`full=8375`, `compact=3569`, `lines_total=197`).

@@ -4,3 +4,4 @@
 {"run":3,"commit":"99599d8","metric":12370,"metrics":{},"status":"keep","description":"Further trim redundant wording in layers 0, 2, 3, 5, and 6 while preserving section structure and tested directives","timestamp":1773842140760,"segment":0}
 {"run":4,"commit":"bc9a3cf","metric":12251,"metrics":{},"status":"keep","description":"Compact layers 1, 4, 7, 8, and 9 with wording-only reductions while preserving behavior and prompt tests","timestamp":1773842229525,"segment":0}
 {"run":5,"commit":"06045cf","metric":12223,"metrics":{},"status":"keep","description":"Shorten section separator to reduce prompt framing overhead and update benchmark to read the separator from source","timestamp":1773842277712,"segment":0}
+{"run":6,"commit":"97fe250","metric":12195,"metrics":{},"status":"keep","description":"Remove the no-active-skills placeholder line from layer 5 rendering to shave prompt overhead in both full and compact prompts","timestamp":1773842333802,"segment":0}
