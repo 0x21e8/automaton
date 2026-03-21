@@ -39,11 +39,11 @@ use crate::domain::types::{
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
     OutboxStats, PromptLayer, PromptLayerView, ReflectionMemoryRecord, RetentionConfig,
     RetentionMaintenanceRuntime, RuntimeView, ScheduledJob, SchedulerRuntime, SessionSummary,
-    SkillRecord, StewardCommand, StewardState, StewardStatusView, StrategyKillSwitchState,
-    StrategyOutcomeStats, StrategyQuarantine, StrategyTemplate, StrategyTemplateKey,
-    SubmitInferenceResultArgs, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
-    TemplateActivationState, TemplateRevocationState, TemplateStatus, ToolCallRecord,
-    TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    SkillRecord, SpawnBootstrapView, StewardCommand, StewardState, StewardStatusView,
+    StrategyKillSwitchState, StrategyOutcomeStats, StrategyQuarantine, StrategyTemplate,
+    StrategyTemplateKey, SubmitInferenceResultArgs, TaskKind, TaskScheduleConfig,
+    TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState, TemplateStatus,
+    ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
@@ -143,6 +143,33 @@ struct InitArgs {
     cycle_topup_enabled: Option<bool>,
     #[serde(default)]
     auto_topup_cycle_threshold: Option<u64>,
+    #[serde(default)]
+    spawn_bootstrap: Option<SpawnBootstrapArgs>,
+}
+
+#[derive(CandidType, Deserialize)]
+struct SpawnProviderBootstrapArgs {
+    #[serde(default)]
+    open_router_api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    brave_search_api_key: Option<String>,
+}
+
+#[derive(CandidType, Deserialize)]
+struct SpawnBootstrapArgs {
+    steward_address: String,
+    session_id: String,
+    #[serde(default)]
+    parent_id: Option<String>,
+    risk: u8,
+    #[serde(default)]
+    strategies: Vec<String>,
+    #[serde(default)]
+    skills: Vec<String>,
+    provider: SpawnProviderBootstrapArgs,
+    version_commit: String,
 }
 
 /// Arguments for the `ingest_strategy_abi_artifact_admin` update call.
@@ -481,6 +508,103 @@ fn init(args: InitArgs) {
     arm_timer();
 }
 
+fn normalize_optional_trimmed(value: Option<String>) -> Option<String> {
+    value.and_then(|entry| {
+        let trimmed = entry.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn normalize_string_list(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .filter_map(|entry| {
+            let trimmed = entry.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .collect()
+}
+
+fn validate_version_commit(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.len() != 40 {
+        return Err(
+            "spawn bootstrap version_commit must be a 40-character lowercase git SHA".to_string(),
+        );
+    }
+    if !trimmed
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("spawn bootstrap version_commit must be lowercase hex".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn apply_spawn_bootstrap(args: SpawnBootstrapArgs) -> Result<(), String> {
+    let chain_id = stable::runtime_snapshot().evm_cursor.chain_id;
+    let steward = stable::set_active_steward(Some(StewardState {
+        chain_id,
+        address: args.steward_address,
+        enabled: true,
+        last_used_at_ns: None,
+        principal: None,
+    }))?
+    .expect("spawn bootstrap should persist steward");
+
+    let session_id = args.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err("spawn bootstrap session_id cannot be empty".to_string());
+    }
+
+    let strategies = normalize_string_list(args.strategies);
+    let skills = normalize_string_list(args.skills);
+    let parent_id = normalize_optional_trimmed(args.parent_id);
+    let version_commit = validate_version_commit(&args.version_commit)?;
+    let model = normalize_optional_trimmed(args.provider.model);
+    let open_router_api_key = normalize_optional_trimmed(args.provider.open_router_api_key);
+    let brave_search_api_key = normalize_optional_trimmed(args.provider.brave_search_api_key);
+
+    if let Some(model) = model {
+        let _ = stable::set_inference_model(model)?;
+    }
+    if let Some(api_key) = open_router_api_key {
+        stable::set_openrouter_api_key(Some(api_key));
+        stable::set_inference_provider(InferenceProvider::OpenRouter);
+    }
+    if let Some(api_key) = brave_search_api_key {
+        let _ = apply_search_config(SearchConfigArgs {
+            api_key,
+            max_searches_per_turn: None,
+        })?;
+    }
+
+    stable::set_spawn_bootstrap_metadata(SpawnBootstrapView {
+        session_id: Some(session_id),
+        parent_id,
+        risk: Some(args.risk),
+        strategies,
+        skills,
+        version_commit: Some(version_commit),
+    });
+
+    log!(
+        StewardAdminLogPriority::StewardInfo,
+        "spawn_bootstrap_applied steward={} chain_id={} session_id_set=true",
+        steward.address,
+        steward.chain_id,
+    );
+    Ok(())
+}
+
 /// Applies all `InitArgs` fields to stable storage, trapping on the first
 /// validation error.  Separated from `init` so tests can call it directly.
 fn apply_init_args(args: InitArgs) {
@@ -519,6 +643,9 @@ fn apply_init_args(args: InitArgs) {
             max_searches_per_turn: None,
         })
         .unwrap_or_else(|error| ic_cdk::trap(&error));
+    }
+    if let Some(spawn_bootstrap) = args.spawn_bootstrap {
+        apply_spawn_bootstrap(spawn_bootstrap).unwrap_or_else(|error| ic_cdk::trap(&error));
     }
 
     let mut snapshot = stable::runtime_snapshot();
@@ -573,7 +700,7 @@ fn install_default_autonomy_policy_if_missing(source: &str) {
     let version = policy.version;
     let updated_at_ns = policy.updated_at_ns;
     if let Err(error) = stable::set_autonomy_policy(policy) {
-        ic_cdk::trap(&format!(
+        ic_cdk::trap(format!(
             "failed to install default autonomy policy on {source}: {error}"
         ));
     }
@@ -1223,6 +1350,12 @@ fn set_http_allowed_domains(domains: Vec<String>) -> Result<Vec<String>, String>
 #[ic_cdk::query]
 fn get_runtime_view() -> RuntimeView {
     stable::snapshot_to_view()
+}
+
+/// Returns the persisted launchpad/factory bootstrap metadata, if any.
+#[ic_cdk::query]
+fn get_spawn_bootstrap_view() -> SpawnBootstrapView {
+    stable::spawn_bootstrap_view_snapshot()
 }
 
 /// Returns the current EVM route state (chain ID, RPC URL, addresses, …).
@@ -2249,6 +2382,7 @@ mod tests {
             search_api_key: None,
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
+            spawn_bootstrap: None,
         });
 
         assert!(stable::is_http_allowlist_enforced());
@@ -2275,6 +2409,7 @@ mod tests {
             search_api_key: None,
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
+            spawn_bootstrap: None,
         });
 
         assert_eq!(stable::get_llm_canister_id(), "w36hm-eqaaa-aaaal-qr76a-cai");
@@ -2294,6 +2429,7 @@ mod tests {
             search_api_key: Some("brave-test-key".to_string()),
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
+            spawn_bootstrap: None,
         });
 
         assert_eq!(
@@ -2316,6 +2452,7 @@ mod tests {
             search_api_key: None,
             cycle_topup_enabled: Some(false),
             auto_topup_cycle_threshold: Some(150_000_000_000),
+            spawn_bootstrap: None,
         });
 
         let snapshot = stable::runtime_snapshot();
@@ -2340,10 +2477,72 @@ mod tests {
             search_api_key: None,
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
+            spawn_bootstrap: None,
         });
 
         let snapshot = stable::runtime_snapshot();
         assert_eq!(snapshot.evm_bootstrap_lookback_blocks, 0);
+    }
+
+    #[test]
+    fn apply_init_args_can_apply_spawn_bootstrap() {
+        apply_init_args(InitArgs {
+            ecdsa_key_name: "dfx_test_key".to_string(),
+            inbox_contract_address: None,
+            evm_chain_id: Some(31337),
+            evm_rpc_url: None,
+            evm_confirmation_depth: None,
+            evm_bootstrap_lookback_blocks: None,
+            http_allowed_domains: None,
+            llm_canister_id: None,
+            search_api_key: None,
+            cycle_topup_enabled: None,
+            auto_topup_cycle_threshold: None,
+            spawn_bootstrap: Some(SpawnBootstrapArgs {
+                steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),
+                session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                parent_id: Some("parent-automaton".to_string()),
+                risk: 4,
+                strategies: vec![" carry ".to_string(), "".to_string()],
+                skills: vec![" messaging ".to_string()],
+                provider: SpawnProviderBootstrapArgs {
+                    open_router_api_key: Some(" sk-or-test ".to_string()),
+                    model: Some(" openai/gpt-4o-mini ".to_string()),
+                    brave_search_api_key: Some(" brave-test-key ".to_string()),
+                },
+                version_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            }),
+        });
+
+        let steward = stable::active_steward().expect("spawn bootstrap should configure steward");
+        assert_eq!(steward.chain_id, 31337);
+        assert_eq!(
+            steward.address,
+            "0x62daffdc4d59ea05feddb0a77a266b0a7b6f28ca"
+        );
+        assert!(steward.enabled);
+
+        let snapshot = stable::runtime_snapshot();
+        assert_eq!(snapshot.inference_provider, InferenceProvider::OpenRouter);
+        assert_eq!(snapshot.inference_model, "openai/gpt-4o-mini");
+        assert_eq!(snapshot.openrouter_api_key, Some("sk-or-test".to_string()));
+        assert_eq!(
+            stable::get_search_api_key(),
+            Some("brave-test-key".to_string())
+        );
+
+        let bootstrap = get_spawn_bootstrap_view();
+        assert_eq!(
+            bootstrap,
+            SpawnBootstrapView {
+                session_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+                parent_id: Some("parent-automaton".to_string()),
+                risk: Some(4),
+                strategies: vec!["carry".to_string()],
+                skills: vec!["messaging".to_string()],
+                version_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            }
+        );
     }
 
     #[test]

@@ -197,7 +197,7 @@ fn infer_notional_wei(args: &Value) -> Option<u128> {
         "amount",
     ] {
         if let Some(value) = find_first_scalar(args, candidate) {
-            if let Some(parsed) = parse_u128_value(&value) {
+            if let Some(parsed) = parse_u128_value(value) {
                 return Some(parsed);
             }
         }
@@ -213,7 +213,7 @@ fn parse_u128_value(value: &Value) -> Option<u128> {
     }
 }
 
-fn find_first_string<'a>(value: &'a Value, dotted_key: &str) -> Option<String> {
+fn find_first_string(value: &Value, dotted_key: &str) -> Option<String> {
     find_first_scalar(value, dotted_key).and_then(|value| {
         value
             .as_str()
@@ -315,7 +315,7 @@ mod tests {
             error: None,
         };
         let tool_call = sample_tool_call();
-        stable::append_turn_record(&turn, &[tool_call.clone()]);
+        stable::append_turn_record(&turn, std::slice::from_ref(&tool_call));
 
         assert_eq!(
             stable::active_exposure("morpho-v1:supply:8453:morpho-enter-supply"),

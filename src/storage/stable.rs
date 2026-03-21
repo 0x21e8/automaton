@@ -18,13 +18,13 @@ use crate::domain::types::{
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
     OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, ReflectionMemoryRecord,
     ReflectionOrigin, RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView,
-    ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord, StewardNonceState,
-    StewardState, StewardStatusView, StorageGrowthMetrics, StoragePressureLevel,
-    StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats,
-    StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
-    SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane, TaskScheduleConfig,
-    TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState, ToolCallRecord,
-    TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
+    ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord,
+    SpawnBootstrapView, StewardNonceState, StewardState, StewardStatusView, StorageGrowthMetrics,
+    StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind,
+    StrategyOutcomeStats, StrategyQuarantine, StrategyTemplate, StrategyTemplateKey,
+    SubmitInferenceResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+    TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState,
+    ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
     WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 pub use crate::domain::types::{
@@ -1652,6 +1652,27 @@ pub fn steward_status_view() -> StewardStatusView {
         active_steward: snapshot.active_steward,
         next_nonce: snapshot.steward_nonce.next_nonce,
     }
+}
+
+pub fn set_spawn_bootstrap_metadata(view: SpawnBootstrapView) -> SpawnBootstrapView {
+    let mut snapshot = runtime_snapshot();
+    snapshot.spawn_session_id = view.session_id.clone();
+    snapshot.spawn_parent_id = view.parent_id.clone();
+    snapshot.spawn_risk = view.risk;
+    snapshot.spawn_strategies = view.strategies.clone();
+    snapshot.spawn_skills = view.skills.clone();
+    snapshot.installed_version_commit = view.version_commit.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    view
+}
+
+pub fn spawn_bootstrap_view() -> SpawnBootstrapView {
+    SpawnBootstrapView::from(&runtime_snapshot())
+}
+
+pub fn installed_version_commit() -> Option<String> {
+    runtime_snapshot().installed_version_commit
 }
 
 pub fn set_steward_nonce_state(state: StewardNonceState) -> StewardNonceState {
@@ -3554,6 +3575,10 @@ pub fn increment_turn_counter() -> RuntimeSnapshot {
 
 pub fn snapshot_to_view() -> RuntimeView {
     RuntimeView::from(&runtime_snapshot())
+}
+
+pub fn spawn_bootstrap_view_snapshot() -> SpawnBootstrapView {
+    SpawnBootstrapView::from(&runtime_snapshot())
 }
 
 pub fn evm_route_state_view() -> EvmRouteStateView {

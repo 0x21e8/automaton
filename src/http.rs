@@ -223,7 +223,7 @@ struct WelcomeView {
 /// Serialisable build metadata served by `GET /api/build-info`.
 #[derive(Clone, Debug, Serialize)]
 struct BuildInfoView {
-    commit: &'static str,
+    commit: String,
 }
 
 /// Serialisable scheduler timing configuration served by
@@ -285,7 +285,11 @@ fn welcome_view() -> WelcomeView {
 
 fn build_info_view() -> BuildInfoView {
     BuildInfoView {
-        commit: option_env!("AUTOMATON_GIT_COMMIT").unwrap_or("unknown"),
+        commit: stable::installed_version_commit().unwrap_or_else(|| {
+            option_env!("AUTOMATON_GIT_COMMIT")
+                .unwrap_or("unknown")
+                .to_string()
+        }),
     }
 }
 
@@ -1664,6 +1668,30 @@ mod tests {
         assert_eq!(
             body.get("commit").and_then(Value::as_str),
             Some(option_env!("AUTOMATON_GIT_COMMIT").unwrap_or("unknown"))
+        );
+    }
+
+    #[test]
+    fn get_build_info_route_prefers_installed_version_commit() {
+        stable::init_storage();
+        let _ = stable::set_spawn_bootstrap_metadata(crate::domain::types::SpawnBootstrapView {
+            session_id: None,
+            parent_id: None,
+            risk: None,
+            strategies: Vec::new(),
+            skills: Vec::new(),
+            version_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        });
+        init_certification();
+
+        let request = HttpRequest::get("/api/build-info").build();
+        let response = handle_http_request(request);
+        let body = serde_json::from_slice::<Value>(response.body())
+            .expect("build info body should decode as json");
+
+        assert_eq!(
+            body.get("commit").and_then(Value::as_str),
+            Some("0123456789abcdef0123456789abcdef01234567")
         );
     }
 

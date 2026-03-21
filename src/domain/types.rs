@@ -866,6 +866,8 @@ pub struct RuntimeSnapshot {
     #[serde(default)]
     pub openrouter_proxy: OpenRouterProxyWorkerConfig,
     #[serde(default)]
+    pub installed_version_commit: Option<String>,
+    #[serde(default)]
     pub ecdsa_key_name: String,
     #[serde(default)]
     pub evm_address: Option<String>,
@@ -889,6 +891,16 @@ pub struct RuntimeSnapshot {
     pub wallet_balance_sync: WalletBalanceSyncConfig,
     #[serde(default)]
     pub autonomy_suppression: AutonomySuppressionConfig,
+    #[serde(default)]
+    pub spawn_session_id: Option<String>,
+    #[serde(default)]
+    pub spawn_parent_id: Option<String>,
+    #[serde(default)]
+    pub spawn_risk: Option<u8>,
+    #[serde(default)]
+    pub spawn_strategies: Vec<String>,
+    #[serde(default)]
+    pub spawn_skills: Vec<String>,
     #[serde(default = "default_wallet_balance_bootstrap_pending")]
     pub wallet_balance_bootstrap_pending: bool,
     #[serde(default)]
@@ -919,6 +931,7 @@ impl Default for RuntimeSnapshot {
             openrouter_max_response_bytes: default_openrouter_max_response_bytes(),
             openrouter_reasoning_level: OpenRouterReasoningLevel::default(),
             openrouter_proxy: OpenRouterProxyWorkerConfig::default(),
+            installed_version_commit: None,
             ecdsa_key_name: String::new(),
             evm_address: None,
             inbox_contract_address: None,
@@ -931,6 +944,11 @@ impl Default for RuntimeSnapshot {
             wallet_balance: WalletBalanceSnapshot::default(),
             wallet_balance_sync: WalletBalanceSyncConfig::default(),
             autonomy_suppression: AutonomySuppressionConfig::default(),
+            spawn_session_id: None,
+            spawn_parent_id: None,
+            spawn_risk: None,
+            spawn_strategies: Vec::new(),
+            spawn_skills: Vec::new(),
             wallet_balance_bootstrap_pending: default_wallet_balance_bootstrap_pending(),
             cycle_topup: CycleTopUpConfig::default(),
             timing_telemetry: RuntimeTimingTelemetry::default(),
@@ -1575,6 +1593,22 @@ pub struct RuntimeView {
     pub timing_telemetry: RuntimeTimingTelemetry,
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct SpawnBootstrapView {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub risk: Option<u8>,
+    #[serde(default)]
+    pub strategies: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub version_commit: Option<String>,
+}
+
 /// Read-only view of the EVM polling configuration and cursor, returned by queries.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct EvmRouteStateView {
@@ -1606,6 +1640,19 @@ impl From<&RuntimeSnapshot> for RuntimeView {
             inference_provider: snapshot.inference_provider.clone(),
             inference_model: snapshot.inference_model.clone(),
             timing_telemetry: snapshot.timing_telemetry.clone(),
+        }
+    }
+}
+
+impl From<&RuntimeSnapshot> for SpawnBootstrapView {
+    fn from(snapshot: &RuntimeSnapshot) -> Self {
+        Self {
+            session_id: snapshot.spawn_session_id.clone(),
+            parent_id: snapshot.spawn_parent_id.clone(),
+            risk: snapshot.spawn_risk,
+            strategies: snapshot.spawn_strategies.clone(),
+            skills: snapshot.spawn_skills.clone(),
+            version_commit: snapshot.installed_version_commit.clone(),
         }
     }
 }

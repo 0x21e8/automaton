@@ -258,6 +258,7 @@ type InitArgs = record {
   evm_confirmation_depth : opt nat64;
   evm_rpc_url : opt text;
   ecdsa_key_name : text;
+  spawn_bootstrap : opt SpawnBootstrapArgs;
   llm_canister_id : opt principal;
   auto_topup_cycle_threshold : opt nat64;
   cycle_topup_enabled : opt bool;
@@ -509,6 +510,29 @@ type SkillRecord = record {
   enabled : bool;
   mutable : bool;
   allowed_canister_calls : vec CanisterCallPermission;
+};
+type SpawnBootstrapArgs = record {
+  provider : SpawnProviderBootstrapArgs;
+  session_id : text;
+  risk : nat8;
+  parent_id : opt text;
+  version_commit : text;
+  skills : vec text;
+  steward_address : text;
+  strategies : vec text;
+};
+type SpawnBootstrapView = record {
+  session_id : opt text;
+  risk : opt nat8;
+  parent_id : opt text;
+  version_commit : opt text;
+  skills : vec text;
+  strategies : vec text;
+};
+type SpawnProviderBootstrapArgs = record {
+  model : opt text;
+  open_router_api_key : opt text;
+  brave_search_api_key : opt text;
 };
 type StewardCommand = variant {
   IngestStrategyAbiArtifact : StrategyAbiIngestArgs;
@@ -802,7 +826,7 @@ service : (InitArgs) -> {
   activate_strategy_template_admin : (StrategyTemplateKey, opt text) -> (
       Result,
     );
-  // Stores the web-search API key and optional search budget overrides (controller only).
+  // Stores the web-search API key and optional per-turn search budget override (controller only).
   configure_search : (SearchConfigArgs) -> (Result_1);
   // Marks a template as `Deprecated` and deactivates it.  Use this for orderly
   // rotation; the template remains readable (controller only).
@@ -857,6 +881,8 @@ service : (InitArgs) -> {
   get_scheduler_view : () -> (SchedulerRuntime) query;
   // Returns the agent's "soul" — the core identity/persona prompt layer.
   get_soul : () -> (text) query;
+  // Returns the persisted launchpad/factory bootstrap metadata, if any.
+  get_spawn_bootstrap_view : () -> (SpawnBootstrapView) query;
   // Returns the currently configured steward identity and next expected nonce.
   get_steward_status : () -> (StewardStatusView) query;
   // Returns accumulated outcome statistics (success/failure counts, last outcome)
