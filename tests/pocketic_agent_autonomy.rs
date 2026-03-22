@@ -276,11 +276,22 @@ enum DecisionTrigger {
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum EscalationClass {
-    MissingPolicy { what: String },
-    OutOfAuthority { what: String },
-    CapabilityGap { what: String },
-    SafetyConflict { what: String },
-    RepeatedFailure { strategy: String, failure_count: u32 },
+    MissingPolicy {
+        what: String,
+    },
+    OutOfAuthority {
+        what: String,
+    },
+    CapabilityGap {
+        what: String,
+    },
+    SafetyConflict {
+        what: String,
+    },
+    RepeatedFailure {
+        strategy: String,
+        failure_count: u32,
+    },
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1492,7 +1503,9 @@ fn invalid_autonomy_decision_envelope_falls_back_to_noop_in_pocketic() {
     )
     .expect("prompt layer update should succeed");
     assert_eq!(updated.layer_id, 6);
-    assert!(updated.content.contains("request_autonomy_decision_invalid_persistent:true"));
+    assert!(updated
+        .content
+        .contains("request_autonomy_decision_invalid_persistent:true"));
 
     pic.advance_time(Duration::from_secs(61));
     pic.tick();

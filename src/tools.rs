@@ -2628,12 +2628,7 @@ async fn execute_strategy_action_tool(
         return Err(format!("strategy validation failed: {error}"));
     }
 
-    enforce_strategy_execution_policy(
-        &policy,
-        &plan,
-        history,
-        args_json,
-    )?;
+    enforce_strategy_execution_policy(&policy, &plan, history, args_json)?;
 
     log!(
         StrategyToolLogPriority::Info,
@@ -2725,8 +2720,8 @@ fn enforce_strategy_execution_policy(
 
 fn enforce_reserve_floors(policy: &AutonomyPolicy) -> Result<(), String> {
     let cycles = stable::cycle_telemetry();
-    let min_cycles_runway_secs = u128::from(policy.reserve_policy.min_cycles_runway_hours)
-        .saturating_mul(3_600);
+    let min_cycles_runway_secs =
+        u128::from(policy.reserve_policy.min_cycles_runway_hours).saturating_mul(3_600);
     if cycles.total_cycles > 0 && cycles.liquid_cycles > 0 {
         if let Some(estimated_seconds) = cycles.estimated_seconds_until_freezing_threshold {
             if u128::from(estimated_seconds) < min_cycles_runway_secs {
@@ -2753,7 +2748,9 @@ fn enforce_reserve_floors(policy: &AutonomyPolicy) -> Result<(), String> {
 
     let snapshot = stable::wallet_balance_snapshot();
     if let Some(min_gas_wei) = policy.reserve_policy.min_gas_wei {
-        if let Some(eth_balance_wei) = parse_optional_hex_u128(snapshot.eth_balance_wei_hex.as_deref()) {
+        if let Some(eth_balance_wei) =
+            parse_optional_hex_u128(snapshot.eth_balance_wei_hex.as_deref())
+        {
             if eth_balance_wei < min_gas_wei {
                 return Err(format!(
                     "execute_strategy_action blocked: reserve_gas_floor_below_min:{}",
@@ -2764,7 +2761,9 @@ fn enforce_reserve_floors(policy: &AutonomyPolicy) -> Result<(), String> {
     }
 
     if let Some(min_inference_usdc_6dp) = policy.reserve_policy.min_inference_usdc_6dp {
-        if let Some(usdc_balance_raw) = parse_optional_hex_u128(snapshot.usdc_balance_raw_hex.as_deref()) {
+        if let Some(usdc_balance_raw) =
+            parse_optional_hex_u128(snapshot.usdc_balance_raw_hex.as_deref())
+        {
             if usdc_balance_raw < u128::from(min_inference_usdc_6dp) {
                 return Err(format!(
                     "execute_strategy_action blocked: reserve_usdc_floor_below_min:{}",
@@ -2870,9 +2869,7 @@ fn strategy_simulation_succeeded(history: &[ToolCallRecord], plan: &ExecutionPla
         }
         parse_strategy_intent_args(&record.args_json)
             .ok()
-            .map(|intent| {
-                intent.key == plan.key && intent.action_id == plan.action_id
-            })
+            .map(|intent| intent.key == plan.key && intent.action_id == plan.action_id)
             .unwrap_or(false)
     })
 }
@@ -2903,13 +2900,14 @@ fn active_strategy_quarantine(strategy_id: &str, now_ns: u64) -> Option<Strategy
 
 fn record_strategy_failure(plan: &ExecutionPlan, reason: &str, now_ns: u64) {
     let strategy_id = strategy_id_from_key(&plan.key);
-    let mut quarantine = stable::strategy_quarantine(&strategy_id).unwrap_or_else(|| StrategyQuarantine {
-        strategy_id: strategy_id.clone(),
-        reason: reason.to_string(),
-        failure_count: 0,
-        quarantined_at_ns: now_ns,
-        release_after_ns: None,
-    });
+    let mut quarantine =
+        stable::strategy_quarantine(&strategy_id).unwrap_or_else(|| StrategyQuarantine {
+            strategy_id: strategy_id.clone(),
+            reason: reason.to_string(),
+            failure_count: 0,
+            quarantined_at_ns: now_ns,
+            release_after_ns: None,
+        });
     quarantine.failure_count = quarantine.failure_count.saturating_add(1);
     quarantine.reason = reason.to_string();
     if quarantine.quarantined_at_ns == 0 {
@@ -2919,7 +2917,8 @@ fn record_strategy_failure(plan: &ExecutionPlan, reason: &str, now_ns: u64) {
     if quarantine.failure_count >= policy.escalation_rules.failure_quarantine_threshold {
         quarantine.release_after_ns = Some(
             now_ns.saturating_add(
-                stable::autonomy_suppression_config().failure_cooldown_secs
+                stable::autonomy_suppression_config()
+                    .failure_cooldown_secs
                     .saturating_mul(1_000_000_000),
             ),
         );
@@ -2927,7 +2926,11 @@ fn record_strategy_failure(plan: &ExecutionPlan, reason: &str, now_ns: u64) {
     let _ = stable::set_strategy_quarantine(quarantine);
 }
 
-fn record_strategy_success(plan: &ExecutionPlan, args_json: &str, now_ns: u64) -> Result<(), String> {
+fn record_strategy_success(
+    plan: &ExecutionPlan,
+    args_json: &str,
+    now_ns: u64,
+) -> Result<(), String> {
     let strategy_id = strategy_id_from_key(&plan.key);
     if is_enter_or_exit_action(&plan.action_id) {
         let updated = match plan.action_id.starts_with("exit_") {
@@ -2957,8 +2960,10 @@ fn update_exposure_after_enter(
     let notional_wei = parse_strategy_notional_wei(args_json);
     let asset_symbol = parse_strategy_asset_symbol(args_json, &key.template_id);
     let existing = stable::active_exposure(strategy_id);
-    let next_notional = match (existing.as_ref().and_then(|exposure| exposure.notional_wei), notional_wei)
-    {
+    let next_notional = match (
+        existing.as_ref().and_then(|exposure| exposure.notional_wei),
+        notional_wei,
+    ) {
         (Some(current), Some(delta)) => Some(current.saturating_add(delta)),
         (Some(current), None) => Some(current),
         (None, Some(delta)) => Some(delta),

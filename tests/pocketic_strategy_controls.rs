@@ -261,11 +261,22 @@ enum DecisionTrigger {
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum EscalationClass {
-    MissingPolicy { what: String },
-    OutOfAuthority { what: String },
-    CapabilityGap { what: String },
-    SafetyConflict { what: String },
-    RepeatedFailure { strategy: String, failure_count: u32 },
+    MissingPolicy {
+        what: String,
+    },
+    OutOfAuthority {
+        what: String,
+    },
+    CapabilityGap {
+        what: String,
+    },
+    SafetyConflict {
+        what: String,
+    },
+    RepeatedFailure {
+        strategy: String,
+        failure_count: u32,
+    },
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -412,7 +423,8 @@ fn set_task_interval_secs(
     let payload = encode_args((kind, interval_secs)).unwrap_or_else(|error| {
         panic!("failed to encode set_task_interval_secs args: {error}");
     });
-    let _: Result<String, String> = call_update(pic, canister_id, "set_task_interval_secs", payload);
+    let _: Result<String, String> =
+        call_update(pic, canister_id, "set_task_interval_secs", payload);
 }
 
 fn configure_only_agent_turn(pic: &PocketIc, canister_id: Principal, interval_secs: u64) {
@@ -490,7 +502,11 @@ fn get_exposure_reconciliation_status(
     )
 }
 
-fn get_tool_calls_for_turn(pic: &PocketIc, canister_id: Principal, turn_id: &str) -> Vec<ToolCallRecord> {
+fn get_tool_calls_for_turn(
+    pic: &PocketIc,
+    canister_id: Principal,
+    turn_id: &str,
+) -> Vec<ToolCallRecord> {
     call_query(
         pic,
         canister_id,
@@ -614,12 +630,13 @@ fn drive_openrouter_strategy_turn(pic: &PocketIc, canister_id: Principal) -> Str
         let runtime = get_runtime_view(pic, canister_id);
         if runtime.turn_counter > starting_turn_counter
             && pic.get_canister_http().is_empty()
-            && runtime
-                .last_turn_id
-                .as_ref()
-                .is_some_and(|turn_id| !get_tool_calls_for_turn(pic, canister_id, turn_id).is_empty())
+            && runtime.last_turn_id.as_ref().is_some_and(|turn_id| {
+                !get_tool_calls_for_turn(pic, canister_id, turn_id).is_empty()
+            })
         {
-            return runtime.last_turn_id.expect("turn id should be present when tool calls exist");
+            return runtime
+                .last_turn_id
+                .expect("turn id should be present when tool calls exist");
         }
     }
 
