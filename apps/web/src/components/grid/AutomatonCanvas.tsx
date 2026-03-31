@@ -310,39 +310,6 @@ export function AutomatonCanvas({
       }
       drawingContext.setLineDash([]);
 
-      const messageRoutes = nodes
-        .flatMap((node, index) => {
-          const next = nodes[(index + 1) % nodes.length];
-
-          if (next === undefined || next.automaton.canisterId === node.automaton.canisterId) {
-            return [];
-          }
-
-          return [[node, next] as const];
-        })
-        .slice(0, 3);
-
-      drawingContext.strokeStyle = "rgba(0, 0, 0, 0.12)";
-      drawingContext.lineWidth = 1;
-      for (const [from, to] of messageRoutes) {
-        drawManhattanPath(drawingContext, from, to);
-
-        const progress = (timeSeconds * 0.12 + from.cx * 0.0008) % 1;
-        const midX =
-          progress < 0.5
-            ? from.cx + (to.cx - from.cx) * (progress * 2)
-            : to.cx;
-        const midY =
-          progress < 0.5
-            ? from.cy
-            : from.cy + (to.cy - from.cy) * ((progress - 0.5) * 2);
-
-        drawingContext.fillStyle = "rgba(230, 51, 18, 0.88)";
-        drawingContext.beginPath();
-        drawingContext.arc(midX, midY, 3.2, 0, Math.PI * 2);
-        drawingContext.fill();
-      }
-
       const nextHitAreas: HitArea[] = [];
 
       for (const node of nodes) {
