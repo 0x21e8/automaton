@@ -25,6 +25,7 @@
     "playground:bootstrap": "sh ./scripts/playground-bootstrap.sh",
     "playground:reset": "sh ./scripts/playground-reset.sh",
     "playground:smoke": "sh ./scripts/playground-smoke.sh",
+    "playground:spawn-payment-e2e": "sh ./scripts/spawn-payment-e2e.sh",
     "playground:status": "sh ./scripts/with-repo-node.sh node ./scripts/write-playground-status.mjs",
     "factory:upload-artifact": "sh ./scripts/with-repo-node.sh node ./scripts/upload-factory-artifact.mjs",
     "evm:test": "forge test --root evm",

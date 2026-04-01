@@ -282,6 +282,10 @@ npm run factory:upload-artifact
 # 8. Smoke-test the full deposit → release path
 sh ./scripts/smoke-local-escrow.sh
 # → writes tmp/local-escrow-smoke.json
+
+# 9. Run the playground smoke plus a dedicated spawn payment e2e
+npm run playground:spawn-payment-e2e
+# → writes tmp/playground-smoke.json and tmp/spawn-payment-e2e.json
 ```
 
 The smoke script mints MockUSDC-compatible balances at the configured USDC token address, deposits into escrow, verifies the `Deposited` event is discoverable via `eth_getLogs`, and calls `release`.

@@ -5,6 +5,13 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      run_playground_spawn_e2e:
+        description: Run the spawn payment e2e against the configured playground VPS.
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -18,6 +25,7 @@ env:
 
 jobs:
   validate:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.run_playground_spawn_e2e }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -82,3 +90,77 @@ jobs:
 
       - name: Build rpc-gateway image
         run: docker build -f apps/rpc-gateway/Dockerfile -t automaton-playground-rpc-gateway:ci .
+
+  playground-spawn-payment-e2e:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_playground_spawn_e2e }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: playground-vps
+
+    steps:
+      - name: Install Tailscale
+        if: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Join Tailnet
+        if: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY != '' }}
+        shell: bash
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTHKEY" \
+            --hostname="gha-playground-e2e-${GITHUB_RUN_ID}" \
+            --accept-routes=false \
+            --ssh=false
+          tailscale status
+
+      - name: Prepare SSH files
+        shell: bash
+        env:
+          VPS_KNOWN_HOSTS: ${{ secrets.PLAYGROUND_VPS_KNOWN_HOSTS }}
+          VPS_SSH_KEY: ${{ secrets.PLAYGROUND_VPS_SSH_KEY }}
+          PLAYGROUND_VPS_REPO_ROOT: ${{ vars.PLAYGROUND_VPS_REPO_ROOT }}
+          PLAYGROUND_ENV_FILE: /etc/automaton-playground/playground.env
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          printf '%s\n' "$VPS_SSH_KEY" >"$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          python3 - <<'PY' >"$RUNNER_TEMP/playground-e2e.env"
+          import os, shlex
+          values = {
+              "PLAYGROUND_VPS_REPO_ROOT": os.environ.get("PLAYGROUND_VPS_REPO_ROOT", ""),
+              "PLAYGROUND_ENV_FILE": os.environ.get("PLAYGROUND_ENV_FILE", ""),
+          }
+          for key, value in values.items():
+              if value:
+                  print(f"{key}={shlex.quote(value)}")
+          PY
+
+      - name: Run remote spawn payment e2e
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.PLAYGROUND_VPS_HOST }}
+          VPS_PORT: ${{ secrets.PLAYGROUND_VPS_PORT }}
+          VPS_USER: ${{ secrets.PLAYGROUND_VPS_USER }}
+        run: |
+          set -euo pipefail
+          port="${VPS_PORT:-22}"
+          repo_root="${PLAYGROUND_VPS_REPO_ROOT:-/srv/automaton-launchpad/current}"
+          remote_env="/tmp/automaton-playground-e2e-${GITHUB_RUN_ID}.env"
+          scp -P "$port" "$RUNNER_TEMP/playground-e2e.env" "${VPS_USER}@${VPS_HOST}:${remote_env}"
+          ssh -p "$port" "${VPS_USER}@${VPS_HOST}" \
+            "set -euo pipefail; . '${remote_env}'; repo_root=\${PLAYGROUND_VPS_REPO_ROOT:-${repo_root}}; if [ -n \"\${PLAYGROUND_ENV_FILE:-}\" ] && [ -f \"\${PLAYGROUND_ENV_FILE}\" ]; then . \"\${PLAYGROUND_ENV_FILE}\"; fi; cd \"\${repo_root}\"; npm run playground:spawn-payment-e2e; rm -f '${remote_env}'"
+
+      - name: Leave Tailnet
+        if: ${{ always() && secrets.PLAYGROUND_TAILSCALE_AUTHKEY != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo tailscale logout || true
