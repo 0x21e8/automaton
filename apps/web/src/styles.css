@@ -1415,6 +1415,13 @@ h2 {
   text-transform: uppercase;
 }
 
+.provider-model-price {
+  color: var(--color-ink, #1a1a1a);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
 .fund-field {
   min-width: 0;
 }

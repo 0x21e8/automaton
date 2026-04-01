@@ -31,6 +31,7 @@ import {
   hexQuantityToBigInt,
   parseDecimalAmount,
   resolveSpawnChainId,
+  resolveSpawnChainMetadata,
   resolveSpawnUsdcContractAddress
 } from "../../lib/wallet-transaction-helpers";
 import {
@@ -42,9 +43,6 @@ import {
   getFundingPreview,
   getSelectedModel,
   getRiskProfile,
-  skillCatalog,
-  strategyCatalog,
-  toggleSelection,
   TOTAL_SPAWN_STEPS,
   type SpawnWizardState
 } from "./spawn-state";
@@ -53,8 +51,6 @@ import { ChainStep } from "./steps/ChainStep";
 import { FundStep } from "./steps/FundStep";
 import { ProviderConfigStep } from "./steps/ProviderConfigStep";
 import { RiskStep } from "./steps/RiskStep";
-import { SkillsStep } from "./steps/SkillsStep";
-import { StrategiesStep } from "./steps/StrategiesStep";
 
 interface SpawnWizardProps {
   isOpen: boolean;
@@ -76,8 +72,6 @@ interface WalletBalanceState {
 const stepTitles = [
   "Select chain",
   "Risk appetite",
-  "Strategies",
-  "Skills",
   "Provider config",
   "Fund"
 ] as const;
@@ -109,6 +103,22 @@ function formatNullableValue(value: string | null): string {
 
 function formatShortHash(value: string): string {
   return `${value.slice(0, 10)}...${value.slice(-8)}`;
+}
+
+function describePendingReceipts(
+  pendingReceipts: SpawnPaymentExecutionResult["pendingReceipts"]
+): string {
+  if (pendingReceipts.length === 0) {
+    return "";
+  }
+
+  if (pendingReceipts.length === 1) {
+    return pendingReceipts[0] === "approval"
+      ? "approval transaction"
+      : "deposit transaction";
+  }
+
+  return "approval and deposit transactions";
 }
 
 function formatTokenAmount(
@@ -154,6 +164,46 @@ function formatClaimWindow(seconds: number): string {
   }
 
   return `${seconds}s`;
+}
+
+async function requestRpcHexValue(
+  rpcUrl: string,
+  method: string,
+  params: unknown[]
+): Promise<string> {
+  const response = await fetch(rpcUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: Date.now(),
+      method,
+      params
+    })
+  });
+
+  const payload = (await response.json()) as {
+    error?: {
+      message?: unknown;
+    };
+    result?: unknown;
+  };
+
+  if (!response.ok || payload.error) {
+    throw new Error(
+      typeof payload.error?.message === "string"
+        ? payload.error.message
+        : `${method} failed.`
+    );
+  }
+
+  if (typeof payload.result !== "string") {
+    throw new Error(`${method} returned an unreadable response.`);
+  }
+
+  return payload.result;
 }
 
 function formatFaucetAmounts(metadata: PlaygroundMetadata | null): string {
@@ -335,8 +385,26 @@ export function SpawnWizard({
       return;
     }
 
-    const usdcContractAddress = resolveSpawnUsdcContractAddress(state.chain);
+    const chainMetadata = resolveSpawnChainMetadata(
+      state.chain,
+      playgroundMetadata
+    );
+    const rpcUrl = chainMetadata?.rpcUrl;
+    const usdcContractAddress = resolveSpawnUsdcContractAddress(
+      state.chain,
+      import.meta.env
+    );
     const balanceOfData = encodeErc20BalanceOfData(viewerAddress);
+
+    if (rpcUrl === null || rpcUrl === undefined) {
+      setWalletBalances({
+        error: "Playground RPC URL is unavailable for balance checks.",
+        ethWei: null,
+        isLoading: false,
+        usdcRaw: null
+      });
+      return;
+    }
 
     if (balanceOfData === null) {
       setWalletBalances({
@@ -357,22 +425,16 @@ export function SpawnWizard({
     }));
 
     void Promise.all([
-      walletSession.request<string>({
-        method: "eth_getBalance",
-        params: [viewerAddress, "latest"]
-      }),
+      requestRpcHexValue(rpcUrl, "eth_getBalance", [viewerAddress, "latest"]),
       usdcContractAddress === null
         ? Promise.resolve<string | null>(null)
-        : walletSession.request<string>({
-            method: "eth_call",
-            params: [
-              {
-                data: balanceOfData,
-                to: usdcContractAddress
-              },
-              "latest"
-            ]
-          })
+        : requestRpcHexValue(rpcUrl, "eth_call", [
+            {
+              data: balanceOfData,
+              to: usdcContractAddress
+            },
+            "latest"
+          ])
     ])
       .then(([ethBalanceHex, usdcBalanceHex]) => {
         if (cancelled) {
@@ -419,6 +481,7 @@ export function SpawnWizard({
   }, [
     balanceRefreshToken,
     isOpen,
+    playgroundMetadata,
     state.chain,
     viewerAddress,
     walletOnExpectedChain,
@@ -508,7 +571,6 @@ export function SpawnWizard({
   }
 
   async function submitPaymentForSession(
-    grossPayment: SpawnPaymentExecutionResult | null,
     payment:
       | {
           sessionId: string;
@@ -522,7 +584,7 @@ export function SpawnWizard({
         }
       | null
   ) {
-    if (viewerAddress === null || payment === null || grossPayment !== null) {
+    if (viewerAddress === null || payment === null) {
       return;
     }
 
@@ -563,7 +625,7 @@ export function SpawnWizard({
       return;
     }
 
-    await submitPaymentForSession(null, response.quote.payment);
+    await submitPaymentForSession(response.quote.payment);
   }
 
   const paymentAvailability = getSpawnPaymentAvailability(
@@ -584,7 +646,7 @@ export function SpawnWizard({
       return;
     }
 
-    await submitPaymentForSession(paymentResult, paymentInstructions);
+    await submitPaymentForSession(paymentInstructions);
   }
 
   async function handleWalletConnect() {
@@ -644,6 +706,12 @@ export function SpawnWizard({
     try {
       const result = await claimPlaygroundFaucet(viewerAddress);
       setFaucetResult(result);
+      setWalletBalances({
+        error: null,
+        ethWei: BigInt(result.balances.ethWei),
+        isLoading: false,
+        usdcRaw: BigInt(result.balances.usdcRaw)
+      });
       setBalanceRefreshToken((current) => current + 1);
     } catch (error) {
       setFaucetError(formatSpawnPaymentError(error));
@@ -824,32 +892,6 @@ export function SpawnWizard({
           ) : null}
 
           {stepIndex === 2 ? (
-            <StrategiesStep
-              catalog={strategyCatalog}
-              onToggle={(id) => {
-                setState((current) => ({
-                  ...current,
-                  strategies: toggleSelection(current.strategies, id)
-                }));
-              }}
-              selectedIds={state.strategies}
-            />
-          ) : null}
-
-          {stepIndex === 3 ? (
-            <SkillsStep
-              catalog={skillCatalog}
-              onToggle={(id) => {
-                setState((current) => ({
-                  ...current,
-                  skills: toggleSelection(current.skills, id)
-                }));
-              }}
-              selectedIds={state.skills}
-            />
-          ) : null}
-
-          {stepIndex === 4 ? (
             <ProviderConfigStep
               braveSearchApiKey={state.braveSearchApiKey}
               customModelId={state.customModelId}
@@ -885,7 +927,7 @@ export function SpawnWizard({
             />
           ) : null}
 
-          {stepIndex === 5 ? (
+          {stepIndex === 3 ? (
             <FundStep
               asset={state.asset}
               balances={{
@@ -1078,7 +1120,39 @@ export function SpawnWizard({
               {paymentInstructions !== null ? (
                 <p className="spawn-session-meta">
                   {paymentAvailability.disabledReason ??
-                    "This submits a USDC approval followed by the escrow deposit transaction from the connected wallet."}
+                    "This submits a USDC approval followed by the escrow deposit transaction from the connected wallet. Wallets may still show 0 ETH because the payment value is carried in contract calldata, not as native ETH."}
+                </p>
+              ) : null}
+
+              {activeSession.state === "awaiting_payment" && paymentResult === null ? (
+                <p className="spawn-session-error" role="alert">
+                  No playground payment has been detected for this session yet. If you
+                  already clicked pay, open the wallet notification queue and confirm
+                  both the USDC approval and the escrow deposit on{" "}
+                  {playgroundChainName} (chain {playgroundMetadata?.chain.id ?? "pending"}).
+                </p>
+              ) : null}
+
+              {activeSession.state === "awaiting_payment" &&
+              activeSession.paymentStatus === "unpaid" &&
+              paymentResult !== null &&
+              paymentResult.pendingReceipts.length === 0 ? (
+                <p className="spawn-session-meta">
+                  Wallet transactions were confirmed on {playgroundChainName} (chain{" "}
+                  {playgroundMetadata?.chain.id ?? "pending"}), but the factory has
+                  not marked this session as paid yet. Leave this session open while
+                  the indexer catches up.
+                </p>
+              ) : null}
+
+              {activeSession.state === "awaiting_payment" &&
+              paymentResult !== null &&
+              paymentResult.pendingReceipts.length > 0 ? (
+                <p className="spawn-session-meta">
+                  Wallet transactions were submitted and are still waiting for
+                  on-chain confirmation. Leave this session open while the playground
+                  confirms the{" "}
+                  {describePendingReceipts(paymentResult.pendingReceipts)}.
                 </p>
               ) : null}
 
@@ -1089,6 +1163,10 @@ export function SpawnWizard({
                     ? "Submitting factory session action."
                     : spawnSession.isRefreshing
                       ? "Refreshing factory session state from the indexer."
+                      : activeSession.state === "awaiting_payment" &&
+                          paymentResult !== null &&
+                          paymentResult.pendingReceipts.length === 0
+                        ? "Waiting for the factory/indexer to mirror the confirmed playground payment."
                       : "Factory session data is mirrored here when the indexer reports it."}
               </p>
 
@@ -1109,9 +1187,14 @@ export function SpawnWizard({
 
               {paymentResult !== null ? (
                 <p className="spawn-session-meta">
-                  Payment submitted. Approval tx:{" "}
-                  {formatShortHash(paymentResult.approvalTxHash)}. Deposit tx:{" "}
-                  {formatShortHash(paymentResult.paymentTxHash)}.
+                  {paymentResult.pendingReceipts.length === 0
+                    ? "Transactions submitted and confirmed."
+                    : "Transactions submitted."}{" "}
+                  Approval tx: {formatShortHash(paymentResult.approvalTxHash)}.
+                  Deposit tx: {formatShortHash(paymentResult.paymentTxHash)}.
+                  {paymentResult.pendingReceipts.length > 0
+                    ? ` Waiting for ${describePendingReceipts(paymentResult.pendingReceipts)} confirmation.`
+                    : ""}
                 </p>
               ) : null}
 

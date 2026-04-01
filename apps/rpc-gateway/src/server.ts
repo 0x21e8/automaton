@@ -39,6 +39,16 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     bodyLimit: config.bodyLimitBytes
   });
 
+  app.addHook("onRequest", async (request, reply) => {
+    reply.header("access-control-allow-origin", "*");
+    reply.header("access-control-allow-methods", "POST, GET, OPTIONS");
+    reply.header("access-control-allow-headers", "content-type, accept");
+
+    if (request.method === "OPTIONS") {
+      reply.code(204).send();
+    }
+  });
+
   app.get("/health", async () => {
     return {
       ok: true,

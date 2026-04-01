@@ -1,3 +1,6 @@
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+
 mod api;
 pub mod base_rpc;
 pub mod controllers;
@@ -60,8 +63,39 @@ pub fn bootstrap_status() -> &'static str {
 }
 
 #[cfg(target_arch = "wasm32")]
+const SCHEDULER_TICK_INTERVAL_MS: u64 = 30_000;
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static SCHEDULER_TIMER_ID: RefCell<Option<ic_cdk_timers::TimerId>> = const { RefCell::new(None) };
+}
+
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn now_ms() -> u64 {
     ic_cdk::api::time() / 1_000_000
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ensure_scheduler_timer_registered() {
+    SCHEDULER_TIMER_ID.with(|timer_id| {
+        let mut timer_id = timer_id.borrow_mut();
+        if let Some(existing) = timer_id.take() {
+            ic_cdk_timers::clear_timer(existing);
+        }
+
+        let next_timer_id = ic_cdk_timers::set_timer_interval(
+            std::time::Duration::from_millis(SCHEDULER_TICK_INTERVAL_MS),
+            || {
+                let current_time_ms = now_ms();
+                if read_state(|state| state.pause) {
+                    return;
+                }
+
+                scheduler::schedule_due_jobs(current_time_ms);
+            },
+        );
+        *timer_id = Some(next_timer_id);
+    });
 }
 
 #[cfg(test)]
@@ -94,6 +128,7 @@ fn init(args: Option<FactoryInitArgs>) {
         Some(ic_cdk::api::msg_caller().to_text()),
     );
     restore_state(state.into());
+    ensure_scheduler_timer_registered();
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -104,17 +139,7 @@ fn pre_upgrade() {}
 #[ic_cdk::post_upgrade]
 fn post_upgrade(_args: Option<FactoryInitArgs>) {
     state::initialize_storage_after_upgrade();
-}
-
-#[cfg(target_arch = "wasm32")]
-#[ic_cdk::heartbeat]
-fn heartbeat() {
-    let current_time_ms = now_ms();
-    if read_state(|state| state.pause) {
-        return;
-    }
-
-    scheduler::schedule_due_jobs(current_time_ms);
+    ensure_scheduler_timer_registered();
 }
 
 #[cfg(target_arch = "wasm32")]

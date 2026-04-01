@@ -13,6 +13,21 @@ import {
   getSpawnPaymentAvailability
 } from "./spawn-payment";
 
+function mockSuccessfulReceiptFetch() {
+  return vi
+    .spyOn(globalThis, "fetch")
+    .mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          status: "0x1"
+        }
+      })
+    } as Response);
+}
+
 function createSession(overrides: Partial<SpawnSession> = {}): SpawnSession {
   const sessionId = overrides.sessionId ?? "session-1";
 
@@ -22,10 +37,10 @@ function createSession(overrides: Partial<SpawnSession> = {}): SpawnSession {
     stewardAddress: "0xabc",
     chain: "base",
     asset: "usdc",
-    grossAmount: "100",
-    platformFee: "4.5",
-    creationCost: "8",
-    netForwardAmount: "87.5",
+    grossAmount: "100000000",
+    platformFee: "4500000",
+    creationCost: "8000000",
+    netForwardAmount: "87500000",
     quoteTermsHash: "0xdeadbeef",
     expiresAt: 1_709_912_400_000,
     state: "awaiting_payment",
@@ -66,7 +81,7 @@ function createPayment(
     chain: "base",
     asset: "usdc",
     paymentAddress: "0x1111111111111111111111111111111111111111",
-    grossAmount: "100",
+    grossAmount: "100000000",
     quoteTermsHash: session.quoteTermsHash,
     expiresAt: session.expiresAt,
     ...overrides
@@ -119,14 +134,16 @@ function createPlaygroundMetadata() {
 
 describe("spawn payment executor", () => {
   it("submits approval and deposit transactions using session instructions", async () => {
+    const fetchMock = mockSuccessfulReceiptFetch();
     const request = vi
       .fn()
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce("0xapprove")
-      .mockResolvedValueOnce("0xdeposit");
+      .mockResolvedValueOnce("0xdeposit")
+      .mockResolvedValue(null);
 
     const payment = createPayment({
-      grossAmount: "75.25",
+      grossAmount: "75250000",
       paymentAddress: "0x2222222222222222222222222222222222222222"
     });
 
@@ -136,6 +153,7 @@ describe("spawn payment executor", () => {
       { request },
       null,
       {
+        VITE_SPAWN_CHAIN_RPC_URL: "https://rpc.playground.example.com",
         VITE_SPAWN_USDC_CONTRACT_ADDRESS:
           "0x3333333333333333333333333333333333333333"
       }
@@ -168,13 +186,25 @@ describe("spawn payment executor", () => {
         }
       ]
     });
+    expect(request).toHaveBeenNthCalledWith(4, {
+      method: "eth_getTransactionReceipt",
+      params: ["0xapprove"]
+    });
+    expect(request).toHaveBeenNthCalledWith(5, {
+      method: "eth_getTransactionReceipt",
+      params: ["0xdeposit"]
+    });
     expect(result).toEqual({
       approvalTxHash: "0xapprove",
-      paymentTxHash: "0xdeposit"
+      paymentTxHash: "0xdeposit",
+      pendingReceipts: []
     });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    fetchMock.mockRestore();
   });
 
   it("adds and switches to the runtime playground chain when the wallet does not know it yet", async () => {
+    const fetchMock = mockSuccessfulReceiptFetch();
     const request = vi
       .fn()
       .mockRejectedValueOnce({
@@ -184,10 +214,11 @@ describe("spawn payment executor", () => {
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce("0xapprove")
-      .mockResolvedValueOnce("0xdeposit");
+      .mockResolvedValueOnce("0xdeposit")
+      .mockResolvedValue(null);
 
     const payment = createPayment({
-      grossAmount: "75.25",
+      grossAmount: "75250000",
       paymentAddress: "0x2222222222222222222222222222222222222222"
     });
 
@@ -249,10 +280,60 @@ describe("spawn payment executor", () => {
         }
       ]
     });
+    expect(request).toHaveBeenNthCalledWith(6, {
+      method: "eth_getTransactionReceipt",
+      params: ["0xapprove"]
+    });
+    expect(request).toHaveBeenNthCalledWith(7, {
+      method: "eth_getTransactionReceipt",
+      params: ["0xdeposit"]
+    });
     expect(result).toEqual({
       approvalTxHash: "0xapprove",
-      paymentTxHash: "0xdeposit"
+      paymentTxHash: "0xdeposit",
+      pendingReceipts: []
     });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    fetchMock.mockRestore();
+  });
+
+  it("returns pending receipt metadata instead of failing when confirmations lag", async () => {
+    vi.useFakeTimers();
+
+    try {
+      const request = vi
+        .fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce("0xapprove")
+        .mockResolvedValueOnce("0xdeposit")
+        .mockResolvedValue(null);
+
+      const payment = createPayment({
+        grossAmount: "75250000",
+        paymentAddress: "0x2222222222222222222222222222222222222222"
+      });
+
+      const resultPromise = executeSpawnPayment(
+        payment,
+        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        { request },
+        null,
+        {
+          VITE_SPAWN_USDC_CONTRACT_ADDRESS:
+            "0x3333333333333333333333333333333333333333"
+        }
+      );
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      await expect(resultPromise).resolves.toEqual({
+        approvalTxHash: "0xapprove",
+        paymentTxHash: "0xdeposit",
+        pendingReceipts: ["approval", "deposit"]
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("uses the configured fallback chain id when runtime metadata is unavailable", async () => {
@@ -335,6 +416,20 @@ describe("spawn payment executor", () => {
     });
 
     expect(rejected).toBe("Wallet rejected the payment transaction.");
+    expect(
+      formatSpawnPaymentError({
+        code: -32603,
+        message: "Internal JSON-RPC error."
+      })
+    ).toBe("Internal JSON-RPC error.");
+    expect(
+      formatSpawnPaymentError({
+        code: -32603,
+        data: {
+          message: "execution reverted: ERC20: insufficient allowance"
+        }
+      })
+    ).toBe("Connected wallet does not have enough USDC for the quoted deposit.");
     expect(
       formatSpawnPaymentError(
         new Error("insufficient funds for gas * price + value")

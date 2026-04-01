@@ -17,6 +17,7 @@ const require = createRequire(import.meta.url);
 const BetterSqlite3 = require("better-sqlite3") as {
   new (path: string): {
     close(): void;
+    exec(sql: string): void;
     prepare<T>(sql: string): { all(): T[] };
   };
 };
@@ -206,6 +207,76 @@ describe("sqlite store", () => {
         trackedCanisters: 2
       }
     });
+
+    await store.close();
+  });
+
+  it("migrates legacy spawn session tables before reapplying the current schema", async () => {
+    const databasePath = await createDatabasePath();
+    const detail = createSpawnSessionDetailFixture();
+    const database = new BetterSqlite3(databasePath);
+
+    database.exec(`
+      CREATE TABLE spawn_sessions (
+        session_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        payment_status TEXT NOT NULL,
+        retryable INTEGER NOT NULL,
+        refundable INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        session_json TEXT NOT NULL,
+        escrow_json TEXT,
+        audit_json TEXT NOT NULL,
+        registry_json TEXT
+      );
+    `);
+    database
+      .prepare(
+        `INSERT INTO spawn_sessions (
+          session_id,
+          state,
+          payment_status,
+          retryable,
+          refundable,
+          updated_at,
+          session_json,
+          escrow_json,
+          audit_json,
+          registry_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
+      )
+      .run(
+        detail.session.sessionId,
+        detail.session.state,
+        detail.session.paymentStatus,
+        detail.session.retryable ? 1 : 0,
+        detail.session.refundable ? 1 : 0,
+        detail.session.updatedAt,
+        JSON.stringify(detail.session),
+        JSON.stringify(detail.payment),
+        JSON.stringify(detail.audit),
+        detail.registryRecord ? JSON.stringify(detail.registryRecord) : null
+      );
+    database.close();
+
+    const store = createSqliteStore({
+      databasePath
+    });
+
+    await store.initialize();
+
+    const migratedDatabase = new BetterSqlite3(databasePath);
+    const columns = migratedDatabase
+      .prepare<{ name: string }>("PRAGMA table_info(spawn_sessions);")
+      .all()
+      .map((column) => column.name);
+    migratedDatabase.close();
+
+    expect(columns).toContain("claim_id");
+    expect(columns).toContain("payment_json");
+    expect(columns).toContain("release_tx_hash");
+    expect(columns).toContain("release_broadcast_at");
+    expect(columns).not.toContain("escrow_json");
 
     await store.close();
   });

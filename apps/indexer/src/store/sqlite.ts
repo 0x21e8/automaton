@@ -174,6 +174,16 @@ function tableHasColumn(
   return rows.some((row) => row.name === columnName);
 }
 
+function tableExists(database: BetterSqliteDatabase, tableName: string) {
+  const row = database
+    .prepare<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1;"
+    )
+    .get(tableName);
+
+  return row !== undefined;
+}
+
 function migrateSpawnSessionsSchema(database: BetterSqliteDatabase) {
   const hasEscrowJson = tableHasColumn(database, "spawn_sessions", "escrow_json");
   const hasClaimId = tableHasColumn(database, "spawn_sessions", "claim_id");
@@ -286,8 +296,11 @@ class BetterSqliteStore implements IndexerStore {
     await mkdir(dirname(this.databasePath), { recursive: true });
     this.database = new BetterSqlite3(this.databasePath);
     const schemaSql = await this.schemaSqlPromise;
-    this.database.exec(schemaSql);
-    migrateSpawnSessionsSchema(this.database);
+
+    if (tableExists(this.database, "spawn_sessions")) {
+      migrateSpawnSessionsSchema(this.database);
+    }
+
     this.database.exec(schemaSql);
     this.initialized = true;
   }

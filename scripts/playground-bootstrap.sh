@@ -27,7 +27,7 @@ PLAYGROUND_ICP_ENVIRONMENT=${PLAYGROUND_ICP_ENVIRONMENT:-local}
 PLAYGROUND_LOCAL_REPLICA_HOST=${PLAYGROUND_LOCAL_REPLICA_HOST:-127.0.0.1}
 PLAYGROUND_LOCAL_REPLICA_PORT=${PLAYGROUND_LOCAL_REPLICA_PORT:-8000}
 PLAYGROUND_FACTORY_CANISTER=${PLAYGROUND_FACTORY_CANISTER:-factory}
-PLAYGROUND_FACTORY_TOP_UP_AMOUNT=${PLAYGROUND_FACTORY_TOP_UP_AMOUNT:-5t}
+PLAYGROUND_FACTORY_TOP_UP_AMOUNT=${PLAYGROUND_FACTORY_TOP_UP_AMOUNT:-1000t}
 LOCAL_EVM_HOST=${LOCAL_EVM_HOST:-127.0.0.1}
 LOCAL_EVM_PORT=${LOCAL_EVM_PORT:-8545}
 LOCAL_EVM_CHAIN_ID=${LOCAL_EVM_CHAIN_ID:-$PLAYGROUND_CHAIN_ID}
@@ -35,6 +35,7 @@ LOCAL_EVM_RPC_URL=${LOCAL_EVM_RPC_URL:-http://$LOCAL_EVM_HOST:$LOCAL_EVM_PORT}
 LOCAL_EVM_LOG_PATH=${LOCAL_EVM_LOG_PATH:-"$SERVICE_DIR/anvil.log"}
 LOCAL_EVM_PID_PATH=${LOCAL_EVM_PID_PATH:-"$SERVICE_DIR/anvil.pid"}
 LOCAL_EVM_DEPLOYMENT_FILE=${LOCAL_EVM_DEPLOYMENT_FILE:-"$TMP_DIR/local-escrow-deployment.json"}
+AUTOMATON_INBOX_DEPLOYMENT_FILE=${AUTOMATON_INBOX_DEPLOYMENT_FILE:-"$TMP_DIR/automaton-inbox-deployment.json"}
 PLAYGROUND_FACTORY_CANISTER_ID_FILE=${PLAYGROUND_FACTORY_CANISTER_ID_FILE:-"$TMP_DIR/factory-canister-id.txt"}
 INDEXER_DB_PATH=${INDEXER_DB_PATH:-"$TMP_DIR/playground-indexer.sqlite"}
 PLAYGROUND_INDEXER_PID_FILE=${PLAYGROUND_INDEXER_PID_FILE:-"$SERVICE_DIR/indexer.pid"}
@@ -49,6 +50,7 @@ PLAYGROUND_FAUCET_MAX_CLAIMS_PER_WALLET=${PLAYGROUND_FAUCET_MAX_CLAIMS_PER_WALLE
 PLAYGROUND_FAUCET_MAX_CLAIMS_PER_IP=${PLAYGROUND_FAUCET_MAX_CLAIMS_PER_IP:-20}
 PLAYGROUND_BOOTSTRAP_SEED_WALLET=${PLAYGROUND_BOOTSTRAP_SEED_WALLET:-1}
 PLAYGROUND_BOOTSTRAP_SEED_OUTPUT_FILE=${PLAYGROUND_BOOTSTRAP_SEED_OUTPUT_FILE:-"$TMP_DIR/playground-bootstrap-seed.json"}
+PLAYGROUND_BUILD_CHILD_ARTIFACT=${PLAYGROUND_BUILD_CHILD_ARTIFACT:-1}
 
 CHILD_WASM_PATH=${CHILD_WASM_PATH:-}
 CHILD_VERSION_COMMIT=${CHILD_VERSION_COMMIT:-${PLAYGROUND_ENV_VERSION:-}}
@@ -58,12 +60,105 @@ export PLAYGROUND_STATUS_FILE="$STATUS_FILE"
 export LOCAL_EVM_CHAIN_ID
 export LOCAL_EVM_RPC_URL
 export LOCAL_EVM_DEPLOYMENT_FILE
+export AUTOMATON_INBOX_DEPLOYMENT_FILE
 export INDEXER_DB_PATH
 
 mkdir -p "$TMP_DIR" "$SERVICE_DIR" "$PLAYGROUND_ICP_HOME"
 
 run_with_repo_node() {
   sh "$ROOT_DIR/scripts/with-repo-node.sh" "$@"
+}
+
+derive_child_version_commit() {
+  if [ -n "$CHILD_VERSION_COMMIT" ]; then
+    return 0
+  fi
+
+  if [ -n "${IC_AUTOMATON_REPO:-}" ]; then
+    CHILD_VERSION_COMMIT=$(git -C "$IC_AUTOMATON_REPO" rev-parse HEAD)
+    export CHILD_VERSION_COMMIT
+  fi
+}
+
+preferred_sibling_child_wasm_path() {
+  if [ -z "${IC_AUTOMATON_REPO:-}" ]; then
+    return 1
+  fi
+
+  printf '%s\n' "$IC_AUTOMATON_REPO/target/wasm32-wasip1/release/backend_nowasi.wasm"
+}
+
+should_build_sibling_child_artifact() {
+  if [ -z "${IC_AUTOMATON_REPO:-}" ] || [ "$PLAYGROUND_BUILD_CHILD_ARTIFACT" != "1" ]; then
+    return 1
+  fi
+
+  if [ -z "$CHILD_WASM_PATH" ]; then
+    return 0
+  fi
+
+  case "$CHILD_WASM_PATH" in
+    "$IC_AUTOMATON_REPO"/target/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+build_sibling_child_artifact() {
+  if ! should_build_sibling_child_artifact; then
+    return 0
+  fi
+
+  build_script="$IC_AUTOMATON_REPO/scripts/build-backend-wasm.sh"
+  if [ ! -f "$build_script" ]; then
+    echo "missing sibling child artifact build script at $build_script" >&2
+    return 1
+  fi
+
+  (
+    cd "$IC_AUTOMATON_REPO"
+    sh "$build_script"
+  )
+}
+
+resolve_child_wasm_path() {
+  preferred_path=
+  if preferred_path=$(preferred_sibling_child_wasm_path 2>/dev/null); then
+    case "$CHILD_WASM_PATH" in
+      ""|"$IC_AUTOMATON_REPO/target/wasm32-unknown-unknown/release/backend.wasm"|"$IC_AUTOMATON_REPO/target/wasm32-wasip1/release/backend.wasm")
+        if [ -f "$preferred_path" ]; then
+          if [ -n "$CHILD_WASM_PATH" ] && [ "$CHILD_WASM_PATH" != "$preferred_path" ]; then
+            echo "switching CHILD_WASM_PATH to canister-ready sibling artifact $preferred_path" >&2
+          fi
+          CHILD_WASM_PATH="$preferred_path"
+          export CHILD_WASM_PATH
+          return 0
+        fi
+        ;;
+    esac
+  fi
+
+  if [ -n "$CHILD_WASM_PATH" ]; then
+    export CHILD_WASM_PATH
+    return 0
+  fi
+
+  return 1
+}
+
+ensure_child_artifact() {
+  derive_child_version_commit
+  build_sibling_child_artifact
+
+  if resolve_child_wasm_path; then
+    return 0
+  fi
+
+  echo "CHILD_WASM_PATH is required for playground bootstrap. Set IC_AUTOMATON_REPO so the sibling canister artifact can be built and resolved automatically, or point CHILD_WASM_PATH at a canister-ready child Wasm (for ic-automaton that is usually target/wasm32-wasip1/release/backend_nowasi.wasm)." >&2
+  return 1
 }
 
 write_status() {
@@ -173,15 +268,14 @@ ensure_local_network() {
 }
 
 deploy_factory() {
-  if [ -z "$CHILD_WASM_PATH" ]; then
-    echo "CHILD_WASM_PATH is required for playground bootstrap" >&2
-    return 1
-  fi
-
   if [ -z "$CHILD_VERSION_COMMIT" ]; then
     echo "CHILD_VERSION_COMMIT or PLAYGROUND_ENV_VERSION is required for playground bootstrap" >&2
     return 1
   fi
+
+  CHILD_WASM_PATH="$CHILD_WASM_PATH" \
+  IC_AUTOMATON_REPO="${IC_AUTOMATON_REPO:-}" \
+    run_with_repo_node node "$ROOT_DIR/scripts/validate-child-canister-interface.mjs"
 
   FACTORY_VERSION_COMMIT="$CHILD_VERSION_COMMIT" \
   FACTORY_CHILD_EVM_CHAIN_ID="$PLAYGROUND_CHAIN_ID" \
@@ -304,6 +398,22 @@ deploy_escrow() {
     run_with_repo_node node "$ROOT_DIR/scripts/deploy-local-escrow.mjs"
 }
 
+deploy_automaton_inbox() {
+  if [ -n "${FACTORY_CHILD_INBOX_CONTRACT_ADDRESS:-}" ]; then
+    return 0
+  fi
+
+  if [ -z "${IC_AUTOMATON_REPO:-}" ]; then
+    return 0
+  fi
+
+  IC_AUTOMATON_REPO="$IC_AUTOMATON_REPO" \
+  LOCAL_EVM_RPC_URL="$LOCAL_EVM_RPC_URL" \
+  LOCAL_EVM_DEPLOYMENT_FILE="$LOCAL_EVM_DEPLOYMENT_FILE" \
+  AUTOMATON_INBOX_DEPLOYMENT_FILE="$AUTOMATON_INBOX_DEPLOYMENT_FILE" \
+    run_with_repo_node node "$ROOT_DIR/scripts/deploy-automaton-inbox.mjs"
+}
+
 upload_child_artifact() {
   CHILD_WASM_PATH="$CHILD_WASM_PATH" \
   CHILD_VERSION_COMMIT="$CHILD_VERSION_COMMIT" \
@@ -391,6 +501,8 @@ ensure_services() {
   verify_rpc_endpoint "$PLAYGROUND_RPC_GATEWAY_URL"
 }
 
+ensure_child_artifact
+
 PLAYGROUND_STATUS_ENVIRONMENT_VERSION="$CHILD_VERSION_COMMIT" \
 PLAYGROUND_STATUS_MAINTENANCE="true" \
 PLAYGROUND_STATUS_UPDATED_AT="now" \
@@ -399,6 +511,7 @@ PLAYGROUND_STATUS_UPDATED_AT="now" \
 ensure_local_network
 ensure_anvil
 deploy_escrow
+deploy_automaton_inbox
 deploy_factory
 reconcile_factory_runtime_config
 top_up_factory_canister

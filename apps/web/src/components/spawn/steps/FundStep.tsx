@@ -112,7 +112,7 @@ export function FundStep({
 }: FundStepProps) {
   return (
     <section className="spawn-step">
-      <p className="section-label">Step 6</p>
+      <p className="section-label">Step 4</p>
       <h3 className="spawn-step-title">Fund</h3>
       <p className="spawn-step-copy">
         Connect a wallet, add the playground network, top up test funds if

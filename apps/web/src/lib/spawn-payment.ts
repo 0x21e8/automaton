@@ -9,13 +9,10 @@ import {
   bigintToHex,
   encodeErc20ApproveData,
   encodeEscrowDepositData,
-  parseDecimalAmount,
   resolveSpawnChainId,
   resolveSpawnChainMetadata,
   resolveSpawnUsdcContractAddress
 } from "./wallet-transaction-helpers";
-
-const USDC_DECIMALS = 6;
 
 export interface SpawnPaymentWalletState {
   address: string | null;
@@ -31,10 +28,23 @@ export interface SpawnPaymentAvailability {
 export interface SpawnPaymentExecutionResult {
   approvalTxHash: string;
   paymentTxHash: string;
+  pendingReceipts: Array<"approval" | "deposit">;
 }
 
 const UNKNOWN_CHAIN_ERROR_CODE = 4902;
 const USER_REJECTED_REQUEST_ERROR_CODE = 4001;
+const RECEIPT_POLL_INTERVAL_MS = 1_000;
+const RECEIPT_TIMEOUT_MS = 30_000;
+
+function parseRawTokenAmount(value: string): bigint | null {
+  const normalized = value.trim();
+
+  if (!/^\d+$/.test(normalized)) {
+    return null;
+  }
+
+  return BigInt(normalized);
+}
 
 class SpawnPaymentError extends Error {
   readonly kind:
@@ -51,6 +61,29 @@ class SpawnPaymentError extends Error {
   }
 }
 
+function extractProviderErrorMessage(error: unknown): string | null {
+  if (typeof error !== "object" || error === null) {
+    return null;
+  }
+
+  if ("message" in error && typeof error.message === "string" && error.message.trim() !== "") {
+    return error.message.trim();
+  }
+
+  if (
+    "data" in error &&
+    typeof error.data === "object" &&
+    error.data !== null &&
+    "message" in error.data &&
+    typeof error.data.message === "string" &&
+    error.data.message.trim() !== ""
+  ) {
+    return error.data.message.trim();
+  }
+
+  return null;
+}
+
 function toHexChainId(chainId: number): string {
   return `0x${chainId.toString(16)}`;
 }
@@ -62,6 +95,120 @@ function isProviderErrorWithCode(error: unknown, code: number) {
     "code" in error &&
     error.code === code
   );
+}
+
+async function requestJsonRpcResult<T>(
+  rpcUrl: string,
+  method: string,
+  params: unknown[]
+): Promise<T> {
+  const response = await fetch(rpcUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: Date.now(),
+      method,
+      params
+    })
+  });
+
+  const payload = (await response.json()) as {
+    error?: {
+      message?: unknown;
+    };
+    result?: unknown;
+  };
+
+  if (!response.ok || payload.error) {
+    throw new Error(
+      typeof payload.error?.message === "string"
+        ? payload.error.message
+        : `${method} failed.`
+    );
+  }
+
+  return payload.result as T;
+}
+
+async function requestTransactionReceipt(
+  txHash: string,
+  transport: WalletTransport,
+  rpcUrl: string | null
+): Promise<
+  | {
+      status?: unknown;
+    }
+  | null
+> {
+  let transportReceipt:
+    | {
+        status?: unknown;
+      }
+    | null
+    | undefined;
+
+  try {
+    transportReceipt = await transport.request<
+      | {
+          status?: unknown;
+        }
+      | null
+    >({
+      method: "eth_getTransactionReceipt",
+      params: [txHash]
+    });
+  } catch {}
+
+  if (transportReceipt !== undefined && transportReceipt !== null) {
+    return transportReceipt;
+  }
+
+  if (rpcUrl === null) {
+    return transportReceipt ?? null;
+  }
+
+  try {
+    return await requestJsonRpcResult<
+      | {
+          status?: unknown;
+        }
+      | null
+    >(rpcUrl, "eth_getTransactionReceipt", [txHash]);
+  } catch {
+    return transportReceipt ?? null;
+  }
+}
+
+async function waitForTransactionReceipt(
+  txHash: string,
+  transport: WalletTransport,
+  chain: SpawnSession["chain"],
+  label: string,
+  playgroundMetadata: PlaygroundMetadata | null,
+  env: Record<string, string | undefined>
+): Promise<"confirmed" | "pending"> {
+  const rpcUrl = resolveSpawnChainMetadata(chain, playgroundMetadata, env)?.rpcUrl ?? null;
+
+  const deadline = Date.now() + RECEIPT_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    const receipt = await requestTransactionReceipt(txHash, transport, rpcUrl);
+
+    if (receipt !== null) {
+      if (typeof receipt.status === "string" && receipt.status.toLowerCase() === "0x0") {
+        throw new Error(`${label} transaction reverted on-chain.`);
+      }
+
+      return "confirmed";
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, RECEIPT_POLL_INTERVAL_MS));
+  }
+
+  return "pending";
 }
 
 async function requestWalletChainSwitch(
@@ -237,6 +384,8 @@ export function formatSpawnPaymentError(error: unknown): string {
     return error.message;
   }
 
+  const providerMessage = extractProviderErrorMessage(error);
+
   if (
     typeof error === "object" &&
     error !== null &&
@@ -246,8 +395,13 @@ export function formatSpawnPaymentError(error: unknown): string {
     return "Wallet rejected the payment transaction.";
   }
 
-  if (error instanceof Error) {
-    const normalized = error.message.toLowerCase();
+  const normalizedMessage =
+    error instanceof Error
+      ? error.message
+      : providerMessage;
+
+  if (normalizedMessage !== undefined && normalizedMessage !== null) {
+    const normalized = normalizedMessage.toLowerCase();
 
     if (
       normalized.includes("insufficient funds") &&
@@ -279,6 +433,10 @@ export function formatSpawnPaymentError(error: unknown): string {
     return error.message;
   }
 
+  if (providerMessage !== null) {
+    return providerMessage;
+  }
+
   return "Spawn payment failed.";
 }
 
@@ -298,7 +456,7 @@ export async function executeSpawnPayment(
         throw new Error(`USDC contract address is not configured for ${payment.chain}.`);
       }
 
-      const amount = parseDecimalAmount(payment.grossAmount, USDC_DECIMALS);
+      const amount = parseRawTokenAmount(payment.grossAmount);
       if (amount === null) {
         throw new Error(`Invalid USDC payment amount: ${payment.grossAmount}`);
       }
@@ -337,9 +495,37 @@ export async function executeSpawnPayment(
         ]
       });
 
+      const pendingReceipts: Array<"approval" | "deposit"> = [];
+
+      const [approvalReceiptState, paymentReceiptState] = await Promise.all([
+        waitForTransactionReceipt(
+          approvalTxHash,
+          transport,
+          payment.chain,
+          "Approval",
+          playgroundMetadata,
+          env
+        ),
+        waitForTransactionReceipt(
+          paymentTxHash,
+          transport,
+          payment.chain,
+          "Deposit",
+          playgroundMetadata,
+          env
+        )
+      ]);
+      if (approvalReceiptState === "pending") {
+        pendingReceipts.push("approval");
+      }
+      if (paymentReceiptState === "pending") {
+        pendingReceipts.push("deposit");
+      }
+
       return {
         approvalTxHash,
-        paymentTxHash
+        paymentTxHash,
+        pendingReceipts
       };
     }
     default:

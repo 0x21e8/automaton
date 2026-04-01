@@ -24,7 +24,7 @@ const DEFAULT_UPSTREAM_URL = "http://127.0.0.1:8545";
 const DEFAULT_CHAIN_ID = 8453;
 const DEFAULT_BODY_LIMIT_BYTES = 32 * 1024;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
-const DEFAULT_RATE_LIMIT_MAX_REQUESTS = 60;
+const DEFAULT_RATE_LIMIT_MAX_REQUESTS = 2_000;
 
 function parsePositiveInteger(value: string | undefined, fallback: number) {
   if (!value) {

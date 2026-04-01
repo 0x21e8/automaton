@@ -9,14 +9,11 @@ describe("App", () => {
 
     expect(markup).toContain("automaton lab");
     expect(markup).toContain("Self-sovereign AI agents");
-    expect(markup).toContain("Playground / test environment");
-    expect(markup).toContain("Local development");
-    expect(markup).toContain("Non-durable canisters, balances, and spawn sessions can be reset at any time.");
     expect(markup).toContain("LIVE");
     expect(markup).toContain("Wallet not detected");
     expect(markup).toContain("Automaton grid");
     expect(markup).toContain("Spawn Automaton");
-    expect(markup).toContain("Step 1 of 6");
+    expect(markup).toContain("Step 1 of 4");
     expect(markup).toContain("Select Chain");
     expect(markup).toContain("Select an automaton");
     expect(markup).toContain("Command Surface");

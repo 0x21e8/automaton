@@ -3,7 +3,7 @@ import { useEffect, useState, type CSSProperties } from "react";
 import { AutomatonDrawer } from "./components/drawer/AutomatonDrawer";
 import { AutomatonCanvas } from "./components/grid/AutomatonCanvas";
 import { SpawnWizard } from "./components/spawn/SpawnWizard";
-import { formatPlaygroundTimestamp, usePlayground } from "./hooks/usePlayground";
+import { usePlayground } from "./hooks/usePlayground";
 import { useAutomatonDetail } from "./hooks/useAutomatonDetail";
 import { useAutomatons } from "./hooks/useAutomatons";
 import { themeTokens } from "./theme/tokens";
@@ -197,76 +197,6 @@ export default function App() {
           </div>
         </div>
       </header>
-
-      {playground.metadata !== null ? (
-        <section
-          className={`playground-banner${playground.metadata.maintenance ? " is-maintenance" : ""}`}
-        >
-          <div className="playground-banner-head">
-            <div>
-              <p className="section-label">Playground / test environment</p>
-              <h2 className="playground-banner-title">
-                {playground.metadata.environmentLabel}
-              </h2>
-            </div>
-            <span className="playground-banner-pill">
-              {playground.metadata.maintenance ? "Maintenance active" : "Public test network"}
-            </span>
-          </div>
-
-          <div className="playground-banner-grid">
-            <div className="playground-banner-row">
-              <span>Chain</span>
-              <strong>{playground.metadata.chain.name}</strong>
-            </div>
-            <div className="playground-banner-row">
-              <span>Last reset</span>
-              <strong>
-                {formatPlaygroundTimestamp(
-                  playground.metadata.reset.lastResetAt,
-                  "Pending"
-                )}
-              </strong>
-            </div>
-            <div className="playground-banner-row">
-              <span>Next window</span>
-              <strong>
-                {formatPlaygroundTimestamp(
-                  playground.metadata.reset.nextResetAt,
-                  "Pending"
-                )}
-              </strong>
-            </div>
-            <div className="playground-banner-row">
-              <span>Reset cadence</span>
-              <strong>{playground.metadata.reset.cadenceLabel}</strong>
-            </div>
-          </div>
-
-          <p className="playground-banner-copy">
-            Non-durable canisters, balances, and spawn sessions can be reset at
-            any time.
-          </p>
-
-          {playground.error !== null ? (
-            <p className="playground-banner-note">{playground.error}</p>
-          ) : playground.isLoading ? (
-            <p className="playground-banner-note">
-              Loading runtime playground metadata.
-            </p>
-          ) : playground.hasRuntimeMetadata ? null : (
-            <p className="playground-banner-note">
-              Using local fallback playground metadata until the indexer responds.
-            </p>
-          )}
-
-          {wallet.errorMessage !== null ? (
-            <p className="playground-banner-note is-error" role="alert">
-              {wallet.errorMessage}
-            </p>
-          ) : null}
-        </section>
-      ) : null}
 
       <main className="shell-main">
         <AutomatonCanvas

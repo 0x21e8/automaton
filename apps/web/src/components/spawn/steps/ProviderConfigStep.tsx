@@ -14,6 +14,58 @@ interface ProviderConfigStepProps {
   onBraveSearchApiKeyChange: (value: string) => void;
 }
 
+function formatPricePerMillion(rawValue: string | null | undefined): string | null {
+  if (rawValue === null || rawValue === undefined) {
+    return null;
+  }
+
+  const parsed = Number(rawValue);
+
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  const perMillion = parsed * 1_000_000;
+
+  if (perMillion === 0) {
+    return "$0/M";
+  }
+
+  if (perMillion >= 1) {
+    return `$${perMillion.toFixed(2)}/M`;
+  }
+
+  if (perMillion >= 0.01) {
+    return `$${perMillion.toFixed(3)}/M`;
+  }
+
+  return `$${perMillion.toFixed(4)}/M`;
+}
+
+function formatModelPricing(model: ProviderModelOption): string {
+  const promptPrice = formatPricePerMillion(model.pricing?.prompt);
+  const completionPrice = formatPricePerMillion(model.pricing?.completion);
+  const requestPrice = model.pricing?.request?.trim() ?? null;
+
+  if (promptPrice !== null && completionPrice !== null) {
+    return `${promptPrice} in · ${completionPrice} out`;
+  }
+
+  if (promptPrice !== null) {
+    return `${promptPrice} in`;
+  }
+
+  if (completionPrice !== null) {
+    return `${completionPrice} out`;
+  }
+
+  if (requestPrice !== null && requestPrice !== "") {
+    return `$${requestPrice} / request`;
+  }
+
+  return "Pricing unavailable";
+}
+
 export function ProviderConfigStep({
   openRouterApiKey,
   selectedModelId,
@@ -29,7 +81,7 @@ export function ProviderConfigStep({
 }: ProviderConfigStepProps) {
   return (
     <section className="spawn-step">
-      <p className="section-label">Step 5</p>
+      <p className="section-label">Step 3</p>
       <h3 className="spawn-step-title">Model &amp; External APIs</h3>
       <p className="spawn-step-copy">
         OpenRouter and Brave are optional. Leave either field blank to keep that
@@ -63,6 +115,8 @@ export function ProviderConfigStep({
             {modelOptions.map((model) => (
               <option key={model.id} value={model.id}>
                 {model.label}
+                {" · "}
+                {formatModelPricing(model)}
                 {model.source === "fallback" ? " (fallback)" : ""}
               </option>
             ))}
@@ -93,6 +147,7 @@ export function ProviderConfigStep({
             <li key={model.id}>
               <strong>{model.label}</strong>
               <span>{model.description}</span>
+              <span className="provider-model-price">{formatModelPricing(model)}</span>
             </li>
           ))}
         </ul>

@@ -21,6 +21,7 @@
     "evm:deploy-automaton-inbox": "sh ./scripts/with-repo-node.sh node ./scripts/deploy-automaton-inbox.mjs",
     "evm:seed-wallet": "sh ./scripts/with-repo-node.sh node ./scripts/seed-local-wallet.mjs",
     "evm:smoke": "sh ./scripts/smoke-local-escrow.sh",
+    "playground:dev": "sh ./scripts/playground-dev.sh",
     "playground:bootstrap": "sh ./scripts/playground-bootstrap.sh",
     "playground:reset": "sh ./scripts/playground-reset.sh",
     "playground:smoke": "sh ./scripts/playground-smoke.sh",

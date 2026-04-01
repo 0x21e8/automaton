@@ -134,8 +134,21 @@ This starts:
 Open `http://127.0.0.1:5173`. The app works with an empty database — you get the full UI shell with an empty automaton list.
 
 For the full local spawn setup, including Base-fork Anvil, canonical Base USDC mock injection,
-launchpad escrow, shared `ic-automaton` inbox deployment, real child Wasm upload, wallet seeding,
-and web/indexer wiring, use [ralph/notes/local-launchpad-runbook.md](/Users/domwoe/Dev/projects/automaton-launchpad/ralph/notes/local-launchpad-runbook.md).
+launchpad escrow, sibling `ic-automaton` inbox deployment, real child Wasm upload, wallet seeding,
+local ICP, factory/indexer/rpc-gateway startup, and hot-reload web:
+
+```bash
+cp playground.local.env.example playground.local.env
+$EDITOR playground.local.env
+npm run playground:dev
+```
+
+When `IC_AUTOMATON_REPO` is set, `playground:dev` builds the sibling child canister artifact
+and uses the canister-ready `backend_nowasi.wasm` automatically. You only need to set
+`CHILD_WASM_PATH` if you want to pin a different artifact.
+
+`playground:dev` bootstraps the backend stack and then starts only the Vite web app in hot-reload mode.
+Use it instead of `npm run dev` when you need the full local playground.
 
 ### Run each service separately
 
@@ -244,25 +257,29 @@ sh ./scripts/start-local-evm.sh --background
 sh ./scripts/deploy-local-escrow.sh
 # → writes tmp/local-escrow-deployment.json
 
-# 3. Seed the fixed browser wallet used by the manual E2E flow
+# 3. Deploy the sibling ic-automaton Inbox.sol against the same USDC token
+IC_AUTOMATON_REPO=/path/to/ic-automaton npm run evm:deploy-automaton-inbox
+# → writes tmp/automaton-inbox-deployment.json
+
+# 4. Seed the fixed browser wallet used by the manual E2E flow
 npm run evm:seed-wallet
 # → writes tmp/local-wallet-seed.json
 
-# 4. Generate factory init args from deployment + child runtime defaults
+# 5. Generate factory init args from deployment + child runtime defaults
 node ./scripts/render-factory-local-init-args.mjs
 
-# 5. Install factory with local escrow config
+# 6. Install factory with local escrow config
 icp build
 icp canister create factory -e local
 icp canister install factory -e local --mode reinstall \
   --args "$(node ./scripts/render-factory-local-init-args.mjs)"
 
-# 6. Upload a real child artifact built from the sibling ic-automaton repo
-CHILD_WASM_PATH=/absolute/path/to/backend.wasm.gz \
+# 7. Upload a real child artifact built from the sibling ic-automaton repo
+CHILD_WASM_PATH=/path/to/ic-automaton/target/wasm32-wasip1/release/backend_nowasi.wasm \
 CHILD_VERSION_COMMIT=$(git -C /path/to/ic-automaton rev-parse HEAD) \
 npm run factory:upload-artifact
 
-# 7. Smoke-test the full deposit → release path
+# 8. Smoke-test the full deposit → release path
 sh ./scripts/smoke-local-escrow.sh
 # → writes tmp/local-escrow-smoke.json
 ```

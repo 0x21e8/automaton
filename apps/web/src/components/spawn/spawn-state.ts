@@ -8,7 +8,7 @@ import {
   type SpawnChain
 } from "../../../../../packages/shared/src/spawn.js";
 
-export const TOTAL_SPAWN_STEPS = 6;
+export const TOTAL_SPAWN_STEPS = 4;
 export const MOCK_ETH_USD_RATE = 3200;
 export const MOCK_PLATFORM_FEE_USD = 4.5;
 export const MOCK_CREATION_COST_USD = 8;
