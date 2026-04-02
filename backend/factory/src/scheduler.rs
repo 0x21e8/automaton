@@ -26,6 +26,7 @@ pub struct SchedulerRunReport {
 
 #[derive(Clone, Debug)]
 struct JobExecutionFailure {
+    #[cfg(not(target_arch = "wasm32"))]
     error: Option<Box<FactoryError>>,
     failure: SchedulerJobFailure,
 }
@@ -270,7 +271,7 @@ fn lease_due_jobs(now_ms: u64, limit: usize) -> Vec<SchedulerJob> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn lease_due_jobs_for_test(now_ms: u64, limit: usize) -> Vec<SchedulerJob> {
     lease_due_jobs(now_ms, limit)
 }
@@ -467,6 +468,7 @@ fn execute_job_sync(
         SchedulerJobKind::PaymentPoll => {
             if let Some(failure) = payment_poll_prerequisite_failure(now_ms) {
                 return Err(JobExecutionFailure {
+                    #[cfg(not(target_arch = "wasm32"))]
                     error: None,
                     failure,
                 });
@@ -476,6 +478,7 @@ fn execute_job_sync(
                 .map(|_| None)
                 .map_err(|error| JobExecutionFailure {
                     failure: classify_payment_poll_error(&error, now_ms),
+                    #[cfg(not(target_arch = "wasm32"))]
                     error: Some(Box::new(error)),
                 })
         }
@@ -484,6 +487,7 @@ fn execute_job_sync(
                 .map(Some)
                 .map_err(|error| JobExecutionFailure {
                     failure: classify_spawn_error(&error, now_ms),
+                    #[cfg(not(target_arch = "wasm32"))]
                     error: Some(Box::new(error)),
                 })
         }
@@ -547,6 +551,7 @@ async fn execute_job_async(
         SchedulerJobKind::PaymentPoll => {
             if let Some(failure) = payment_poll_prerequisite_failure(now_ms) {
                 return Err(JobExecutionFailure {
+                    #[cfg(not(target_arch = "wasm32"))]
                     error: None,
                     failure,
                 });
@@ -557,6 +562,7 @@ async fn execute_job_async(
                 .map(|_| None)
                 .map_err(|error| JobExecutionFailure {
                     failure: classify_payment_poll_error(&error, now_ms),
+                    #[cfg(not(target_arch = "wasm32"))]
                     error: Some(Box::new(error)),
                 })
         }
@@ -566,6 +572,7 @@ async fn execute_job_async(
                 .map(Some)
                 .map_err(|error| JobExecutionFailure {
                     failure: classify_spawn_error(&error, now_ms),
+                    #[cfg(not(target_arch = "wasm32"))]
                     error: Some(Box::new(error)),
                 })
         }
@@ -583,7 +590,7 @@ pub(crate) fn schedule_due_jobs(now_ms: u64) {
     finish_tick(now_ms);
 
     for job in leased_jobs {
-        ic_cdk::spawn(async move {
+        ic_cdk::futures::spawn_017_compat(async move {
             match execute_job_async(&job, now_ms).await {
                 Ok(_) => finalize_job_success(&job.job_id, current_time_ms()),
                 Err(error) => finalize_job_failure(&job.job_id, error.failure, current_time_ms()),

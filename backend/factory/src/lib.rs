@@ -36,7 +36,7 @@ pub use escrow::{
 pub use expiry::expire_spawn_session;
 pub use retry::{mark_session_failed, retry_failed_session};
 pub use spawn::execute_spawn;
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub use state::set_mock_canister_balance;
 pub use state::{
     apply_factory_init_args, clear_provider_secrets, current_canister_balance,
@@ -85,7 +85,7 @@ fn ensure_scheduler_timer_registered() {
 
         let next_timer_id = ic_cdk_timers::set_timer_interval(
             std::time::Duration::from_millis(SCHEDULER_TICK_INTERVAL_MS),
-            || {
+            || async {
                 let current_time_ms = now_ms();
                 if read_state(|state| state.pause) {
                     return;
@@ -98,7 +98,7 @@ fn ensure_scheduler_timer_registered() {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn auto_run_spawn_scheduler(now_ms: u64) -> Vec<Result<SpawnExecutionReceipt, FactoryError>> {
     scheduler::run_scheduler_tick(now_ms)
         .into_iter()
@@ -127,7 +127,7 @@ fn init(args: Option<FactoryInitArgs>) {
         args.unwrap_or_default(),
         Some(ic_cdk::api::msg_caller().to_text()),
     );
-    restore_state(state.into());
+    restore_state(state);
     ensure_scheduler_timer_registered();
 }
 
@@ -322,7 +322,7 @@ fn commit_artifact_upload() -> Result<FactoryArtifactSnapshot, FactoryError> {
 #[cfg(target_arch = "wasm32")]
 ic_cdk::export_candid!();
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{
         append_artifact_chunk, apply_factory_init_args, auto_run_spawn_scheduler,

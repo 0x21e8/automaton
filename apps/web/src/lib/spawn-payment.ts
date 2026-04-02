@@ -31,6 +31,11 @@ export interface SpawnPaymentExecutionResult {
   pendingReceipts: Array<"approval" | "deposit">;
 }
 
+interface JsonRpcBlockHeader {
+  hash?: unknown;
+  number?: unknown;
+}
+
 const UNKNOWN_CHAIN_ERROR_CODE = 4902;
 const USER_REJECTED_REQUEST_ERROR_CODE = 4001;
 const RECEIPT_POLL_INTERVAL_MS = 1_000;
@@ -53,7 +58,8 @@ class SpawnPaymentError extends Error {
     | "chain_switch_rejected"
     | "insufficient_eth"
     | "insufficient_usdc"
-    | "quote_expired";
+    | "quote_expired"
+    | "stale_network_config";
 
   constructor(kind: SpawnPaymentError["kind"], message: string) {
     super(message);
@@ -219,6 +225,103 @@ async function requestWalletChainSwitch(
     method: "wallet_switchEthereumChain",
     params: [{ chainId: toHexChainId(chainId) }]
   });
+}
+
+function normalizeHexQuantity(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return /^0x[0-9a-f]+$/.test(normalized) ? normalized : null;
+}
+
+function normalizeBlockHeader(
+  value: unknown
+): { hash: string; number: string } | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const hash = "hash" in value ? normalizeHexQuantity(value.hash) : null;
+  const number = "number" in value ? normalizeHexQuantity(value.number) : null;
+
+  if (hash === null || number === null) {
+    return null;
+  }
+
+  return {
+    hash,
+    number
+  };
+}
+
+function isEmptyContractCode(value: unknown) {
+  return typeof value === "string" && /^0x0*$/.test(value.trim().toLowerCase());
+}
+
+async function requestWalletRpcResult<T>(
+  transport: WalletTransport,
+  method: string,
+  params: unknown[]
+): Promise<T | null> {
+  try {
+    return await transport.request<T>({
+      method,
+      params
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function assertWalletTargetsActivePlaygroundNetwork(
+  payment: SpawnPaymentInstructions,
+  transport: WalletTransport,
+  tokenAddress: string,
+  playgroundMetadata: PlaygroundMetadata | null,
+  env: Record<string, string | undefined>
+) {
+  const chainMetadata = resolveSpawnChainMetadata(payment.chain, playgroundMetadata, env);
+  const rpcUrl = chainMetadata?.rpcUrl ?? null;
+
+  if (rpcUrl !== null) {
+    const trustedLatestBlock = normalizeBlockHeader(
+      await requestJsonRpcResult<JsonRpcBlockHeader>(rpcUrl, "eth_getBlockByNumber", [
+        "latest",
+        false
+      ])
+    );
+
+    if (trustedLatestBlock !== null) {
+      const walletBlock = normalizeBlockHeader(
+        await requestWalletRpcResult<JsonRpcBlockHeader>(
+          transport,
+          "eth_getBlockByNumber",
+          [trustedLatestBlock.number, false]
+        )
+      );
+
+      if (walletBlock !== null && walletBlock.hash !== trustedLatestBlock.hash) {
+        throw new SpawnPaymentError(
+          "stale_network_config",
+          `Connected wallet is pointed at a different Automaton Playground network than chain ${chainMetadata?.chainId ?? "the expected chain"}. Remove the existing playground network from the wallet, add it again, and retry the payment.`
+        );
+      }
+    }
+  }
+
+  const [walletTokenCode, walletEscrowCode] = await Promise.all([
+    requestWalletRpcResult<string>(transport, "eth_getCode", [tokenAddress, "latest"]),
+    requestWalletRpcResult<string>(transport, "eth_getCode", [payment.paymentAddress, "latest"])
+  ]);
+
+  if (isEmptyContractCode(walletTokenCode) || isEmptyContractCode(walletEscrowCode)) {
+    throw new SpawnPaymentError(
+      "stale_network_config",
+      `Connected wallet is missing the live playground contracts for chain ${chainMetadata?.chainId ?? "the expected chain"}. Remove the existing playground network from the wallet, add it again, and retry the payment.`
+    );
+  }
 }
 
 export async function connectWalletToSpawnChain(
@@ -470,6 +573,14 @@ export async function executeSpawnPayment(
       if (depositData === null) {
         throw new Error("Unable to encode the escrow deposit transaction.");
       }
+
+      await assertWalletTargetsActivePlaygroundNetwork(
+        payment,
+        transport,
+        tokenAddress,
+        playgroundMetadata,
+        env
+      );
 
       const approvalTxHash = await transport.request<string>({
         method: "eth_sendTransaction",

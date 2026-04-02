@@ -556,7 +556,7 @@ pub fn initialize_storage_after_upgrade() {
     let _ = read_state(|state| state.version_commit.clone());
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn reload_storage_for_test() {
     #[cfg(not(target_arch = "wasm32"))]
     FACTORY_STORAGE.with(|storage| storage.borrow_mut().reload());
@@ -564,7 +564,7 @@ pub(crate) fn reload_storage_for_test() {
 
 #[cfg(target_arch = "wasm32")]
 pub fn current_canister_balance() -> u128 {
-    ic_cdk::api::canister_balance128()
+    ic_cdk::api::canister_cycle_balance()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -572,7 +572,7 @@ pub fn current_canister_balance() -> u128 {
     MOCK_CANISTER_BALANCE.with(|balance| *balance.borrow())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub fn set_mock_canister_balance(balance: u128) {
     MOCK_CANISTER_BALANCE.with(|value| {
         *value.borrow_mut() = balance;

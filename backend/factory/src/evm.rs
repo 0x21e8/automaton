@@ -761,7 +761,7 @@ pub(crate) fn broadcast_release_transaction(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{
         broadcast_release_transaction, build_release_broadcast_record, build_release_plan,

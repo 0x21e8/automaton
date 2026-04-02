@@ -2,10 +2,8 @@
 use crate::types::FactoryError;
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn rejection_message(
-    (code, message): (ic_cdk::api::call::RejectionCode, String),
-) -> String {
-    format!("{code:?}: {message}")
+pub(crate) fn rejection_message(error: impl std::fmt::Display) -> String {
+    error.to_string()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -33,15 +31,15 @@ fn canister_principal(canister_id: &str) -> Result<candid::Principal, FactoryErr
 
 #[cfg(target_arch = "wasm32")]
 pub async fn complete_controller_handoff_live(canister_id: &str) -> Result<(), FactoryError> {
-    use ic_cdk::api::management_canister::main::{
-        canister_status, update_settings, CanisterIdRecord, CanisterSettings,
-        UpdateSettingsArgument,
+    use ic_cdk::management_canister::{
+        canister_status, update_settings, CanisterSettings, CanisterStatusArgs,
+        UpdateSettingsArgs,
     };
 
     let canister = canister_principal(canister_id)?;
-    let factory_controller = ic_cdk::api::id();
+    let factory_controller = ic_cdk::api::canister_self();
 
-    let first_update = update_settings(UpdateSettingsArgument {
+    let first_update = update_settings(&UpdateSettingsArgs {
         canister_id: canister,
         settings: CanisterSettings {
             controllers: Some(vec![factory_controller, canister]),
@@ -59,7 +57,7 @@ pub async fn complete_controller_handoff_live(canister_id: &str) -> Result<(), F
         Err(error) => return Err(error),
     }
 
-    let first_status = canister_status(CanisterIdRecord {
+    let first_status = canister_status(&CanisterStatusArgs {
         canister_id: canister,
     })
     .await
@@ -67,7 +65,7 @@ pub async fn complete_controller_handoff_live(canister_id: &str) -> Result<(), F
         method: "canister_status".to_string(),
         message: rejection_message(error),
     });
-    let (status,) = match first_status {
+    let status = match first_status {
         Ok(status) => status,
         Err(error) if is_self_controlled_error(&error) => return Ok(()),
         Err(error) => return Err(error),
@@ -90,7 +88,7 @@ pub async fn complete_controller_handoff_live(canister_id: &str) -> Result<(), F
         });
     }
 
-    let second_update = update_settings(UpdateSettingsArgument {
+    let second_update = update_settings(&UpdateSettingsArgs {
         canister_id: canister,
         settings: CanisterSettings {
             controllers: Some(vec![canister]),
@@ -108,7 +106,7 @@ pub async fn complete_controller_handoff_live(canister_id: &str) -> Result<(), F
         Err(error) => return Err(error),
     }
 
-    let second_status = canister_status(CanisterIdRecord {
+    let second_status = canister_status(&CanisterStatusArgs {
         canister_id: canister,
     })
     .await
@@ -116,7 +114,7 @@ pub async fn complete_controller_handoff_live(canister_id: &str) -> Result<(), F
         method: "canister_status".to_string(),
         message: rejection_message(error),
     });
-    let (status,) = match second_status {
+    let status = match second_status {
         Ok(status) => status,
         Err(error) if is_self_controlled_error(&error) => return Ok(()),
         Err(error) => return Err(error),

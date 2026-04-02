@@ -8,6 +8,7 @@ use crate::cycles::ensure_spawn_creation_cycles;
 use crate::evm::derive_child_evm_address;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::evm::derive_child_evm_address_for_key_name;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::expiry::expire_spawn_session;
 #[cfg(target_arch = "wasm32")]
 use crate::init::build_automaton_install_args;
@@ -15,15 +16,23 @@ use crate::init::{initialize_automaton, validate_automaton_child_runtime_config}
 use crate::retry::mark_session_failed_in_state;
 use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent};
 use crate::state::{clear_provider_secrets, read_state, write_state, FactoryState};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::types::{amount_to_string, parse_amount};
 use crate::types::{
-    amount_to_string, parse_amount, AutomatonBootstrapEvidence, AutomatonBootstrapVerification,
-    AutomatonRuntimeState, FactoryError, PaymentStatus, ReleaseBroadcastRecord, SessionAuditActor,
-    SpawnExecutionReceipt, SpawnSession, SpawnSessionState, SpawnedAutomatonRecord,
-    CONTROLLER_FIELD,
+    AutomatonBootstrapEvidence, AutomatonBootstrapVerification, AutomatonRuntimeState,
+    FactoryError, PaymentStatus, ReleaseBroadcastRecord, SessionAuditActor,
+    SpawnExecutionReceipt, SpawnSession, SpawnSessionState, SpawnedAutomatonRecord, CONTROLLER_FIELD,
 };
 
 #[cfg(target_arch = "wasm32")]
 use crate::now_ms as current_time_ms;
+#[cfg(target_arch = "wasm32")]
+use ic_cdk::call::Call;
+#[cfg(target_arch = "wasm32")]
+use ic_cdk::management_canister::{
+    create_canister_with_extra_cycles, delete_canister, install_code, CanisterInstallMode,
+    CanisterSettings, CreateCanisterArgs, DeleteCanisterArgs, InstallCodeArgs,
+};
 
 fn normalize_bootstrap_list(values: &[String]) -> Vec<String> {
     values
@@ -214,6 +223,27 @@ enum ChildDerivedAddressResult {
 async fn load_spawned_automaton_bootstrap_evidence(
     canister_id: &str,
 ) -> Result<AutomatonBootstrapEvidence, FactoryError> {
+    async fn call_child_canister_tuple<R>(
+        principal: &candid::Principal,
+        method: &'static str,
+    ) -> Result<R, FactoryError>
+    where
+        R: for<'de> candid::utils::ArgumentDecoder<'de>,
+    {
+        let response = Call::unbounded_wait(*principal, method)
+            .await
+            .map_err(|error| FactoryError::ManagementCallFailed {
+                method: method.to_string(),
+                message: rejection_message(error),
+            })?;
+        response
+            .candid_tuple()
+            .map_err(|error| FactoryError::ManagementCallFailed {
+                method: method.to_string(),
+                message: rejection_message(error),
+            })
+    }
+
     use candid::Principal;
 
     let principal =
@@ -222,34 +252,14 @@ async fn load_spawned_automaton_bootstrap_evidence(
             message: error.to_string(),
         })?;
     let (bootstrap_view,): (ChildSpawnBootstrapView,) =
-        ic_cdk::call(principal, "get_spawn_bootstrap_view", ())
-            .await
-            .map_err(|error| FactoryError::ManagementCallFailed {
-                method: "get_spawn_bootstrap_view".to_string(),
-                message: rejection_message(error),
-            })?;
+        call_child_canister_tuple(&principal, "get_spawn_bootstrap_view").await?;
     let (steward_status,): (ChildStewardStatusView,) =
-        ic_cdk::call(principal, "get_steward_status", ())
-            .await
-            .map_err(|error| FactoryError::ManagementCallFailed {
-                method: "get_steward_status".to_string(),
-                message: rejection_message(error),
-            })?;
+        call_child_canister_tuple(&principal, "get_steward_status").await?;
     let (mut evm_address,): (Option<String>,) =
-        ic_cdk::call(principal, "get_automaton_evm_address", ())
-            .await
-            .map_err(|error| FactoryError::ManagementCallFailed {
-                method: "get_automaton_evm_address".to_string(),
-                message: rejection_message(error),
-            })?;
+        call_child_canister_tuple(&principal, "get_automaton_evm_address").await?;
     if evm_address.is_none() {
         let (derived_address_result,): (ChildDerivedAddressResult,) =
-            ic_cdk::call(principal, "derive_automaton_evm_address", ())
-                .await
-                .map_err(|error| FactoryError::ManagementCallFailed {
-                    method: "derive_automaton_evm_address".to_string(),
-                    message: rejection_message(error),
-                })?;
+            call_child_canister_tuple(&principal, "derive_automaton_evm_address").await?;
         let derived_address = match derived_address_result {
             ChildDerivedAddressResult::Ok(address) => address,
             ChildDerivedAddressResult::Err(message) => {
@@ -656,15 +666,13 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
 #[cfg(target_arch = "wasm32")]
 async fn cleanup_orphaned_canister(canister_id: &str) {
     use candid::Principal;
-    use ic_cdk::api::management_canister::main::delete_canister;
-    use ic_cdk::api::management_canister::main::CanisterIdRecord;
 
     let principal = match Principal::from_text(canister_id) {
         Ok(principal) => principal,
         Err(_) => return,
     };
 
-    let _ = delete_canister(CanisterIdRecord {
+    let _ = delete_canister(&DeleteCanisterArgs {
         canister_id: principal,
     })
     .await;
@@ -706,10 +714,6 @@ pub async fn execute_spawn(
     started_at_ms: u64,
 ) -> Result<SpawnExecutionReceipt, FactoryError> {
     use candid::Principal;
-    use ic_cdk::api::management_canister::main::{
-        create_canister, install_code, CanisterInstallMode, CanisterSettings,
-        CreateCanisterArgument, InstallCodeArgument,
-    };
 
     let session_snapshot = read_state(|state| {
         state
@@ -842,14 +846,15 @@ pub async fn execute_spawn(
         .unwrap_or(true);
 
     if needs_install {
-        let (record,) = match create_canister(
-            CreateCanisterArgument {
+        let create_extra_cycles = create_cycles.saturating_sub(ic_cdk::api::cost_create_canister());
+        let record = match create_canister_with_extra_cycles(
+            &CreateCanisterArgs {
                 settings: Some(CanisterSettings {
                     controllers: None,
                     ..Default::default()
                 }),
             },
-            create_cycles,
+            create_extra_cycles,
         )
         .await
         {
@@ -939,7 +944,7 @@ pub async fn execute_spawn(
             }
         })?;
 
-        if let Err(error) = install_code(InstallCodeArgument {
+        if let Err(error) = install_code(&InstallCodeArgs {
             mode: CanisterInstallMode::Install,
             canister_id: canister_principal,
             wasm_module,
@@ -1156,7 +1161,7 @@ pub async fn execute_spawn(
     {
         Ok(release) => release,
         Err(error) => {
-            let _ = write_state(|state| {
+            write_state(|state| {
                 persist_release_broadcast_record(state, session_id, &error.record);
             });
             return fail_spawn_session(

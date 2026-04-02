@@ -701,7 +701,7 @@ pub fn eth_send_raw_transaction(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{
         configured_rpc_endpoints, eth_block_number, eth_get_deposited_logs,

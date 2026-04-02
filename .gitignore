@@ -12,5 +12,6 @@ tmp/
 .claude
 .icp
 playground.local.env
+ops/playground/playground.env
 apps/web/.env.local
 apps/web/.env.development.local

@@ -134,10 +134,38 @@ function createPlaygroundMetadata() {
 
 describe("spawn payment executor", () => {
   it("submits approval and deposit transactions using session instructions", async () => {
-    const fetchMock = mockSuccessfulReceiptFetch();
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            number: "0x64",
+            hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        })
+      } as Response)
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            status: "0x1"
+          }
+        })
+      } as Response);
     const request = vi
       .fn()
       .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        number: "0x64",
+        hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      })
+      .mockResolvedValueOnce("0x60806040")
+      .mockResolvedValueOnce("0x60806040")
       .mockResolvedValueOnce("0xapprove")
       .mockResolvedValueOnce("0xdeposit")
       .mockResolvedValue(null);
@@ -164,6 +192,18 @@ describe("spawn payment executor", () => {
       params: [{ chainId: "0x2105" }]
     });
     expect(request).toHaveBeenNthCalledWith(2, {
+      method: "eth_getBlockByNumber",
+      params: ["0x64", false]
+    });
+    expect(request).toHaveBeenNthCalledWith(3, {
+      method: "eth_getCode",
+      params: ["0x3333333333333333333333333333333333333333", "latest"]
+    });
+    expect(request).toHaveBeenNthCalledWith(4, {
+      method: "eth_getCode",
+      params: ["0x2222222222222222222222222222222222222222", "latest"]
+    });
+    expect(request).toHaveBeenNthCalledWith(5, {
       method: "eth_sendTransaction",
       params: [
         {
@@ -175,7 +215,7 @@ describe("spawn payment executor", () => {
         }
       ]
     });
-    expect(request).toHaveBeenNthCalledWith(3, {
+    expect(request).toHaveBeenNthCalledWith(6, {
       method: "eth_sendTransaction",
       params: [
         {
@@ -186,11 +226,11 @@ describe("spawn payment executor", () => {
         }
       ]
     });
-    expect(request).toHaveBeenNthCalledWith(4, {
+    expect(request).toHaveBeenNthCalledWith(7, {
       method: "eth_getTransactionReceipt",
       params: ["0xapprove"]
     });
-    expect(request).toHaveBeenNthCalledWith(5, {
+    expect(request).toHaveBeenNthCalledWith(8, {
       method: "eth_getTransactionReceipt",
       params: ["0xdeposit"]
     });
@@ -199,12 +239,34 @@ describe("spawn payment executor", () => {
       paymentTxHash: "0xdeposit",
       pendingReceipts: []
     });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     fetchMock.mockRestore();
   });
 
   it("adds and switches to the runtime playground chain when the wallet does not know it yet", async () => {
-    const fetchMock = mockSuccessfulReceiptFetch();
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            number: "0x64",
+            hash: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        })
+      } as Response)
+      .mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            status: "0x1"
+          }
+        })
+      } as Response);
     const request = vi
       .fn()
       .mockRejectedValueOnce({
@@ -213,6 +275,12 @@ describe("spawn payment executor", () => {
       })
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        number: "0x64",
+        hash: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      })
+      .mockResolvedValueOnce("0x60806040")
+      .mockResolvedValueOnce("0x60806040")
       .mockResolvedValueOnce("0xapprove")
       .mockResolvedValueOnce("0xdeposit")
       .mockResolvedValue(null);
@@ -258,6 +326,18 @@ describe("spawn payment executor", () => {
       params: [{ chainId: "0x13525e6" }]
     });
     expect(request).toHaveBeenNthCalledWith(4, {
+      method: "eth_getBlockByNumber",
+      params: ["0x64", false]
+    });
+    expect(request).toHaveBeenNthCalledWith(5, {
+      method: "eth_getCode",
+      params: ["0x3333333333333333333333333333333333333333", "latest"]
+    });
+    expect(request).toHaveBeenNthCalledWith(6, {
+      method: "eth_getCode",
+      params: ["0x2222222222222222222222222222222222222222", "latest"]
+    });
+    expect(request).toHaveBeenNthCalledWith(7, {
       method: "eth_sendTransaction",
       params: [
         {
@@ -269,7 +349,7 @@ describe("spawn payment executor", () => {
         }
       ]
     });
-    expect(request).toHaveBeenNthCalledWith(5, {
+    expect(request).toHaveBeenNthCalledWith(8, {
       method: "eth_sendTransaction",
       params: [
         {
@@ -280,11 +360,11 @@ describe("spawn payment executor", () => {
         }
       ]
     });
-    expect(request).toHaveBeenNthCalledWith(6, {
+    expect(request).toHaveBeenNthCalledWith(9, {
       method: "eth_getTransactionReceipt",
       params: ["0xapprove"]
     });
-    expect(request).toHaveBeenNthCalledWith(7, {
+    expect(request).toHaveBeenNthCalledWith(10, {
       method: "eth_getTransactionReceipt",
       params: ["0xdeposit"]
     });
@@ -293,7 +373,7 @@ describe("spawn payment executor", () => {
       paymentTxHash: "0xdeposit",
       pendingReceipts: []
     });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     fetchMock.mockRestore();
   });
 
@@ -301,9 +381,36 @@ describe("spawn payment executor", () => {
     vi.useFakeTimers();
 
     try {
+      const fetchMock = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            jsonrpc: "2.0",
+            id: 1,
+            result: {
+              number: "0x64",
+              hash: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          })
+        } as Response)
+        .mockResolvedValue({
+          ok: true,
+          json: async () => ({
+            jsonrpc: "2.0",
+            id: 1,
+            result: null
+          })
+        } as Response);
       const request = vi
         .fn()
         .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          number: "0x64",
+          hash: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        })
+        .mockResolvedValueOnce("0x60806040")
+        .mockResolvedValueOnce("0x60806040")
         .mockResolvedValueOnce("0xapprove")
         .mockResolvedValueOnce("0xdeposit")
         .mockResolvedValue(null);
@@ -319,6 +426,7 @@ describe("spawn payment executor", () => {
         { request },
         null,
         {
+          VITE_SPAWN_CHAIN_RPC_URL: "https://rpc.playground.example.com",
           VITE_SPAWN_USDC_CONTRACT_ADDRESS:
             "0x3333333333333333333333333333333333333333"
         }
@@ -331,9 +439,60 @@ describe("spawn payment executor", () => {
         paymentTxHash: "0xdeposit",
         pendingReceipts: ["approval", "deposit"]
       });
+      fetchMock.mockRestore();
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("rejects wallet payments when the wallet is pointed at a stale playground backend", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            number: "0x64",
+            hash: "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          }
+        })
+      } as Response);
+
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        number: "0x64",
+        hash: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      });
+
+    await expect(
+      executeSpawnPayment(
+        createPayment({
+          grossAmount: "75250000",
+          paymentAddress: "0x2222222222222222222222222222222222222222"
+        }),
+        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        { request },
+        createPlaygroundMetadata(),
+        {
+          VITE_SPAWN_USDC_CONTRACT_ADDRESS:
+            "0x3333333333333333333333333333333333333333"
+        }
+      )
+    ).rejects.toThrow(/different Automaton Playground network/i);
+
+    expect(request).toHaveBeenNthCalledWith(1, {
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: "0x13525e6" }]
+    });
+    expect(request).toHaveBeenNthCalledWith(2, {
+      method: "eth_getBlockByNumber",
+      params: ["0x64", false]
+    });
+    fetchMock.mockRestore();
   });
 
   it("uses the configured fallback chain id when runtime metadata is unavailable", async () => {
