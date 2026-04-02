@@ -1639,20 +1639,6 @@ export function SpawnWizard({
                     </p>
                   ) : null}
 
-                  <p className="spawn-session-meta">
-                    {spawnSession.isCreating
-                      ? "Creating factory session reference."
-                      : spawnSession.isMutating
-                        ? "Submitting factory session action."
-                        : spawnSession.isRefreshing
-                          ? "Refreshing factory session state from the indexer."
-                          : activeSession.state === "awaiting_payment" &&
-                              paymentResult !== null &&
-                              effectivePendingReceipts.length === 0
-                            ? "Waiting for the factory/indexer to mirror the confirmed playground payment."
-                            : "Live spawn progress updates automatically as indexer events arrive."}
-                  </p>
-
                   {activeSession.state === "expired" ? (
                     <p className="spawn-session-error" role="alert">
                       This session expired before completion. The quote TTL may
@@ -1668,20 +1654,6 @@ export function SpawnWizard({
                     </p>
                   ) : null}
 
-                  {paymentResult !== null ? (
-                    <p className="spawn-session-meta">
-                      {effectivePendingReceipts.length === 0
-                        ? "Transactions submitted and confirmed."
-                        : "Transactions submitted."}{" "}
-                      Approval tx: {formatShortHash(paymentResult.approvalTxHash)}
-                      . Deposit tx: {formatShortHash(paymentResult.paymentTxHash)}.
-                      {effectivePendingReceipts.length > 0
-                        ? ` Waiting for ${describePendingReceipts(
-                            effectivePendingReceipts
-                          )} confirmation.`
-                        : ""}
-                    </p>
-                  ) : null}
                 </>
               ) : (
                 <p className="spawn-session-meta">
