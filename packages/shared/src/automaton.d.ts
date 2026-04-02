@@ -39,6 +39,7 @@ export interface AutomatonRecord {
     chain: ChainSlug;
     chainId: number;
     name: string;
+    model: string | null;
     soul: string;
     tier: AutomatonTier;
     agentState: string;
@@ -139,6 +140,7 @@ export interface AutomatonDetail extends AutomatonSummary {
     soul: string;
     canisterUrl: string;
     explorerUrl: string | null;
+    model: string | null;
     financials: AutomatonFinancials;
     runtime: AutomatonRuntime;
     version: AutomatonVersion;

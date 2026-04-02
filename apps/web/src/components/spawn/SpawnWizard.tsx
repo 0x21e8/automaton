@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import type {
   CreateSpawnSessionRequest,
-  PlaygroundMetadata
+  PlaygroundMetadata,
+  SpawnSession
 } from "@ic-automaton/shared";
 
 import {
@@ -69,6 +70,24 @@ interface WalletBalanceState {
   usdcRaw: bigint | null;
 }
 
+type SpawnJourneyStatus = "pending" | "current" | "complete" | "error";
+
+interface SpawnJourneyStep {
+  detail: string;
+  key: "session" | "payment" | "detection" | "provision" | "complete";
+  label: string;
+  status: SpawnJourneyStatus;
+}
+
+interface SpawnJourneyProgress {
+  completedCount: number;
+  currentDetail: string;
+  currentLabel: string;
+  progressPercent: number;
+  steps: SpawnJourneyStep[];
+  totalCount: number;
+}
+
 const stepTitles = [
   "Select chain",
   "Risk appetite",
@@ -86,19 +105,6 @@ function createEmptyWalletBalanceState(): WalletBalanceState {
     isLoading: false,
     usdcRaw: null
   };
-}
-
-function formatTimestamp(value: number): string {
-  return new Intl.DateTimeFormat("en-GB", {
-    dateStyle: "medium",
-    timeStyle: "medium",
-    hour12: false,
-    timeZone: "UTC"
-  }).format(value);
-}
-
-function formatNullableValue(value: string | null): string {
-  return value ?? "pending";
 }
 
 function formatShortHash(value: string): string {
@@ -119,6 +125,51 @@ function describePendingReceipts(
   }
 
   return "approval and deposit transactions";
+}
+
+export function getEffectivePendingReceipts(
+  session: Pick<SpawnSession, "state" | "paymentStatus"> | null,
+  paymentResult: SpawnPaymentExecutionResult | null
+): SpawnPaymentExecutionResult["pendingReceipts"] {
+  if (paymentResult === null) {
+    return [];
+  }
+
+  if (session === null) {
+    return [...paymentResult.pendingReceipts];
+  }
+
+  if (session.paymentStatus === "paid" || session.state !== "awaiting_payment") {
+    return [];
+  }
+
+  if (session.paymentStatus === "partial") {
+    return ["deposit"];
+  }
+
+  return [...paymentResult.pendingReceipts];
+}
+
+export function getPaymentSubmissionLockReason(
+  session: Pick<SpawnSession, "state" | "paymentStatus"> | null,
+  paymentResult: SpawnPaymentExecutionResult | null,
+  pendingReceipts: SpawnPaymentExecutionResult["pendingReceipts"]
+): string | null {
+  if (paymentResult === null || session === null) {
+    return null;
+  }
+
+  if (session.state !== "awaiting_payment") {
+    return null;
+  }
+
+  if (session.paymentStatus !== "unpaid") {
+    return null;
+  }
+
+  return pendingReceipts.length > 0
+    ? "Wallet payment was already submitted for this session. Confirm or cancel the queued wallet transactions instead of sending another pair."
+    : "Wallet payment was already submitted for this session. Wait for the factory/indexer to mirror it instead of sending another pair.";
 }
 
 function formatTokenAmount(
@@ -164,6 +215,409 @@ function formatClaimWindow(seconds: number): string {
   }
 
   return `${seconds}s`;
+}
+
+function createSpawnJourneySteps(): SpawnJourneyStep[] {
+  return [
+    {
+      key: "session",
+      label: "Create session",
+      detail: "Factory prepares the quoted escrow session and payment instructions.",
+      status: "pending"
+    },
+    {
+      key: "payment",
+      label: "Confirm wallet payment",
+      detail: "Approve USDC and submit the escrow deposit from the connected wallet.",
+      status: "pending"
+    },
+    {
+      key: "detection",
+      label: "Detect funding",
+      detail: "The factory and indexer mark the session paid after the deposit lands.",
+      status: "pending"
+    },
+    {
+      key: "provision",
+      label: "Provision automaton",
+      detail: "The factory creates the automaton canister and applies its initial configuration.",
+      status: "pending"
+    },
+    {
+      key: "complete",
+      label: "Complete",
+      detail: "The new automaton appears on the grid and the session closes.",
+      status: "pending"
+    }
+  ];
+}
+
+function setSpawnJourneyStep(
+  steps: SpawnJourneyStep[],
+  key: SpawnJourneyStep["key"],
+  status: SpawnJourneyStatus,
+  detail?: string
+) {
+  const step = steps.find((candidate) => candidate.key === key);
+  if (step === undefined) {
+    return;
+  }
+
+  step.status = status;
+
+  if (detail !== undefined) {
+    step.detail = detail;
+  }
+}
+
+function finalizeSpawnJourneyProgress(
+  steps: SpawnJourneyStep[],
+  currentLabel: string,
+  currentDetail: string
+): SpawnJourneyProgress {
+  const completedCount = steps.filter((step) => step.status === "complete").length;
+  const totalCount = steps.length;
+  const progressPercent =
+    completedCount === totalCount
+      ? 100
+      : ((completedCount + 0.5) / totalCount) * 100;
+
+  return {
+    completedCount,
+    currentDetail,
+    currentLabel,
+    progressPercent,
+    steps,
+    totalCount
+  };
+}
+
+export function formatSpawnJourneyStatusLabel(status: SpawnJourneyStatus): string {
+  switch (status) {
+    case "complete":
+      return "Done";
+    case "current":
+      return "In progress";
+    case "error":
+      return "Attention";
+    default:
+      return "Waiting";
+  }
+}
+
+export function deriveSpawnJourneyProgress(
+  session: Pick<
+    SpawnSession,
+    "state" | "paymentStatus" | "refundable" | "retryable"
+  > | null,
+  paymentResult: SpawnPaymentExecutionResult | null,
+  pendingReceipts: SpawnPaymentExecutionResult["pendingReceipts"],
+  isCreating: boolean,
+  isSubmittingPayment: boolean
+): SpawnJourneyProgress | null {
+  if (session === null && !isCreating) {
+    return null;
+  }
+
+  const steps = createSpawnJourneySteps();
+
+  if (session === null) {
+    setSpawnJourneyStep(
+      steps,
+      "session",
+      "current",
+      "Generating the session ID, quote, and escrow destination."
+    );
+
+    return finalizeSpawnJourneyProgress(
+      steps,
+      "Creating factory session",
+      "Factory is preparing the live payment session for this spawn attempt."
+    );
+  }
+
+  setSpawnJourneyStep(
+    steps,
+    "session",
+    "complete",
+    "Session is ready with a locked quote and escrow destination."
+  );
+
+  switch (session.state) {
+    case "awaiting_payment":
+      if (isSubmittingPayment) {
+        setSpawnJourneyStep(
+          steps,
+          "payment",
+          "current",
+          "Check the wallet and confirm both the USDC approval and escrow deposit."
+        );
+
+        return finalizeSpawnJourneyProgress(
+          steps,
+          "Waiting for wallet confirmation",
+          "The wallet is preparing the approval and deposit transactions for this session."
+        );
+      }
+
+      if (paymentResult !== null && pendingReceipts.length > 0) {
+        setSpawnJourneyStep(
+          steps,
+          "payment",
+          "current",
+          `Transactions were submitted. Waiting for the ${describePendingReceipts(
+            pendingReceipts
+          )} to confirm on-chain.`
+        );
+
+        return finalizeSpawnJourneyProgress(
+          steps,
+          "Confirming on-chain payment",
+          "Keep the session open while the playground confirms the submitted wallet transactions."
+        );
+      }
+
+      if (paymentResult !== null || session.paymentStatus === "partial") {
+        setSpawnJourneyStep(
+          steps,
+          "payment",
+          "complete",
+          "Wallet approval and deposit were submitted from the connected wallet."
+        );
+        setSpawnJourneyStep(
+          steps,
+          "detection",
+          "current",
+          session.paymentStatus === "partial"
+            ? "The payment is only partially mirrored so far. Waiting for the full quoted amount to settle."
+            : "On-chain payment is confirmed. Waiting for the factory and indexer to mirror it."
+        );
+
+        return finalizeSpawnJourneyProgress(
+          steps,
+          "Waiting for factory confirmation",
+          session.paymentStatus === "partial"
+            ? "The escrow session shows partial funding. The factory will continue once the full quote is recognized."
+            : "The wallet payment landed, but the session is still waiting for the backend to mark it as paid."
+        );
+      }
+
+      setSpawnJourneyStep(
+        steps,
+        "payment",
+        "current",
+        "Use Pay with wallet to approve USDC and submit the escrow deposit for this session."
+      );
+
+      return finalizeSpawnJourneyProgress(
+        steps,
+        "Waiting for wallet payment",
+        "The factory session is ready. The next step is to authorize the wallet payment."
+      );
+
+    case "payment_detected":
+      setSpawnJourneyStep(
+        steps,
+        "payment",
+        "complete",
+        "Wallet payment reached the escrow session."
+      );
+      setSpawnJourneyStep(
+        steps,
+        "detection",
+        "complete",
+        "Factory detected the quoted escrow payment."
+      );
+      setSpawnJourneyStep(
+        steps,
+        "provision",
+        "current",
+        "Funding is confirmed. The factory is preparing the spawn pipeline."
+      );
+
+      return finalizeSpawnJourneyProgress(
+        steps,
+        "Provisioning automaton",
+        "Escrow payment is locked in and the factory has started the spawn pipeline."
+      );
+
+    case "spawning":
+      setSpawnJourneyStep(
+        steps,
+        "payment",
+        "complete",
+        "Wallet payment reached the escrow session."
+      );
+      setSpawnJourneyStep(
+        steps,
+        "detection",
+        "complete",
+        "Factory detected the quoted escrow payment."
+      );
+      setSpawnJourneyStep(
+        steps,
+        "provision",
+        "current",
+        "The factory is creating the automaton canister and applying its initial configuration."
+      );
+
+      return finalizeSpawnJourneyProgress(
+        steps,
+        "Provisioning automaton",
+        "The automaton is being created and configured now."
+      );
+
+    case "broadcasting_release":
+      setSpawnJourneyStep(
+        steps,
+        "payment",
+        "complete",
+        "Wallet payment reached the escrow session."
+      );
+      setSpawnJourneyStep(
+        steps,
+        "detection",
+        "complete",
+        "Factory detected the quoted escrow payment."
+      );
+      setSpawnJourneyStep(
+        steps,
+        "provision",
+        "current",
+        "Provisioning succeeded. Finalizing the release transaction and registry update."
+      );
+
+      return finalizeSpawnJourneyProgress(
+        steps,
+        "Finalizing release",
+        "The automaton is provisioned. The session is finishing its release and registry work."
+      );
+
+    case "complete":
+      setSpawnJourneyStep(
+        steps,
+        "payment",
+        "complete",
+        "Wallet payment reached the escrow session."
+      );
+      setSpawnJourneyStep(
+        steps,
+        "detection",
+        "complete",
+        "Factory detected the quoted escrow payment."
+      );
+      setSpawnJourneyStep(
+        steps,
+        "provision",
+        "complete",
+        "Factory created the automaton and finalized the release."
+      );
+      setSpawnJourneyStep(
+        steps,
+        "complete",
+        "complete",
+        "Spawn completed and the new automaton should now appear on the grid."
+      );
+
+      return finalizeSpawnJourneyProgress(
+        steps,
+        "Spawn complete",
+        "The spawn finished successfully. The new automaton should now be visible on the grid."
+      );
+
+    case "failed":
+      setSpawnJourneyStep(
+        steps,
+        "payment",
+        session.paymentStatus === "unpaid" ? "error" : "complete",
+        session.paymentStatus === "unpaid"
+          ? "The session failed before a valid wallet payment was completed."
+          : "Wallet payment reached the escrow session."
+      );
+
+      if (session.paymentStatus === "paid") {
+        setSpawnJourneyStep(
+          steps,
+          "detection",
+          "complete",
+          "Factory detected the quoted escrow payment."
+        );
+      } else if (session.paymentStatus !== "unpaid") {
+        setSpawnJourneyStep(
+          steps,
+          "detection",
+          "error",
+          "Funding was not mirrored cleanly before the session failed."
+        );
+      }
+
+      setSpawnJourneyStep(
+        steps,
+        "provision",
+        "error",
+        describeSpawnSessionProgress(session as SpawnSession)
+      );
+
+      return finalizeSpawnJourneyProgress(
+        steps,
+        "Spawn failed",
+        describeSpawnSessionProgress(session as SpawnSession)
+      );
+
+    case "expired":
+      if (session.paymentStatus === "unpaid") {
+        setSpawnJourneyStep(
+          steps,
+          "payment",
+          "error",
+          "The quote expired before the wallet payment completed."
+        );
+      } else {
+        setSpawnJourneyStep(
+          steps,
+          "payment",
+          "complete",
+          session.paymentStatus === "refunded"
+            ? "A wallet payment was submitted and later refunded."
+            : "Wallet payment reached the escrow session."
+        );
+      }
+
+      if (session.paymentStatus === "paid" || session.paymentStatus === "refunded") {
+        setSpawnJourneyStep(
+          steps,
+          "detection",
+          "complete",
+          "Factory detected the quoted escrow payment."
+        );
+        setSpawnJourneyStep(
+          steps,
+          "provision",
+          "error",
+          "The session expired before the spawn could finish."
+        );
+      } else if (session.paymentStatus === "partial") {
+        setSpawnJourneyStep(
+          steps,
+          "detection",
+          "error",
+          "Only part of the quoted payment was mirrored before the session expired."
+        );
+      }
+
+      return finalizeSpawnJourneyProgress(
+        steps,
+        "Session expired",
+        describeSpawnSessionProgress(session as SpawnSession)
+      );
+
+    default:
+      return finalizeSpawnJourneyProgress(
+        steps,
+        "Session in progress",
+        describeSpawnSessionProgress(session as SpawnSession)
+      );
+  }
 }
 
 async function requestRpcHexValue(
@@ -328,6 +782,10 @@ export function SpawnWizard({
   const hasTrackedSession = spawnSession.sessionId !== null;
   const activeSession = spawnSession.session;
   const paymentInstructions = spawnSession.paymentInstructions;
+  const effectivePendingReceipts = getEffectivePendingReceipts(
+    activeSession,
+    paymentResult
+  );
   const expectedChainId = resolveSpawnChainId(state.chain, playgroundMetadata);
   const walletOnExpectedChain =
     expectedChainId !== null && walletSession.chainId === expectedChainId;
@@ -634,13 +1092,46 @@ export function SpawnWizard({
     walletSession,
     playgroundMetadata
   );
+  const paymentSubmissionLockReason = getPaymentSubmissionLockReason(
+    activeSession,
+    paymentResult,
+    effectivePendingReceipts
+  );
+  const canSubmitPaymentAction =
+    paymentAvailability.canSubmit &&
+    paymentSubmissionLockReason === null &&
+    !isSubmittingPayment;
+  const paymentActionDisabledReason =
+    paymentSubmissionLockReason ?? paymentAvailability.disabledReason;
+  const showPaymentAction =
+    paymentInstructions !== null &&
+    (paymentAvailability.canSubmit || isSubmittingPayment);
+  const showRetryAction = activeSession?.retryable ?? false;
+  const showRefundAction = activeSession?.refundable ?? false;
+  const showSessionActions =
+    showPaymentAction || showRetryAction || showRefundAction;
+  const spawnJourney = deriveSpawnJourneyProgress(
+    activeSession,
+    paymentResult,
+    effectivePendingReceipts,
+    spawnSession.isCreating,
+    isSubmittingPayment
+  );
+  const headerMetaLabel =
+    spawnJourney === null
+      ? `Step ${stepIndex + 1} of ${TOTAL_SPAWN_STEPS}`
+      : `Live progress · ${spawnJourney.completedCount} / ${spawnJourney.totalCount} complete`;
+  const headerMetaTitle = spawnJourney?.currentLabel ?? stepTitles[stepIndex];
+  const progressPercent =
+    spawnJourney?.progressPercent ??
+    ((stepIndex + 1) / TOTAL_SPAWN_STEPS) * 100;
 
   async function handlePayment() {
     if (
       activeSession === null ||
       paymentInstructions === null ||
       viewerAddress === null ||
-      !paymentAvailability.canSubmit ||
+      !canSubmitPaymentAction ||
       isSubmittingPayment
     ) {
       return;
@@ -850,10 +1341,8 @@ export function SpawnWizard({
             <h2 className="spawn-heading">Spawn Automaton</h2>
           </div>
           <div className="spawn-header-meta">
-            <span>
-              Step {stepIndex + 1} of {TOTAL_SPAWN_STEPS}
-            </span>
-            <strong>{stepTitles[stepIndex]}</strong>
+            <span>{headerMetaLabel}</span>
+            <strong>{headerMetaTitle}</strong>
           </div>
         </header>
 
@@ -861,7 +1350,7 @@ export function SpawnWizard({
           <div
             className="spawn-progress-fill"
             style={{
-              width: `${((stepIndex + 1) / TOTAL_SPAWN_STEPS) * 100}%`
+              width: `${progressPercent}%`
             }}
           />
         </div>
@@ -1021,182 +1510,185 @@ export function SpawnWizard({
             />
           ) : null}
 
-          {activeSession !== null ? (
+          {spawnJourney !== null ? (
             <section className="spawn-session-status" aria-live="polite">
               <div className="spawn-session-header">
                 <div>
-                  <p className="section-label">Factory session data</p>
-                  <h3 className="spawn-step-title">Factory Session Reference</h3>
+                  <p className="section-label">Live spawn progress</p>
+                  <h3 className="spawn-step-title">Funding and Provisioning</h3>
                 </div>
                 <span className="spawn-session-pill">
-                  {formatSpawnSessionStateLabel(activeSession.state)}
+                  {spawnJourney.currentLabel}
                 </span>
               </div>
 
               <p className="spawn-step-copy">
-                {describeSpawnSessionProgress(activeSession)}
+                {spawnJourney.currentDetail}
               </p>
 
-              <div className="spawn-session-grid">
-                <div className="spawn-session-row">
-                  <span>Session ID</span>
-                  <strong>{activeSession.sessionId}</strong>
-                </div>
-                <div className="spawn-session-row">
-                  <span>Payment status</span>
-                  <strong>{formatSpawnSessionStateLabel(activeSession.paymentStatus)}</strong>
-                </div>
-                <div className="spawn-session-row">
-                  <span>Quoted payment</span>
-                  <strong>{spawnSession.formatAmount()}</strong>
-                </div>
-                <div className="spawn-session-row">
-                  <span>Expires</span>
-                  <strong>{formatTimestamp(activeSession.expiresAt)}</strong>
-                </div>
-                <div className="spawn-session-row">
-                  <span>Escrow address</span>
+              <div className="spawn-journey-overview">
+                <div className="spawn-journey-overview-head">
                   <strong>
-                    {formatNullableValue(paymentInstructions?.paymentAddress ?? null)}
+                    {spawnJourney.completedCount} of {spawnJourney.totalCount} steps
+                    complete
                   </strong>
+                  <span>{headerMetaTitle}</span>
                 </div>
-                <div className="spawn-session-row">
-                  <span>Quote terms</span>
-                  <strong>{activeSession.quoteTermsHash}</strong>
-                </div>
-                <div className="spawn-session-row">
-                  <span>Retry</span>
-                  <strong>{activeSession.retryable ? "Available" : "Not available"}</strong>
-                </div>
-                <div className="spawn-session-row">
-                  <span>Refund</span>
-                  <strong>{activeSession.refundable ? "Available" : "Not available"}</strong>
-                </div>
-                <div className="spawn-session-row">
-                  <span>Automaton canister</span>
-                  <strong>{formatNullableValue(activeSession.automatonCanisterId)}</strong>
-                </div>
-                <div className="spawn-session-row">
-                  <span>Automaton EVM</span>
-                  <strong>{formatNullableValue(activeSession.automatonEvmAddress)}</strong>
-                </div>
+                <ol className="spawn-journey-list">
+                  {spawnJourney.steps.map((step) => (
+                    <li
+                      className={`spawn-journey-step is-${step.status}`}
+                      key={step.key}
+                    >
+                      <span aria-hidden="true" className="spawn-journey-marker" />
+                      <div className="spawn-journey-content">
+                        <p className="spawn-journey-label">{step.label}</p>
+                        <p className="spawn-journey-copy">{step.detail}</p>
+                      </div>
+                      <span className="spawn-journey-step-status">
+                        {formatSpawnJourneyStatusLabel(step.status)}
+                      </span>
+                    </li>
+                  ))}
+                </ol>
               </div>
 
-              <div className="spawn-session-actions">
-                {paymentInstructions !== null ? (
-                  <button
-                    className="spawn-nav-button is-primary"
-                    disabled={!paymentAvailability.canSubmit || isSubmittingPayment}
-                    onClick={() => {
-                      void handlePayment();
-                    }}
-                    type="button"
-                  >
-                    {isSubmittingPayment ? "Submitting payment..." : "Pay with wallet"}
-                  </button>
-                ) : null}
-                <button
-                  className="spawn-nav-button"
-                  disabled={!activeSession.retryable || spawnSession.isMutating}
-                  onClick={() => {
-                    void spawnSession.retry();
-                  }}
-                  type="button"
-                >
-                  Retry spawn
-                </button>
-                <button
-                  className="spawn-nav-button"
-                  disabled={!activeSession.refundable || spawnSession.isMutating}
-                  onClick={() => {
-                    void spawnSession.refund();
-                  }}
-                  type="button"
-                >
-                  Claim refund
-                </button>
-              </div>
+              {activeSession !== null ? (
+                <>
+                  {showSessionActions ? (
+                    <div className="spawn-session-actions">
+                      {showPaymentAction ? (
+                        <button
+                          className="spawn-nav-button is-primary"
+                          disabled={!canSubmitPaymentAction}
+                          onClick={() => {
+                            void handlePayment();
+                          }}
+                          type="button"
+                        >
+                          {isSubmittingPayment
+                            ? "Submitting payment..."
+                            : "Pay with wallet"}
+                        </button>
+                      ) : null}
+                      {showRetryAction ? (
+                        <button
+                          className="spawn-nav-button"
+                          disabled={spawnSession.isMutating}
+                          onClick={() => {
+                            void spawnSession.retry();
+                          }}
+                          type="button"
+                        >
+                          Retry spawn
+                        </button>
+                      ) : null}
+                      {showRefundAction ? (
+                        <button
+                          className="spawn-nav-button"
+                          disabled={spawnSession.isMutating}
+                          onClick={() => {
+                            void spawnSession.refund();
+                          }}
+                          type="button"
+                        >
+                          Claim refund
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
 
-              {paymentInstructions !== null ? (
+                  {showPaymentAction ? (
+                    <p className="spawn-session-meta">
+                      {paymentActionDisabledReason ??
+                        "This submits a USDC approval followed by the escrow deposit transaction from the connected wallet. Wallets may still show 0 ETH because the payment value is carried in contract calldata, not as native ETH."}
+                    </p>
+                  ) : null}
+
+                  {activeSession.state === "awaiting_payment" &&
+                  paymentResult === null ? (
+                    <p className="spawn-session-error" role="alert">
+                      No playground payment has been detected for this session yet.
+                      If you already clicked pay, open the wallet notification
+                      queue and confirm both the USDC approval and the escrow
+                      deposit on {playgroundChainName} (chain{" "}
+                      {playgroundMetadata?.chain.id ?? "pending"}).
+                    </p>
+                  ) : null}
+
+                  {activeSession.state === "awaiting_payment" &&
+                  activeSession.paymentStatus === "unpaid" &&
+                  paymentResult !== null &&
+                  effectivePendingReceipts.length === 0 ? (
+                    <p className="spawn-session-meta">
+                      Wallet transactions were confirmed on {playgroundChainName}{" "}
+                      (chain {playgroundMetadata?.chain.id ?? "pending"}), but
+                      the factory has not marked this session as paid yet. Leave
+                      this session open while the indexer catches up.
+                    </p>
+                  ) : null}
+
+                  {activeSession.state === "awaiting_payment" &&
+                  paymentResult !== null &&
+                  effectivePendingReceipts.length > 0 ? (
+                    <p className="spawn-session-meta">
+                      Wallet transactions were submitted and are still waiting
+                      for on-chain confirmation. Leave this session open while
+                      the playground confirms the{" "}
+                      {describePendingReceipts(effectivePendingReceipts)}.
+                    </p>
+                  ) : null}
+
+                  <p className="spawn-session-meta">
+                    {spawnSession.isCreating
+                      ? "Creating factory session reference."
+                      : spawnSession.isMutating
+                        ? "Submitting factory session action."
+                        : spawnSession.isRefreshing
+                          ? "Refreshing factory session state from the indexer."
+                          : activeSession.state === "awaiting_payment" &&
+                              paymentResult !== null &&
+                              effectivePendingReceipts.length === 0
+                            ? "Waiting for the factory/indexer to mirror the confirmed playground payment."
+                            : "Live spawn progress updates automatically as indexer events arrive."}
+                  </p>
+
+                  {activeSession.state === "expired" ? (
+                    <p className="spawn-session-error" role="alert">
+                      This session expired before completion. The quote TTL may
+                      have elapsed or the playground may have reset. Start a new
+                      session and claim a refund first if one is available.
+                    </p>
+                  ) : null}
+
+                  {playgroundMetadata?.maintenance ? (
+                    <p className="spawn-session-error" role="alert">
+                      Playground maintenance is active. New sessions are paused
+                      until the reset completes.
+                    </p>
+                  ) : null}
+
+                  {paymentResult !== null ? (
+                    <p className="spawn-session-meta">
+                      {effectivePendingReceipts.length === 0
+                        ? "Transactions submitted and confirmed."
+                        : "Transactions submitted."}{" "}
+                      Approval tx: {formatShortHash(paymentResult.approvalTxHash)}
+                      . Deposit tx: {formatShortHash(paymentResult.paymentTxHash)}.
+                      {effectivePendingReceipts.length > 0
+                        ? ` Waiting for ${describePendingReceipts(
+                            effectivePendingReceipts
+                          )} confirmation.`
+                        : ""}
+                    </p>
+                  ) : null}
+                </>
+              ) : (
                 <p className="spawn-session-meta">
-                  {paymentAvailability.disabledReason ??
-                    "This submits a USDC approval followed by the escrow deposit transaction from the connected wallet. Wallets may still show 0 ETH because the payment value is carried in contract calldata, not as native ETH."}
+                  Session reference details will appear here as soon as the
+                  factory returns the live quote and escrow instructions.
                 </p>
-              ) : null}
-
-              {activeSession.state === "awaiting_payment" && paymentResult === null ? (
-                <p className="spawn-session-error" role="alert">
-                  No playground payment has been detected for this session yet. If you
-                  already clicked pay, open the wallet notification queue and confirm
-                  both the USDC approval and the escrow deposit on{" "}
-                  {playgroundChainName} (chain {playgroundMetadata?.chain.id ?? "pending"}).
-                </p>
-              ) : null}
-
-              {activeSession.state === "awaiting_payment" &&
-              activeSession.paymentStatus === "unpaid" &&
-              paymentResult !== null &&
-              paymentResult.pendingReceipts.length === 0 ? (
-                <p className="spawn-session-meta">
-                  Wallet transactions were confirmed on {playgroundChainName} (chain{" "}
-                  {playgroundMetadata?.chain.id ?? "pending"}), but the factory has
-                  not marked this session as paid yet. Leave this session open while
-                  the indexer catches up.
-                </p>
-              ) : null}
-
-              {activeSession.state === "awaiting_payment" &&
-              paymentResult !== null &&
-              paymentResult.pendingReceipts.length > 0 ? (
-                <p className="spawn-session-meta">
-                  Wallet transactions were submitted and are still waiting for
-                  on-chain confirmation. Leave this session open while the playground
-                  confirms the{" "}
-                  {describePendingReceipts(paymentResult.pendingReceipts)}.
-                </p>
-              ) : null}
-
-              <p className="spawn-session-meta">
-                {spawnSession.isCreating
-                  ? "Creating factory session reference."
-                  : spawnSession.isMutating
-                    ? "Submitting factory session action."
-                    : spawnSession.isRefreshing
-                      ? "Refreshing factory session state from the indexer."
-                      : activeSession.state === "awaiting_payment" &&
-                          paymentResult !== null &&
-                          paymentResult.pendingReceipts.length === 0
-                        ? "Waiting for the factory/indexer to mirror the confirmed playground payment."
-                      : "Factory session data is mirrored here when the indexer reports it."}
-              </p>
-
-              {activeSession.state === "expired" ? (
-                <p className="spawn-session-error" role="alert">
-                  This session expired before completion. The quote TTL may have
-                  elapsed or the playground may have reset. Start a new session
-                  and claim a refund first if one is available.
-                </p>
-              ) : null}
-
-              {playgroundMetadata?.maintenance ? (
-                <p className="spawn-session-error" role="alert">
-                  Playground maintenance is active. New sessions are paused until
-                  the reset completes.
-                </p>
-              ) : null}
-
-              {paymentResult !== null ? (
-                <p className="spawn-session-meta">
-                  {paymentResult.pendingReceipts.length === 0
-                    ? "Transactions submitted and confirmed."
-                    : "Transactions submitted."}{" "}
-                  Approval tx: {formatShortHash(paymentResult.approvalTxHash)}.
-                  Deposit tx: {formatShortHash(paymentResult.paymentTxHash)}.
-                  {paymentResult.pendingReceipts.length > 0
-                    ? ` Waiting for ${describePendingReceipts(paymentResult.pendingReceipts)} confirmation.`
-                    : ""}
-                </p>
-              ) : null}
+              )}
 
               {paymentError !== null ? (
                 <p className="spawn-session-error" role="alert">
@@ -1232,7 +1724,7 @@ export function SpawnWizard({
             <>
               <button
                 className="spawn-nav-button"
-                disabled={stepIndex === 0}
+                disabled={stepIndex === 0 || spawnSession.isCreating || isSubmittingPayment}
                 onClick={retreatStep}
                 type="button"
               >

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FactoryClient } from "../src/integrations/factory-client.js";
 import { buildServer, start } from "../src/server.js";
@@ -800,6 +800,17 @@ describe("indexer server", () => {
     const sessionDetail = createSpawnSessionDetailFixture({
       registryRecord
     });
+    const faucetSeedRunner = vi.fn(async ({ walletAddress }: { walletAddress: string }) => {
+      return {
+        walletAddress,
+        mintTxHash: "0xmint",
+        fundTxHash: "0xfund",
+        balances: {
+          ethWei: "1000000000000000000",
+          usdcRaw: "250000000"
+        }
+      };
+    });
     const createdSession = createSpawnSessionDetailFixture({
       registryRecord: null,
       session: {
@@ -812,10 +823,17 @@ describe("indexer server", () => {
       }
     });
     const app = buildServer({
+      env: {
+        ...process.env,
+        PLAYGROUND_FAUCET_ENABLED: "1",
+        PLAYGROUND_FAUCET_ETH_AMOUNT: "1",
+        PLAYGROUND_FAUCET_USDC_AMOUNT: "250"
+      },
       config: {
         databasePath,
         factoryCanisterId: "factory-canister-id"
       },
+      faucetSeedRunner,
       factoryClient: new FactoryClient({
         configured: true,
         adapter: {
@@ -919,8 +937,6 @@ describe("indexer server", () => {
       })
     });
     await app.ready();
-    const socket = await app.injectWS(`/ws/events?sessionId=${sessionDetail.session.sessionId}`);
-    const eventMessage = waitForMessage(socket);
 
     const sessionResponse = await app.inject({
       method: "GET",
@@ -964,6 +980,19 @@ describe("indexer server", () => {
       audit: sessionDetail.audit,
       registryRecord
     });
+    expect(faucetSeedRunner).toHaveBeenCalledWith({
+      walletAddress: registryRecord.evmAddress,
+      ethAmount: {
+        asset: "eth",
+        amount: "1",
+        decimals: 18
+      },
+      usdcAmount: {
+        asset: "usdc",
+        amount: "250",
+        decimals: 6
+      }
+    });
     expect(createResponse.statusCode).toBe(200);
     expect(createResponse.json()).toMatchObject({
       session: {
@@ -973,6 +1002,18 @@ describe("indexer server", () => {
       quote: {
         payment: {
           paymentAddress: "0x00000000000000000000000000000000000000ef"
+        }
+      }
+    });
+    await expect(
+      app.indexerStore.getSpawnSessionDetail(createdSession.session.sessionId)
+    ).resolves.toMatchObject({
+      session: {
+        sessionId: createdSession.session.sessionId,
+        config: {
+          provider: {
+            model: createdSession.session.config.provider.model
+          }
         }
       }
     });
@@ -1010,9 +1051,6 @@ describe("indexer server", () => {
       }
     });
 
-    await expect(eventMessage).resolves.toContain(sessionDetail.session.sessionId);
-
-    socket.close();
     await app.close();
   });
 

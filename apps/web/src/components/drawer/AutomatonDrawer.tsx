@@ -25,6 +25,27 @@ function formatEth(wei: string | null): string {
   return `${(Number(wei) / 1e18).toFixed(3)} ETH`;
 }
 
+function formatUsdc(raw: string | null): string {
+  if (raw === null) {
+    return "n/a";
+  }
+
+  let value: bigint;
+
+  try {
+    value = BigInt(raw);
+  } catch {
+    return "n/a";
+  }
+
+  const decimals = 6n;
+  const divisor = 10n ** decimals;
+  const whole = value / divisor;
+  const fraction = (value % divisor).toString().padStart(Number(decimals), "0").slice(0, 3);
+
+  return fraction === "000" ? `${whole.toString()} USDC` : `${whole.toString()}.${fraction} USDC`;
+}
+
 function formatCycles(value: number): string {
   if (value >= 1_000_000_000_000) {
     return `${(value / 1_000_000_000_000).toFixed(2)}T cycles`;
@@ -35,6 +56,24 @@ function formatCycles(value: number): string {
 
 function formatAddress(value: string): string {
   return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function formatLifetime(createdAt: number, now = Date.now()): string {
+  const elapsedMs = Math.max(0, now - createdAt);
+  const totalMinutes = Math.floor(elapsedMs / 60_000);
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+
+  if (days > 0) {
+    return `${days}d ${hours}h`;
+  }
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+
+  return `${minutes}m`;
 }
 
 interface AutomatonDrawerProps {
@@ -225,6 +264,17 @@ export function AutomatonDrawer({
             </div>
 
             <div className="detail-field">
+              <div className="lbl">USDC Balance</div>
+              <div className="val">
+                {automaton === null
+                  ? isLoading
+                    ? "loading"
+                    : "n/a"
+                  : formatUsdc(automaton.financials.usdcBalanceRaw)}
+              </div>
+            </div>
+
+            <div className="detail-field">
               <div className="lbl">Net Worth</div>
               <div className="val">
                 {automaton === null
@@ -245,6 +295,28 @@ export function AutomatonDrawer({
                     ? "loading"
                     : "n/a"
                   : `${automaton.runtime.heartbeatIntervalSeconds ?? "n/a"}s`}
+              </div>
+            </div>
+
+            <div className="detail-field">
+              <div className="lbl">Lifetime</div>
+              <div className="val">
+                {automaton === null
+                  ? isLoading
+                    ? "loading"
+                    : "n/a"
+                  : formatLifetime(automaton.createdAt)}
+              </div>
+            </div>
+
+            <div className="detail-field">
+              <div className="lbl">Model</div>
+              <div className="val">
+                {automaton === null
+                  ? isLoading
+                    ? "loading"
+                    : "n/a"
+                  : automaton.model ?? "Not configured"}
               </div>
             </div>
 

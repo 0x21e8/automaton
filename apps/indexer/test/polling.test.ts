@@ -18,7 +18,10 @@ import {
   type RealtimeEventPublisher
 } from "../src/polling/automaton-indexer.js";
 import { createSqliteStore } from "../src/store/sqlite.js";
-import { createSpawnedAutomatonRecordFixture } from "./fixtures.js";
+import {
+  createSpawnSessionDetailFixture,
+  createSpawnedAutomatonRecordFixture
+} from "./fixtures.js";
 
 const tempPaths: string[] = [];
 
@@ -376,6 +379,36 @@ describe("automaton indexer poller", () => {
 
   it("indexes a factory-discovered canister without a seed config entry", async () => {
     const canisterId = "txyno-ch777-77776-aaaaq-cai";
+    const registryRecord = createSpawnedAutomatonRecordFixture({ canisterId });
+    const spawnSessionDetail = createSpawnSessionDetailFixture({
+      registryRecord
+    });
+    const faucetService = {
+      claim: vi.fn(async () => ({
+        ok: true as const,
+        walletAddress: registryRecord.evmAddress,
+        txHashes: {
+          eth: "0xfund",
+          usdc: "0xmint"
+        },
+        fundedAmounts: {
+          eth: {
+            amount: "1",
+            decimals: 18,
+            wei: "1000000000000000000"
+          },
+          usdc: {
+            amount: "250",
+            decimals: 6,
+            raw: "250000000"
+          }
+        },
+        balances: {
+          ethWei: "1000000000000000000",
+          usdcRaw: "250000000"
+        }
+      }))
+    };
     const store = createSqliteStore({
       databasePath: await createDatabasePath()
     });
@@ -387,14 +420,42 @@ describe("automaton indexer poller", () => {
     const indexer = new AutomatonIndexer({
       client,
       store,
+      faucetService,
       factoryClient: {
         isConfigured: () => true,
+        getSpawnSession: vi.fn(async (sessionId: string) => ({
+          session: {
+            ...spawnSessionDetail.session,
+            sessionId
+          },
+          payment: {
+            ...spawnSessionDetail.payment,
+            sessionId
+          },
+          audit: spawnSessionDetail.audit,
+          registryRecord: {
+            ...registryRecord,
+            sessionId
+          }
+        })),
         listSpawnedAutomatons: vi.fn(async () => ({
-          items: [createSpawnedAutomatonRecordFixture({ canisterId })],
+          items: [registryRecord],
           nextCursor: null
         }))
       },
-      config: createIndexerConfig([], "factory-canister-id"),
+      config: {
+        ...createIndexerConfig([], "factory-canister-id"),
+        playground: {
+          ...createPlaygroundConfig(),
+          metadata: {
+            ...createPlaygroundConfig().metadata,
+            faucet: {
+              ...createPlaygroundConfig().metadata.faucet,
+              available: true
+            }
+          }
+        }
+      },
       priceSource: new FixedEthUsdPriceSource(2_500)
     });
 
@@ -409,7 +470,16 @@ describe("automaton indexer poller", () => {
     await expect(store.listTrackedCanisterIds()).resolves.toEqual([canisterId]);
     await expect(store.getAutomatonDetail(canisterId)).resolves.toMatchObject({
       canisterId,
-      chain: "base"
+      chain: "base",
+      createdAt: registryRecord.createdAt,
+      model: "openrouter/auto",
+      steward: {
+        address: registryRecord.stewardAddress
+      }
+    });
+    expect(faucetService.claim).toHaveBeenCalledWith({
+      ipAddress: `automaton:${registryRecord.sessionId}`,
+      walletAddress: registryRecord.evmAddress
     });
   });
 
@@ -431,6 +501,7 @@ describe("automaton indexer poller", () => {
       store,
       factoryClient: {
         isConfigured: () => true,
+        getSpawnSession: vi.fn(async () => null),
         listSpawnedAutomatons: vi.fn(async () => ({
           items: [createSpawnedAutomatonRecordFixture({ canisterId: discoveredCanisterId })],
           nextCursor: null
@@ -472,6 +543,7 @@ describe("automaton indexer poller", () => {
       store,
       factoryClient: {
         isConfigured: () => true,
+        getSpawnSession: vi.fn(async () => null),
         listSpawnedAutomatons: vi.fn(async () => ({
           items: [createSpawnedAutomatonRecordFixture({ canisterId })],
           nextCursor: null

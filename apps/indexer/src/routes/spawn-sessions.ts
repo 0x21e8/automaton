@@ -6,6 +6,8 @@ import type {
 } from "@ic-automaton/shared";
 import type { FastifyInstance, FastifyPluginAsync } from "fastify";
 
+import { FaucetError } from "../lib/faucet.js";
+
 function normalizeLimit(value: unknown) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -68,6 +70,30 @@ async function resolveSpawnSessionDetail(
   };
 
   await fastify.indexerStore.upsertSpawnSession(detail);
+  if (detail.session.state === "complete") {
+    const walletAddress =
+      detail.registryRecord?.evmAddress ?? detail.session.automatonEvmAddress;
+
+    if (walletAddress) {
+      try {
+        await fastify.faucetService.claim({
+          ipAddress: `automaton:${detail.session.sessionId}`,
+          walletAddress
+        });
+      } catch (error) {
+        if (!(error instanceof FaucetError && error.statusCode === 429)) {
+          fastify.log.warn(
+            {
+              err: error,
+              sessionId: detail.session.sessionId,
+              walletAddress
+            },
+            "automatic playground automaton funding skipped"
+          );
+        }
+      }
+    }
+  }
   if (shouldBroadcastSpawnSessionUpdate(cached, detail)) {
     fastify.realtimeHub.broadcast({
       type: selectSpawnSessionEventType(detail),
@@ -114,7 +140,18 @@ export const spawnSessionRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     const body = request.body as CreateSpawnSessionRequest;
-    return fastify.factoryClient.createSpawnSession(body);
+    const created = await fastify.factoryClient.createSpawnSession(body);
+
+    // Ensure freshly created sessions are immediately available to routes that
+    // enrich automaton details from spawn-session config (for example model id).
+    await fastify.indexerStore.upsertSpawnSession({
+      session: created.session,
+      payment: created.quote.payment,
+      audit: [],
+      registryRecord: null
+    });
+
+    return created;
   });
 
   fastify.get("/api/spawn-sessions/:sessionId", async (request, reply) => {

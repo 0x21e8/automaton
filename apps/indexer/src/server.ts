@@ -89,17 +89,6 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       : new FactoryClient());
   const realtimeHub = options.realtimeHub ?? new RealtimeHub(config.websocketPath);
   const automatonClient = options.automatonClient ?? new LiveAutomatonClient(config.ingestion);
-  const automatonIndexer =
-    options.automatonIndexer ??
-    new AutomatonIndexer({
-      client: automatonClient,
-      config,
-      eventPublisher: realtimeHub,
-      factoryClient: effectiveFactoryClient,
-      store,
-      priceSource: options.ethUsdPriceSource ?? new FixedEthUsdPriceSource()
-    } satisfies AutomatonIndexerOptions);
-  automatonIndexer.setEventPublisher(realtimeHub);
   const faucetService =
     options.faucetService ??
     createFaucetService({
@@ -107,6 +96,18 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       seedWallet: options.faucetSeedRunner,
       store
     });
+  const automatonIndexer =
+    options.automatonIndexer ??
+    new AutomatonIndexer({
+      client: automatonClient,
+      config,
+      eventPublisher: realtimeHub,
+      factoryClient: effectiveFactoryClient,
+      faucetService,
+      store,
+      priceSource: options.ethUsdPriceSource ?? new FixedEthUsdPriceSource()
+    } satisfies AutomatonIndexerOptions);
+  automatonIndexer.setEventPublisher(realtimeHub);
 
   const app = Fastify({
     logger: options.logger ?? false

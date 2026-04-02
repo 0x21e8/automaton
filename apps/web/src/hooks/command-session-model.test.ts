@@ -42,6 +42,7 @@ function createAutomatonDetail(): AutomatonDetail {
     heartbeatIntervalSeconds: 60,
     lastPolledAt: 1_700_000_100_000,
     lastTransitionAt: 1_700_000_050_000,
+    model: "openrouter/auto",
     monologue: [],
     name: "Atlas",
     netWorthEth: "1.0",

@@ -1,6 +1,8 @@
 import type { FastifyPluginAsync } from "fastify";
 
-import type { AutomatonTier, ChainSlug } from "@ic-automaton/shared";
+import type { AutomatonTier, ChainSlug, SpawnSessionDetail } from "@ic-automaton/shared";
+
+const EMPTY_STEWARD_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 function normalizeLimit(value: unknown) {
   const parsed = Number(value);
@@ -22,6 +24,14 @@ function normalizeCursor(value: unknown) {
 
 function normalizeString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function chainIdFromChain(chain: ChainSlug, fallback: number) {
+  if (chain === "base") {
+    return 8453;
+  }
+
+  return fallback;
 }
 
 export const automatonRoutes: FastifyPluginAsync = async (fastify) => {
@@ -52,7 +62,55 @@ export const automatonRoutes: FastifyPluginAsync = async (fastify) => {
       };
     }
 
-    return automaton;
+    const registryRecord =
+      await fastify.indexerStore.getSpawnedAutomatonRegistryRecord(params.canisterId);
+    let spawnSession =
+      registryRecord === null
+        ? null
+        : await fastify.indexerStore.getSpawnSessionDetail(registryRecord.sessionId);
+
+    if (
+      spawnSession === null &&
+      registryRecord !== null &&
+      fastify.factoryClient.isConfigured()
+    ) {
+      const liveSession = await fastify.factoryClient.getSpawnSession(
+        registryRecord.sessionId
+      );
+
+      if (liveSession !== null) {
+        const hydratedDetail: SpawnSessionDetail = {
+          session: liveSession.session,
+          payment: liveSession.payment,
+          audit: liveSession.audit,
+          registryRecord: liveSession.registryRecord ?? registryRecord
+        };
+
+        await fastify.indexerStore.upsertSpawnSession(hydratedDetail);
+        spawnSession = hydratedDetail;
+      }
+    }
+
+    return {
+      ...automaton,
+      ethAddress: automaton.ethAddress ?? registryRecord?.evmAddress ?? null,
+      chain: registryRecord?.chain ?? automaton.chain,
+      steward:
+        registryRecord &&
+        (automaton.steward.address === EMPTY_STEWARD_ADDRESS || !automaton.steward.enabled)
+          ? {
+              ...automaton.steward,
+              address: registryRecord.stewardAddress,
+              chainId: chainIdFromChain(registryRecord.chain, automaton.steward.chainId),
+              enabled: true
+            }
+          : automaton.steward,
+      parentId: automaton.parentId ?? registryRecord?.parentId ?? null,
+      childIds:
+        automaton.childIds.length > 0 ? automaton.childIds : registryRecord?.childIds ?? [],
+      createdAt: registryRecord?.createdAt ?? automaton.createdAt,
+      model: automaton.model ?? spawnSession?.session.config.provider.model ?? null
+    };
   });
 
   fastify.get("/api/automatons/:canisterId/monologue", async (request) => {

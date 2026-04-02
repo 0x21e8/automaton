@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { AutomatonDetail } from "@ic-automaton/shared";
 import { AutomatonDrawer } from "./AutomatonDrawer";
@@ -38,6 +38,7 @@ function createAutomatonDetail(): AutomatonDetail {
     heartbeatIntervalSeconds: 60,
     lastPolledAt: 1_700_000_100_000,
     lastTransitionAt: 1_700_000_050_000,
+    model: "openrouter/auto",
     monologue: [],
     name: "Atlas",
     netWorthEth: "1.0",
@@ -84,6 +85,10 @@ function createAutomatonDetail(): AutomatonDetail {
     }
   };
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("drawer messaging", () => {
   it("distinguishes a missing indexed automaton from a generic detail failure", () => {
@@ -144,6 +149,28 @@ describe("drawer messaging", () => {
     expect(markup).not.toContain("help  Public");
     expect(markup).not.toContain("Wallet required");
     expect(markup).not.toContain("Connected wallet is not the steward");
+  });
+
+  it("shows the indexed USDC balance in the drawer detail view", () => {
+    const automaton = createAutomatonDetail();
+    automaton.financials.usdcBalanceRaw = "250000000";
+    automaton.usdcBalanceRaw = "250000000";
+
+    const markup = renderToStaticMarkup(
+      <AutomatonDrawer
+        automaton={automaton}
+        errorMessage={null}
+        isLoading={false}
+        isOpen
+        onClose={() => {}}
+        selectedCanisterId={automaton.canisterId}
+        viewerAddress={null}
+        walletSession={null}
+      />
+    );
+
+    expect(markup).toContain("USDC Balance");
+    expect(markup).toContain("250 USDC");
   });
 
   it("shows public guidance when no wallet is connected", () => {
@@ -211,5 +238,28 @@ describe("drawer messaging", () => {
     expect(markup).toContain("2 tools");
     expect(markup).toContain("Show");
     expect(markup).not.toContain("with a two-step swap");
+  });
+
+  it("shows lifetime and the configured model in the details section", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2023-11-15T00:13:20.000Z"));
+
+    const markup = renderToStaticMarkup(
+      <AutomatonDrawer
+        automaton={createAutomatonDetail()}
+        errorMessage={null}
+        isLoading={false}
+        isOpen
+        onClose={() => {}}
+        selectedCanisterId="txyno-ch777-77776-aaaaq-cai"
+        viewerAddress={null}
+        walletSession={null}
+      />
+    );
+
+    expect(markup).toContain("Lifetime");
+    expect(markup).toContain("2h 0m");
+    expect(markup).toContain("Model");
+    expect(markup).toContain("openrouter/auto");
   });
 });

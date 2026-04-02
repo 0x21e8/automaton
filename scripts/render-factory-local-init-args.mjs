@@ -167,7 +167,7 @@ const childAutoTopupCycleThreshold = normalizeOptionalInteger(
   process.env.FACTORY_CHILD_AUTO_TOPUP_CYCLE_THRESHOLD
 );
 const cyclesPerSpawn =
-  normalizeOptionalInteger(process.env.FACTORY_CYCLES_PER_SPAWN) ?? 2_000_000_000_000;
+  normalizeOptionalInteger(process.env.FACTORY_CYCLES_PER_SPAWN) ?? 10_000_000_000_000;
 const minPoolBalance = normalizeOptionalInteger(process.env.FACTORY_MIN_POOL_BALANCE) ?? 0;
 const estimatedOutcallCyclesPerInterval =
   normalizeOptionalInteger(process.env.FACTORY_ESTIMATED_OUTCALL_CYCLES_PER_INTERVAL) ?? 0;

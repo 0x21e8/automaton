@@ -8,6 +8,7 @@ import type {
 import type { IndexerConfig } from "../config.js";
 import type { AutomatonClient } from "../integrations/automaton-client.js";
 import type { FactoryClient } from "../integrations/factory-client.js";
+import { FaucetError, type FaucetService } from "../lib/faucet.js";
 import { diffAutomatonRecord } from "../lib/automaton-record.js";
 import { normalizeAutomatonDetail, normalizeMonologueEntries } from "../normalize/automaton.js";
 import type { IndexerStore } from "../store/sqlite.js";
@@ -91,7 +92,9 @@ export interface AutomatonIndexerOptions {
   client: AutomatonClient;
   config: IndexerConfig;
   eventPublisher?: RealtimeEventPublisher;
-  factoryClient?: Pick<FactoryClient, "isConfigured" | "listSpawnedAutomatons">;
+  factoryClient?: Pick<FactoryClient, "isConfigured" | "listSpawnedAutomatons"> &
+    Partial<Pick<FactoryClient, "getSpawnSession">>;
+  faucetService?: FaucetService;
   priceSource?: EthUsdPriceSource;
   store: IndexerStore;
 }
@@ -104,7 +107,9 @@ export class AutomatonIndexer {
   private readonly client: AutomatonClient;
   private readonly config: IndexerConfig;
   private eventPublisher?: RealtimeEventPublisher;
-  private readonly factoryClient?: Pick<FactoryClient, "isConfigured" | "listSpawnedAutomatons">;
+  private readonly factoryClient?: Pick<FactoryClient, "isConfigured" | "listSpawnedAutomatons"> &
+    Partial<Pick<FactoryClient, "getSpawnSession">>;
+  private readonly faucetService?: FaucetService;
   private readonly priceSource: EthUsdPriceSource;
   private readonly store: IndexerStore;
   private factoryDiscoveryInFlight = false;
@@ -123,6 +128,7 @@ export class AutomatonIndexer {
     this.config = options.config;
     this.store = options.store;
     this.factoryClient = options.factoryClient;
+    this.faucetService = options.faucetService;
     this.priceSource = options.priceSource ?? new FixedEthUsdPriceSource();
     this.eventPublisher = options.eventPublisher;
   }
@@ -185,6 +191,12 @@ export class AutomatonIndexer {
     for (const canisterId of await this.listTrackedCanisterIds()) {
       await this.runPoll(canisterId, "identity", async () => {
         const existingDetail = await this.store.getAutomatonDetail(canisterId);
+        const registryRecord =
+          await this.store.getSpawnedAutomatonRegistryRecord(canisterId);
+        const spawnSession =
+          registryRecord === null
+            ? null
+            : await this.store.getSpawnSessionDetail(registryRecord.sessionId);
         const identity = await this.client.readIdentityConfig(canisterId);
         const detail = normalizeAutomatonDetail({
           canisterId,
@@ -192,6 +204,8 @@ export class AutomatonIndexer {
           existingDetail,
           identity,
           now: Date.now(),
+          registryRecord,
+          spawnModel: spawnSession?.session.config.provider.model ?? null,
           ethUsd: this.snapshot.price?.ethUsd ?? null
         });
 
@@ -204,13 +218,21 @@ export class AutomatonIndexer {
     for (const canisterId of await this.listTrackedCanisterIds()) {
       await this.runPoll(canisterId, "runtime", async () => {
         const existingDetail = await this.store.getAutomatonDetail(canisterId);
+        const registryRecord =
+          await this.store.getSpawnedAutomatonRegistryRecord(canisterId);
+        const spawnSession =
+          registryRecord === null
+            ? null
+            : await this.store.getSpawnSessionDetail(registryRecord.sessionId);
         const runtime = await this.client.readRuntimeFinancial(canisterId);
         const detail = normalizeAutomatonDetail({
           canisterId,
           config: this.config.ingestion,
           existingDetail,
           now: Date.now(),
+          registryRecord,
           runtime,
+          spawnModel: spawnSession?.session.config.provider.model ?? null,
           ethUsd: this.snapshot.price?.ethUsd ?? null
         });
 
@@ -270,8 +292,57 @@ export class AutomatonIndexer {
     try {
       const records = await this.readFactoryRegistry();
       await this.store.replaceSpawnedAutomatonRegistry(records);
+
+      if (this.factoryClient.getSpawnSession) {
+        for (const record of records) {
+          const detail = await this.factoryClient.getSpawnSession(record.sessionId);
+          if (!detail) {
+            await this.autoFundSpawnedAutomaton(record.sessionId, record.evmAddress);
+            continue;
+          }
+
+          await this.store.upsertSpawnSession({
+            session: detail.session,
+            payment: detail.payment,
+            audit: detail.audit,
+            registryRecord: record
+          });
+          await this.autoFundSpawnedAutomaton(
+            detail.session.sessionId,
+            detail.registryRecord?.evmAddress ?? detail.session.automatonEvmAddress ?? record.evmAddress
+          );
+        }
+      } else {
+        for (const record of records) {
+          await this.autoFundSpawnedAutomaton(record.sessionId, record.evmAddress);
+        }
+      }
     } finally {
       this.factoryDiscoveryInFlight = false;
+    }
+  }
+
+  private async autoFundSpawnedAutomaton(
+    sessionId: string,
+    walletAddress: string | null | undefined
+  ) {
+    if (
+      !this.config.playground.metadata.faucet.available ||
+      !this.faucetService ||
+      !walletAddress
+    ) {
+      return;
+    }
+
+    try {
+      await this.faucetService.claim({
+        ipAddress: `automaton:${sessionId}`,
+        walletAddress
+      });
+    } catch (error) {
+      if (error instanceof FaucetError && error.statusCode === 429) {
+        return;
+      }
     }
   }
 

@@ -2,6 +2,7 @@ import type {
   AutomatonDetail,
   MonologueEntry,
   SkillSelection,
+  SpawnedAutomatonRecord,
   StrategySelection
 } from "@ic-automaton/shared";
 
@@ -28,6 +29,19 @@ import {
   toOptionalString,
   toVariantName
 } from "../lib/automaton-derived.js";
+
+const EMPTY_STEWARD_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+function chainIdFromRegistryChain(
+  chain: SpawnedAutomatonRecord["chain"] | undefined,
+  fallback: number
+) {
+  if (chain === "base") {
+    return 8453;
+  }
+
+  return fallback;
+}
 
 export function normalizeMonologueEntries(turns: HttpTurnRecordResponse[]): MonologueEntry[] {
   return turns
@@ -140,14 +154,22 @@ function normalizeTier(
   return "normal";
 }
 
-function defaultDetail(canisterId: string, config: IndexerTargetConfig, now: number): AutomatonDetail {
+function defaultDetail(
+  canisterId: string,
+  config: IndexerTargetConfig,
+  now: number,
+  registryRecord?: SpawnedAutomatonRecord | null,
+  spawnModel: string | null = null
+): AutomatonDetail {
   const { corePatternIndex, corePattern } = computeCorePattern(canisterId);
+  const chain = registryRecord?.chain ?? "base";
+  const chainId = chainIdFromRegistryChain(registryRecord?.chain, 8453);
 
   return {
     canisterId,
-    ethAddress: null,
-    chain: "base",
-    chainId: 8453,
+    ethAddress: registryRecord?.evmAddress ?? null,
+    chain,
+    chainId,
     name: deriveAutomatonName(canisterId),
     tier: "normal",
     agentState: "Unknown",
@@ -158,20 +180,21 @@ function defaultDetail(canisterId: string, config: IndexerTargetConfig, now: num
     netWorthUsd: null,
     heartbeatIntervalSeconds: null,
     steward: {
-      address: "0x0000000000000000000000000000000000000000",
-      chainId: 8453,
+      address: registryRecord?.stewardAddress ?? EMPTY_STEWARD_ADDRESS,
+      chainId,
       ensName: null,
-      enabled: false
+      enabled: registryRecord !== undefined && registryRecord !== null
     },
     gridPosition: computeGridPosition(canisterId),
     corePatternIndex,
     corePattern,
-    parentId: null,
-    createdAt: now,
+    parentId: registryRecord?.parentId ?? null,
+    createdAt: registryRecord?.createdAt ?? now,
     lastTransitionAt: now,
     soul: "",
     canisterUrl: buildCanisterUrl(config, canisterId),
     explorerUrl: null,
+    model: spawnModel,
     financials: {
       ethBalanceWei: null,
       usdcBalanceRaw: null,
@@ -197,7 +220,7 @@ function defaultDetail(canisterId: string, config: IndexerTargetConfig, now: num
     skills: [],
     promptLayers: [],
     monologue: [],
-    childIds: [],
+    childIds: registryRecord?.childIds ?? [],
     lastPolledAt: now
   };
 }
@@ -209,17 +232,35 @@ export function normalizeAutomatonDetail(options: {
   identity?: IdentityConfigRead;
   monologue?: MonologueEntry[];
   now: number;
+  registryRecord?: SpawnedAutomatonRecord | null;
   runtime?: RuntimeFinancialRead;
+  spawnModel?: string | null;
   ethUsd: number | null;
 }): AutomatonDetail {
   const base =
-    options.existingDetail ?? defaultDetail(options.canisterId, options.config, options.now);
+    options.existingDetail ??
+    defaultDetail(
+      options.canisterId,
+      options.config,
+      options.now,
+      options.registryRecord,
+      options.spawnModel ?? null
+    );
   const identity = options.identity;
   const runtime = options.runtime;
-  const chainId = toOptionalInteger(identity?.evmConfig.chain_id) ?? base.chainId;
+  const identityChainId = toOptionalInteger(identity?.evmConfig.chain_id);
+  const chainId =
+    identityChainId ?? chainIdFromRegistryChain(options.registryRecord?.chain, base.chainId);
+  const chain =
+    identityChainId === null
+      ? options.registryRecord?.chain ?? base.chain
+      : toChainSlug(chainId);
   const automatonAddress =
-    toOptionalString(identity?.evmConfig.automaton_address) ?? base.ethAddress;
-  const walletEthBalance = toOptionalString(runtime?.walletBalance.eth_balance_wei_hex) ?? base.financials.ethBalanceWei;
+    toOptionalString(identity?.evmConfig.automaton_address) ??
+    options.registryRecord?.evmAddress ??
+    base.ethAddress;
+  const walletEthBalance =
+    toOptionalString(runtime?.walletBalance.eth_balance_wei_hex) ?? base.financials.ethBalanceWei;
   const walletUsdcBalance =
     toOptionalString(runtime?.walletBalance.usdc_balance_raw_hex) ?? base.financials.usdcBalanceRaw;
   const usdcDecimals = toOptionalInteger(runtime?.walletBalance.usdc_decimals) ?? 6;
@@ -238,8 +279,9 @@ export function normalizeAutomatonDetail(options: {
     canisterId: options.canisterId,
     ethAddress: automatonAddress,
     chainId,
-    chain: toChainSlug(chainId),
+    chain,
     name: deriveAutomatonName(options.canisterId),
+    model: options.spawnModel ?? base.model,
     tier: normalizeTier(runtime?.snapshot.scheduler?.survival_tier, base.tier),
     agentState: runtimeState,
     ethBalanceWei: walletEthBalance,
@@ -261,9 +303,19 @@ export function normalizeAutomatonDetail(options: {
             ensName: base.steward.ensName,
             enabled: Boolean(identity.stewardStatus.active_steward.enabled)
           }
-        : base.steward,
+        : options.registryRecord
+          ? {
+              address: options.registryRecord.stewardAddress,
+              chainId: chainIdFromRegistryChain(options.registryRecord.chain, chainId),
+              ensName: base.steward.ensName,
+              enabled: true
+            }
+          : base.steward,
     gridPosition: computeGridPosition(options.canisterId),
     ...computeCorePattern(options.canisterId),
+    parentId: options.registryRecord?.parentId ?? base.parentId,
+    childIds: options.registryRecord?.childIds ?? base.childIds,
+    createdAt: options.registryRecord?.createdAt ?? base.createdAt,
     lastTransitionAt: transitionAt,
     soul:
       toOptionalString(runtime?.snapshot.runtime?.soul) ??
