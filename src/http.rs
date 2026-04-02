@@ -684,21 +684,21 @@ pub async fn handle_http_request_update(
         }
         (&Method::POST, "/api/steward/model/execute") => {
             match parse_steward_model_execute_request(request.body()) {
-                Ok(payload) => {
-                    match steward_set_model_command(payload.model) {
-                        Ok(command) => match execute_signed_steward_command(command, payload.proof).await {
+                Ok(payload) => match steward_set_model_command(payload.model) {
+                    Ok(command) => {
+                        match execute_signed_steward_command(command, payload.proof).await {
                             Ok(result) => json_update_response(StatusCode::OK, &result),
                             Err(error) => json_update_response(
                                 StatusCode::BAD_REQUEST,
                                 &ConversationLookupError { ok: false, error },
                             ),
-                        },
-                        Err(error) => json_update_response(
-                            StatusCode::BAD_REQUEST,
-                            &ConversationLookupError { ok: false, error },
-                        ),
+                        }
                     }
-                }
+                    Err(error) => json_update_response(
+                        StatusCode::BAD_REQUEST,
+                        &ConversationLookupError { ok: false, error },
+                    ),
+                },
                 Err(error) => json_update_response(
                     StatusCode::BAD_REQUEST,
                     &ConversationLookupError { ok: false, error },

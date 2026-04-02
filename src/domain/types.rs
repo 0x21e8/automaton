@@ -911,6 +911,8 @@ pub struct RuntimeSnapshot {
     pub timing_telemetry: RuntimeTimingTelemetry,
     #[serde(default)]
     pub room_poll: RoomPollingState,
+    #[serde(default)]
+    pub room_observations: Vec<RoomMessage>,
 }
 
 impl Default for RuntimeSnapshot {
@@ -958,6 +960,7 @@ impl Default for RuntimeSnapshot {
             cycle_topup: CycleTopUpConfig::default(),
             timing_telemetry: RuntimeTimingTelemetry::default(),
             room_poll: RoomPollingState::default(),
+            room_observations: Vec::new(),
         }
     }
 }

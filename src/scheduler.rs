@@ -754,6 +754,7 @@ async fn maybe_poll_factory_room(now_ns: u64, snapshot: &RuntimeSnapshot) {
     {
         Ok(page) => {
             let fetched = page.messages.len();
+            let observations_loaded = stable::store_room_observations(&page.messages);
             let last_seen_seq = if page.next_after_seq.is_none() {
                 page.latest_seq
                     .or_else(|| page.messages.last().map(|message| message.seq))
@@ -771,8 +772,9 @@ async fn maybe_poll_factory_room(now_ns: u64, snapshot: &RuntimeSnapshot) {
             stable::record_room_poll_success(now_ns, last_seen_seq, page.latest_seq, fetched);
             log!(
                 SchedulerLogPriority::Info,
-                "scheduler_room_poll_success fetched={} last_seen_seq={:?} latest_seq={:?} room_head_gap={:?}",
+                "scheduler_room_poll_success fetched={} observations_loaded={} last_seen_seq={:?} latest_seq={:?} room_head_gap={:?}",
                 fetched,
+                observations_loaded,
                 last_seen_seq,
                 page.latest_seq,
                 room_head_gap
@@ -3091,6 +3093,7 @@ mod tests {
         block_on_with_spin(run_poll_inbox_job(1_000)).expect("poll job should not fail");
 
         let room_poll = stable::room_poll_state();
+        let room_observations = stable::runtime_snapshot().room_observations;
         assert_eq!(call_count.get(), 1);
         assert_eq!(room_poll.last_seen_seq, Some(9));
         assert_eq!(room_poll.last_attempted_at_ns, Some(1_000));
@@ -3099,6 +3102,10 @@ mod tests {
         assert_eq!(room_poll.last_batch_count, 2);
         assert_eq!(room_poll.consecutive_failures, 0);
         assert!(room_poll.last_error.is_none());
+        assert_eq!(room_observations.len(), 2);
+        assert_eq!(room_observations[0].seq, 7);
+        assert_eq!(room_observations[1].seq, 9);
+        assert_eq!(room_observations[0].body, "untrusted room body");
 
         crate::features::factory_room::clear_mock_factory_room_call();
     }

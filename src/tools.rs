@@ -22,12 +22,14 @@
 /// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
     AbiTypeSpec, ActiveExposure, AgentState, AutonomyPolicy, ExecutionPlan, MemoryFact,
-    PromptLayer, StrategyExecutionIntent, StrategyQuarantine, StrategyTemplateKey,
-    SurvivalOperationClass, ToolCall, ToolCallOutcome, ToolCallRecord, ToolFailureKind,
+    PostRoomMessageRequest, PromptLayer, RoomContentType, StrategyExecutionIntent,
+    StrategyQuarantine, StrategyTemplateKey, SurvivalOperationClass, ToolCall, ToolCallOutcome,
+    ToolCallRecord, ToolFailureKind,
 };
 use crate::features::canister_call::canister_call_tool;
 use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool};
 use crate::features::evm::{evm_read_tool, send_eth_tool};
+use crate::features::factory_room::FactoryRoomClient;
 use crate::features::http_fetch::http_fetch_tool;
 use crate::features::inference::canonicalize_tool_name;
 use crate::features::web_search::web_search_tool;
@@ -221,6 +223,7 @@ fn classify_tool_failure_kind(tool: &str, error: &str) -> ToolFailureKind {
         "market_fetch" => classify_market_fetch_failure_kind(&normalized),
         "http_fetch" => classify_http_fetch_failure_kind(&normalized),
         "web_search" => classify_web_search_failure_kind(&normalized),
+        "post_room_message" => classify_post_room_message_failure_kind(&normalized),
         "list_strategy_templates" => classify_list_strategy_templates_failure_kind(&normalized),
         "describe_strategy_action" => classify_describe_strategy_action_failure_kind(&normalized),
         "simulate_strategy_action" | "execute_strategy_action" => {
@@ -335,6 +338,26 @@ fn classify_web_search_failure_kind(normalized_error: &str) -> ToolFailureKind {
     if normalized_error.starts_with("web_search failed")
         || normalized_error.starts_with("web_search provider returned http")
         || normalized_error.starts_with("web_search failed to parse provider response")
+    {
+        return ToolFailureKind::OutcallFailure;
+    }
+    ToolFailureKind::InternalFailure
+}
+
+fn classify_post_room_message_failure_kind(normalized_error: &str) -> ToolFailureKind {
+    if normalized_error.starts_with("invalid post_room_message args json:")
+        || normalized_error.starts_with("missing required field: body")
+        || normalized_error == "room message body cannot be empty"
+        || normalized_error == "room mentions must be an array of strings"
+        || normalized_error == "room mention entries cannot be empty"
+        || normalized_error.starts_with("invalid content_type:")
+    {
+        return ToolFailureKind::MalformedInput;
+    }
+    if normalized_error.starts_with("factory room")
+        || normalized_error.starts_with("failed to encode post_room_message args:")
+        || normalized_error.contains("call rejected")
+        || normalized_error.contains("insufficient cycles")
     {
         return ToolFailureKind::OutcallFailure;
     }
@@ -736,6 +759,13 @@ impl ToolManager {
                 allowed_states: vec![AgentState::ExecutingActions],
             },
         );
+        policies.insert(
+            "post_room_message".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
 
         Self { policies }
     }
@@ -1108,6 +1138,34 @@ impl ToolManager {
                 })
             }
             "set_welcome_message" => set_welcome_message_tool(&call.args_json),
+            "post_room_message" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::InterCanisterCall,
+                    now_ns,
+                ) {
+                    Err("post_room_message skipped due to survival policy".to_string())
+                } else {
+                    let result = post_room_message_tool(&call.args_json).await;
+                    match &result {
+                        Ok(_) => {
+                            stable::record_survival_operation_success(
+                                &SurvivalOperationClass::InterCanisterCall,
+                            );
+                            stable::record_room_post_success(now_ns);
+                        }
+                        Err(error) => {
+                            stable::record_survival_operation_failure(
+                                &SurvivalOperationClass::InterCanisterCall,
+                                now_ns,
+                                stable::SURVIVAL_OPERATION_MAX_BACKOFF_SECS_INTER_CANISTER_CALL,
+                            );
+                            stable::record_room_post_error(now_ns, error.clone());
+                        }
+                    }
+                    result
+                }
+            }
             "evm_read" => {
                 let now_ns = current_time_ns();
                 if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns) {
@@ -1264,6 +1322,22 @@ fn set_welcome_message_tool(args_json: &str) -> Result<String, String> {
     }
 }
 
+async fn post_room_message_tool(args_json: &str) -> Result<String, String> {
+    let request = parse_post_room_message_args(args_json)?;
+    let response = FactoryRoomClient::from_runtime()?
+        .post_room_message(request)
+        .await?;
+    serde_json::to_string(&serde_json::json!({
+        "message_id": response.message_id,
+        "seq": response.seq,
+        "author_canister_id": response.author_canister_id,
+        "created_at_ns": response.created_at,
+        "content_type": format!("{:?}", response.content_type),
+        "mention_count": response.mentions.len(),
+    }))
+    .map_err(|error| format!("failed to serialize post_room_message result: {error}"))
+}
+
 // ── Argument parsers ──────────────────────────────────────────────────────────
 
 /// Extract `message_hash` from the JSON args of a `sign_message` call.
@@ -1275,6 +1349,62 @@ fn parse_sign_message_args(args_json: &str) -> Result<String, String> {
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .ok_or_else(|| "missing required field: message_hash".to_string())
+}
+
+fn parse_post_room_message_args(args_json: &str) -> Result<PostRoomMessageRequest, String> {
+    let value: serde_json::Value = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid post_room_message args json: {error}"))?;
+    let body = value
+        .get("body")
+        .and_then(|entry| entry.as_str())
+        .ok_or_else(|| "missing required field: body".to_string())?
+        .trim()
+        .to_string();
+    if body.is_empty() {
+        return Err("room message body cannot be empty".to_string());
+    }
+
+    let mentions = value
+        .get("mentions")
+        .map(|entry| {
+            entry
+                .as_array()
+                .ok_or_else(|| "room mentions must be an array of strings".to_string())?
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| "room mention entries cannot be empty".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .filter(|entries| !entries.is_empty());
+
+    let content_type = value
+        .get("content_type")
+        .map(|entry| {
+            let raw = entry
+                .as_str()
+                .ok_or_else(|| "invalid content_type: expected string".to_string())?;
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "text_plain" | "text/plain" | "textplain" => Ok(RoomContentType::TextPlain),
+                "application_json" | "application/json" | "applicationjson" => {
+                    Ok(RoomContentType::ApplicationJson)
+                }
+                other => Err(format!("invalid content_type: {other}")),
+            }
+        })
+        .transpose()?;
+
+    Ok(PostRoomMessageRequest {
+        body,
+        mentions,
+        content_type,
+    })
 }
 
 fn prepare_market_fetch_http_fetch_args(
@@ -3229,8 +3359,9 @@ mod tests {
     use super::*;
     use crate::domain::types::{
         AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, AgentState,
-        ContractRoleBinding, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
-        SurvivalTier, TemplateActivationState, TemplateStatus, ToolFailureKind,
+        ContractRoleBinding, RoomContentType, RoomMessage, SpawnBootstrapView, StrategyTemplate,
+        StrategyTemplateKey, SurvivalOperationClass, SurvivalTier, TemplateActivationState,
+        TemplateStatus, ToolFailureKind,
     };
     use crate::features::cycle_topup::TopUpStage;
     use crate::storage::stable;
@@ -3290,6 +3421,23 @@ mod tests {
     fn with_fixed_time_ns(now_ns: u64) -> TimeOverrideGuard {
         timing::set_test_time_ns(now_ns);
         TimeOverrideGuard
+    }
+
+    fn test_factory_principal() -> candid::Principal {
+        candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+            .expect("test principal should parse")
+    }
+
+    fn configure_factory_room_access() {
+        stable::set_spawn_bootstrap_metadata(SpawnBootstrapView {
+            session_id: None,
+            parent_id: None,
+            factory_principal: Some(test_factory_principal()),
+            risk: None,
+            strategies: Vec::new(),
+            skills: Vec::new(),
+            version_commit: None,
+        });
     }
 
     fn sample_strategy_key() -> StrategyTemplateKey {
@@ -5775,6 +5923,119 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records[0].success);
         assert!(records[1].success);
+    }
+
+    #[test]
+    fn post_room_message_tool_succeeds_and_updates_room_post_telemetry() {
+        crate::features::factory_room::clear_mock_factory_room_call();
+        let _time_guard = with_fixed_time_ns(9_876);
+        stable::init_storage();
+        configure_factory_room_access();
+
+        crate::features::factory_room::set_mock_factory_room_call(
+            move |canister_id, method, encoded_args| {
+                assert_eq!(canister_id, test_factory_principal());
+                assert_eq!(method, "post_room_message");
+                let request: PostRoomMessageRequest =
+                    candid::decode_one(encoded_args).expect("room post args should decode");
+                assert_eq!(request.body, "peer status update");
+                assert_eq!(
+                    request.mentions,
+                    Some(vec!["um5iw-rqaaa-aaaaq-qaaba-cai".to_string()])
+                );
+                assert_eq!(request.content_type, Some(RoomContentType::TextPlain));
+
+                candid::encode_one(crate::features::factory_room::FactoryRoomCallResult::Ok(
+                    RoomMessage {
+                        message_id: "room-message-42".to_string(),
+                        seq: 42,
+                        author_canister_id: "rrkah-fqaaa-aaaaa-aaaaq-cai".to_string(),
+                        created_at: 9_876,
+                        body: "peer status update".to_string(),
+                        mentions: vec!["um5iw-rqaaa-aaaaq-qaaba-cai".to_string()],
+                        content_type: RoomContentType::TextPlain,
+                    },
+                ))
+                .map_err(|error| error.to_string())
+            },
+        );
+
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "post_room_message".to_string(),
+            args_json: r#"{"body":"peer status update","mentions":["um5iw-rqaaa-aaaaq-qaaba-cai"],"content_type":"text_plain"}"#.to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-room-post"));
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].success,
+            "room post should succeed: {:?}",
+            records[0]
+        );
+        assert!(records[0].output.contains("\"seq\":42"));
+
+        let room_poll = stable::room_poll_state();
+        assert_eq!(room_poll.last_post_attempted_at_ns, Some(9_876));
+        assert_eq!(room_poll.last_post_succeeded_at_ns, Some(9_876));
+        assert!(room_poll.last_post_error.is_none());
+
+        crate::features::factory_room::clear_mock_factory_room_call();
+    }
+
+    #[test]
+    fn post_room_message_tool_failure_updates_room_post_telemetry() {
+        crate::features::factory_room::clear_mock_factory_room_call();
+        let _time_guard = with_fixed_time_ns(5_432);
+        stable::init_storage();
+        configure_factory_room_access();
+
+        crate::features::factory_room::set_mock_factory_room_call(
+            move |canister_id, method, _encoded_args| {
+                assert_eq!(canister_id, test_factory_principal());
+                assert_eq!(method, "post_room_message");
+                Err(
+                    "factory room call rejected: code=5 msg=temporary room post failure"
+                        .to_string(),
+                )
+            },
+        );
+
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "post_room_message".to_string(),
+            args_json: r#"{"body":"peer status update"}"#.to_string(),
+        }];
+
+        let records = block_on_with_spin(manager.execute_actions(
+            &state,
+            &calls,
+            &signer,
+            "turn-room-post-error",
+        ));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert_eq!(
+            records[0].failure_kind,
+            Some(ToolFailureKind::OutcallFailure)
+        );
+
+        let room_poll = stable::room_poll_state();
+        assert_eq!(room_poll.last_post_attempted_at_ns, Some(5_432));
+        assert_eq!(room_poll.last_post_succeeded_at_ns, None);
+        assert_eq!(
+            room_poll.last_post_error.as_deref(),
+            Some("factory room call rejected: code=5 msg=temporary room post failure")
+        );
+
+        crate::features::factory_room::clear_mock_factory_room_call();
     }
 
     #[test]

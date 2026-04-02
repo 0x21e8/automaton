@@ -17,7 +17,7 @@ use crate::domain::types::{
     InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup,
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
     OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, ReflectionMemoryRecord,
-    ReflectionOrigin, RetentionConfig, RetentionMaintenanceRuntime, RoomPollingState,
+    ReflectionOrigin, RetentionConfig, RetentionMaintenanceRuntime, RoomMessage, RoomPollingState,
     RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary,
     SkillRecord, SpawnBootstrapView, StewardNonceState, StewardState, StewardStatusView,
     StorageGrowthMetrics, StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent,
@@ -133,6 +133,10 @@ pub const MAX_REFLECTION_MEMORY_LINES: usize = 5;
 pub const MAX_REFLECTION_MEMORY_LINE_CHARS: usize = 160;
 /// Maximum inbox message body size (in characters) accepted by `post_inbox_message`.
 pub const MAX_INBOX_BODY_CHARS: usize = 4_096;
+/// Maximum number of untrusted room observations retained in the runtime snapshot.
+pub const MAX_ROOM_OBSERVATIONS: usize = 10;
+/// Character limit applied to persisted room-observation bodies.
+pub const MAX_ROOM_OBSERVATION_BODY_CHARS: usize = 1_000;
 /// Character limit for the `inner_dialogue` field of a stored `TurnRecord`.
 const MAX_TURN_INNER_DIALOGUE_CHARS: usize = 12_000;
 /// Character limit for tool call `args_json` stored in `tool_calls`.
@@ -1688,6 +1692,38 @@ pub fn room_poll_state() -> RoomPollingState {
     runtime_snapshot().room_poll
 }
 
+pub fn store_room_observations(messages: &[RoomMessage]) -> usize {
+    if messages.is_empty() {
+        return runtime_snapshot().room_observations.len();
+    }
+
+    let mut snapshot = runtime_snapshot();
+    let mut observations = snapshot.room_observations;
+
+    for message in messages {
+        let bounded = bounded_room_observation(message);
+        if let Some(existing) = observations
+            .iter_mut()
+            .find(|entry| entry.seq == bounded.seq)
+        {
+            *existing = bounded;
+        } else {
+            observations.push(bounded);
+        }
+    }
+
+    observations.sort_by_key(|entry| entry.seq);
+    if observations.len() > MAX_ROOM_OBSERVATIONS {
+        let overflow = observations.len().saturating_sub(MAX_ROOM_OBSERVATIONS);
+        observations.drain(0..overflow);
+    }
+
+    snapshot.room_observations = observations;
+    let count = snapshot.room_observations.len();
+    save_runtime_snapshot(&snapshot);
+    count
+}
+
 pub fn record_room_poll_success(
     now_ns: u64,
     last_seen_seq: Option<u64>,
@@ -2224,6 +2260,23 @@ fn truncate_to_chars(value: &str, max_chars: usize) -> String {
         return value.to_string();
     }
     value.chars().take(max_chars).collect()
+}
+
+fn bounded_room_observation(message: &RoomMessage) -> RoomMessage {
+    RoomMessage {
+        message_id: truncate_text_field(&message.message_id, 128),
+        seq: message.seq,
+        author_canister_id: truncate_text_field(&message.author_canister_id, 128),
+        created_at: message.created_at,
+        body: truncate_text_field(&message.body, MAX_ROOM_OBSERVATION_BODY_CHARS),
+        mentions: message
+            .mentions
+            .iter()
+            .take(16)
+            .map(|mention| truncate_text_field(mention, 128))
+            .collect(),
+        content_type: message.content_type,
+    }
 }
 
 fn update_memory_rollups(_now_ns: u64) -> u32 {
