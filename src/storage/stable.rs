@@ -1891,6 +1891,10 @@ pub fn get_search_api_key() -> Option<String> {
         .flatten()
 }
 
+pub fn web_search_runtime_enabled() -> bool {
+    get_search_api_key().is_some()
+}
+
 pub fn set_search_max_per_turn(max_per_turn: Option<u8>) -> Result<(), String> {
     match max_per_turn {
         Some(0) => Err("search max_per_turn must be at least 1".to_string()),

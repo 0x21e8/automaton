@@ -18,7 +18,7 @@ use crate::domain::cycle_admission::{
     OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
-    InferenceInput, InferenceProvider, OpenRouterReasoningLevel, OperationFailure,
+    DecisionTrigger, InferenceInput, InferenceProvider, OpenRouterReasoningLevel, OperationFailure,
     OperationFailureKind, OutcallFailure, OutcallFailureKind, RecoveryFailure, RuntimeSnapshot,
     SurvivalOperationClass, ToolCall,
 };
@@ -300,7 +300,7 @@ fn run_deterministic_inference(
         return Ok(InferenceOutput {
             tool_calls: Vec::new(),
             explanation: serde_json::json!({
-                "trigger": "ScheduledReview",
+                "trigger": DecisionTrigger::ScheduledReview.as_wire_name(),
                 "candidates_summary": "policy-bounded autonomy turn",
                 "outcome": {
                     "NoOp": {
@@ -316,7 +316,7 @@ fn run_deterministic_inference(
         return Ok(InferenceOutput {
             tool_calls: Vec::new(),
             explanation: serde_json::json!({
-                "trigger": "ScheduledReview",
+                "trigger": DecisionTrigger::ScheduledReview.as_wire_name(),
                 "candidates_summary": "policy-bounded autonomy turn",
                 "outcome": {
                     "Executed": {
@@ -938,7 +938,7 @@ fn evm_read_shared_tool() -> SharedToolDefinition {
 }
 
 fn ic_llm_tools() -> Vec<IcLlmTool> {
-    vec![
+    let mut tools = vec![
         IcLlmTool::Function(IcLlmFunction {
             name: "sign_message".to_string(),
             description: Some(
@@ -1094,7 +1094,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "http_fetch".to_string(),
             description: Some(
-                "Fetch text from an allowlisted HTTPS URL via GET. Use optional `extract` to return only structured fields or regex-matching lines."
+                "Fetch text from an allowlisted HTTPS URL via GET. Use optional `extract` to return only structured fields or regex-matching lines. Do not use this for supported market/provider APIs; use `market_fetch` instead."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -1122,7 +1122,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "market_fetch".to_string(),
             description: Some(
-                "Fetch market/provider data using canonical runtime-managed endpoints (no raw URL construction). Supported providers/endpoints include coingecko:{simple_price,coins_markets,token_price} and dexscreener:{search_pairs,pair_by_address,token_pairs}."
+                "Fetch market/provider data using canonical runtime-managed endpoints (no raw URL construction). Use this instead of raw `http_fetch` for supported market APIs. Supported providers/endpoints include coingecko:{simple_price,coins_markets,token_price} and dexscreener:{search_pairs,pair_by_address,token_pairs}."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -1161,7 +1161,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     IcLlmProperty {
                         type_: "object".to_string(),
                         name: "extract".to_string(),
-                        description: Some("Optional extraction config. JSON mode: {\"mode\":\"json_path\",\"path\":\"...\"}. Regex mode: {\"mode\":\"regex\",\"pattern\":\"...\"}.".to_string()),
+                        description: Some("Extraction config. JSON mode: {\"mode\":\"json_path\",\"path\":\"...\"}. Regex mode: {\"mode\":\"regex\",\"pattern\":\"...\"}. Include this until the provider+endpoint pair has been verified; afterwards the runtime can reuse the stored extract.".to_string()),
                         enum_values: None,
                     },
                 ]),
@@ -1506,7 +1506,11 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 ]),
             }),
         }),
-    ]
+    ];
+    if !stable::web_search_runtime_enabled() {
+        tools.retain(|tool| ic_llm_tool_name(tool) != "web_search");
+    }
+    tools
 }
 
 fn ic_llm_tool_name(tool: &IcLlmTool) -> &str {
@@ -3065,8 +3069,13 @@ fn nat_to_status_code(status: &Nat) -> Result<u16, String> {
 mod tests {
     use super::*;
     use crate::domain::types::SkillRecord;
-    use crate::storage::stable;
+    use crate::storage::{sqlite, stable};
     use crate::util::block_on_with_spin;
+
+    fn reset_test_storage() {
+        sqlite::close_storage().expect("reset sqlite");
+        stable::init_storage();
+    }
 
     #[test]
     fn parses_ic_llm_models() {
@@ -3397,7 +3406,7 @@ mod tests {
 
     #[test]
     fn ic_llm_request_uses_compact_assembled_prompt_with_conversation_context() {
-        stable::init_storage();
+        reset_test_storage();
         stable::set_soul("compact-soul".to_string());
         stable::upsert_skill(&SkillRecord {
             name: "compact-skill".to_string(),
@@ -3434,7 +3443,7 @@ mod tests {
 
     #[test]
     fn openrouter_request_body_uses_full_assembled_prompt_with_conversation_context() {
-        stable::init_storage();
+        reset_test_storage();
         stable::set_soul("full-soul".to_string());
         let input = InferenceInput {
             input: "hello".to_string(),
@@ -3629,6 +3638,9 @@ mod tests {
 
     #[test]
     fn ic_llm_tools_include_agent_runtime_tools() {
+        reset_test_storage();
+        stable::set_search_api_key(Some("brave-test-key".to_string()));
+
         let names = ic_llm_tools()
             .into_iter()
             .map(|tool| match tool {
@@ -3650,6 +3662,21 @@ mod tests {
         assert!(names.contains(&"simulate_strategy_action".to_string()));
         assert!(names.contains(&"execute_strategy_action".to_string()));
         assert!(names.contains(&"get_strategy_outcomes".to_string()));
+    }
+
+    #[test]
+    fn ic_llm_tools_omit_web_search_without_search_api_key() {
+        reset_test_storage();
+        stable::set_search_api_key(None);
+
+        let names = ic_llm_tools()
+            .into_iter()
+            .map(|tool| match tool {
+                IcLlmTool::Function(function) => function.name,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!names.contains(&"web_search".to_string()));
     }
 
     #[test]
@@ -3937,6 +3964,9 @@ mod tests {
 
     #[test]
     fn openrouter_request_body_includes_agent_runtime_tools() {
+        reset_test_storage();
+        stable::set_search_api_key(Some("brave-test-key".to_string()));
+
         let body = build_openrouter_request_body(
             &InferenceInput {
                 input: "hello".to_string(),
@@ -3976,7 +4006,40 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_request_body_omits_web_search_without_search_api_key() {
+        reset_test_storage();
+        stable::set_search_api_key(None);
+
+        let body = build_openrouter_request_body(
+            &InferenceInput {
+                input: "hello".to_string(),
+                context_snippet: "ctx".to_string(),
+                turn_id: "turn-1".to_string(),
+                proxy_resume_job_id: None,
+                allow_global_proxy_callback_resume: false,
+            },
+            "openai/gpt-4o-mini",
+        );
+
+        let tools = body
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .expect("tools array must exist");
+        let names = tools
+            .iter()
+            .filter_map(|entry| entry.get("function"))
+            .filter_map(|function| function.get("name"))
+            .filter_map(|name| name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!names.contains(&"web_search"));
+    }
+
+    #[test]
     fn openrouter_tools_stay_in_sync_with_ic_llm_tool_catalog() {
+        reset_test_storage();
+        stable::set_search_api_key(Some("brave-test-key".to_string()));
+
         let mut ic_names = ic_llm_tools()
             .into_iter()
             .map(|tool| match tool {
@@ -4179,7 +4242,7 @@ mod tests {
 
     #[test]
     fn deterministic_ic_llm_model_layer_6_probe_reflects_prompt_layer_updates() {
-        stable::init_storage();
+        reset_test_storage();
         let adapter = IcLlmInferenceAdapter {
             model: DETERMINISTIC_IC_LLM_MODEL.to_string(),
             llm_canister_id: "w36hm-eqaaa-aaaal-qr76a-cai".to_string(),
@@ -4269,7 +4332,7 @@ mod tests {
 
     #[test]
     fn openrouter_proxy_provider_consumes_completed_callback_before_submit() {
-        stable::init_storage();
+        reset_test_storage();
         stable::set_inference_provider(InferenceProvider::OpenRouterProxyWorker);
         stable::set_openrouter_proxy_config(crate::domain::types::OpenRouterProxyWorkerConfig {
             worker_base_url: "https://proxy.example.workers.dev".to_string(),
@@ -4312,7 +4375,7 @@ mod tests {
         let output = block_on_with_spin(infer_with_provider(
             &snapshot,
             &InferenceInput {
-                input: "autonomy_tick".to_string(),
+                input: "recovery_follow_up".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-resume".to_string(),
                 proxy_resume_job_id: Some("job-1".to_string()),
@@ -4330,7 +4393,7 @@ mod tests {
 
     #[test]
     fn openrouter_proxy_provider_defers_when_pending_job_exists() {
-        stable::init_storage();
+        reset_test_storage();
         stable::set_inference_provider(InferenceProvider::OpenRouterProxyWorker);
         stable::set_openrouter_proxy_config(crate::domain::types::OpenRouterProxyWorkerConfig {
             worker_base_url: "https://proxy.example.workers.dev".to_string(),
@@ -4354,7 +4417,7 @@ mod tests {
         let output = block_on_with_spin(infer_with_provider(
             &snapshot,
             &InferenceInput {
-                input: "autonomy_tick".to_string(),
+                input: "recovery_follow_up".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-wait".to_string(),
                 proxy_resume_job_id: Some("job-pending".to_string()),
@@ -4371,7 +4434,7 @@ mod tests {
 
     #[test]
     fn openrouter_proxy_provider_targeted_resume_keeps_unrelated_callback_buffered() {
-        stable::init_storage();
+        reset_test_storage();
         stable::set_inference_provider(InferenceProvider::OpenRouterProxyWorker);
         stable::set_openrouter_proxy_config(crate::domain::types::OpenRouterProxyWorkerConfig {
             worker_base_url: "https://proxy.example.workers.dev".to_string(),

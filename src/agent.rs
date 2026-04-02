@@ -862,10 +862,10 @@ fn reflection_http_fetch_subject(args: Option<&serde_json::Value>) -> String {
 
     match host.as_deref() {
         Some("api.dexscreener.com" | "dexscreener.com" | "www.dexscreener.com") => {
-            "config.endpoint.dexscreener.latest".to_string()
+            "config.endpoint.dexscreener.raw_http.latest".to_string()
         }
         Some("api.coingecko.com" | "coingecko.com" | "www.coingecko.com") => {
-            "config.endpoint.coingecko.latest".to_string()
+            "config.endpoint.coingecko.raw_http.latest".to_string()
         }
         Some(host) => host.to_string(),
         None => "http_fetch".to_string(),
@@ -948,7 +948,9 @@ fn reflection_failure_summary(error_class: &str) -> String {
 
 fn reflection_failure_hint(tool: &str, subject: &str) -> &'static str {
     match tool {
-        "market_fetch" => "use canonical provider:endpoint params",
+        "market_fetch" => {
+            "use canonical provider:endpoint params + extract until endpoint is verified"
+        }
         "http_fetch" => "verify allowlisted host and extract",
         "evm_read" if subject == "eth_call" => "use address + calldata",
         "evm_read" if subject == "eth_getBalance" || subject == "eth_getTransactionCount" => {
@@ -1499,7 +1501,7 @@ fn current_turn_context_line(staged_message_count: usize, evm_events: usize) -> 
         return format!("context: processing {evm_events} newly observed EVM event(s)");
     }
 
-    "context: autonomy tick (scheduler, no external input)".to_string()
+    "context: scheduled review (scheduler, no external input)".to_string()
 }
 
 fn should_skip_periodic_turn_for_proxy_wait(
@@ -1525,6 +1527,10 @@ fn should_apply_autonomy_suppression(
     inference_round_count: usize,
 ) -> bool {
     trigger == ScheduledTurnTrigger::Periodic && !has_external_input && inference_round_count == 1
+}
+
+fn scheduled_turn_marker(trigger: ScheduledTurnTrigger) -> &'static str {
+    decision_trigger_for_turn(trigger, false).inference_input_marker()
 }
 
 fn load_staged_inbox_proxy_wait_state(
@@ -2257,7 +2263,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             } else if evm_events > 0 {
                 format!("poll:new_events={evm_events}")
             } else {
-                "autonomy_tick".to_string()
+                scheduled_turn_marker(trigger).to_string()
             },
             context_snippet: context_summary,
             turn_id: turn_id.clone(),
@@ -3057,7 +3063,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             if last_error.is_none() {
                 let envelope = decision_envelope.unwrap_or_else(|| AutonomyDecisionEnvelope {
                     trigger: decision_trigger.clone(),
-                    candidates_summary: "autonomy tick completed".to_string(),
+                    candidates_summary: "scheduled review completed".to_string(),
                     outcome: DecisionEnvelopeOutcome::NoOp {
                         reason: "invalid_decision_shape".to_string(),
                     },
@@ -3127,7 +3133,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         let _ = advance_state(&mut state, &AgentEvent::TurnFailed { reason }, &turn_id);
     }
     if inner_dialogue.is_none() && !has_external_input && last_error.is_none() {
-        inner_dialogue = Some("result: autonomy tick completed with no actions".to_string());
+        inner_dialogue = Some("result: scheduled review completed with no actions".to_string());
     }
     let finished_at_ns = current_time_ns();
     let turn_duration_ms = finished_at_ns.saturating_sub(started_at_ns) / 1_000_000;
@@ -3212,6 +3218,7 @@ mod tests {
         turn_in_flight: bool,
         turn_counter: u64,
     ) {
+        sqlite::close_storage().expect("reset sqlite");
         stable::init_storage();
         let snapshot = RuntimeSnapshot {
             state,
@@ -3943,6 +3950,18 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_turn_markers_match_decision_contract() {
+        assert_eq!(
+            scheduled_turn_marker(ScheduledTurnTrigger::Periodic),
+            DecisionTrigger::ScheduledReview.inference_input_marker()
+        );
+        assert_eq!(
+            scheduled_turn_marker(ScheduledTurnTrigger::InferenceProxyResume),
+            DecisionTrigger::RecoveryFollowUp.inference_input_marker()
+        );
+    }
+
+    #[test]
     fn skipped_when_loop_disabled_is_successful_and_non_mutating() {
         reset_runtime(AgentState::Sleeping, false, false, 41);
 
@@ -4116,6 +4135,15 @@ mod tests {
         let section = build_available_tools_section("turn-0");
         assert!(section.contains("- send_eth: calls_this_turn=0"));
         assert!(!section.contains("broadcast_transaction"));
+    }
+
+    #[test]
+    fn available_tools_section_omits_web_search_without_search_api_key() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_search_api_key(None);
+
+        let section = build_available_tools_section("turn-0");
+        assert!(!section.contains("- web_search:"));
     }
 
     #[test]
@@ -4464,7 +4492,7 @@ mod tests {
             turn.inner_dialogue
                 .as_deref()
                 .unwrap_or_default()
-                .contains("context: autonomy tick (scheduler, no external input)"),
+                .contains("context: scheduled review (scheduler, no external input)"),
             "inner dialogue should include autonomy turn context"
         );
         assert!(

@@ -1035,6 +1035,28 @@ pub enum DecisionTrigger {
     RecoveryFollowUp,
 }
 
+impl DecisionTrigger {
+    pub fn as_wire_name(&self) -> &'static str {
+        match self {
+            Self::ScheduledReview => "ScheduledReview",
+            Self::InboxMessage => "InboxMessage",
+            Self::LowRunway => "LowRunway",
+            Self::PositionMaintenance => "PositionMaintenance",
+            Self::RecoveryFollowUp => "RecoveryFollowUp",
+        }
+    }
+
+    pub fn inference_input_marker(&self) -> &'static str {
+        match self {
+            Self::ScheduledReview => "scheduled_review",
+            Self::InboxMessage => "inbox_message",
+            Self::LowRunway => "low_runway",
+            Self::PositionMaintenance => "position_maintenance",
+            Self::RecoveryFollowUp => "recovery_follow_up",
+        }
+    }
+}
+
 /// Escalation category emitted when the automaton cannot proceed autonomously.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum EscalationClass {

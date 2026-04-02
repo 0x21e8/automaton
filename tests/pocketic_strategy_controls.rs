@@ -250,55 +250,6 @@ struct ExposureReconciliationStatus {
     last_error: Option<String>,
 }
 
-#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-enum DecisionTrigger {
-    ScheduledReview,
-    InboxMessage,
-    LowRunway,
-    PositionMaintenance,
-    RecoveryFollowUp,
-}
-
-#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-enum EscalationClass {
-    MissingPolicy {
-        what: String,
-    },
-    OutOfAuthority {
-        what: String,
-    },
-    CapabilityGap {
-        what: String,
-    },
-    SafetyConflict {
-        what: String,
-    },
-    RepeatedFailure {
-        strategy: String,
-        failure_count: u32,
-    },
-}
-
-#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-enum DecisionOutcome {
-    Executed { action_summary: String },
-    Simulated { action_summary: String },
-    NoOp { reason: String },
-    Deferred { reason: String },
-    Escalated { gap: EscalationClass },
-}
-
-#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct DecisionRecord {
-    turn_id: String,
-    timestamp_ns: u64,
-    trigger: DecisionTrigger,
-    outcome: DecisionOutcome,
-    policy_version: u32,
-    candidates_summary: String,
-    explanation: String,
-}
-
 fn assert_wasm_artifact_present() -> Vec<u8> {
     for path in WASM_PATHS {
         if Path::new(path).exists() {
@@ -460,15 +411,6 @@ fn update_autonomy_policy(
         canister_id,
         "update_autonomy_policy",
         encode_args((policy,)).expect("failed to encode update_autonomy_policy args"),
-    )
-}
-
-fn get_recent_decisions(pic: &PocketIc, canister_id: Principal) -> Vec<DecisionRecord> {
-    call_query(
-        pic,
-        canister_id,
-        "get_recent_decisions",
-        encode_args(()).expect("failed to encode get_recent_decisions args"),
     )
 }
 

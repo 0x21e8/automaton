@@ -61,6 +61,7 @@ pub const MAX_PROMPT_LAYER_CONTENT_CHARS: usize = 4_000;
 /// Number of consecutive market endpoint failures before requiring re-discovery.
 const MARKET_ENDPOINT_STALE_FAILURE_THRESHOLD: u32 = 2;
 const MARKET_FETCH_RESPONSE_BYTES_DEFAULT: u64 = 64 * 1024;
+const MARKET_ENDPOINT_RAW_HTTP_SCOPE: &str = "raw_http";
 
 struct MarketEndpointProvider {
     id: &'static str,
@@ -645,7 +646,7 @@ impl ToolManager {
         policies.insert(
             "web_search".to_string(),
             ToolPolicy {
-                enabled: true,
+                enabled: stable::web_search_runtime_enabled(),
                 allowed_states: vec![AgentState::ExecutingActions],
             },
         );
@@ -1006,10 +1007,6 @@ impl ToolManager {
                 let prepared = prepare_market_http_fetch_args(&call.args_json)?;
                 let result = http_fetch_tool(&prepared.effective_args_json).await;
                 if result.is_ok() {
-                    if let Some((endpoint_key, endpoint_origin)) = prepared.endpoint_fact {
-                        let _ =
-                            persist_market_endpoint_fact(&endpoint_key, &endpoint_origin, turn_id);
-                    }
                     if let Some(handshake) = prepared.handshake.as_ref() {
                         let _ = persist_market_fetch_handshake_success(handshake, turn_id);
                     }
@@ -1026,10 +1023,6 @@ impl ToolManager {
                 let prepared = prepare_market_fetch_http_fetch_args(&call.args_json)?;
                 let result = http_fetch_tool(&prepared.effective_args_json).await;
                 if result.is_ok() {
-                    if let Some((endpoint_key, endpoint_origin)) = prepared.endpoint_fact {
-                        let _ =
-                            persist_market_endpoint_fact(&endpoint_key, &endpoint_origin, turn_id);
-                    }
                     if let Some(handshake) = prepared.handshake.as_ref() {
                         let _ = persist_market_fetch_handshake_success(handshake, turn_id);
                     }
@@ -1397,7 +1390,10 @@ fn prepare_market_fetch_http_fetch_args(
     );
 
     let effective_args_json = serde_json::Value::Object(http_fetch_args).to_string();
-    prepare_market_http_fetch_args(&effective_args_json)
+    prepare_market_http_fetch_args_for_scope(
+        &effective_args_json,
+        Some((provider.as_str(), endpoint.as_str())),
+    )
 }
 
 fn resolve_market_fetch_param_alias<'a>(
@@ -1463,7 +1459,6 @@ fn percent_encode_market_component(value: &str) -> String {
 
 struct PreparedMarketHttpFetchArgs {
     effective_args_json: String,
-    endpoint_fact: Option<(String, String)>,
     handshake: Option<MarketFetchHandshake>,
 }
 
@@ -1476,112 +1471,45 @@ struct MarketFetchHandshake {
     extract_signature: Option<String>,
 }
 
+fn market_endpoint_fact_keys(
+    provider: &str,
+    endpoint_scope: &str,
+) -> (String, String, String, String) {
+    let prefix = format!("config.endpoint.{provider}.{endpoint_scope}");
+    (
+        format!("{prefix}.latest"),
+        format!("{prefix}.status.latest"),
+        format!("{prefix}.failure_count.latest"),
+        format!("{prefix}.extract.latest"),
+    )
+}
+
 fn prepare_market_http_fetch_args(args_json: &str) -> Result<PreparedMarketHttpFetchArgs, String> {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(args_json) else {
-        return Ok(PreparedMarketHttpFetchArgs {
-            effective_args_json: args_json.to_string(),
-            endpoint_fact: None,
-            handshake: None,
-        });
-    };
-    let Some(args_object) = value.as_object_mut() else {
-        return Ok(PreparedMarketHttpFetchArgs {
-            effective_args_json: args_json.to_string(),
-            endpoint_fact: None,
-            handshake: None,
-        });
-    };
-    let Some(raw_url) = args_object.get("url").and_then(|entry| entry.as_str()) else {
-        return Ok(PreparedMarketHttpFetchArgs {
-            effective_args_json: args_json.to_string(),
-            endpoint_fact: None,
-            handshake: None,
-        });
-    };
-    let raw_url = raw_url.to_string();
+    prepare_market_http_fetch_args_for_scope(args_json, None)
+}
 
-    let parsed = extract_https_host_and_suffix(&raw_url);
-    if url_looks_like_market_provider(&raw_url) {
-        let (host, suffix) =
-            parsed.map_err(|error| format!("invalid market-data url: {error}; url={raw_url}"))?;
-        let Some(provider) = market_endpoint_provider_for_host(&host) else {
-            return Err(format!(
-                "invalid market-data url host `{host}`; expected one of: {}",
-                known_market_hosts_summary()
-            ));
-        };
-        validate_market_provider_path(provider, suffix, &raw_url)?;
-        let endpoint_key = format!("config.endpoint.{}.latest", provider.id);
-        let endpoint_origin = stable::get_memory_fact(&endpoint_key)
-            .and_then(|fact| normalize_market_endpoint_origin(&fact.value, provider))
-            .unwrap_or_else(|| provider.default_origin.to_string());
-        let status_key = format!("config.endpoint.{}.status.latest", provider.id);
-        let failure_count_key = format!("config.endpoint.{}.failure_count.latest", provider.id);
-        let extract_key = format!("config.endpoint.{}.extract.latest", provider.id);
-        let status = stable::get_memory_fact(&status_key)
-            .map(|fact| fact.value.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "unverified".to_string());
-        let stored_extract = stable::get_memory_fact(&extract_key)
-            .map(|fact| fact.value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let mut extract_signature = parse_market_extract_signature(args_object);
-        let verified = status == "verified" && stored_extract.is_some();
-        if extract_signature.is_none() && verified {
-            if let Some(stored) = stored_extract.clone() {
-                inject_market_extract_signature(args_object, &stored)?;
-                extract_signature = Some(stored);
-            }
-        }
-        if !verified && extract_signature.is_none() {
-            return Err(format!(
-                "market endpoint discovery required for provider `{}`: include `extract` (json_path or regex) so the runtime can verify and persist a canonical endpoint/path",
-                provider.id
-            ));
-        }
-        let rewritten_url = if suffix.is_empty() {
-            endpoint_origin.clone()
-        } else {
-            format!("{}{}", endpoint_origin.trim_end_matches('/'), suffix)
-        };
-        args_object.insert("url".to_string(), serde_json::Value::String(rewritten_url));
-        let handshake = MarketFetchHandshake {
-            endpoint_key: endpoint_key.clone(),
-            endpoint_origin: endpoint_origin.clone(),
-            status_key,
-            failure_count_key,
-            extract_key,
-            extract_signature,
-        };
-        return Ok(PreparedMarketHttpFetchArgs {
-            effective_args_json: serde_json::to_string(&value)
-                .unwrap_or_else(|_| args_json.to_string()),
-            endpoint_fact: Some((endpoint_key, endpoint_origin)),
-            handshake: Some(handshake),
-        });
+fn prepare_market_http_fetch_passthrough(args_json: &str) -> PreparedMarketHttpFetchArgs {
+    PreparedMarketHttpFetchArgs {
+        effective_args_json: args_json.to_string(),
+        handshake: None,
     }
+}
 
-    let Ok((host, suffix)) = parsed else {
-        return Ok(PreparedMarketHttpFetchArgs {
-            effective_args_json: args_json.to_string(),
-            endpoint_fact: None,
-            handshake: None,
-        });
-    };
-    let Some(provider) = market_endpoint_provider_for_host(&host) else {
-        return Ok(PreparedMarketHttpFetchArgs {
-            effective_args_json: args_json.to_string(),
-            endpoint_fact: None,
-            handshake: None,
-        });
-    };
-    validate_market_provider_path(provider, suffix, &raw_url)?;
-    let endpoint_key = format!("config.endpoint.{}.latest", provider.id);
+fn prepare_market_fetch_handshake(
+    args_object: &mut serde_json::Map<String, serde_json::Value>,
+    provider: &MarketEndpointProvider,
+    suffix: &str,
+    market_scope: Option<(&str, &str)>,
+) -> Result<MarketFetchHandshake, String> {
+    let endpoint_scope = market_scope
+        .filter(|(scope_provider, _)| *scope_provider == provider.id)
+        .map(|(_, scope)| scope)
+        .unwrap_or(MARKET_ENDPOINT_RAW_HTTP_SCOPE);
+    let (endpoint_key, status_key, failure_count_key, extract_key) =
+        market_endpoint_fact_keys(provider.id, endpoint_scope);
     let endpoint_origin = stable::get_memory_fact(&endpoint_key)
         .and_then(|fact| normalize_market_endpoint_origin(&fact.value, provider))
         .unwrap_or_else(|| provider.default_origin.to_string());
-    let status_key = format!("config.endpoint.{}.status.latest", provider.id);
-    let failure_count_key = format!("config.endpoint.{}.failure_count.latest", provider.id);
-    let extract_key = format!("config.endpoint.{}.extract.latest", provider.id);
     let status = stable::get_memory_fact(&status_key)
         .map(|fact| fact.value.trim().to_ascii_lowercase())
         .unwrap_or_else(|| "unverified".to_string());
@@ -1608,18 +1536,62 @@ fn prepare_market_http_fetch_args(args_json: &str) -> Result<PreparedMarketHttpF
         format!("{}{}", endpoint_origin.trim_end_matches('/'), suffix)
     };
     args_object.insert("url".to_string(), serde_json::Value::String(rewritten_url));
-    let handshake = MarketFetchHandshake {
-        endpoint_key: endpoint_key.clone(),
-        endpoint_origin: endpoint_origin.clone(),
+    Ok(MarketFetchHandshake {
+        endpoint_key,
+        endpoint_origin,
         status_key,
         failure_count_key,
         extract_key,
         extract_signature,
+    })
+}
+
+fn prepare_market_http_fetch_args_for_scope(
+    args_json: &str,
+    market_scope: Option<(&str, &str)>,
+) -> Result<PreparedMarketHttpFetchArgs, String> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(args_json) else {
+        return Ok(prepare_market_http_fetch_passthrough(args_json));
     };
+    let Some(args_object) = value.as_object_mut() else {
+        return Ok(prepare_market_http_fetch_passthrough(args_json));
+    };
+    let Some(raw_url) = args_object.get("url").and_then(|entry| entry.as_str()) else {
+        return Ok(prepare_market_http_fetch_passthrough(args_json));
+    };
+    let raw_url = raw_url.to_string();
+
+    let parsed = extract_https_host_and_suffix(&raw_url);
+    if url_looks_like_market_provider(&raw_url) {
+        let (host, suffix) =
+            parsed.map_err(|error| format!("invalid market-data url: {error}; url={raw_url}"))?;
+        let Some(provider) = market_endpoint_provider_for_host(&host) else {
+            return Err(format!(
+                "invalid market-data url host `{host}`; expected one of: {}",
+                known_market_hosts_summary()
+            ));
+        };
+        validate_market_provider_path(provider, suffix, &raw_url)?;
+        let handshake =
+            prepare_market_fetch_handshake(args_object, provider, suffix, market_scope)?;
+        return Ok(PreparedMarketHttpFetchArgs {
+            effective_args_json: serde_json::to_string(&value)
+                .unwrap_or_else(|_| args_json.to_string()),
+            handshake: Some(handshake),
+        });
+    }
+
+    let Ok((host, suffix)) = parsed else {
+        return Ok(prepare_market_http_fetch_passthrough(args_json));
+    };
+    let Some(provider) = market_endpoint_provider_for_host(&host) else {
+        return Ok(prepare_market_http_fetch_passthrough(args_json));
+    };
+    validate_market_provider_path(provider, suffix, &raw_url)?;
+    let handshake = prepare_market_fetch_handshake(args_object, provider, suffix, market_scope)?;
     Ok(PreparedMarketHttpFetchArgs {
         effective_args_json: serde_json::to_string(&value)
             .unwrap_or_else(|_| args_json.to_string()),
-        endpoint_fact: Some((endpoint_key, endpoint_origin)),
         handshake: Some(handshake),
     })
 }
@@ -5464,17 +5436,17 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].success);
 
-        let fact = stable::get_memory_fact("config.endpoint.dexscreener.latest")
+        let fact = stable::get_memory_fact("config.endpoint.dexscreener.raw_http.latest")
             .expect("market endpoint fact should be stored");
         assert_eq!(fact.value, "https://api.dexscreener.com");
         assert_eq!(
-            stable::get_memory_fact("config.endpoint.dexscreener.status.latest")
+            stable::get_memory_fact("config.endpoint.dexscreener.raw_http.status.latest")
                 .expect("market endpoint status fact should be stored")
                 .value,
             "verified"
         );
         assert_eq!(
-            stable::get_memory_fact("config.endpoint.dexscreener.extract.latest")
+            stable::get_memory_fact("config.endpoint.dexscreener.raw_http.extract.latest")
                 .expect("market endpoint extract fact should be stored")
                 .value,
             "regex:stub"
@@ -5553,11 +5525,12 @@ mod tests {
     fn market_handshake_marks_status_stale_after_repeated_failures() {
         stable::init_storage();
         let handshake = MarketFetchHandshake {
-            endpoint_key: "config.endpoint.dexscreener.latest".to_string(),
+            endpoint_key: "config.endpoint.dexscreener.search_pairs.latest".to_string(),
             endpoint_origin: "https://api.dexscreener.com".to_string(),
-            status_key: "config.endpoint.dexscreener.status.latest".to_string(),
-            failure_count_key: "config.endpoint.dexscreener.failure_count.latest".to_string(),
-            extract_key: "config.endpoint.dexscreener.extract.latest".to_string(),
+            status_key: "config.endpoint.dexscreener.search_pairs.status.latest".to_string(),
+            failure_count_key: "config.endpoint.dexscreener.search_pairs.failure_count.latest"
+                .to_string(),
+            extract_key: "config.endpoint.dexscreener.search_pairs.extract.latest".to_string(),
             extract_signature: Some("regex:stub".to_string()),
         };
         upsert_memory_fact(&handshake.status_key, "verified", "turn-0")
@@ -5591,6 +5564,42 @@ mod tests {
                 .expect("failure count should be present")
                 .value,
             "2"
+        );
+    }
+
+    #[test]
+    fn market_fetch_persists_endpoint_scoped_verification_facts() {
+        stable::init_storage();
+        stable::set_http_allowed_domains(vec!["api.dexscreener.com".to_string()])
+            .expect("allowlist should set");
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "market_fetch".to_string(),
+            args_json: r#"{"provider":"dexscreener","endpoint":"search_pairs","params":{"q":"eth"},"extract":{"mode":"regex","pattern":"stub"}}"#.to_string(),
+        }];
+
+        let records = block_on_with_spin(manager.execute_actions(
+            &state,
+            &calls,
+            &signer,
+            "turn-market-fetch",
+        ));
+        assert_eq!(records.len(), 1);
+        assert!(records[0].success);
+        assert_eq!(
+            stable::get_memory_fact("config.endpoint.dexscreener.search_pairs.status.latest")
+                .expect("endpoint-scoped status fact should be stored")
+                .value,
+            "verified"
+        );
+        assert_eq!(
+            stable::get_memory_fact("config.endpoint.dexscreener.search_pairs.extract.latest")
+                .expect("endpoint-scoped extract fact should be stored")
+                .value,
+            "regex:stub"
         );
     }
 
