@@ -1821,6 +1821,41 @@ fn render_decision_envelope_error_context(error: &str) -> String {
     )
 }
 
+fn autonomy_noop_envelope_for_inference_error(
+    error: &str,
+    trigger: DecisionTrigger,
+) -> AutonomyDecisionEnvelope {
+    let reason = match crate::features::inference::classify_inference_failure(error) {
+        crate::domain::types::RecoveryFailure::Operation(
+            crate::domain::types::OperationFailure {
+                kind:
+                    crate::domain::types::OperationFailureKind::MissingConfiguration
+                    | crate::domain::types::OperationFailureKind::InvalidConfiguration
+                    | crate::domain::types::OperationFailureKind::Unauthorized,
+            },
+        ) => "inference_configuration_error",
+        crate::domain::types::RecoveryFailure::Outcall(crate::domain::types::OutcallFailure {
+            kind:
+                crate::domain::types::OutcallFailureKind::InvalidRequest
+                | crate::domain::types::OutcallFailureKind::RejectedByPolicy,
+            ..
+        }) => "inference_provider_rejected",
+        _ => "inference_error",
+    };
+
+    AutonomyDecisionEnvelope {
+        trigger,
+        candidates_summary: "autonomy turn could not obtain model output".to_string(),
+        outcome: DecisionEnvelopeOutcome::NoOp {
+            reason: reason.to_string(),
+        },
+        explanation: format!(
+            "autonomy inference failed before decision generation: {}",
+            sanitize_preview(error, 180)
+        ),
+    }
+}
+
 fn validate_decision_envelope(
     envelope: &AutonomyDecisionEnvelope,
     expected_trigger: &DecisionTrigger,
@@ -2372,6 +2407,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         let mut inference_deferred = false;
         let mut staged_external_input_handled = false;
         let mut executed_any_tool = false;
+        let mut autonomy_inference_error: Option<String> = None;
 
         loop {
             if inference_round_count >= max_inference_rounds {
@@ -2432,6 +2468,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                         if has_external_input {
                             last_error = Some(reason);
                         } else {
+                            autonomy_inference_error = Some(reason.clone());
                             append_inner_dialogue(
                                 &mut inner_dialogue,
                                 &format!("autonomy inference error: {reason}"),
@@ -3074,9 +3111,15 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             let decision_trigger = decision_trigger_for_turn(trigger, has_external_input);
             let policy = stable::autonomy_policy()
                 .unwrap_or_else(|| AutonomyPolicy::conservative_default(current_time_ns()));
-            let mut decision_envelope = assistant_reply
-                .as_deref()
-                .and_then(|reply| parse_autonomy_decision_envelope(reply, &decision_trigger).ok());
+            let mut decision_envelope = autonomy_inference_error.as_deref().map(|error| {
+                autonomy_noop_envelope_for_inference_error(error, decision_trigger.clone())
+            });
+
+            if decision_envelope.is_none() {
+                decision_envelope = assistant_reply.as_deref().and_then(|reply| {
+                    parse_autonomy_decision_envelope(reply, &decision_trigger).ok()
+                });
+            }
 
             if decision_envelope.is_none() {
                 let parse_error = assistant_reply
@@ -4380,6 +4423,51 @@ mod tests {
             }
         );
         assert_eq!(decisions[0].policy_version, 1);
+    }
+
+    #[test]
+    fn no_input_inference_error_records_noop_without_invalid_envelope_noise() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_inference_provider(InferenceProvider::OpenRouter);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "scheduled no-input inference failures should degrade to a recorded no-op"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].error.is_none(),
+            "degraded autonomy inference failures must not fault the turn"
+        );
+        let inner_dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(
+            inner_dialogue
+                .contains("autonomy inference error: openrouter api key is not configured"),
+            "turn dialogue should preserve the original inference error"
+        );
+        assert!(
+            !inner_dialogue.contains("decision envelope invalid"),
+            "turn dialogue should not add misleading invalid-envelope noise after inference failure"
+        );
+
+        let decisions = stable::list_recent_decisions(1);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].trigger, DecisionTrigger::ScheduledReview);
+        assert_eq!(
+            decisions[0].outcome,
+            DecisionOutcome::NoOp {
+                reason: "inference_configuration_error".to_string(),
+            }
+        );
+        assert!(
+            decisions[0]
+                .explanation
+                .contains("openrouter api key is not configured"),
+            "decision audit record should preserve the inference failure context"
+        );
     }
 
     #[test]

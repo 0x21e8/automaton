@@ -2718,6 +2718,15 @@ fn is_transport_class_error(error: &str) -> bool {
         || (normalized.contains("outcall failed") && !normalized.contains("insufficient cycles"))
 }
 
+fn is_openrouter_privacy_configuration_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized
+        .contains("no endpoints available matching your guardrail restrictions and data policy")
+        || (normalized.contains("guardrail restrictions")
+            && normalized.contains("data policy")
+            && normalized.contains("settings/privacy"))
+}
+
 // ── Failure classification ───────────────────────────────────────────────────
 
 /// Map a raw inference error string to a structured `RecoveryFailure`.
@@ -2741,6 +2750,7 @@ pub fn classify_inference_failure(error: &str) -> RecoveryFailure {
         || normalized.contains("must be > 0")
         || normalized.contains("unsupported ic_llm model")
         || normalized.contains("invalid ic_llm canister principal")
+        || is_openrouter_privacy_configuration_error(&normalized)
     {
         return RecoveryFailure::Operation(OperationFailure {
             kind: OperationFailureKind::InvalidConfiguration,
@@ -3433,6 +3443,21 @@ mod tests {
                 retry_after_secs: None,
                 observed_response_bytes: None,
             })
+        );
+    }
+
+    #[test]
+    fn classify_inference_failure_maps_openrouter_privacy_404_to_invalid_configuration() {
+        let failure = classify_inference_failure(
+            r#"openrouter returned status 404: {"error":{"message":"No endpoints available matching your guardrail restrictions and data policy. Configure: https://openrouter.ai/settings/privacy","code":404}}"#,
+        );
+        assert_eq!(
+            failure,
+            crate::domain::types::RecoveryFailure::Operation(
+                crate::domain::types::OperationFailure {
+                    kind: crate::domain::types::OperationFailureKind::InvalidConfiguration,
+                }
+            )
         );
     }
 
