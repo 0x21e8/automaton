@@ -1,6 +1,8 @@
 import type {
   AutomatonDetail,
-  AutomatonListResponse
+  AutomatonListResponse,
+  RoomMessagePage,
+  RoomMessagesQuery
 } from "@ic-automaton/shared";
 
 const INDEXER_BASE_URL = import.meta.env.VITE_INDEXER_BASE_URL?.trim() ?? "";
@@ -131,4 +133,48 @@ export async function fetchAutomatonDetail(
   return requestIndexerJson<AutomatonDetail>(`/api/automatons/${canisterId}`, {
     signal
   });
+}
+
+export async function fetchRoomMessagePage(
+  query: RoomMessagesQuery = {},
+  signal?: AbortSignal
+): Promise<RoomMessagePage> {
+  return requestIndexerJson<RoomMessagePage>("/api/room/messages", {
+    query: {
+      afterSeq: query.afterSeq?.toString(),
+      canisterId: query.canisterId,
+      limit: query.limit?.toString(),
+      scope: query.scope
+    },
+    signal
+  });
+}
+
+export async function fetchRoomHistory(signal?: AbortSignal): Promise<RoomMessagePage> {
+  const messages: RoomMessagePage["messages"] = [];
+  let afterSeq: number | undefined;
+  let latestSeq: number | null = null;
+
+  while (true) {
+    const page = await fetchRoomMessagePage(
+      {
+        afterSeq,
+        limit: 100
+      },
+      signal
+    );
+
+    messages.push(...page.messages);
+    latestSeq = page.latestSeq;
+
+    if (page.nextAfterSeq === null || page.nextAfterSeq === afterSeq) {
+      return {
+        messages,
+        nextAfterSeq: null,
+        latestSeq
+      };
+    }
+
+    afterSeq = page.nextAfterSeq;
+  }
 }

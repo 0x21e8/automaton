@@ -90,6 +90,7 @@ pub fn validate_automaton_child_runtime_config(
 
 pub fn build_automaton_install_args(
     session: &SpawnSession,
+    factory_principal: candid::Principal,
     version_commit: &str,
     child_runtime: &ValidatedAutomatonChildRuntimeConfig,
 ) -> Vec<u8> {
@@ -109,6 +110,7 @@ pub fn build_automaton_install_args(
             steward_address: session.steward_address.clone(),
             session_id: session.session_id.clone(),
             parent_id: session.parent_id.clone(),
+            factory_principal,
             risk: session.config.risk,
             strategies: session.config.strategies.clone(),
             skills: session.config.skills.clone(),
@@ -226,6 +228,7 @@ mod tests {
 
         let encoded = build_automaton_install_args(
             &session,
+            Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai").expect("valid factory principal"),
             "0123456789abcdef0123456789abcdef01234567",
             &config,
         );
@@ -245,6 +248,16 @@ mod tests {
                 "https://openrouter.ai".to_string(),
                 "https://api.search.brave.com".to_string()
             ])
+        );
+        assert_eq!(
+            decoded
+                .spawn_bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.factory_principal),
+            Some(
+                Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                    .expect("valid factory principal")
+            )
         );
         assert_eq!(
             decoded

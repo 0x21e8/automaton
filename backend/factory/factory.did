@@ -23,6 +23,26 @@ type CreateSpawnSessionResponse = record {
   session : SpawnSession;
 };
 type CreationCostQuote = record { updated_at : nat64; usdc_cost : text };
+type PostRoomMessageRequest = record {
+  body : text;
+  mentions : opt vec text;
+  content_type : opt RoomContentType;
+};
+type RoomContentType = variant { TextPlain; ApplicationJson };
+type RoomMessage = record {
+  message_id : text;
+  seq : nat64;
+  author_canister_id : text;
+  created_at : nat64;
+  body : text;
+  mentions : vec text;
+  content_type : RoomContentType;
+};
+type RoomMessagePage = record {
+  messages : vec RoomMessage;
+  next_after_seq : opt nat64;
+  latest_seq : opt nat64;
+};
 type EscrowClaim = record {
   updated_at : nat64;
   asset : SpawnAsset;
@@ -148,6 +168,15 @@ type FactoryError = variant {
   ControllerInvariantViolation : record { canister_id : text };
   FactoryPaused : record { pause : bool };
   UnauthorizedSteward : record { session_id : text; caller : text };
+  UnauthorizedRoomPoster : record { caller : text };
+  EmptyRoomMessageBody;
+  RoomMessageBodyTooLarge : record {
+    provided_bytes : nat64;
+    max_bytes : nat64;
+  };
+  TooManyRoomMentions : record { provided : nat64; max_mentions : nat64 };
+  InvalidRoomContentType : record { value : text };
+  InvalidRoomMessageJson : record { message : text };
   PaymentNotSettled : record { status : PaymentStatus; session_id : text };
   SessionNotRefundable : record {
     session_id : text;
@@ -270,6 +299,8 @@ type Result_13 = variant { Ok : FactoryRuntimeSnapshot; Err : FactoryError };
 type Result_14 = variant { Ok : ArtifactUploadStatus; Err : FactoryError };
 type Result_15 = variant { Ok : AutomatonChildRuntimeConfig; Err : FactoryError };
 type Result_16 = variant { Ok : FactoryOperationalConfig; Err : FactoryError };
+type Result_17 = variant { Ok : RoomMessage; Err : FactoryError };
+type Result_18 = variant { Ok : RoomMessagePage; Err : FactoryError };
 type SchedulerFailureAction = variant { Retry; Backoff; Skip; Terminal };
 type SchedulerFailureSource = variant {
   MissingConfig;
@@ -429,7 +460,11 @@ service : (opt FactoryInitArgs) -> {
   get_session_admin : (text) -> (Result_3) query;
   get_spawn_session : (text) -> (Result_4) query;
   get_spawned_automaton : (text) -> (Result_5) query;
+  list_messages_for_automaton : (text, opt nat64, opt nat64) -> (Result_18) query;
+  list_my_room_messages : (opt nat64, opt nat64) -> (Result_18) query;
+  list_room_messages : (opt nat64, opt nat64) -> (Result_18) query;
   list_spawned_automatons : (opt text, nat64) -> (Result_6) query;
+  post_room_message : (PostRoomMessageRequest) -> (Result_17);
   retry_session_admin : (text) -> (Result_4);
   retry_spawn_session : (text) -> (Result_4);
   set_child_runtime_config : (AutomatonChildRuntimeConfig) -> (Result_15);

@@ -2,6 +2,7 @@ import type {
   AutomatonRecord,
   MonologueEntry
 } from "./automaton.js";
+import type { RoomMessage } from "./room.js";
 import type {
   SessionAuditEntry,
   SpawnSession
@@ -48,9 +49,7 @@ export interface AutomatonActionEvent {
 
 export interface AutomatonMessageEvent {
   type: "message";
-  fromCanisterId: string;
-  toCanisterId: string;
-  timestamp: number;
+  message: RoomMessage;
 }
 
 export interface AutomatonMonologueEvent {

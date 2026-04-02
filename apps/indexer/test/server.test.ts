@@ -11,6 +11,7 @@ import { buildServer, start } from "../src/server.js";
 import {
   createAutomatonDetailFixture,
   createMonologueEntryFixture,
+  createRoomMessageFixture,
   createSpawnSessionDetailFixture,
   createSpawnedAutomatonRecordFixture
 } from "./fixtures.js";
@@ -231,6 +232,20 @@ describe("indexer server", () => {
             return {
               items: [],
               nextCursor: null
+            };
+          },
+          async listRoomMessages() {
+            return {
+              messages: [],
+              nextAfterSeq: null,
+              latestSeq: null
+            };
+          },
+          async listMessagesForAutomaton() {
+            return {
+              messages: [],
+              nextAfterSeq: null,
+              latestSeq: null
             };
           },
           async getSpawnedAutomaton() {
@@ -544,6 +559,20 @@ describe("indexer server", () => {
               nextCursor: null
             };
           },
+          async listRoomMessages() {
+            return {
+              messages: [],
+              nextAfterSeq: null,
+              latestSeq: null
+            };
+          },
+          async listMessagesForAutomaton() {
+            return {
+              messages: [],
+              nextAfterSeq: null,
+              latestSeq: null
+            };
+          },
           async getSpawnedAutomaton() {
             return null;
           },
@@ -794,6 +823,61 @@ describe("indexer server", () => {
     await app.close();
   });
 
+  it("serves inert room history and supports relevant room reads", async () => {
+    const app = buildServer({
+      config: {
+        databasePath: await createDatabasePath()
+      }
+    });
+    const broadcast = createRoomMessageFixture({
+      messageId: "room-message-1",
+      seq: 1,
+      mentions: []
+    });
+    const targeted = createRoomMessageFixture({
+      messageId: "room-message-2",
+      seq: 2,
+      mentions: ["txyno-ch777-77776-aaaaq-cai"],
+      body: "<script>alert('xss')</script>"
+    });
+
+    await app.ready();
+    await app.indexerStore.upsertRoomMessages([broadcast, targeted], targeted.seq);
+
+    const allResponse = await app.inject({
+      method: "GET",
+      url: "/api/room/messages?limit=10"
+    });
+    const relevantResponse = await app.inject({
+      method: "GET",
+      url: "/api/room/messages?scope=relevant&canisterId=txyno-ch777-77776-aaaaq-cai"
+    });
+    const invalidResponse = await app.inject({
+      method: "GET",
+      url: "/api/room/messages?scope=relevant"
+    });
+
+    expect(allResponse.statusCode).toBe(200);
+    expect(allResponse.json()).toEqual({
+      messages: [broadcast, targeted],
+      nextAfterSeq: null,
+      latestSeq: targeted.seq
+    });
+    expect(relevantResponse.statusCode).toBe(200);
+    expect(relevantResponse.json()).toEqual({
+      messages: [broadcast, targeted],
+      nextAfterSeq: null,
+      latestSeq: targeted.seq
+    });
+    expect(invalidResponse.statusCode).toBe(400);
+    expect(invalidResponse.json()).toEqual({
+      ok: false,
+      error: "canisterId is required when scope=relevant"
+    });
+
+    await app.close();
+  });
+
   it("serves spawn-session status and registry routes without touching the public automaton list", async () => {
     const databasePath = await createDatabasePath();
     const registryRecord = createSpawnedAutomatonRecordFixture();
@@ -882,6 +966,20 @@ describe("indexer server", () => {
             return {
               items: [registryRecord],
               nextCursor: null
+            };
+          },
+          async listRoomMessages() {
+            return {
+              messages: [],
+              nextAfterSeq: null,
+              latestSeq: null
+            };
+          },
+          async listMessagesForAutomaton() {
+            return {
+              messages: [],
+              nextAfterSeq: null,
+              latestSeq: null
             };
           },
           async retrySpawnSession(sessionId) {

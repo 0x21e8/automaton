@@ -1,3 +1,5 @@
+use std::collections::{BTreeSet, Bound};
+
 use crate::escrow::{claim_escrow_refund, register_escrow_claim};
 use crate::expiry::expire_spawn_session;
 use crate::retry::retry_failed_session;
@@ -6,9 +8,11 @@ use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent
 use crate::state::{read_state, write_state};
 use crate::types::{
     amount_to_string, derive_claim_id, hash_quote_terms, parse_amount, CreateSpawnSessionRequest,
-    CreateSpawnSessionResponse, FactoryError, RefundSpawnResponse, SessionAuditActor,
-    SpawnPaymentInstructions, SpawnQuote, SpawnSession, SpawnSessionState,
-    SpawnSessionStatusResponse, SpawnedAutomatonRegistryPage,
+    CreateSpawnSessionResponse, FactoryError, PostRoomMessageRequest, RefundSpawnResponse,
+    RoomContentType, RoomMessage, RoomMessagePage, SessionAuditActor, SpawnPaymentInstructions,
+    SpawnQuote, SpawnSession, SpawnSessionState, SpawnSessionStatusResponse,
+    SpawnedAutomatonRegistryPage, DEFAULT_ROOM_READ_LIMIT, MAX_ROOM_BODY_BYTES, MAX_ROOM_MENTIONS,
+    MAX_ROOM_MESSAGES_RETAINED, MAX_ROOM_READ_LIMIT,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -43,6 +47,186 @@ pub(crate) fn uuid_v4_from_entropy(entropy: &[u8]) -> String {
         bytes[14],
         bytes[15]
     )
+}
+
+fn normalize_room_read_limit(limit: Option<u64>) -> Result<usize, FactoryError> {
+    let limit = limit.unwrap_or(DEFAULT_ROOM_READ_LIMIT as u64) as usize;
+    if limit == 0 || limit > MAX_ROOM_READ_LIMIT {
+        return Err(FactoryError::InvalidPaginationLimit { limit });
+    }
+
+    Ok(limit)
+}
+
+fn normalize_room_mentions(mentions: Option<Vec<String>>) -> Result<Vec<String>, FactoryError> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for mention in mentions.unwrap_or_default() {
+        if seen.insert(mention.clone()) {
+            normalized.push(mention);
+        }
+    }
+
+    if normalized.len() > MAX_ROOM_MENTIONS {
+        return Err(FactoryError::TooManyRoomMentions {
+            provided: normalized.len(),
+            max_mentions: MAX_ROOM_MENTIONS,
+        });
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_room_body(body: &str) -> Result<String, FactoryError> {
+    let trimmed = body.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(FactoryError::EmptyRoomMessageBody);
+    }
+
+    let provided_bytes = trimmed.as_bytes().len();
+    if provided_bytes > MAX_ROOM_BODY_BYTES {
+        return Err(FactoryError::RoomMessageBodyTooLarge {
+            provided_bytes,
+            max_bytes: MAX_ROOM_BODY_BYTES,
+        });
+    }
+
+    Ok(trimmed)
+}
+
+fn validate_room_body(content_type: &RoomContentType, body: &str) -> Result<(), FactoryError> {
+    if matches!(content_type, RoomContentType::ApplicationJson) {
+        serde_json::from_str::<serde_json::Value>(body).map_err(|error| {
+            FactoryError::InvalidRoomMessageJson {
+                message: error.to_string(),
+            }
+        })?;
+    }
+
+    Ok(())
+}
+
+fn room_message_id(seq: u64) -> String {
+    format!("room-message-{seq}")
+}
+
+fn room_message_matches_target(message: &RoomMessage, target_canister_id: &str) -> bool {
+    message.mentions.is_empty()
+        || message
+            .mentions
+            .iter()
+            .any(|mention| mention == target_canister_id)
+}
+
+fn read_room_page(
+    after_seq: Option<u64>,
+    limit: usize,
+    predicate: impl Fn(&RoomMessage) -> bool,
+) -> RoomMessagePage {
+    read_state(|state| {
+        let start = after_seq.map(Bound::Excluded).unwrap_or(Bound::Unbounded);
+        let mut messages: Vec<RoomMessage> = Vec::with_capacity(limit);
+        let mut next_after_seq = None;
+
+        for (_, message) in state.room_messages.range((start, Bound::Unbounded)) {
+            if !predicate(message) {
+                continue;
+            }
+
+            if messages.len() == limit {
+                next_after_seq = messages.last().map(|entry| entry.seq);
+                break;
+            }
+
+            messages.push(message.clone());
+        }
+
+        RoomMessagePage {
+            messages,
+            next_after_seq,
+            latest_seq: state.room_state.latest_seq,
+        }
+    })
+}
+
+pub fn post_room_message(
+    caller: &str,
+    request: PostRoomMessageRequest,
+    now_ms: u64,
+) -> Result<RoomMessage, FactoryError> {
+    let body = normalize_room_body(&request.body)?;
+    let mentions = normalize_room_mentions(request.mentions)?;
+    let content_type = request.content_type.unwrap_or_default();
+    validate_room_body(&content_type, &body)?;
+
+    write_state(|state| {
+        if !state.registry.contains_key(caller) {
+            return Err(FactoryError::UnauthorizedRoomPoster {
+                caller: caller.to_string(),
+            });
+        }
+
+        let seq = state.room_state.next_seq;
+        let message = RoomMessage {
+            message_id: room_message_id(seq),
+            seq,
+            author_canister_id: caller.to_string(),
+            created_at: now_ms,
+            body,
+            mentions,
+            content_type,
+        };
+
+        state.room_messages.insert(seq, message.clone());
+        state.room_state.next_seq = state
+            .room_state
+            .next_seq
+            .checked_add(1)
+            .expect("room sequence counter should not overflow");
+        state.room_state.latest_seq = Some(seq);
+        if state.room_state.oldest_seq.is_none() {
+            state.room_state.oldest_seq = Some(seq);
+        }
+
+        if state.room_messages.len() > MAX_ROOM_MESSAGES_RETAINED {
+            let oldest_seq = state
+                .room_state
+                .oldest_seq
+                .expect("room oldest_seq should exist when evicting");
+            state.room_messages.remove(&oldest_seq);
+            state.room_state.oldest_seq = state.room_messages.keys().next().copied();
+        }
+
+        Ok(message)
+    })
+}
+
+pub fn list_room_messages(
+    after_seq: Option<u64>,
+    limit: Option<u64>,
+) -> Result<RoomMessagePage, FactoryError> {
+    let limit = normalize_room_read_limit(limit)?;
+    Ok(read_room_page(after_seq, limit, |_| true))
+}
+
+pub fn list_messages_for_automaton(
+    canister_id: &str,
+    after_seq: Option<u64>,
+    limit: Option<u64>,
+) -> Result<RoomMessagePage, FactoryError> {
+    let limit = normalize_room_read_limit(limit)?;
+    Ok(read_room_page(after_seq, limit, |message| {
+        room_message_matches_target(message, canister_id)
+    }))
+}
+
+pub fn list_my_room_messages(
+    caller: &str,
+    after_seq: Option<u64>,
+    limit: Option<u64>,
+) -> Result<RoomMessagePage, FactoryError> {
+    list_messages_for_automaton(caller, after_seq, limit)
 }
 
 pub(crate) fn create_spawn_session_with_session_id(
@@ -238,8 +422,6 @@ pub fn list_spawned_automatons(
     }
 
     read_state(|state| {
-        use std::collections::Bound;
-
         let mut items: Vec<crate::types::SpawnedAutomatonRecord> = Vec::new();
         let mut next_cursor = None;
 

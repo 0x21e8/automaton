@@ -2,6 +2,7 @@ import type {
   AutomatonDetail,
   MonologueEntry,
   RealtimeEvent,
+  RoomMessage,
   SpawnedAutomatonRecord
 } from "@ic-automaton/shared";
 
@@ -12,6 +13,9 @@ import { FaucetError, type FaucetService } from "../lib/faucet.js";
 import { diffAutomatonRecord } from "../lib/automaton-record.js";
 import { normalizeAutomatonDetail, normalizeMonologueEntries } from "../normalize/automaton.js";
 import type { IndexerStore } from "../store/sqlite.js";
+
+const ROOM_POLL_PAGE_LIMIT = 100;
+const ROOM_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface EthUsdPriceSourceSnapshot {
   ethUsd: number | null;
@@ -92,7 +96,10 @@ export interface AutomatonIndexerOptions {
   client: AutomatonClient;
   config: IndexerConfig;
   eventPublisher?: RealtimeEventPublisher;
-  factoryClient?: Pick<FactoryClient, "isConfigured" | "listSpawnedAutomatons"> &
+  factoryClient?: Pick<
+    FactoryClient,
+    "isConfigured" | "listRoomMessages" | "listSpawnedAutomatons"
+  > &
     Partial<Pick<FactoryClient, "getSpawnSession">>;
   faucetService?: FaucetService;
   priceSource?: EthUsdPriceSource;
@@ -107,12 +114,16 @@ export class AutomatonIndexer {
   private readonly client: AutomatonClient;
   private readonly config: IndexerConfig;
   private eventPublisher?: RealtimeEventPublisher;
-  private readonly factoryClient?: Pick<FactoryClient, "isConfigured" | "listSpawnedAutomatons"> &
+  private readonly factoryClient?: Pick<
+    FactoryClient,
+    "isConfigured" | "listRoomMessages" | "listSpawnedAutomatons"
+  > &
     Partial<Pick<FactoryClient, "getSpawnSession">>;
   private readonly faucetService?: FaucetService;
   private readonly priceSource: EthUsdPriceSource;
   private readonly store: IndexerStore;
   private factoryDiscoveryInFlight = false;
+  private roomPollInFlight = false;
 
   private readonly snapshot: AutomatonIndexerSnapshot = {
     startedAt: null,
@@ -150,6 +161,7 @@ export class AutomatonIndexer {
     this.schedule(this.config.fastPollIntervalMs, () => this.pollMonologueNow());
     this.schedule(this.config.pricePollIntervalMs, () => this.refreshPriceNow());
     this.schedule(this.config.slowPollIntervalMs, () => this.syncFactoryRegistryNow());
+    this.schedule(this.config.slowPollIntervalMs, () => this.pollRoomNow());
   }
 
   async stop() {
@@ -322,6 +334,43 @@ export class AutomatonIndexer {
     }
   }
 
+  async pollRoomNow() {
+    if (!this.factoryClient?.isConfigured() || this.roomPollInFlight) {
+      return;
+    }
+
+    this.roomPollInFlight = true;
+
+    try {
+      let afterSeq = await this.store.getLatestRoomMessageSeq();
+
+      while (true) {
+        const page = await this.factoryClient.listRoomMessages(
+          afterSeq ?? undefined,
+          ROOM_POLL_PAGE_LIMIT
+        );
+
+        await this.store.upsertRoomMessages(page.messages, page.latestSeq);
+        await this.store.pruneRoomMessages(Date.now() - ROOM_RETENTION_MS);
+
+        for (const message of this.selectNewRoomMessages(page.messages, afterSeq)) {
+          this.eventPublisher?.broadcast({
+            type: "message",
+            message
+          });
+        }
+
+        if (page.nextAfterSeq === null) {
+          break;
+        }
+
+        afterSeq = page.nextAfterSeq;
+      }
+    } finally {
+      this.roomPollInFlight = false;
+    }
+  }
+
   private async autoFundSpawnedAutomaton(
     sessionId: string,
     walletAddress: string | null | undefined
@@ -385,6 +434,12 @@ export class AutomatonIndexer {
 
   private createMonologueKey(entry: MonologueEntry) {
     return `${entry.timestamp}:${entry.turnId}`;
+  }
+
+  private selectNewRoomMessages(messages: RoomMessage[], afterSeq: number | null) {
+    return messages.filter((message) => {
+      return afterSeq === null || message.seq > afterSeq;
+    });
   }
 
   private async listTrackedCanisterIds() {

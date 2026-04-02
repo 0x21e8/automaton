@@ -20,8 +20,8 @@ use crate::state::{clear_provider_secrets, read_state, write_state, FactoryState
 use crate::types::{amount_to_string, parse_amount};
 use crate::types::{
     AutomatonBootstrapEvidence, AutomatonBootstrapVerification, AutomatonRuntimeState,
-    FactoryError, PaymentStatus, ReleaseBroadcastRecord, SessionAuditActor,
-    SpawnExecutionReceipt, SpawnSession, SpawnSessionState, SpawnedAutomatonRecord, CONTROLLER_FIELD,
+    FactoryError, PaymentStatus, ReleaseBroadcastRecord, SessionAuditActor, SpawnExecutionReceipt,
+    SpawnSession, SpawnSessionState, SpawnedAutomatonRecord, CONTROLLER_FIELD,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -54,6 +54,7 @@ fn same_evm_address(expected: &str, observed: Option<&str>) -> bool {
 
 fn build_bootstrap_verification(
     session: &SpawnSession,
+    expected_factory_principal: &candid::Principal,
     expected_chain_id: u64,
     expected_version_commit: &str,
     expected_evm_address: &str,
@@ -79,6 +80,17 @@ fn build_bootstrap_verification(
             "parent_id mismatch: expected={}, observed={}",
             session.parent_id.as_deref().unwrap_or("<none>"),
             evidence.bootstrap_parent_id.as_deref().unwrap_or("<none>")
+        ));
+    }
+    if evidence.bootstrap_factory_principal.as_ref() != Some(expected_factory_principal) {
+        failures.push(format!(
+            "factory_principal mismatch: expected={}, observed={}",
+            expected_factory_principal.to_text(),
+            evidence
+                .bootstrap_factory_principal
+                .as_ref()
+                .map(|value| value.to_text())
+                .unwrap_or_else(|| "<missing>".to_string())
         ));
     }
     if evidence.bootstrap_risk != Some(session.config.risk) {
@@ -160,6 +172,7 @@ fn build_bootstrap_verification(
 fn verify_spawned_automaton_bootstrap_sync(
     session: &SpawnSession,
     runtime: &AutomatonRuntimeState,
+    expected_factory_principal: &candid::Principal,
     expected_chain_id: u64,
     expected_version_commit: &str,
     checked_at: u64,
@@ -168,12 +181,14 @@ fn verify_spawned_automaton_bootstrap_sync(
     // installed child views using the runtime/session data that would back those queries.
     build_bootstrap_verification(
         session,
+        expected_factory_principal,
         expected_chain_id,
         expected_version_commit,
         &runtime.evm_address,
         AutomatonBootstrapEvidence {
             bootstrap_session_id: Some(runtime.session_id.clone()),
             bootstrap_parent_id: session.parent_id.clone(),
+            bootstrap_factory_principal: Some(*expected_factory_principal),
             bootstrap_risk: Some(runtime.risk),
             bootstrap_strategies: normalize_bootstrap_list(&runtime.strategies),
             bootstrap_skills: normalize_bootstrap_list(&runtime.skills),
@@ -192,6 +207,7 @@ fn verify_spawned_automaton_bootstrap_sync(
 struct ChildSpawnBootstrapView {
     session_id: Option<String>,
     parent_id: Option<String>,
+    factory_principal: Option<candid::Principal>,
     risk: Option<u8>,
     strategies: Vec<String>,
     skills: Vec<String>,
@@ -275,6 +291,7 @@ async fn load_spawned_automaton_bootstrap_evidence(
     Ok(AutomatonBootstrapEvidence {
         bootstrap_session_id: bootstrap_view.session_id,
         bootstrap_parent_id: bootstrap_view.parent_id,
+        bootstrap_factory_principal: bootstrap_view.factory_principal,
         bootstrap_risk: bootstrap_view.risk,
         bootstrap_strategies: normalize_bootstrap_list(&bootstrap_view.strategies),
         bootstrap_skills: normalize_bootstrap_list(&bootstrap_view.skills),
@@ -522,6 +539,8 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
         runtime.bootstrap_verification = Some(verify_spawned_automaton_bootstrap_sync(
             &session_snapshot,
             &runtime,
+            &candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                .expect("test factory principal should parse"),
             state.release_broadcast_config.chain_id,
             &version_commit,
             now_ms,
@@ -935,8 +954,12 @@ pub async fn execute_spawn(
             .await;
         }
 
-        let install_args =
-            build_automaton_install_args(&session_snapshot, &version_commit, &child_runtime);
+        let install_args = build_automaton_install_args(
+            &session_snapshot,
+            ic_cdk::api::canister_self(),
+            &version_commit,
+            &child_runtime,
+        );
         let canister_principal = Principal::from_text(&created_canister_id).map_err(|error| {
             FactoryError::ManagementCallFailed {
                 method: "parse_canister_id".to_string(),
@@ -1084,6 +1107,7 @@ pub async fn execute_spawn(
     };
     let verification = build_bootstrap_verification(
         &session_snapshot,
+        &ic_cdk::api::id(),
         expected_child_chain_id,
         &version_commit,
         &expected_evm_address,
@@ -1279,12 +1303,18 @@ mod tests {
         session.steward_address = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8".to_string();
         let verification = build_bootstrap_verification(
             &session,
+            &candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                .expect("test factory principal should parse"),
             8_453,
             "0123456789abcdef0123456789abcdef01234567",
             "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
             AutomatonBootstrapEvidence {
                 bootstrap_session_id: Some(session.session_id.clone()),
                 bootstrap_parent_id: session.parent_id.clone(),
+                bootstrap_factory_principal: Some(
+                    candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                        .expect("test factory principal should parse"),
+                ),
                 bootstrap_risk: Some(session.config.risk),
                 bootstrap_strategies: vec!["trend".to_string()],
                 bootstrap_skills: vec!["search".to_string()],
@@ -1308,12 +1338,15 @@ mod tests {
         let session = sample_session();
         let verification = build_bootstrap_verification(
             &session,
+            &candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                .expect("test factory principal should parse"),
             8_453,
             "0123456789abcdef0123456789abcdef01234567",
             "0xautomaton",
             AutomatonBootstrapEvidence {
                 bootstrap_session_id: Some("wrong-session".to_string()),
                 bootstrap_parent_id: None,
+                bootstrap_factory_principal: None,
                 bootstrap_risk: Some(3),
                 bootstrap_strategies: vec!["mean-reversion".to_string()],
                 bootstrap_skills: vec!["messaging".to_string()],

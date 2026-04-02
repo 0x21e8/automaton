@@ -2,19 +2,18 @@ import { useEffect, useState, type CSSProperties } from "react";
 
 import { AutomatonDrawer } from "./components/drawer/AutomatonDrawer";
 import { AutomatonCanvas } from "./components/grid/AutomatonCanvas";
+import { RoomTimeline } from "./components/room/RoomTimeline";
 import { SpawnWizard } from "./components/spawn/SpawnWizard";
 import { usePlayground } from "./hooks/usePlayground";
 import { useAutomatonDetail } from "./hooks/useAutomatonDetail";
 import { useAutomatons } from "./hooks/useAutomatons";
+import { useRoomTimeline } from "./hooks/useRoomTimeline";
 import { themeTokens } from "./theme/tokens";
 import { useWalletSession } from "./wallet/useWalletSession";
-
-const navigationItems = ["Spawn", "Strategies", "Skills"] as const;
 
 type ThemeStyle = CSSProperties & Record<`--${string}`, string>;
 
 export default function App() {
-  const [menuOpen, setMenuOpen] = useState(false);
   const [scope, setScope] = useState<"all" | "mine">("all");
   const [selectedCanisterId, setSelectedCanisterId] = useState<string | null>(
     null
@@ -22,6 +21,7 @@ export default function App() {
   const [spawnWizardOpen, setSpawnWizardOpen] = useState(false);
   const wallet = useWalletSession();
   const playground = usePlayground();
+  const roomTimeline = useRoomTimeline();
   const viewerAddress = wallet.address;
   const {
     automatons: visibleAutomatons,
@@ -125,88 +125,46 @@ export default function App() {
           <h1 className="brand-wordmark">automaton lab</h1>
           <p className="brand-tagline">Self-sovereign AI agents</p>
         </div>
+        <div className="header-utility">
+          <span className="live-pill">{liveCount} LIVE</span>
+          <button
+            className={walletClassName}
+            disabled={wallet.isConnecting}
+            onClick={() => {
+              if (wallet.isConnected) {
+                wallet.disconnect();
+                return;
+              }
 
-        <button
-          aria-controls="primary-navigation"
-          aria-expanded={menuOpen}
-          className="menu-toggle"
-          onClick={() => {
-            setMenuOpen((open) => !open);
-          }}
-          type="button"
-        >
-          MENU
-        </button>
-
-        <div
-          className={`header-actions${menuOpen ? " is-open" : ""}`}
-          id="primary-navigation"
-        >
-          <nav aria-label="Primary" className="nav-cluster">
-            {navigationItems.map((item) => (
-              <button
-                className="nav-button"
-                key={item}
-                onClick={() => {
-                  if (item === "Spawn") {
-                    setSpawnWizardOpen(true);
-                  }
-                }}
-                type="button"
-              >
-                {item}
-              </button>
-            ))}
-          </nav>
-
-          <div className="header-utility">
-            {wallet.providers.length > 1 ? (
-              <label className="wallet-provider-field">
-                <span className="wallet-provider-label">Wallet</span>
-                <select
-                  className="wallet-provider-select"
-                  onChange={(event) => {
-                    wallet.setSelectedProvider(event.currentTarget.value);
-                  }}
-                  value={wallet.selectedProviderId ?? wallet.providers[0]?.id ?? ""}
-                >
-                  {wallet.providers.map((provider) => (
-                    <option key={provider.id} value={provider.id}>
-                      {provider.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : null}
-            <span className="live-pill">{liveCount} LIVE</span>
-            <button
-              className={walletClassName}
-              disabled={wallet.isConnecting}
-              onClick={() => {
-                if (wallet.isConnected) {
-                  wallet.disconnect();
-                  return;
-                }
-
-                void wallet.connect();
-              }}
-              type="button"
-            >
-              {walletLabel}
-            </button>
-          </div>
+              void wallet.connect();
+            }}
+            type="button"
+          >
+            {walletLabel}
+          </button>
         </div>
       </header>
 
       <main className="shell-main">
-        <AutomatonCanvas
+        <div className="shell-stage">
+          <AutomatonCanvas
+            automatons={visibleAutomatons}
+            onSpawn={() => {
+              setSpawnWizardOpen(true);
+            }}
+            onSelect={(canisterId) => {
+              setSelectedCanisterId(canisterId);
+            }}
+            selectedCanisterId={selectedCanisterId}
+            statusNotice={stageNotice}
+            viewerAddress={viewerAddress}
+          />
+        </div>
+        <RoomTimeline
           automatons={visibleAutomatons}
-          onSelect={(canisterId) => {
-            setSelectedCanisterId(canisterId);
-          }}
-          selectedCanisterId={selectedCanisterId}
-          statusNotice={stageNotice}
-          viewerAddress={viewerAddress}
+          error={roomTimeline.error}
+          isLoading={roomTimeline.isLoading}
+          messages={roomTimeline.messages}
         />
       </main>
 

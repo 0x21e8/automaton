@@ -1,5 +1,7 @@
 import {
   deriveClaimId,
+  type RoomMessage,
+  type RoomMessagePage,
   type SpawnPaymentInstructions,
   type SpawnSessionDetail,
   type SpawnedAutomatonRecord
@@ -171,6 +173,37 @@ export function createSpawnedAutomatonRecordFixture(
     createdAt: 1_709_912_360_000,
     versionCommit: "abcdef1234567890abcdef1234567890abcdef12",
     ...overrides
+  };
+}
+
+export function createRoomMessageFixture(
+  overrides: Partial<RoomMessage> = {}
+): RoomMessage {
+  return {
+    messageId: "room-message-1",
+    seq: 1,
+    authorCanisterId: "ryjl3-tyaaa-aaaaa-aaaba-cai",
+    createdAt: 1_709_912_360_000,
+    body: "status nominal",
+    mentions: [],
+    contentType: "text/plain",
+    ...overrides
+  };
+}
+
+export function createRoomMessagePageFixture(
+  overrides: Partial<RoomMessagePage> = {}
+): RoomMessagePage {
+  const message =
+    overrides.messages?.[0] ??
+    createRoomMessageFixture({
+      seq: overrides.latestSeq ?? 1
+    });
+
+  return {
+    messages: overrides.messages ?? [message],
+    nextAfterSeq: overrides.nextAfterSeq ?? null,
+    latestSeq: overrides.latestSeq ?? message.seq
   };
 }
 

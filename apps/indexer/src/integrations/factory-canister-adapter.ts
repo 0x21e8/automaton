@@ -10,6 +10,8 @@ import type {
   CreateSpawnSessionResponse,
   PaymentStatus,
   RefundSpawnResponse,
+  RoomContentType,
+  RoomMessagePage,
   RetrySpawnResponse,
   SessionAuditActor,
   SpawnAsset,
@@ -147,6 +149,24 @@ interface CandidSpawnedAutomatonRegistryPage {
   next_cursor: Optional<string>;
 }
 
+type CandidRoomContentType = CandidVariant<"TextPlain" | "ApplicationJson">;
+
+interface CandidRoomMessage {
+  message_id: string;
+  seq: bigint;
+  author_canister_id: string;
+  created_at: bigint;
+  body: string;
+  mentions: string[];
+  content_type: CandidRoomContentType;
+}
+
+interface CandidRoomMessagePage {
+  messages: CandidRoomMessage[];
+  next_after_seq: Optional<bigint>;
+  latest_seq: Optional<bigint>;
+}
+
 interface CandidRefundSpawnResponse {
   payment_status: CandidPaymentStatus;
   refunded_at: bigint;
@@ -203,6 +223,18 @@ interface FactoryCanisterActor {
   get_factory_health: ActorMethod<[], CandidFactoryHealthSnapshot>;
   get_spawn_session: ActorMethod<[string], CandidResult<CandidSpawnSessionStatusResponse>>;
   get_spawned_automaton: ActorMethod<[string], CandidResult<CandidSpawnedAutomatonRecord>>;
+  list_messages_for_automaton: ActorMethod<
+    [string, Optional<bigint>, Optional<bigint>],
+    CandidResult<CandidRoomMessagePage>
+  >;
+  list_my_room_messages: ActorMethod<
+    [Optional<bigint>, Optional<bigint>],
+    CandidResult<CandidRoomMessagePage>
+  >;
+  list_room_messages: ActorMethod<
+    [Optional<bigint>, Optional<bigint>],
+    CandidResult<CandidRoomMessagePage>
+  >;
   list_spawned_automatons: ActorMethod<
     [Optional<string>, bigint],
     CandidResult<CandidSpawnedAutomatonRegistryPage>
@@ -333,6 +365,24 @@ function createFactoryIdl() {
       next_cursor: candid.Opt(candid.Text),
       items: candid.Vec(SpawnedAutomatonRecord)
     });
+    const RoomContentType = candid.Variant({
+      TextPlain: candid.Null,
+      ApplicationJson: candid.Null
+    });
+    const RoomMessage = candid.Record({
+      message_id: candid.Text,
+      seq: candid.Nat64,
+      author_canister_id: candid.Text,
+      created_at: candid.Nat64,
+      body: candid.Text,
+      mentions: candid.Vec(candid.Text),
+      content_type: RoomContentType
+    });
+    const RoomMessagePage = candid.Record({
+      messages: candid.Vec(RoomMessage),
+      next_after_seq: candid.Opt(candid.Nat64),
+      latest_seq: candid.Opt(candid.Nat64)
+    });
     const RefundSpawnResponse = candid.Record({
       session_id: candid.Text,
       payment_status: PaymentStatus,
@@ -423,6 +473,10 @@ function createFactoryIdl() {
       Ok: SpawnedAutomatonRegistryPage,
       Err: FactoryError
     });
+    const ResultRoomPage = candid.Variant({
+      Ok: RoomMessagePage,
+      Err: FactoryError
+    });
 
     return candid.Service({
       claim_spawn_refund: candid.Func([candid.Text], [ResultRefund], []),
@@ -430,6 +484,21 @@ function createFactoryIdl() {
       get_factory_health: candid.Func([], [FactoryHealthSnapshot], ["query"]),
       get_spawn_session: candid.Func([candid.Text], [ResultSession], ["query"]),
       get_spawned_automaton: candid.Func([candid.Text], [ResultRecord], ["query"]),
+      list_messages_for_automaton: candid.Func(
+        [candid.Text, candid.Opt(candid.Nat64), candid.Opt(candid.Nat64)],
+        [ResultRoomPage],
+        ["query"]
+      ),
+      list_my_room_messages: candid.Func(
+        [candid.Opt(candid.Nat64), candid.Opt(candid.Nat64)],
+        [ResultRoomPage],
+        ["query"]
+      ),
+      list_room_messages: candid.Func(
+        [candid.Opt(candid.Nat64), candid.Opt(candid.Nat64)],
+        [ResultRoomPage],
+        ["query"]
+      ),
       list_spawned_automatons: candid.Func(
         [candid.Opt(candid.Text), candid.Nat64],
         [ResultRegistryPage],
@@ -645,6 +714,39 @@ function mapRefundResponse(response: CandidRefundSpawnResponse): RefundSpawnResp
   };
 }
 
+function mapRoomContentType(contentType: CandidRoomContentType): RoomContentType {
+  if ("TextPlain" in contentType) {
+    return "text/plain";
+  }
+  if ("ApplicationJson" in contentType) {
+    return "application/json";
+  }
+
+  throw new Error(`Unsupported room content type variant: ${JSON.stringify(contentType)}`);
+}
+
+function mapRoomMessagePage(page: CandidRoomMessagePage): RoomMessagePage {
+  return {
+    messages: page.messages.map((message) => ({
+      messageId: message.message_id,
+      seq: toNumber(message.seq),
+      authorCanisterId: message.author_canister_id,
+      createdAt: toNumber(message.created_at),
+      body: message.body,
+      mentions: [...message.mentions],
+      contentType: mapRoomContentType(message.content_type)
+    })),
+    nextAfterSeq:
+      unwrapOptional(page.next_after_seq) === null
+        ? null
+        : toNumber(unwrapOptional(page.next_after_seq) as bigint),
+    latestSeq:
+      unwrapOptional(page.latest_seq) === null
+        ? null
+        : toNumber(unwrapOptional(page.latest_seq) as bigint)
+  };
+}
+
 function mapCreateRequest(
   request: CreateSpawnSessionRequest
 ): CandidCreateSpawnSessionRequest {
@@ -806,6 +908,38 @@ export class CanisterFactoryAdapter implements FactoryAdapter {
     const actor = await this.getActor();
     return mapRegistryPage(
       expectOk(await actor.list_spawned_automatons(cursor ? [cursor] : [], BigInt(limit)))
+    );
+  }
+
+  async listRoomMessages(
+    afterSeq: number | undefined,
+    limit: number
+  ): Promise<RoomMessagePage> {
+    const actor = await this.getActor();
+    return mapRoomMessagePage(
+      expectOk(
+        await actor.list_room_messages(
+          afterSeq === undefined ? [] : [BigInt(afterSeq)],
+          [BigInt(limit)]
+        )
+      )
+    );
+  }
+
+  async listMessagesForAutomaton(
+    canisterId: string,
+    afterSeq: number | undefined,
+    limit: number
+  ): Promise<RoomMessagePage> {
+    const actor = await this.getActor();
+    return mapRoomMessagePage(
+      expectOk(
+        await actor.list_messages_for_automaton(
+          canisterId,
+          afterSeq === undefined ? [] : [BigInt(afterSeq)],
+          [BigInt(limit)]
+        )
+      )
     );
   }
 

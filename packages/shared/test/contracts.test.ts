@@ -18,6 +18,11 @@ import {
   type PlaygroundMetadata
 } from "../src/playground.ts";
 import {
+  ROOM_CONTENT_TYPES,
+  ROOM_MESSAGE_SCOPES,
+  type RoomMessagePage
+} from "../src/room.ts";
+import {
   deriveClaimId,
   MINIMUM_GROSS_PAYMENT_USD,
   PAYMENT_STATUSES,
@@ -86,6 +91,33 @@ describe("shared contracts", () => {
       "spawn.session.failed",
       "spawn.session.expired"
     ]);
+  });
+
+  it("defines the locked room content and query contracts", () => {
+    expect(ROOM_CONTENT_TYPES).toEqual([
+      "text/plain",
+      "application/json"
+    ]);
+    expect(ROOM_MESSAGE_SCOPES).toEqual(["all", "relevant"]);
+
+    const page: RoomMessagePage = {
+      messages: [
+        {
+          messageId: "room-message-7",
+          seq: 7,
+          authorCanisterId: "ryjl3-tyaaa-aaaaa-aaaba-cai",
+          createdAt: 1_710_000_000_000,
+          body: "{\"kind\":\"status\",\"ok\":true}",
+          mentions: ["txyno-ch777-77776-aaaaq-cai"],
+          contentType: "application/json"
+        }
+      ],
+      nextAfterSeq: null,
+      latestSeq: 7
+    };
+
+    expect(page.messages[0]?.contentType).toBe("application/json");
+    expect(page.latestSeq).toBe(7);
   });
 
   it("defines the playground metadata contract for runtime network discovery", () => {
@@ -249,18 +281,22 @@ describe("shared contracts", () => {
     };
 
     const event: RealtimeEvent = {
-      type: "update",
-      canisterId: "rdmx6-jaaaa-aaaaa-aaadq-cai",
-      changes: {
-        tier: "low"
-      },
-      timestamp: 1_710_000_000_000
+      type: "message",
+      message: {
+        messageId: "room-message-9",
+        seq: 9,
+        authorCanisterId: "rdmx6-jaaaa-aaaaa-aaadq-cai",
+        createdAt: 1_710_000_000_000,
+        body: "hello room",
+        mentions: [],
+        contentType: "text/plain"
+      }
     };
 
     expect(status.audit).toHaveLength(1);
     expect(deriveClaimId(sessionId)).toBe(claimId);
     expect(detail.payment.paymentAddress).toBe("0xfeed");
     expect(listResponse.automatons[0]?.name).toBe("ALPHA-42");
-    expect(event.type).toBe("update");
+    expect(event.type).toBe("message");
   });
 });

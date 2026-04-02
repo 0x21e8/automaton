@@ -93,6 +93,29 @@ CREATE TABLE IF NOT EXISTS spawned_automaton_registry (
 CREATE INDEX IF NOT EXISTS spawned_automaton_registry_session_idx
   ON spawned_automaton_registry (session_id);
 
+CREATE TABLE IF NOT EXISTS room_messages (
+  seq INTEGER PRIMARY KEY,
+  message_id TEXT NOT NULL UNIQUE,
+  author_canister_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  content_type TEXT NOT NULL,
+  body TEXT NOT NULL,
+  mentions_json TEXT NOT NULL,
+  message_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS room_messages_created_at_idx
+  ON room_messages (created_at DESC, seq DESC);
+
+CREATE INDEX IF NOT EXISTS room_messages_author_idx
+  ON room_messages (author_canister_id, created_at DESC, seq DESC);
+
+CREATE TABLE IF NOT EXISTS room_state (
+  room_id TEXT PRIMARY KEY,
+  latest_ingested_seq INTEGER,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS faucet_claims (
   claim_id INTEGER PRIMARY KEY AUTOINCREMENT,
   wallet_address TEXT NOT NULL,

@@ -19,6 +19,7 @@ import {
 } from "../src/polling/automaton-indexer.js";
 import { createSqliteStore } from "../src/store/sqlite.js";
 import {
+  createRoomMessageFixture,
   createSpawnSessionDetailFixture,
   createSpawnedAutomatonRecordFixture
 } from "./fixtures.js";
@@ -438,6 +439,11 @@ describe("automaton indexer poller", () => {
             sessionId
           }
         })),
+        listRoomMessages: vi.fn(async () => ({
+          messages: [],
+          nextAfterSeq: null,
+          latestSeq: null
+        })),
         listSpawnedAutomatons: vi.fn(async () => ({
           items: [registryRecord],
           nextCursor: null
@@ -502,6 +508,11 @@ describe("automaton indexer poller", () => {
       factoryClient: {
         isConfigured: () => true,
         getSpawnSession: vi.fn(async () => null),
+        listRoomMessages: vi.fn(async () => ({
+          messages: [],
+          nextAfterSeq: null,
+          latestSeq: null
+        })),
         listSpawnedAutomatons: vi.fn(async () => ({
           items: [createSpawnedAutomatonRecordFixture({ canisterId: discoveredCanisterId })],
           nextCursor: null
@@ -544,6 +555,11 @@ describe("automaton indexer poller", () => {
       factoryClient: {
         isConfigured: () => true,
         getSpawnSession: vi.fn(async () => null),
+        listRoomMessages: vi.fn(async () => ({
+          messages: [],
+          nextAfterSeq: null,
+          latestSeq: null
+        })),
         listSpawnedAutomatons: vi.fn(async () => ({
           items: [createSpawnedAutomatonRecordFixture({ canisterId })],
           nextCursor: null
@@ -705,6 +721,86 @@ describe("automaton indexer poller", () => {
       entry: expect.objectContaining({
         turnId: "turn-2"
       })
+    });
+
+    await store.close();
+  });
+
+  it("ingests room messages, prunes expired rows, and broadcasts the revised message payload", async () => {
+    const canisterId = "txyno-ch777-77776-aaaaq-cai";
+    const publisher: RealtimeEventPublisher = {
+      broadcast: vi.fn()
+    };
+    const freshMessage = createRoomMessageFixture({
+      messageId: "room-message-17",
+      seq: 17,
+      authorCanisterId: "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      createdAt: Date.now(),
+      mentions: [canisterId],
+      contentType: "application/json",
+      body: "{\"kind\":\"status\",\"ok\":true}"
+    });
+    const expiredMessage = createRoomMessageFixture({
+      messageId: "room-message-11",
+      seq: 11,
+      createdAt: Date.now() - 8 * 24 * 60 * 60 * 1000
+    });
+    const store = createSqliteStore({
+      databasePath: await createDatabasePath()
+    });
+    const client: AutomatonClient = {
+      readIdentityConfig: vi.fn(async () => createIdentityConfigRead(canisterId)),
+      readRuntimeFinancial: vi.fn(async () => createRuntimeFinancialRead(canisterId)),
+      readRecentTurns: vi.fn(async () => createRecentTurnsRead(canisterId))
+    };
+    const listRoomMessages = vi
+      .fn()
+      .mockResolvedValueOnce({
+        messages: [freshMessage],
+        nextAfterSeq: null,
+        latestSeq: freshMessage.seq
+      })
+      .mockResolvedValueOnce({
+        messages: [],
+        nextAfterSeq: null,
+        latestSeq: freshMessage.seq
+      });
+    const indexer = new AutomatonIndexer({
+      client,
+      store,
+      eventPublisher: publisher,
+      factoryClient: {
+        isConfigured: () => true,
+        listRoomMessages,
+        listSpawnedAutomatons: vi.fn(async () => ({
+          items: [],
+          nextCursor: null
+        }))
+      },
+      config: createIndexerConfig([canisterId], "factory-canister-id")
+    });
+
+    await store.initialize();
+    await store.upsertRoomMessages([expiredMessage], expiredMessage.seq);
+    await indexer.pollRoomNow();
+    await indexer.pollRoomNow();
+
+    await expect(store.getLatestRoomMessageSeq()).resolves.toBe(freshMessage.seq);
+    await expect(
+      store.listRoomMessages({
+        limit: 10
+      })
+    ).resolves.toEqual({
+      messages: [freshMessage],
+      nextAfterSeq: null,
+      latestSeq: freshMessage.seq
+    });
+    expect(listRoomMessages).toHaveBeenNthCalledWith(1, expiredMessage.seq, 100);
+    expect(listRoomMessages).toHaveBeenNthCalledWith(2, freshMessage.seq, 100);
+    expect(publisher.broadcast).toHaveBeenCalledTimes(1);
+    expect(publisher.broadcast).toHaveBeenCalledWith({
+      type: "message",
+      message: freshMessage
     });
 
     await store.close();

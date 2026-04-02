@@ -15,6 +15,7 @@ const MAX_LAYOUT_SCALE = 1.15;
 
 interface AutomatonCanvasProps {
   automatons: readonly AutomatonSummary[];
+  onSpawn: () => void;
   selectedCanisterId: string | null;
   statusNotice: string | null;
   viewerAddress: string | null;
@@ -216,6 +217,7 @@ function drawManhattanPath(
 
 export function AutomatonCanvas({
   automatons,
+  onSpawn,
   selectedCanisterId,
   statusNotice,
   viewerAddress,
@@ -443,6 +445,15 @@ export function AutomatonCanvas({
         ref={containerRef}
       >
         <canvas className="automaton-canvas" ref={canvasRef} />
+        <button
+          className="canvas-spawn-button"
+          onClick={() => {
+            onSpawn();
+          }}
+          type="button"
+        >
+          Spawn
+        </button>
         <div
           className={`canvas-tooltip${tooltip.visible ? " is-visible" : ""}`}
           style={{

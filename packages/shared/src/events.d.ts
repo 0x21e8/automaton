@@ -1,4 +1,5 @@
 import type { AutomatonRecord, MonologueEntry } from "./automaton.js";
+import type { RoomMessage } from "./room.js";
 import type { SessionAuditEntry, SpawnSession } from "./spawn.js";
 export declare const AUTOMATON_EVENT_TYPES: readonly ["spawn", "update", "action", "message", "monologue", "offline"];
 export declare const SPAWN_EVENT_TYPES: readonly ["spawn.session.updated", "spawn.session.completed", "spawn.session.failed", "spawn.session.expired"];
@@ -23,9 +24,7 @@ export interface AutomatonActionEvent {
 }
 export interface AutomatonMessageEvent {
     type: "message";
-    fromCanisterId: string;
-    toCanisterId: string;
-    timestamp: number;
+    message: RoomMessage;
 }
 export interface AutomatonMonologueEvent {
     type: "monologue";

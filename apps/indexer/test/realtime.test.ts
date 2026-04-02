@@ -19,6 +19,7 @@ import { createSqliteStore } from "../src/store/sqlite.js";
 import { RealtimeHub, shouldDeliverEvent } from "../src/ws/events.js";
 import {
   createAutomatonRecordFixture,
+  createRoomMessageFixture,
   createSpawnSessionDetailFixture
 } from "./fixtures.js";
 
@@ -273,6 +274,35 @@ describe("realtime hub", () => {
     ).toBe(false);
   });
 
+  it("treats broadcast room messages as relevant to canister-scoped subscribers", () => {
+    const broadcastEvent: RealtimeEvent = {
+      type: "message",
+      message: createRoomMessageFixture({
+        mentions: []
+      })
+    };
+    const targetedEvent: RealtimeEvent = {
+      type: "message",
+      message: createRoomMessageFixture({
+        messageId: "room-message-2",
+        seq: 2,
+        mentions: ["txyno-ch777-77776-aaaaq-cai"]
+      })
+    };
+    const unrelatedEvent: RealtimeEvent = {
+      type: "message",
+      message: createRoomMessageFixture({
+        messageId: "room-message-3",
+        seq: 3,
+        mentions: ["ryjl3-tyaaa-aaaaa-aaaba-cai"]
+      })
+    };
+
+    expect(shouldDeliverEvent("txyno-ch777-77776-aaaaq-cai", broadcastEvent)).toBe(true);
+    expect(shouldDeliverEvent("txyno-ch777-77776-aaaaq-cai", targetedEvent)).toBe(true);
+    expect(shouldDeliverEvent("txyno-ch777-77776-aaaaq-cai", unrelatedEvent)).toBe(false);
+  });
+
   it("streams live update events over a real websocket and honors canister filters", async () => {
     const canisterId = "txyno-ch777-77776-aaaaq-cai";
     const databasePath = await createDatabasePath();
@@ -350,6 +380,60 @@ describe("realtime hub", () => {
     await expect(eventMessage.then((payload) => JSON.parse(payload))).resolves.toMatchObject({
       type: "update",
       canisterId
+    });
+    await expect(noMessage).resolves.toBeUndefined();
+
+    matchingSocket.close();
+    nonMatchingSocket.close();
+    await app.close();
+  });
+
+  it("streams room message events over websocket filters without enriching the payload", async () => {
+    const app = buildServer({
+      config: {
+        host: "127.0.0.1",
+        port: 0,
+        databasePath: await createDatabasePath(),
+        websocketPath: "/ws/events",
+        corsAllowedOrigins: [],
+        ingestion: {
+          canisterIds: ["txyno-ch777-77776-aaaaq-cai"],
+          network: {
+            target: "local",
+            local: {
+              host: "localhost",
+              port: 8000
+            }
+          }
+        }
+      }
+    });
+    const targetedMessage = createRoomMessageFixture({
+      messageId: "room-message-5",
+      seq: 5,
+      body: "<script>alert('xss')</script>",
+      mentions: ["txyno-ch777-77776-aaaaq-cai"]
+    });
+
+    await app.ready();
+
+    const matchingSocket = (await app.injectWS(
+      "/ws/events?canisterId=txyno-ch777-77776-aaaaq-cai"
+    )) as TestWebSocket;
+    const nonMatchingSocket = (await app.injectWS(
+      "/ws/events?canisterId=ryjl3-tyaaa-aaaaa-aaaba-cai"
+    )) as TestWebSocket;
+    const eventMessage = waitForWebSocketMessage(matchingSocket);
+    const noMessage = expectNoWebSocketMessage(nonMatchingSocket);
+
+    app.realtimeHub.broadcast({
+      type: "message",
+      message: targetedMessage
+    });
+
+    await expect(eventMessage.then((payload) => JSON.parse(payload))).resolves.toEqual({
+      type: "message",
+      message: targetedMessage
     });
     await expect(noMessage).resolves.toBeUndefined();
 

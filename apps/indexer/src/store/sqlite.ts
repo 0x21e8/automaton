@@ -10,6 +10,9 @@ import type {
   ChainSlug,
   MonologueEntry,
   MonologuePage,
+  RoomMessage,
+  RoomMessagePage,
+  RoomMessageScope,
   SpawnSessionDetail,
   SpawnedAutomatonRecord
 } from "@ic-automaton/shared";
@@ -46,6 +49,13 @@ export interface AutomatonFilters {
 export interface MonologueQuery {
   before?: number;
   limit: number;
+}
+
+export interface RoomMessageStoreQuery {
+  afterSeq?: number;
+  limit: number;
+  canisterId?: string;
+  scope?: RoomMessageScope;
 }
 
 export interface StoreHealth {
@@ -100,6 +110,10 @@ export interface IndexerStore {
   upsertAutomaton(detail: AutomatonDetail): Promise<void>;
   listMonologue(canisterId: string, query: MonologueQuery): Promise<MonologuePage>;
   appendMonologue(canisterId: string, entries: MonologueEntry[]): Promise<void>;
+  getLatestRoomMessageSeq(): Promise<number | null>;
+  listRoomMessages(query: RoomMessageStoreQuery): Promise<RoomMessagePage>;
+  upsertRoomMessages(messages: RoomMessage[], latestSeq: number | null): Promise<void>;
+  pruneRoomMessages(olderThan: number): Promise<void>;
   listSpawnSessionDetails(limit: number): Promise<SpawnSessionDetail[]>;
   getSpawnSessionDetail(sessionId: string): Promise<SpawnSessionDetail | null>;
   upsertSpawnSession(detail: SpawnSessionDetail): Promise<void>;
@@ -275,6 +289,8 @@ function normalizeRegistryRecords(records: SpawnedAutomatonRecord[]) {
     (left, right) => left.canisterId.localeCompare(right.canisterId)
   );
 }
+
+const SHARED_ROOM_ID = "shared";
 
 class BetterSqliteStore implements IndexerStore {
   readonly databasePath: string;
@@ -595,6 +611,157 @@ class BetterSqliteStore implements IndexerStore {
     });
 
     insertEntries(entries);
+  }
+
+  async getLatestRoomMessageSeq() {
+    await this.initialize();
+    const database = this.getDatabase();
+    const stateRow = database
+      .prepare<{ latest_ingested_seq: number | null }>(
+        `SELECT latest_ingested_seq
+         FROM room_state
+         WHERE room_id = ?
+         LIMIT 1;`
+      )
+      .get(SHARED_ROOM_ID);
+
+    if (stateRow?.latest_ingested_seq !== null && stateRow?.latest_ingested_seq !== undefined) {
+      return Number(stateRow.latest_ingested_seq);
+    }
+
+    const messageRow = database
+      .prepare<{ latest_seq: number | null }>(
+        `SELECT MAX(seq) AS latest_seq
+         FROM room_messages;`
+      )
+      .get();
+
+    return messageRow?.latest_seq === null || messageRow?.latest_seq === undefined
+      ? null
+      : Number(messageRow.latest_seq);
+  }
+
+  async listRoomMessages(query: RoomMessageStoreQuery): Promise<RoomMessagePage> {
+    await this.initialize();
+    const database = this.getDatabase();
+    const clauses: string[] = [];
+    const parameters: SqliteValue[] = [];
+
+    if (query.afterSeq !== undefined) {
+      clauses.push("seq > ?");
+      parameters.push(query.afterSeq);
+    }
+
+    if (query.scope === "relevant" && query.canisterId) {
+      clauses.push(`(
+        json_array_length(mentions_json) = 0
+        OR EXISTS (
+          SELECT 1
+          FROM json_each(room_messages.mentions_json)
+          WHERE json_each.value = ?
+        )
+      )`);
+      parameters.push(query.canisterId);
+    }
+
+    parameters.push(query.limit + 1);
+    const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = database
+      .prepare<{ message_json: string }>(
+        `SELECT message_json
+         FROM room_messages
+         ${whereClause}
+         ORDER BY seq ASC
+         LIMIT ?;`
+      )
+      .all(...parameters);
+
+    const hasMore = rows.length > query.limit;
+    const messages = rows.slice(0, query.limit).map((row) => {
+      return JSON.parse(row.message_json) as RoomMessage;
+    });
+    const lastMessage = messages.at(-1);
+
+    return {
+      messages,
+      nextAfterSeq: hasMore && lastMessage ? lastMessage.seq : null,
+      latestSeq: await this.getLatestRoomMessageSeq()
+    };
+  }
+
+  async upsertRoomMessages(messages: RoomMessage[], latestSeq: number | null) {
+    await this.initialize();
+    const database = this.getDatabase();
+    const effectiveLatestSeq =
+      latestSeq ?? messages.reduce<number | null>((current, message) => {
+        return current === null || message.seq > current ? message.seq : current;
+      }, null);
+
+    const insertMessage = database.prepare(
+      `INSERT INTO room_messages (
+        seq,
+        message_id,
+        author_canister_id,
+        created_at,
+        content_type,
+        body,
+        mentions_json,
+        message_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(seq) DO UPDATE SET
+        message_id = excluded.message_id,
+        author_canister_id = excluded.author_canister_id,
+        created_at = excluded.created_at,
+        content_type = excluded.content_type,
+        body = excluded.body,
+        mentions_json = excluded.mentions_json,
+        message_json = excluded.message_json;`
+    );
+    const upsertRoomState = database.prepare(
+      `INSERT INTO room_state (
+        room_id,
+        latest_ingested_seq,
+        updated_at
+      ) VALUES (?, ?, ?)
+      ON CONFLICT(room_id) DO UPDATE SET
+        latest_ingested_seq = MAX(
+          COALESCE(room_state.latest_ingested_seq, excluded.latest_ingested_seq),
+          excluded.latest_ingested_seq
+        ),
+        updated_at = excluded.updated_at;`
+    );
+    const persistMessages = database.transaction((roomMessages: RoomMessage[]) => {
+      for (const message of roomMessages) {
+        insertMessage.run(
+          message.seq,
+          message.messageId,
+          message.authorCanisterId,
+          message.createdAt,
+          message.contentType,
+          message.body,
+          JSON.stringify(message.mentions),
+          JSON.stringify(message)
+        );
+      }
+
+      if (effectiveLatestSeq !== null) {
+        upsertRoomState.run(SHARED_ROOM_ID, effectiveLatestSeq, Date.now());
+      }
+    });
+
+    persistMessages(messages);
+  }
+
+  async pruneRoomMessages(olderThan: number) {
+    await this.initialize();
+    const database = this.getDatabase();
+
+    database
+      .prepare(
+        `DELETE FROM room_messages
+         WHERE created_at < ?;`
+      )
+      .run(olderThan);
   }
 
   async getSpawnSessionDetail(sessionId: string) {

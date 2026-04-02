@@ -9,6 +9,11 @@ pub const EXPIRES_AT_FIELD: &str = "expiresAt";
 pub const SESSION_ID_FIELD: &str = "sessionId";
 pub const BROADCASTING_RELEASE_STATE: &str = "broadcasting_release";
 pub const CONTROLLER_FIELD: &str = "controller";
+pub const MAX_ROOM_MESSAGES_RETAINED: usize = 500;
+pub const MAX_ROOM_BODY_BYTES: usize = 2_048;
+pub const MAX_ROOM_MENTIONS: usize = 16;
+pub const DEFAULT_ROOM_READ_LIMIT: usize = 50;
+pub const MAX_ROOM_READ_LIMIT: usize = 100;
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub enum SpawnChain {
@@ -114,6 +119,7 @@ pub struct AutomatonSpawnBootstrapArgs {
     pub steward_address: String,
     pub session_id: String,
     pub parent_id: Option<String>,
+    pub factory_principal: Principal,
     pub risk: u8,
     pub strategies: Vec<String>,
     pub skills: Vec<String>,
@@ -335,6 +341,7 @@ pub struct AutomatonRuntimeState {
 pub struct AutomatonBootstrapEvidence {
     pub bootstrap_session_id: Option<String>,
     pub bootstrap_parent_id: Option<String>,
+    pub bootstrap_factory_principal: Option<Principal>,
     pub bootstrap_risk: Option<u8>,
     pub bootstrap_strategies: Vec<String>,
     pub bootstrap_skills: Vec<String>,
@@ -541,6 +548,54 @@ pub struct SpawnedAutomatonRegistryPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RoomState {
+    pub next_seq: u64,
+    pub oldest_seq: Option<u64>,
+    pub latest_seq: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub enum RoomContentType {
+    #[default]
+    TextPlain,
+    ApplicationJson,
+}
+
+impl RoomContentType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TextPlain => "text/plain",
+            Self::ApplicationJson => "application/json",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RoomMessage {
+    pub message_id: String,
+    pub seq: u64,
+    pub author_canister_id: String,
+    pub created_at: u64,
+    pub body: String,
+    pub mentions: Vec<String>,
+    pub content_type: RoomContentType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RoomMessagePage {
+    pub messages: Vec<RoomMessage>,
+    pub next_after_seq: Option<u64>,
+    pub latest_seq: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct PostRoomMessageRequest {
+    pub body: String,
+    pub mentions: Option<Vec<String>>,
+    pub content_type: Option<RoomContentType>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct FactoryConfigSnapshot {
     pub fee_config: FeeConfig,
@@ -709,6 +764,24 @@ pub enum FactoryError {
         caller: String,
         session_id: String,
     },
+    UnauthorizedRoomPoster {
+        caller: String,
+    },
+    EmptyRoomMessageBody,
+    RoomMessageBodyTooLarge {
+        provided_bytes: usize,
+        max_bytes: usize,
+    },
+    TooManyRoomMentions {
+        provided: usize,
+        max_mentions: usize,
+    },
+    InvalidRoomContentType {
+        value: String,
+    },
+    InvalidRoomMessageJson {
+        message: String,
+    },
     InvalidPaginationLimit {
         limit: usize,
     },
@@ -824,6 +897,37 @@ impl Display for FactoryError {
                     f,
                     "caller is not the steward for session {session_id}: {caller}"
                 )
+            }
+            Self::UnauthorizedRoomPoster { caller } => {
+                write!(
+                    f,
+                    "caller is not a registered automaton room poster: {caller}"
+                )
+            }
+            Self::EmptyRoomMessageBody => write!(f, "room message body is empty after trimming"),
+            Self::RoomMessageBodyTooLarge {
+                provided_bytes,
+                max_bytes,
+            } => {
+                write!(
+                    f,
+                    "room message body exceeds limit: provided_bytes={provided_bytes}, max_bytes={max_bytes}"
+                )
+            }
+            Self::TooManyRoomMentions {
+                provided,
+                max_mentions,
+            } => {
+                write!(
+                    f,
+                    "room message mentions exceed limit: provided={provided}, max_mentions={max_mentions}"
+                )
+            }
+            Self::InvalidRoomContentType { value } => {
+                write!(f, "invalid room content type: {value}")
+            }
+            Self::InvalidRoomMessageJson { message } => {
+                write!(f, "invalid room message json: {message}")
             }
             Self::InvalidPaginationLimit { limit } => {
                 write!(f, "pagination limit must be positive: {limit}")

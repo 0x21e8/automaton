@@ -9,6 +9,7 @@ import { createSqliteStore } from "../src/store/sqlite.js";
 import {
   createAutomatonDetailFixture,
   createMonologueEntryFixture,
+  createRoomMessageFixture,
   createSpawnSessionDetailFixture,
   createSpawnedAutomatonRecordFixture
 } from "./fixtures.js";
@@ -206,6 +207,69 @@ describe("sqlite store", () => {
         spawnedAutomatonRegistryRecords: 2,
         trackedCanisters: 2
       }
+    });
+
+    await store.close();
+  });
+
+  it("persists room messages, supports relevant reads, and prunes old rows", async () => {
+    const store = createSqliteStore({
+      databasePath: await createDatabasePath()
+    });
+    const broadcast = createRoomMessageFixture({
+      messageId: "room-message-1",
+      seq: 1,
+      createdAt: 1_710_000_000_000,
+      mentions: []
+    });
+    const targeted = createRoomMessageFixture({
+      messageId: "room-message-2",
+      seq: 2,
+      createdAt: 1_710_000_100_000,
+      mentions: ["txyno-ch777-77776-aaaaq-cai"]
+    });
+    const unrelated = createRoomMessageFixture({
+      messageId: "room-message-3",
+      seq: 3,
+      createdAt: 1_710_000_200_000,
+      mentions: ["ryjl3-tyaaa-aaaaa-aaaba-cai"]
+    });
+
+    await store.initialize();
+    await store.upsertRoomMessages([broadcast, targeted, unrelated], 3);
+
+    await expect(store.getLatestRoomMessageSeq()).resolves.toBe(3);
+    await expect(
+      store.listRoomMessages({
+        limit: 10
+      })
+    ).resolves.toEqual({
+      messages: [broadcast, targeted, unrelated],
+      nextAfterSeq: null,
+      latestSeq: 3
+    });
+    await expect(
+      store.listRoomMessages({
+        limit: 10,
+        canisterId: "txyno-ch777-77776-aaaaq-cai",
+        scope: "relevant"
+      })
+    ).resolves.toEqual({
+      messages: [broadcast, targeted],
+      nextAfterSeq: null,
+      latestSeq: 3
+    });
+
+    await store.pruneRoomMessages(1_710_000_150_000);
+
+    await expect(
+      store.listRoomMessages({
+        limit: 10
+      })
+    ).resolves.toEqual({
+      messages: [unrelated],
+      nextAfterSeq: null,
+      latestSeq: 3
     });
 
     await store.close();

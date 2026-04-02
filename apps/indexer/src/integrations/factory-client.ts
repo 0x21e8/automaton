@@ -1,6 +1,7 @@
 import type {
   CreateSpawnSessionRequest,
   CreateSpawnSessionResponse,
+  RoomMessagePage,
   RefundSpawnResponse,
   RetrySpawnResponse,
   SpawnSessionStatusResponse,
@@ -45,6 +46,15 @@ export interface FactoryAdapter {
     cursor: string | undefined,
     limit: number
   ): Promise<SpawnedAutomatonRegistryPage>;
+  listRoomMessages(
+    afterSeq: number | undefined,
+    limit: number
+  ): Promise<RoomMessagePage>;
+  listMessagesForAutomaton(
+    canisterId: string,
+    afterSeq: number | undefined,
+    limit: number
+  ): Promise<RoomMessagePage>;
   getSpawnedAutomaton(canisterId: string): Promise<SpawnedAutomatonRecord | null>;
   getFactoryHealth(): Promise<FactoryHealthSnapshot>;
 }
@@ -74,6 +84,22 @@ class UnconfiguredFactoryAdapter implements FactoryAdapter {
     return {
       items: [],
       nextCursor: null
+    };
+  }
+
+  async listRoomMessages(): Promise<RoomMessagePage> {
+    return {
+      messages: [],
+      nextAfterSeq: null,
+      latestSeq: null
+    };
+  }
+
+  async listMessagesForAutomaton(): Promise<RoomMessagePage> {
+    return {
+      messages: [],
+      nextAfterSeq: null,
+      latestSeq: null
     };
   }
 
@@ -147,6 +173,17 @@ function normalizeRegistryRecord(
   return {
     ...record,
     childIds: [...record.childIds]
+  };
+}
+
+function normalizeRoomMessagePage(page: RoomMessagePage): RoomMessagePage {
+  return {
+    messages: page.messages.map((message) => ({
+      ...message,
+      mentions: [...message.mentions]
+    })),
+    nextAfterSeq: page.nextAfterSeq,
+    latestSeq: page.latestSeq
   };
 }
 
@@ -229,6 +266,25 @@ export class FactoryClient {
       }),
       nextCursor: page.nextCursor
     };
+  }
+
+  async listRoomMessages(
+    afterSeq: number | undefined,
+    limit: number
+  ): Promise<RoomMessagePage> {
+    return normalizeRoomMessagePage(
+      await this.adapter.listRoomMessages(afterSeq, limit)
+    );
+  }
+
+  async listMessagesForAutomaton(
+    canisterId: string,
+    afterSeq: number | undefined,
+    limit: number
+  ): Promise<RoomMessagePage> {
+    return normalizeRoomMessagePage(
+      await this.adapter.listMessagesForAutomaton(canisterId, afterSeq, limit)
+    );
   }
 
   async getSpawnedAutomaton(canisterId: string): Promise<SpawnedAutomatonRecord | null> {

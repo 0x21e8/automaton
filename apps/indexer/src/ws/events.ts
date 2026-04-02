@@ -37,7 +37,7 @@ function extractEventCanisterIds(event: RealtimeEvent) {
     case "offline":
       return [event.canisterId];
     case "message":
-      return [event.fromCanisterId, event.toCanisterId];
+      return [...event.message.mentions];
     case "spawn.session.updated":
     case "spawn.session.completed":
     case "spawn.session.failed":
@@ -66,6 +66,14 @@ export function shouldDeliverEvent(
 ) {
   const normalizedFilter =
     typeof filter === "string" || filter === undefined ? { canisterId: filter } : filter;
+
+  if (
+    normalizedFilter.canisterId &&
+    event.type === "message" &&
+    event.message.mentions.length === 0
+  ) {
+    return true;
+  }
 
   if (
     normalizedFilter.canisterId &&

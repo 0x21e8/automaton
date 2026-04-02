@@ -32,8 +32,7 @@ fn canister_principal(canister_id: &str) -> Result<candid::Principal, FactoryErr
 #[cfg(target_arch = "wasm32")]
 pub async fn complete_controller_handoff_live(canister_id: &str) -> Result<(), FactoryError> {
     use ic_cdk::management_canister::{
-        canister_status, update_settings, CanisterSettings, CanisterStatusArgs,
-        UpdateSettingsArgs,
+        canister_status, update_settings, CanisterSettings, CanisterStatusArgs, UpdateSettingsArgs,
     };
 
     let canister = canister_principal(canister_id)?;

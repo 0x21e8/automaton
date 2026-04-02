@@ -13,11 +13,12 @@ use serde::{Deserialize, Serialize};
 use crate::types::{
     AutomatonChildRuntimeConfig, AutomatonRuntimeState, CreationCostQuote, EscrowClaim,
     FactoryError, FactoryInitArgs, FeeConfig, PendingArtifactUpload, ReleaseBroadcastConfig,
-    SchedulerJob, SchedulerRuntime, SessionAuditActor, SessionAuditEntry, SpawnSession,
-    SpawnSessionState, SpawnedAutomatonRecord,
+    RoomMessage, RoomState, SchedulerJob, SchedulerRuntime, SessionAuditActor, SessionAuditEntry,
+    SpawnSession, SpawnSessionState, SpawnedAutomatonRecord,
 };
 
-const STORAGE_SCHEMA_VERSION: u32 = 2;
+const STORAGE_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_STORAGE_SCHEMA_VERSION: u32 = 2;
 const STORAGE_METADATA_MEMORY_ID: u8 = 0;
 const FACTORY_CONFIG_MEMORY_ID: u8 = 1;
 const SESSIONS_MEMORY_ID: u8 = 2;
@@ -27,6 +28,8 @@ const RUNTIMES_MEMORY_ID: u8 = 5;
 const AUDIT_LOG_MEMORY_ID: u8 = 6;
 const SCHEDULER_RUNTIME_MEMORY_ID: u8 = 7;
 const SCHEDULER_JOBS_MEMORY_ID: u8 = 8;
+const ROOM_STATE_MEMORY_ID: u8 = 9;
+const ROOM_MESSAGES_MEMORY_ID: u8 = 10;
 
 type StableMemory<M> = VirtualMemory<M>;
 
@@ -57,6 +60,8 @@ pub struct FactoryState {
     pub registry: BTreeMap<String, SpawnedAutomatonRecord>,
     pub runtimes: BTreeMap<String, AutomatonRuntimeState>,
     pub audit_log: BTreeMap<String, Vec<SessionAuditEntry>>,
+    pub room_state: RoomState,
+    pub room_messages: BTreeMap<u64, RoomMessage>,
     pub scheduler_jobs: BTreeMap<String, SchedulerJob>,
     pub scheduler_runtime: SchedulerRuntime,
     pub fee_config: FeeConfig,
@@ -151,6 +156,8 @@ impl Default for FactoryState {
             registry: BTreeMap::new(),
             runtimes: BTreeMap::new(),
             audit_log: BTreeMap::new(),
+            room_state: RoomState::default(),
+            room_messages: BTreeMap::new(),
             scheduler_jobs: BTreeMap::new(),
             scheduler_runtime: SchedulerRuntime::default(),
             fee_config: FeeConfig {
@@ -232,6 +239,8 @@ impl FactoryStableConfig {
         escrow_claims: BTreeMap<String, EscrowClaim>,
         registry: BTreeMap<String, SpawnedAutomatonRecord>,
         runtimes: BTreeMap<String, AutomatonRuntimeState>,
+        room_state: RoomState,
+        room_messages: BTreeMap<u64, RoomMessage>,
         scheduler_jobs: BTreeMap<String, SchedulerJob>,
         scheduler_runtime: SchedulerRuntime,
         audit_log: BTreeMap<String, Vec<SessionAuditEntry>>,
@@ -241,6 +250,8 @@ impl FactoryStableConfig {
             escrow_claims,
             registry,
             runtimes,
+            room_state,
+            room_messages,
             scheduler_jobs,
             scheduler_runtime,
             audit_log,
@@ -279,6 +290,8 @@ impl_candid_storable!(AutomatonRuntimeState);
 impl_candid_storable!(StorageMetadata);
 impl_candid_storable!(FactoryStableConfig);
 impl_candid_storable!(StableAuditEntries);
+impl_candid_storable!(RoomState);
+impl_candid_storable!(RoomMessage);
 impl_candid_storable!(SchedulerRuntime);
 impl_candid_storable!(SchedulerJob);
 
@@ -287,11 +300,13 @@ struct FactoryStableStorage<M: Memory> {
     metadata: StableCell<StorageMetadata, StableMemory<M>>,
     config: StableCell<FactoryStableConfig, StableMemory<M>>,
     scheduler_runtime: StableCell<SchedulerRuntime, StableMemory<M>>,
+    room_state: StableCell<RoomState, StableMemory<M>>,
     sessions: StableBTreeMap<String, SpawnSession, StableMemory<M>>,
     escrow_claims: StableBTreeMap<String, EscrowClaim, StableMemory<M>>,
     registry: StableBTreeMap<String, SpawnedAutomatonRecord, StableMemory<M>>,
     runtimes: StableBTreeMap<String, AutomatonRuntimeState, StableMemory<M>>,
     audit_log: StableBTreeMap<String, StableAuditEntries, StableMemory<M>>,
+    room_messages: StableBTreeMap<u64, RoomMessage, StableMemory<M>>,
     scheduler_jobs: StableBTreeMap<String, SchedulerJob, StableMemory<M>>,
 }
 
@@ -314,11 +329,16 @@ impl<M: Memory> FactoryStableStorage<M> {
             memory_manager.get(MemoryId::new(SCHEDULER_RUNTIME_MEMORY_ID)),
             SchedulerRuntime::default(),
         );
+        let room_state = StableCell::init(
+            memory_manager.get(MemoryId::new(ROOM_STATE_MEMORY_ID)),
+            RoomState::default(),
+        );
 
         Self {
             metadata,
             config,
             scheduler_runtime,
+            room_state,
             sessions: StableBTreeMap::init(memory_manager.get(MemoryId::new(SESSIONS_MEMORY_ID))),
             escrow_claims: StableBTreeMap::init(
                 memory_manager.get(MemoryId::new(ESCROW_CLAIMS_MEMORY_ID)),
@@ -326,6 +346,9 @@ impl<M: Memory> FactoryStableStorage<M> {
             registry: StableBTreeMap::init(memory_manager.get(MemoryId::new(REGISTRY_MEMORY_ID))),
             runtimes: StableBTreeMap::init(memory_manager.get(MemoryId::new(RUNTIMES_MEMORY_ID))),
             audit_log: StableBTreeMap::init(memory_manager.get(MemoryId::new(AUDIT_LOG_MEMORY_ID))),
+            room_messages: StableBTreeMap::init(
+                memory_manager.get(MemoryId::new(ROOM_MESSAGES_MEMORY_ID)),
+            ),
             scheduler_jobs: StableBTreeMap::init(
                 memory_manager.get(MemoryId::new(SCHEDULER_JOBS_MEMORY_ID)),
             ),
@@ -335,8 +358,9 @@ impl<M: Memory> FactoryStableStorage<M> {
 
     fn assert_supported_schema(&self) {
         let metadata = self.metadata.get();
-        assert_eq!(
-            metadata.schema_version, STORAGE_SCHEMA_VERSION,
+        assert!(
+            metadata.schema_version == STORAGE_SCHEMA_VERSION
+                || metadata.schema_version == PREVIOUS_STORAGE_SCHEMA_VERSION,
             "unsupported factory storage schema version: {}",
             metadata.schema_version
         );
@@ -355,6 +379,8 @@ impl<M: Memory> FactoryStableStorage<M> {
             load_collection(&self.escrow_claims),
             load_collection(&self.registry),
             load_collection(&self.runtimes),
+            self.room_state.get().clone(),
+            load_collection(&self.room_messages),
             load_collection(&self.scheduler_jobs),
             self.scheduler_runtime.get().clone(),
             self.audit_log
@@ -394,6 +420,9 @@ impl<M: Memory> FactoryStableStorage<M> {
         if self.scheduler_runtime.get() != &next.scheduler_runtime {
             self.scheduler_runtime.set(next.scheduler_runtime.clone());
         }
+        if self.room_state.get() != &next.room_state {
+            self.room_state.set(next.room_state.clone());
+        }
 
         sync_collection(&mut self.sessions, &current.sessions, &next.sessions);
         sync_collection(
@@ -403,6 +432,11 @@ impl<M: Memory> FactoryStableStorage<M> {
         );
         sync_collection(&mut self.registry, &current.registry, &next.registry);
         sync_collection(&mut self.runtimes, &current.runtimes, &next.runtimes);
+        sync_collection(
+            &mut self.room_messages,
+            &current.room_messages,
+            &next.room_messages,
+        );
         sync_collection(
             &mut self.scheduler_jobs,
             &current.scheduler_jobs,

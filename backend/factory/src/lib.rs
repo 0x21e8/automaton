@@ -27,7 +27,8 @@ pub use api::admin::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use api::public::{
     claim_spawn_refund, create_spawn_session, get_spawn_session, get_spawned_automaton,
-    list_spawned_automatons, retry_spawn_session,
+    list_messages_for_automaton, list_my_room_messages, list_room_messages,
+    list_spawned_automatons, post_room_message, retry_spawn_session,
 };
 pub use escrow::{
     claim_escrow_refund, get_escrow_claim, next_payment_scan_plan, reconcile_escrow_payments,
@@ -49,13 +50,16 @@ pub use types::{
     FactoryArtifactSnapshot, FactoryConfigSnapshot, FactoryError, FactoryHealthSnapshot,
     FactoryInitArgs, FactoryOperationalConfig, FactoryRuntimeSnapshot,
     FactorySchedulerHealthSnapshot, FactorySchedulerJobCounts, FactorySessionHealthCounts,
-    FeeConfig, PaymentStatus, ProviderConfig, RefundSpawnResponse, ReleaseBroadcastConfig,
-    ReleaseBroadcastFailure, ReleaseBroadcastRecord, ReleaseBroadcastStage, ReleaseSignatureRecord,
+    FeeConfig, PaymentStatus, PostRoomMessageRequest, ProviderConfig, RefundSpawnResponse,
+    ReleaseBroadcastConfig, ReleaseBroadcastFailure, ReleaseBroadcastRecord, ReleaseBroadcastStage,
+    ReleaseSignatureRecord, RoomContentType, RoomMessage, RoomMessagePage, RoomState,
     SchedulerFailureAction, SchedulerFailureSource, SchedulerJob, SchedulerJobFailure,
     SchedulerJobKind, SchedulerJobStatus, SchedulerRuntime, SessionAdminView, SessionAuditActor,
     SessionAuditEntry, SpawnAsset, SpawnChain, SpawnConfig, SpawnExecutionReceipt,
     SpawnPaymentInstructions, SpawnQuote, SpawnSession, SpawnSessionState,
     SpawnSessionStatusResponse, SpawnedAutomatonRecord, SpawnedAutomatonRegistryPage,
+    DEFAULT_ROOM_READ_LIMIT, MAX_ROOM_BODY_BYTES, MAX_ROOM_MENTIONS, MAX_ROOM_MESSAGES_RETAINED,
+    MAX_ROOM_READ_LIMIT,
 };
 
 pub fn bootstrap_status() -> &'static str {
@@ -176,6 +180,40 @@ fn list_spawned_automatons(
     limit: u64,
 ) -> Result<SpawnedAutomatonRegistryPage, FactoryError> {
     api::public::list_spawned_automatons(cursor.as_deref(), limit as usize)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
+fn post_room_message(request: PostRoomMessageRequest) -> Result<RoomMessage, FactoryError> {
+    api::public::post_room_message(&ic_cdk::api::msg_caller().to_text(), request, now_ms())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::query]
+fn list_room_messages(
+    after_seq: Option<u64>,
+    limit: Option<u64>,
+) -> Result<RoomMessagePage, FactoryError> {
+    api::public::list_room_messages(after_seq, limit)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::query]
+fn list_messages_for_automaton(
+    canister_id: String,
+    after_seq: Option<u64>,
+    limit: Option<u64>,
+) -> Result<RoomMessagePage, FactoryError> {
+    api::public::list_messages_for_automaton(&canister_id, after_seq, limit)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::query]
+fn list_my_room_messages(
+    after_seq: Option<u64>,
+    limit: Option<u64>,
+) -> Result<RoomMessagePage, FactoryError> {
+    api::public::list_my_room_messages(&ic_cdk::api::msg_caller().to_text(), after_seq, limit)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -330,17 +368,19 @@ mod tests {
         create_spawn_session, derive_claim_id, execute_spawn, expire_spawn_session,
         get_artifact_upload_status, get_escrow_claim, get_factory_config, get_factory_health,
         get_factory_runtime, get_session_admin, get_spawn_session, get_spawned_automaton,
-        insert_spawned_automaton_record, list_spawned_automatons, mark_session_failed,
-        next_payment_scan_plan, reconcile_escrow_payments, restore_state, retry_session_admin,
+        insert_spawned_automaton_record, list_messages_for_automaton, list_my_room_messages,
+        list_room_messages, list_spawned_automatons, mark_session_failed, next_payment_scan_plan,
+        post_room_message, reconcile_escrow_payments, restore_state, retry_session_admin,
         retry_spawn_session, set_child_runtime_config, set_creation_cost_quote, set_fee_config,
         set_mock_canister_balance, set_operational_config, set_pause, set_release_broadcast_config,
         snapshot_state, update_artifact, write_state, AutomatonChildRuntimeConfig,
         CreateSpawnSessionRequest, CreationCostQuote, FactoryError, FactoryInitArgs,
-        FactoryOperationalConfig, FactoryStateSnapshot, FeeConfig, PaymentStatus, ProviderConfig,
-        ReleaseBroadcastConfig, SchedulerFailureAction, SchedulerFailureSource, SchedulerJob,
-        SchedulerJobFailure, SchedulerJobKind, SchedulerJobStatus, SchedulerRuntime,
-        SessionAuditActor, SpawnAsset, SpawnChain, SpawnConfig, SpawnSessionState,
-        SpawnedAutomatonRecord,
+        FactoryOperationalConfig, FactoryStateSnapshot, FeeConfig, PaymentStatus,
+        PostRoomMessageRequest, ProviderConfig, ReleaseBroadcastConfig, RoomContentType,
+        SchedulerFailureAction, SchedulerFailureSource, SchedulerJob, SchedulerJobFailure,
+        SchedulerJobKind, SchedulerJobStatus, SchedulerRuntime, SessionAuditActor, SpawnAsset,
+        SpawnChain, SpawnConfig, SpawnSessionState, SpawnedAutomatonRecord, MAX_ROOM_BODY_BYTES,
+        MAX_ROOM_MESSAGES_RETAINED,
     };
     use crate::base_rpc::BaseDepositLog;
     use crate::scheduler::{
@@ -420,6 +460,49 @@ mod tests {
                 },
             },
             parent_id: None,
+        }
+    }
+
+    fn sample_spawned_automaton_record(
+        canister_id: &str,
+        session_id: &str,
+        created_at: u64,
+    ) -> SpawnedAutomatonRecord {
+        SpawnedAutomatonRecord {
+            canister_id: canister_id.to_string(),
+            steward_address: "0xsteward".to_string(),
+            evm_address: format!("0x{created_at:x}"),
+            chain: SpawnChain::Base,
+            session_id: session_id.to_string(),
+            parent_id: None,
+            child_ids: Vec::new(),
+            created_at,
+            version_commit: SHA40.to_string(),
+        }
+    }
+
+    fn register_room_poster(canister_id: &str) {
+        insert_spawned_automaton_record(sample_spawned_automaton_record(
+            canister_id,
+            &format!("session-{canister_id}"),
+            1,
+        ));
+    }
+
+    fn room_request(
+        body: &str,
+        mentions: &[&str],
+        content_type: Option<RoomContentType>,
+    ) -> PostRoomMessageRequest {
+        PostRoomMessageRequest {
+            body: body.to_string(),
+            mentions: Some(
+                mentions
+                    .iter()
+                    .map(|mention| (*mention).to_string())
+                    .collect(),
+            ),
+            content_type,
         }
     }
 
@@ -799,28 +882,16 @@ mod tests {
     fn paginates_registry_reads() {
         reset_factory_state();
 
-        insert_spawned_automaton_record(SpawnedAutomatonRecord {
-            canister_id: "aaaaa-aa".to_string(),
-            steward_address: "0xone".to_string(),
-            evm_address: "0xe1".to_string(),
-            chain: SpawnChain::Base,
-            session_id: "session-1".to_string(),
-            parent_id: None,
-            child_ids: Vec::new(),
-            created_at: 1,
-            version_commit: SHA40.to_string(),
-        });
-        insert_spawned_automaton_record(SpawnedAutomatonRecord {
-            canister_id: "bbbbb-bb".to_string(),
-            steward_address: "0xtwo".to_string(),
-            evm_address: "0xe2".to_string(),
-            chain: SpawnChain::Base,
-            session_id: "session-2".to_string(),
-            parent_id: Some("aaaaa-aa".to_string()),
-            child_ids: Vec::new(),
-            created_at: 2,
-            version_commit: SHA40.to_string(),
-        });
+        insert_spawned_automaton_record(sample_spawned_automaton_record(
+            "aaaaa-aa",
+            "session-1",
+            1,
+        ));
+        let mut child_record = sample_spawned_automaton_record("bbbbb-bb", "session-2", 2);
+        child_record.steward_address = "0xtwo".to_string();
+        child_record.evm_address = "0xe2".to_string();
+        child_record.parent_id = Some("aaaaa-aa".to_string());
+        insert_spawned_automaton_record(child_record);
 
         let first_page = list_spawned_automatons(None, 1).expect("first page should load");
         assert_eq!(first_page.items.len(), 1);
@@ -833,6 +904,227 @@ mod tests {
 
         let record = get_spawned_automaton("bbbbb-bb").expect("single registry record should load");
         assert_eq!(record.parent_id.as_deref(), Some("aaaaa-aa"));
+    }
+
+    #[test]
+    fn posts_room_messages_for_registered_automatons_and_round_trips_untrusted_text() {
+        reset_factory_state();
+        register_room_poster("aaaaa-aa");
+
+        let posted = post_room_message(
+            "aaaaa-aa",
+            room_request(
+                "  <script>alert('fleet')</script>  ",
+                &[],
+                Some(RoomContentType::TextPlain),
+            ),
+            42,
+        )
+        .expect("registered automaton should post");
+        let page = list_room_messages(None, Some(10)).expect("room page should load");
+
+        assert_eq!(posted.message_id, "room-message-0");
+        assert_eq!(posted.seq, 0);
+        assert_eq!(posted.author_canister_id, "aaaaa-aa");
+        assert_eq!(posted.body, "<script>alert('fleet')</script>");
+        assert!(posted.mentions.is_empty());
+        assert_eq!(posted.content_type, RoomContentType::TextPlain);
+        assert_eq!(page.messages, vec![posted.clone()]);
+        assert_eq!(page.next_after_seq, None);
+        assert_eq!(page.latest_seq, Some(0));
+    }
+
+    #[test]
+    fn filters_room_messages_to_broadcasts_and_explicit_mentions() {
+        reset_factory_state();
+        register_room_poster("aaaaa-aa");
+        register_room_poster("bbbbb-bb");
+
+        post_room_message("aaaaa-aa", room_request("broadcast", &[], None), 10)
+            .expect("broadcast should post");
+        let relevant_to_b = post_room_message(
+            "aaaaa-aa",
+            room_request(
+                r#"{"kind":"ping","unsafe":"<tool-call>"}"#,
+                &["bbbbb-bb", "bbbbb-bb", "zzzzz-zz"],
+                Some(RoomContentType::ApplicationJson),
+            ),
+            11,
+        )
+        .expect("mentioned message should post");
+        post_room_message(
+            "bbbbb-bb",
+            room_request(
+                "for a only",
+                &["aaaaa-aa"],
+                Some(RoomContentType::TextPlain),
+            ),
+            12,
+        )
+        .expect("peer mention should post");
+        post_room_message(
+            "aaaaa-aa",
+            room_request(
+                "for unknown only",
+                &["zzzzz-zz"],
+                Some(RoomContentType::TextPlain),
+            ),
+            13,
+        )
+        .expect("unknown mention should still post");
+
+        let filtered = list_messages_for_automaton("bbbbb-bb", None, Some(10))
+            .expect("filtered room page should load");
+        let mine = list_my_room_messages("aaaaa-aa", None, Some(10))
+            .expect("caller-bound room page should load");
+
+        assert_eq!(
+            relevant_to_b.mentions,
+            vec!["bbbbb-bb".to_string(), "zzzzz-zz".to_string()]
+        );
+        assert_eq!(
+            filtered
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            mine.messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(filtered.latest_seq, Some(3));
+    }
+
+    #[test]
+    fn rejects_unauthorized_or_invalid_room_posts() {
+        reset_factory_state();
+        register_room_poster("aaaaa-aa");
+
+        let unauthorized = post_room_message("zzzzz-zz", room_request("hello", &[], None), 1)
+            .expect_err("unregistered caller should be rejected");
+        assert!(matches!(
+            unauthorized,
+            FactoryError::UnauthorizedRoomPoster { caller } if caller == "zzzzz-zz"
+        ));
+
+        let oversized = post_room_message(
+            "aaaaa-aa",
+            room_request(&"x".repeat(MAX_ROOM_BODY_BYTES + 1), &[], None),
+            2,
+        )
+        .expect_err("oversized room body should be rejected");
+        assert!(matches!(
+            oversized,
+            FactoryError::RoomMessageBodyTooLarge {
+                provided_bytes,
+                max_bytes,
+            } if provided_bytes == MAX_ROOM_BODY_BYTES + 1 && max_bytes == MAX_ROOM_BODY_BYTES
+        ));
+
+        let invalid_json = post_room_message(
+            "aaaaa-aa",
+            room_request("{\"broken\":", &[], Some(RoomContentType::ApplicationJson)),
+            3,
+        )
+        .expect_err("malformed json should be rejected");
+        assert!(matches!(
+            invalid_json,
+            FactoryError::InvalidRoomMessageJson { .. }
+        ));
+
+        let empty = post_room_message(
+            "aaaaa-aa",
+            room_request("   \n\t   ", &[], Some(RoomContentType::TextPlain)),
+            4,
+        )
+        .expect_err("empty room body should be rejected");
+        assert!(matches!(empty, FactoryError::EmptyRoomMessageBody));
+
+        let too_many_mentions = post_room_message(
+            "aaaaa-aa",
+            PostRoomMessageRequest {
+                body: "too many".to_string(),
+                mentions: Some((0..17).map(|index| format!("mention-{index}")).collect()),
+                content_type: Some(RoomContentType::TextPlain),
+            },
+            5,
+        )
+        .expect_err("mention overflow should be rejected");
+        assert!(matches!(
+            too_many_mentions,
+            FactoryError::TooManyRoomMentions {
+                provided: 17,
+                max_mentions: 16,
+            }
+        ));
+    }
+
+    #[test]
+    fn paginates_room_reads_and_evicts_oldest_messages_deterministically() {
+        reset_factory_state();
+        register_room_poster("aaaaa-aa");
+
+        for seq in 0..(MAX_ROOM_MESSAGES_RETAINED as u64 + 2) {
+            post_room_message(
+                "aaaaa-aa",
+                room_request(&format!("message-{seq}"), &[], None),
+                seq,
+            )
+            .expect("room message should post");
+        }
+
+        let first_page = list_room_messages(None, Some(2)).expect("first room page should load");
+        let second_page = list_room_messages(first_page.next_after_seq, Some(2))
+            .expect("second room page should load");
+        let tail_page = list_room_messages(Some(MAX_ROOM_MESSAGES_RETAINED as u64), Some(10))
+            .expect("tail room page should load");
+        let snapshot = snapshot_state();
+
+        assert_eq!(snapshot.room_messages.len(), MAX_ROOM_MESSAGES_RETAINED);
+        assert_eq!(snapshot.room_state.oldest_seq, Some(2));
+        assert_eq!(
+            snapshot.room_state.latest_seq,
+            Some(MAX_ROOM_MESSAGES_RETAINED as u64 + 1)
+        );
+        assert_eq!(
+            snapshot.room_state.next_seq,
+            MAX_ROOM_MESSAGES_RETAINED as u64 + 2
+        );
+        assert_eq!(
+            first_page
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(first_page.next_after_seq, Some(3));
+        assert_eq!(
+            second_page
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert_eq!(
+            tail_page
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
+            vec![MAX_ROOM_MESSAGES_RETAINED as u64 + 1]
+        );
+        assert_eq!(tail_page.next_after_seq, None);
+        assert_eq!(
+            tail_page.latest_seq,
+            Some(MAX_ROOM_MESSAGES_RETAINED as u64 + 1)
+        );
     }
 
     #[test]
@@ -881,6 +1173,12 @@ mod tests {
                 },
             );
         });
+        post_room_message(
+            "aaaaa-aa",
+            room_request("persisted room message", &[], None),
+            5_450,
+        )
+        .expect("room message should persist through reload");
         let snapshot = snapshot_state();
 
         reset_factory_state();
@@ -889,6 +1187,7 @@ mod tests {
         let session = get_spawn_session(&response.session.session_id).expect("session should load");
         let admin_view =
             get_session_admin("admin", &response.session.session_id).expect("admin read works");
+        let room_page = list_room_messages(None, Some(10)).expect("room page should load");
 
         assert_eq!(session.session.session_id, response.session.session_id);
         assert_eq!(admin_view.quote.gross_amount, "75000000");
@@ -898,6 +1197,10 @@ mod tests {
         assert_eq!(snapshot.next_payment_poll_at_ms, Some(9_999));
         assert_eq!(snapshot.registry.len(), 1);
         assert_eq!(snapshot.runtimes.len(), 1);
+        assert_eq!(snapshot.room_state.latest_seq, Some(0));
+        assert_eq!(snapshot.room_messages.len(), 1);
+        assert_eq!(room_page.messages.len(), 1);
+        assert_eq!(room_page.messages[0].body, "persisted room message");
 
         crate::state::reload_storage_for_test();
         assert_eq!(snapshot_state(), snapshot);

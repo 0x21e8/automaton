@@ -114,6 +114,24 @@ function createHealthSnapshot() {
   };
 }
 
+function createRoomPage() {
+  return {
+    messages: [
+      {
+        message_id: "room-message-7",
+        seq: 7n,
+        author_canister_id: "ryjl3-tyaaa-aaaaa-aaaba-cai",
+        created_at: 1_709_912_361_000n,
+        body: "{\"kind\":\"status\",\"ok\":true}",
+        mentions: ["txyno-ch777-77776-aaaaq-cai"],
+        content_type: { ApplicationJson: null }
+      }
+    ],
+    next_after_seq: [],
+    latest_seq: [7n]
+  };
+}
+
 function createActor() {
   return {
     claim_spawn_refund: vi.fn(async () => {
@@ -183,6 +201,26 @@ function createActor() {
         next_cursor: cursor.length === 0 && limit === 25n ? ["next-cursor"] : []
       }
     })),
+    list_room_messages: vi.fn(async (_afterSeq: [] | [bigint], limit: [] | [bigint]) => ({
+      Ok: {
+        ...createRoomPage(),
+        next_after_seq: limit[0] === 50n ? [7n] : []
+      }
+    })),
+    list_messages_for_automaton: vi.fn(
+      async (canisterId: string, _afterSeq: [] | [bigint], _limit: [] | [bigint]) => ({
+        Ok: {
+          ...createRoomPage(),
+          messages: createRoomPage().messages.map((message) => ({
+            ...message,
+            mentions: [canisterId]
+          }))
+        }
+      })
+    ),
+    list_my_room_messages: vi.fn(async () => ({
+      Ok: createRoomPage()
+    })),
     retry_spawn_session: vi.fn(async () => {
       throw new Error("not used");
     })
@@ -228,6 +266,12 @@ describe("CanisterFactoryAdapter", () => {
     const registry = await adapter.getSpawnedAutomaton("ryjl3-tyaaa-aaaaa-aaaba-cai");
     const missingRegistry = await adapter.getSpawnedAutomaton("missing-canister");
     const page = await adapter.listSpawnedAutomatons(undefined, 25);
+    const roomPage = await adapter.listRoomMessages(undefined, 50);
+    const relevantRoomPage = await adapter.listMessagesForAutomaton(
+      "txyno-ch777-77776-aaaaq-cai",
+      6,
+      25
+    );
     const health = await adapter.getFactoryHealth();
 
     expect(createAgent).toHaveBeenCalledTimes(1);
@@ -303,6 +347,30 @@ describe("CanisterFactoryAdapter", () => {
       ],
       nextCursor: "next-cursor"
     });
+    expect(roomPage).toEqual({
+      messages: [
+        {
+          messageId: "room-message-7",
+          seq: 7,
+          authorCanisterId: "ryjl3-tyaaa-aaaaa-aaaba-cai",
+          createdAt: 1_709_912_361_000,
+          body: "{\"kind\":\"status\",\"ok\":true}",
+          mentions: ["txyno-ch777-77776-aaaaq-cai"],
+          contentType: "application/json"
+        }
+      ],
+      nextAfterSeq: 7,
+      latestSeq: 7
+    });
+    expect(relevantRoomPage).toEqual({
+      messages: [
+        expect.objectContaining({
+          mentions: ["txyno-ch777-77776-aaaaq-cai"]
+        })
+      ],
+      nextAfterSeq: null,
+      latestSeq: 7
+    });
     expect(health).toEqual({
       activeSessions: {
         activeTotal: 2,
@@ -344,6 +412,9 @@ describe("CanisterFactoryAdapter", () => {
           get_factory_health: vi.fn(async () => createHealthSnapshot()),
           get_spawn_session: vi.fn(),
           get_spawned_automaton: vi.fn(),
+          list_messages_for_automaton: vi.fn(),
+          list_my_room_messages: vi.fn(),
+          list_room_messages: vi.fn(),
           list_spawned_automatons: vi.fn(),
           retry_spawn_session: vi.fn()
         }) as never
