@@ -163,6 +163,7 @@ struct SpawnBootstrapArgs {
     session_id: String,
     #[serde(default)]
     parent_id: Option<String>,
+    factory_principal: Principal,
     risk: u8,
     #[serde(default)]
     strategies: Vec<String>,
@@ -590,6 +591,7 @@ fn apply_spawn_bootstrap(args: SpawnBootstrapArgs) -> Result<(), String> {
     stable::set_spawn_bootstrap_metadata(SpawnBootstrapView {
         session_id: Some(session_id),
         parent_id,
+        factory_principal: Some(args.factory_principal),
         risk: Some(args.risk),
         strategies,
         skills,
@@ -2502,6 +2504,8 @@ mod tests {
                 steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),
                 session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
                 parent_id: Some("parent-automaton".to_string()),
+                factory_principal: Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                    .expect("test principal should parse"),
                 risk: 4,
                 strategies: vec![" carry ".to_string(), "".to_string()],
                 skills: vec![" messaging ".to_string()],
@@ -2527,6 +2531,10 @@ mod tests {
         assert_eq!(snapshot.inference_model, "openai/gpt-4o-mini");
         assert_eq!(snapshot.openrouter_api_key, Some("sk-or-test".to_string()));
         assert_eq!(
+            snapshot.factory_principal,
+            Some("rrkah-fqaaa-aaaaa-aaaaq-cai".to_string())
+        );
+        assert_eq!(
             stable::get_search_api_key(),
             Some("brave-test-key".to_string())
         );
@@ -2537,6 +2545,10 @@ mod tests {
             SpawnBootstrapView {
                 session_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
                 parent_id: Some("parent-automaton".to_string()),
+                factory_principal: Some(
+                    Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                        .expect("test principal should parse"),
+                ),
                 risk: Some(4),
                 strategies: vec!["carry".to_string()],
                 skills: vec!["messaging".to_string()],

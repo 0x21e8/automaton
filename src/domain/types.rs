@@ -896,6 +896,8 @@ pub struct RuntimeSnapshot {
     #[serde(default)]
     pub spawn_parent_id: Option<String>,
     #[serde(default)]
+    pub factory_principal: Option<String>,
+    #[serde(default)]
     pub spawn_risk: Option<u8>,
     #[serde(default)]
     pub spawn_strategies: Vec<String>,
@@ -907,6 +909,8 @@ pub struct RuntimeSnapshot {
     pub cycle_topup: CycleTopUpConfig,
     #[serde(default)]
     pub timing_telemetry: RuntimeTimingTelemetry,
+    #[serde(default)]
+    pub room_poll: RoomPollingState,
 }
 
 impl Default for RuntimeSnapshot {
@@ -946,12 +950,14 @@ impl Default for RuntimeSnapshot {
             autonomy_suppression: AutonomySuppressionConfig::default(),
             spawn_session_id: None,
             spawn_parent_id: None,
+            factory_principal: None,
             spawn_risk: None,
             spawn_strategies: Vec::new(),
             spawn_skills: Vec::new(),
             wallet_balance_bootstrap_pending: default_wallet_balance_bootstrap_pending(),
             cycle_topup: CycleTopUpConfig::default(),
             timing_telemetry: RuntimeTimingTelemetry::default(),
+            room_poll: RoomPollingState::default(),
         }
     }
 }
@@ -1613,6 +1619,8 @@ pub struct RuntimeView {
     pub inference_model: String,
     #[serde(default)]
     pub timing_telemetry: RuntimeTimingTelemetry,
+    #[serde(default)]
+    pub room_poll: RoomPollingState,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
@@ -1622,6 +1630,8 @@ pub struct SpawnBootstrapView {
     #[serde(default)]
     pub parent_id: Option<String>,
     #[serde(default)]
+    pub factory_principal: Option<Principal>,
+    #[serde(default)]
     pub risk: Option<u8>,
     #[serde(default)]
     pub strategies: Vec<String>,
@@ -1629,6 +1639,32 @@ pub struct SpawnBootstrapView {
     pub skills: Vec<String>,
     #[serde(default)]
     pub version_commit: Option<String>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct RoomPollingState {
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
+    pub last_seen_seq: Option<u64>,
+    #[serde(default)]
+    pub last_attempted_at_ns: Option<u64>,
+    #[serde(default)]
+    pub last_succeeded_at_ns: Option<u64>,
+    #[serde(default)]
+    pub last_known_latest_seq: Option<u64>,
+    #[serde(default)]
+    pub last_batch_count: u32,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_post_attempted_at_ns: Option<u64>,
+    #[serde(default)]
+    pub last_post_succeeded_at_ns: Option<u64>,
+    #[serde(default)]
+    pub last_post_error: Option<String>,
 }
 
 /// Read-only view of the EVM polling configuration and cursor, returned by queries.
@@ -1662,6 +1698,7 @@ impl From<&RuntimeSnapshot> for RuntimeView {
             inference_provider: snapshot.inference_provider.clone(),
             inference_model: snapshot.inference_model.clone(),
             timing_telemetry: snapshot.timing_telemetry.clone(),
+            room_poll: snapshot.room_poll.clone(),
         }
     }
 }
@@ -1671,12 +1708,51 @@ impl From<&RuntimeSnapshot> for SpawnBootstrapView {
         Self {
             session_id: snapshot.spawn_session_id.clone(),
             parent_id: snapshot.spawn_parent_id.clone(),
+            factory_principal: snapshot
+                .factory_principal
+                .as_deref()
+                .and_then(|value| Principal::from_text(value).ok()),
             risk: snapshot.spawn_risk,
             strategies: snapshot.spawn_strategies.clone(),
             skills: snapshot.spawn_skills.clone(),
             version_commit: snapshot.installed_version_commit.clone(),
         }
     }
+}
+
+// ── Factory room types ───────────────────────────────────────────────────────
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomContentType {
+    TextPlain,
+    ApplicationJson,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RoomMessage {
+    pub message_id: String,
+    pub seq: u64,
+    pub author_canister_id: String,
+    pub created_at: u64,
+    pub body: String,
+    pub mentions: Vec<String>,
+    pub content_type: RoomContentType,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RoomMessagePage {
+    pub messages: Vec<RoomMessage>,
+    pub next_after_seq: Option<u64>,
+    pub latest_seq: Option<u64>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PostRoomMessageRequest {
+    pub body: String,
+    #[serde(default)]
+    pub mentions: Option<Vec<String>>,
+    #[serde(default)]
+    pub content_type: Option<RoomContentType>,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
@@ -1993,23 +2069,6 @@ pub enum OpenRouterReasoningLevel {
     Low,
     Medium,
     High,
-}
-
-/// User-facing steward model variants used by the signed HTTP command plane.
-#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum StewardModelVariant {
-    Flash,
-    Mini,
-}
-
-impl StewardModelVariant {
-    pub fn inference_model(self) -> &'static str {
-        match self {
-            Self::Flash => "google/gemini-3-flash-preview",
-            Self::Mini => "openai/gpt-4o-mini",
-        }
-    }
 }
 
 /// User-facing steward reasoning variants used by the signed HTTP command plane.

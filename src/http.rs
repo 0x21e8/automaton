@@ -31,9 +31,7 @@
 /// | POST   | `/api/steward/model/execute`  | update      |
 /// | POST   | `/api/steward/reasoning/prepare` | update   |
 /// | POST   | `/api/steward/reasoning/execute` | update   |
-use crate::domain::types::{
-    EvmStewardProof, StewardCommand, StewardModelVariant, StewardReasoningVariant,
-};
+use crate::domain::types::{EvmStewardProof, StewardCommand, StewardReasoningVariant};
 use crate::storage::stable;
 use crate::timing::current_time_ns;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -130,7 +128,7 @@ struct StewardDirectMessagePrepareRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 struct StewardModelPrepareRequest {
-    variant: StewardModelVariant,
+    model: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -148,7 +146,6 @@ struct StewardDirectMessagePrepareView {
 
 #[derive(Clone, Debug, Serialize)]
 struct StewardModelPrepareView {
-    variant: StewardModelVariant,
     model: String,
     proof_template: EvmStewardProofTemplateView,
     signing_payload: String,
@@ -190,7 +187,7 @@ struct StewardDirectMessageExecuteRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 struct StewardModelExecuteRequest {
-    variant: StewardModelVariant,
+    model: String,
     proof: EvmStewardProof,
 }
 
@@ -352,15 +349,22 @@ fn normalize_steward_direct_message(
     Ok((sender, message))
 }
 
+fn normalize_steward_model(model: String) -> Result<String, String> {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("steward model cannot be empty".to_string());
+    }
+    Ok(model)
+}
+
 fn steward_send_message_command(sender: String, message: String) -> Result<StewardCommand, String> {
     let (sender, message) = normalize_steward_direct_message(sender, message)?;
     Ok(StewardCommand::SendStewardMessage { sender, message })
 }
 
-fn steward_set_model_command(variant: StewardModelVariant) -> StewardCommand {
-    StewardCommand::SetInferenceModel {
-        model: variant.inference_model().to_string(),
-    }
+fn steward_set_model_command(model: String) -> Result<StewardCommand, String> {
+    let model = normalize_steward_model(model)?;
+    Ok(StewardCommand::SetInferenceModel { model })
 }
 
 fn steward_set_reasoning_command(variant: StewardReasoningVariant) -> StewardCommand {
@@ -457,11 +461,14 @@ fn prepare_steward_direct_message_view(
 fn prepare_steward_model_view(
     payload: StewardModelPrepareRequest,
 ) -> Result<StewardModelPrepareView, String> {
-    let command = steward_set_model_command(payload.variant);
+    let command = steward_set_model_command(payload.model)?;
+    let model = match &command {
+        StewardCommand::SetInferenceModel { model } => model.clone(),
+        _ => unreachable!("steward model prepare should only build set model command"),
+    };
     let shared = prepare_signed_steward_command(command)?;
     Ok(StewardModelPrepareView {
-        variant: payload.variant,
-        model: payload.variant.inference_model().to_string(),
+        model,
         proof_template: shared.proof_template,
         signing_payload: shared.signing_payload,
     })
@@ -678,9 +685,14 @@ pub async fn handle_http_request_update(
         (&Method::POST, "/api/steward/model/execute") => {
             match parse_steward_model_execute_request(request.body()) {
                 Ok(payload) => {
-                    let command = steward_set_model_command(payload.variant);
-                    match execute_signed_steward_command(command, payload.proof).await {
-                        Ok(result) => json_update_response(StatusCode::OK, &result),
+                    match steward_set_model_command(payload.model) {
+                        Ok(command) => match execute_signed_steward_command(command, payload.proof).await {
+                            Ok(result) => json_update_response(StatusCode::OK, &result),
+                            Err(error) => json_update_response(
+                                StatusCode::BAD_REQUEST,
+                                &ConversationLookupError { ok: false, error },
+                            ),
+                        },
                         Err(error) => json_update_response(
                             StatusCode::BAD_REQUEST,
                             &ConversationLookupError { ok: false, error },
@@ -1169,8 +1181,10 @@ fn parse_steward_model_prepare_request(body: &[u8]) -> Result<StewardModelPrepar
         return Err("steward model prepare body cannot be empty".to_string());
     }
 
-    serde_json::from_slice::<StewardModelPrepareRequest>(body)
-        .map_err(|error| format!("invalid steward model prepare payload: {error}"))
+    let payload = serde_json::from_slice::<StewardModelPrepareRequest>(body)
+        .map_err(|error| format!("invalid steward model prepare payload: {error}"))?;
+    let model = normalize_steward_model(payload.model)?;
+    Ok(StewardModelPrepareRequest { model })
 }
 
 fn parse_steward_model_execute_request(body: &[u8]) -> Result<StewardModelExecuteRequest, String> {
@@ -1178,8 +1192,13 @@ fn parse_steward_model_execute_request(body: &[u8]) -> Result<StewardModelExecut
         return Err("steward model execute body cannot be empty".to_string());
     }
 
-    serde_json::from_slice::<StewardModelExecuteRequest>(body)
-        .map_err(|error| format!("invalid steward model execute payload: {error}"))
+    let payload = serde_json::from_slice::<StewardModelExecuteRequest>(body)
+        .map_err(|error| format!("invalid steward model execute payload: {error}"))?;
+    let model = normalize_steward_model(payload.model)?;
+    Ok(StewardModelExecuteRequest {
+        model,
+        proof: payload.proof,
+    })
 }
 
 fn parse_steward_reasoning_prepare_request(
@@ -1309,16 +1328,16 @@ mod tests {
             "expanded help palette should include direct steward messaging action"
         );
         assert!(
-            body.contains("steward-model <variant>"),
-            "expanded help palette should include steward model command variants"
+            body.contains("steward-model <model>"),
+            "expanded help palette should include steward model command"
         );
         assert!(
             body.contains("steward-reasoning <variant>"),
             "expanded help palette should include steward reasoning command variants"
         );
         assert!(
-            body.contains("flash|mini"),
-            "expanded help palette should show model variant hints"
+            body.contains("google/gemini-3-flash-preview"),
+            "expanded help palette should show arbitrary model examples"
         );
         assert!(
             body.contains("default|low|medium|high"),
@@ -1677,6 +1696,7 @@ mod tests {
         let _ = stable::set_spawn_bootstrap_metadata(crate::domain::types::SpawnBootstrapView {
             session_id: None,
             parent_id: None,
+            factory_principal: None,
             risk: None,
             strategies: Vec::new(),
             skills: Vec::new(),
@@ -1844,7 +1864,7 @@ mod tests {
     }
 
     #[test]
-    fn steward_model_prepare_route_maps_variant_to_set_inference_model_command() {
+    fn steward_model_prepare_route_maps_model_to_set_inference_model_command() {
         stable::init_storage();
         stable::set_active_steward(Some(crate::domain::types::StewardState {
             chain_id: 8453,
@@ -1864,18 +1884,13 @@ mod tests {
                 "content-type".to_string(),
                 CONTENT_TYPE_JSON.to_string(),
             )])
-            .with_body(br#"{"variant":"flash"}"#.to_vec())
+            .with_body(br#"{"model":" google/gemini-3-flash-preview "}"#.to_vec())
             .build_update();
         let response = futures::executor::block_on(handle_http_request_update(request));
         assert_eq!(response.status_code(), StatusCode::OK);
 
         let body = serde_json::from_slice::<Value>(response.body())
             .expect("model prepare response should decode");
-        assert_eq!(
-            body.get("variant").and_then(Value::as_str),
-            Some("flash"),
-            "response should preserve canonical model variant"
-        );
         assert_eq!(
             body.get("model").and_then(Value::as_str),
             Some("google/gemini-3-flash-preview")

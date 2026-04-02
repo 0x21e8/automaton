@@ -17,15 +17,16 @@ use crate::domain::types::{
     InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup,
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
     OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, ReflectionMemoryRecord,
-    ReflectionOrigin, RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot, RuntimeView,
-    ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord,
-    SpawnBootstrapView, StewardNonceState, StewardState, StewardStatusView, StorageGrowthMetrics,
-    StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind,
-    StrategyOutcomeStats, StrategyQuarantine, StrategyTemplate, StrategyTemplateKey,
-    SubmitInferenceResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
-    TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState,
-    ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
-    WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    ReflectionOrigin, RetentionConfig, RetentionMaintenanceRuntime, RoomPollingState,
+    RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary,
+    SkillRecord, SpawnBootstrapView, StewardNonceState, StewardState, StewardStatusView,
+    StorageGrowthMetrics, StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent,
+    StrategyOutcomeKind, StrategyOutcomeStats, StrategyQuarantine, StrategyTemplate,
+    StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind,
+    TaskLane, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
+    TemplateRevocationState, ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary,
+    WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
+    WalletBalanceTelemetryView,
 };
 pub use crate::domain::types::{
     AutonomyToolFailureCooldown, MemoryFactSort, MemoryFactStats, RetentionPruneStats,
@@ -1658,6 +1659,11 @@ pub fn set_spawn_bootstrap_metadata(view: SpawnBootstrapView) -> SpawnBootstrapV
     let mut snapshot = runtime_snapshot();
     snapshot.spawn_session_id = view.session_id.clone();
     snapshot.spawn_parent_id = view.parent_id.clone();
+    snapshot.factory_principal = view.factory_principal.map(|value| value.to_text());
+    snapshot.room_poll.configured = snapshot
+        .factory_principal
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
     snapshot.spawn_risk = view.risk;
     snapshot.spawn_strategies = view.strategies.clone();
     snapshot.spawn_skills = view.skills.clone();
@@ -1669,6 +1675,61 @@ pub fn set_spawn_bootstrap_metadata(view: SpawnBootstrapView) -> SpawnBootstrapV
 
 pub fn spawn_bootstrap_view() -> SpawnBootstrapView {
     SpawnBootstrapView::from(&runtime_snapshot())
+}
+
+pub fn factory_principal() -> Option<Principal> {
+    runtime_snapshot()
+        .factory_principal
+        .as_deref()
+        .and_then(|value| Principal::from_text(value).ok())
+}
+
+pub fn room_poll_state() -> RoomPollingState {
+    runtime_snapshot().room_poll
+}
+
+pub fn record_room_poll_success(
+    now_ns: u64,
+    last_seen_seq: Option<u64>,
+    latest_seq: Option<u64>,
+    batch_count: usize,
+) {
+    let mut snapshot = runtime_snapshot();
+    snapshot.room_poll.last_attempted_at_ns = Some(now_ns);
+    snapshot.room_poll.last_succeeded_at_ns = Some(now_ns);
+    snapshot.room_poll.last_known_latest_seq = latest_seq;
+    snapshot.room_poll.last_batch_count = batch_count.try_into().unwrap_or(u32::MAX);
+    if let Some(seq) = last_seen_seq {
+        snapshot.room_poll.last_seen_seq = Some(seq);
+    }
+    snapshot.room_poll.consecutive_failures = 0;
+    snapshot.room_poll.last_error = None;
+    save_runtime_snapshot(&snapshot);
+}
+
+pub fn record_room_poll_error(now_ns: u64, error: String) {
+    let mut snapshot = runtime_snapshot();
+    snapshot.room_poll.last_attempted_at_ns = Some(now_ns);
+    snapshot.room_poll.last_batch_count = 0;
+    snapshot.room_poll.consecutive_failures =
+        snapshot.room_poll.consecutive_failures.saturating_add(1);
+    snapshot.room_poll.last_error = Some(truncate_text_field(&error, MAX_TIMING_ERROR_CHARS));
+    save_runtime_snapshot(&snapshot);
+}
+
+pub fn record_room_post_success(now_ns: u64) {
+    let mut snapshot = runtime_snapshot();
+    snapshot.room_poll.last_post_attempted_at_ns = Some(now_ns);
+    snapshot.room_poll.last_post_succeeded_at_ns = Some(now_ns);
+    snapshot.room_poll.last_post_error = None;
+    save_runtime_snapshot(&snapshot);
+}
+
+pub fn record_room_post_error(now_ns: u64, error: String) {
+    let mut snapshot = runtime_snapshot();
+    snapshot.room_poll.last_post_attempted_at_ns = Some(now_ns);
+    snapshot.room_poll.last_post_error = Some(truncate_text_field(&error, MAX_TIMING_ERROR_CHARS));
+    save_runtime_snapshot(&snapshot);
 }
 
 pub fn installed_version_commit() -> Option<String> {
@@ -4871,6 +4932,55 @@ mod tests {
             reserve_web_search_budget(&format!("turn-{index}"))
                 .unwrap_or_else(|error| panic!("search {index} should succeed: {error}"));
         }
+    }
+
+    #[test]
+    fn spawn_bootstrap_marks_room_poll_configuration() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        let view = set_spawn_bootstrap_metadata(SpawnBootstrapView {
+            session_id: None,
+            parent_id: None,
+            factory_principal: Some(
+                Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                    .expect("test principal should parse"),
+            ),
+            risk: None,
+            strategies: Vec::new(),
+            skills: Vec::new(),
+            version_commit: None,
+        });
+
+        assert_eq!(
+            view.factory_principal,
+            Some(
+                Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                    .expect("test principal should parse"),
+            )
+        );
+        assert!(room_poll_state().configured);
+    }
+
+    #[test]
+    fn room_post_telemetry_tracks_success_and_error_without_bodies() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        record_room_post_error(55, "factory rejected post".to_string());
+        let failed = room_poll_state();
+        assert_eq!(failed.last_post_attempted_at_ns, Some(55));
+        assert_eq!(failed.last_post_succeeded_at_ns, None);
+        assert_eq!(
+            failed.last_post_error.as_deref(),
+            Some("factory rejected post")
+        );
+
+        record_room_post_success(77);
+        let succeeded = room_poll_state();
+        assert_eq!(succeeded.last_post_attempted_at_ns, Some(77));
+        assert_eq!(succeeded.last_post_succeeded_at_ns, Some(77));
+        assert!(succeeded.last_post_error.is_none());
     }
 
     fn sample_reflection_record(index: usize, updated_at_ns: u64) -> ReflectionMemoryRecord {

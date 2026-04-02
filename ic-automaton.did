@@ -432,6 +432,19 @@ type RiskLimits = record {
   max_total_exposure_bps : nat16;
   max_single_action_bps : nat16;
 };
+type RoomPollingState = record {
+  last_batch_count : nat32;
+  last_error : opt text;
+  last_post_error : opt text;
+  last_post_attempted_at_ns : opt nat64;
+  last_attempted_at_ns : opt nat64;
+  last_known_latest_seq : opt nat64;
+  configured : bool;
+  last_seen_seq : opt nat64;
+  consecutive_failures : nat32;
+  last_post_succeeded_at_ns : opt nat64;
+  last_succeeded_at_ns : opt nat64;
+};
 type RuntimeTimingTelemetry = record {
   last_turn_duration_ms : opt nat64;
   inference_outcall : OutcallTimingStats;
@@ -446,6 +459,7 @@ type RuntimeView = record {
   soul : text;
   turn_counter : nat64;
   last_turn_id : opt text;
+  room_poll : RoomPollingState;
   timing_telemetry : RuntimeTimingTelemetry;
   state : AgentState;
   inference_provider : InferenceProvider;
@@ -515,6 +529,7 @@ type SpawnBootstrapArgs = record {
   provider : SpawnProviderBootstrapArgs;
   session_id : text;
   risk : nat8;
+  factory_principal : principal;
   parent_id : opt text;
   version_commit : text;
   skills : vec text;
@@ -524,6 +539,7 @@ type SpawnBootstrapArgs = record {
 type SpawnBootstrapView = record {
   session_id : opt text;
   risk : opt nat8;
+  factory_principal : opt principal;
   parent_id : opt text;
   version_commit : opt text;
   skills : vec text;

@@ -48,6 +48,7 @@ use crate::features::cycle_topup_host::{
 use crate::features::evm::{
     classify_evm_failure, decode_message_queued_payload, fetch_wallet_balance_sync_read,
 };
+use crate::features::factory_room::FactoryRoomClient;
 use crate::features::inference::classify_inference_failure;
 use crate::features::{EvmPoller, HttpEvmPoller};
 use crate::storage::stable;
@@ -59,6 +60,12 @@ use serde_json::json;
 
 /// Maximum inbox messages promoted from pending → staged in one `PollInbox` job.
 const POLL_INBOX_STAGE_BATCH_SIZE: usize = 50;
+
+/// Keep room reads far less frequent than the main external polling loop.
+const ROOM_POLL_INTERVAL_SECS: u64 = timing::DEFAULT_TASK_INTERVAL_SECS * 5;
+
+/// Cap each room catch-up step so chat remains incremental and low-cost.
+const ROOM_POLL_PAGE_LIMIT: u64 = 20;
 
 /// Reference workflow-envelope cost (cycles) used by `CheckCycles` to
 /// estimate the minimum operational floor.
@@ -694,6 +701,95 @@ fn poll_inbox_rpc_due(now_ns: u64, last_poll_at_ns: u64, consecutive_empty_polls
     now_ns >= last_poll_at_ns.saturating_add(min_delay_ns)
 }
 
+fn room_poll_due(now_ns: u64, last_attempted_at_ns: Option<u64>) -> bool {
+    let Some(last_attempted_at_ns) = last_attempted_at_ns else {
+        return true;
+    };
+    let interval_ns = ROOM_POLL_INTERVAL_SECS.saturating_mul(1_000_000_000);
+    now_ns >= last_attempted_at_ns.saturating_add(interval_ns)
+}
+
+async fn maybe_poll_factory_room(now_ns: u64, snapshot: &RuntimeSnapshot) {
+    if snapshot
+        .factory_principal
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return;
+    }
+
+    if !room_poll_due(now_ns, snapshot.room_poll.last_attempted_at_ns) {
+        let next_due_ns = snapshot
+            .room_poll
+            .last_attempted_at_ns
+            .unwrap_or(0)
+            .saturating_add(ROOM_POLL_INTERVAL_SECS.saturating_mul(1_000_000_000));
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_room_poll_skipped reason=due_not_reached now_ns={} next_due_ns={} last_seen_seq={:?}",
+            now_ns,
+            next_due_ns,
+            snapshot.room_poll.last_seen_seq
+        );
+        return;
+    }
+
+    let client = match FactoryRoomClient::from_runtime() {
+        Ok(client) => client,
+        Err(error) => {
+            stable::record_room_poll_error(now_ns, error.clone());
+            log!(
+                SchedulerLogPriority::Error,
+                "scheduler_room_poll_error stage=client_init last_seen_seq={:?} error={}",
+                snapshot.room_poll.last_seen_seq,
+                error
+            );
+            return;
+        }
+    };
+
+    match client
+        .list_my_room_messages(snapshot.room_poll.last_seen_seq, Some(ROOM_POLL_PAGE_LIMIT))
+        .await
+    {
+        Ok(page) => {
+            let fetched = page.messages.len();
+            let last_seen_seq = if page.next_after_seq.is_none() {
+                page.latest_seq
+                    .or_else(|| page.messages.last().map(|message| message.seq))
+                    .or(snapshot.room_poll.last_seen_seq)
+            } else {
+                page.messages
+                    .last()
+                    .map(|message| message.seq)
+                    .or(snapshot.room_poll.last_seen_seq)
+            };
+            let room_head_gap = page
+                .latest_seq
+                .zip(last_seen_seq)
+                .map(|(latest_seq, seen_seq)| latest_seq.saturating_sub(seen_seq));
+            stable::record_room_poll_success(now_ns, last_seen_seq, page.latest_seq, fetched);
+            log!(
+                SchedulerLogPriority::Info,
+                "scheduler_room_poll_success fetched={} last_seen_seq={:?} latest_seq={:?} room_head_gap={:?}",
+                fetched,
+                last_seen_seq,
+                page.latest_seq,
+                room_head_gap
+            );
+        }
+        Err(error) => {
+            stable::record_room_poll_error(now_ns, error.clone());
+            log!(
+                SchedulerLogPriority::Error,
+                "scheduler_room_poll_error stage=list_my_room_messages last_seen_seq={:?} error={}",
+                snapshot.room_poll.last_seen_seq,
+                error
+            );
+        }
+    }
+}
+
 /// Returns the wallet-balance sync interval for the current survival tier,
 /// or `None` if syncing is disabled or the tier prohibits it (Critical / OutOfCycles).
 fn wallet_balance_sync_interval_secs(
@@ -1010,6 +1106,8 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
         ingested_events,
         skipped_duplicate_events
     );
+
+    maybe_poll_factory_room(now_ns, &snapshot).await;
     Ok(())
 }
 
@@ -1354,12 +1452,16 @@ mod tests {
     use crate::domain::types::{
         AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding,
         EvmEvent, InboxMessageSource, InboxMessageStatus, RecoveryOperation, RecoveryPolicyAction,
-        ResponseLimitAdjustment, RetentionConfig, StrategyTemplate, StrategyTemplateKey,
-        SurvivalOperationClass, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
-        TemplateStatus, WalletBalanceSnapshot, WalletBalanceSyncConfig,
+        ResponseLimitAdjustment, RetentionConfig, RoomContentType, RoomMessage, RoomMessagePage,
+        SpawnBootstrapView, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
+        TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateStatus,
+        WalletBalanceSnapshot, WalletBalanceSyncConfig,
     };
     use crate::storage::stable;
     use crate::util::block_on_with_spin;
+    use candid::Principal;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     fn settle_pending_topup_jobs(now_ns: u64) {
         for job in stable::list_recent_jobs(500)
@@ -1415,6 +1517,34 @@ mod tests {
         config.essential = true;
         config.priority = 0;
         stable::upsert_task_config(config);
+    }
+
+    fn test_factory_principal() -> Principal {
+        Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai").expect("test principal should parse")
+    }
+
+    fn configure_factory_room_access() {
+        stable::set_spawn_bootstrap_metadata(SpawnBootstrapView {
+            session_id: None,
+            parent_id: None,
+            factory_principal: Some(test_factory_principal()),
+            risk: None,
+            strategies: Vec::new(),
+            skills: Vec::new(),
+            version_commit: None,
+        });
+    }
+
+    fn sample_room_message(seq: u64) -> RoomMessage {
+        RoomMessage {
+            message_id: format!("room-message-{seq}"),
+            seq,
+            author_canister_id: "um5iw-rqaaa-aaaaq-qaaba-cai".to_string(),
+            created_at: 123_456_789,
+            body: "untrusted room body".to_string(),
+            mentions: vec!["rrkah-fqaaa-aaaaa-aaaaq-cai".to_string()],
+            content_type: RoomContentType::TextPlain,
+        }
     }
 
     fn strategy_key(template_id: &str) -> StrategyTemplateKey {
@@ -2927,5 +3057,205 @@ mod tests {
                 "bootstrap gate must remain set until a successful sync occurs"
             );
         });
+    }
+
+    #[test]
+    fn poll_inbox_job_incrementally_advances_room_cursor() {
+        crate::features::factory_room::clear_mock_factory_room_call();
+        stable::init_storage();
+        configure_factory_room_access();
+
+        let call_count = Rc::new(Cell::new(0u32));
+        let call_count_for_mock = Rc::clone(&call_count);
+        crate::features::factory_room::set_mock_factory_room_call(
+            move |canister_id, method, encoded_args| {
+                call_count_for_mock.set(call_count_for_mock.get().saturating_add(1));
+                assert_eq!(canister_id, test_factory_principal());
+                assert_eq!(method, "list_my_room_messages");
+                let (after_seq, limit): (Option<u64>, Option<u64>) =
+                    candid::decode_args(encoded_args).expect("query args should decode");
+                assert_eq!(after_seq, None);
+                assert_eq!(limit, Some(ROOM_POLL_PAGE_LIMIT));
+
+                candid::encode_one(crate::features::factory_room::FactoryRoomCallResult::Ok(
+                    RoomMessagePage {
+                        messages: vec![sample_room_message(7), sample_room_message(9)],
+                        next_after_seq: Some(9),
+                        latest_seq: Some(12),
+                    },
+                ))
+                .map_err(|error| error.to_string())
+            },
+        );
+
+        block_on_with_spin(run_poll_inbox_job(1_000)).expect("poll job should not fail");
+
+        let room_poll = stable::room_poll_state();
+        assert_eq!(call_count.get(), 1);
+        assert_eq!(room_poll.last_seen_seq, Some(9));
+        assert_eq!(room_poll.last_attempted_at_ns, Some(1_000));
+        assert_eq!(room_poll.last_succeeded_at_ns, Some(1_000));
+        assert_eq!(room_poll.last_known_latest_seq, Some(12));
+        assert_eq!(room_poll.last_batch_count, 2);
+        assert_eq!(room_poll.consecutive_failures, 0);
+        assert!(room_poll.last_error.is_none());
+
+        crate::features::factory_room::clear_mock_factory_room_call();
+    }
+
+    #[test]
+    fn poll_inbox_job_advances_room_cursor_to_head_when_filtered_read_is_caught_up() {
+        crate::features::factory_room::clear_mock_factory_room_call();
+        stable::init_storage();
+        configure_factory_room_access();
+        stable::record_room_poll_success(500, Some(5), Some(5), 1);
+
+        crate::features::factory_room::set_mock_factory_room_call(
+            move |canister_id, method, encoded_args| {
+                assert_eq!(canister_id, test_factory_principal());
+                assert_eq!(method, "list_my_room_messages");
+                let (after_seq, limit): (Option<u64>, Option<u64>) =
+                    candid::decode_args(encoded_args).expect("query args should decode");
+                assert_eq!(after_seq, Some(5));
+                assert_eq!(limit, Some(ROOM_POLL_PAGE_LIMIT));
+
+                candid::encode_one(crate::features::factory_room::FactoryRoomCallResult::Ok(
+                    RoomMessagePage {
+                        messages: vec![sample_room_message(9)],
+                        next_after_seq: None,
+                        latest_seq: Some(15),
+                    },
+                ))
+                .map_err(|error| error.to_string())
+            },
+        );
+
+        let due_now_ns = 500 + ROOM_POLL_INTERVAL_SECS.saturating_mul(1_000_000_000);
+        block_on_with_spin(run_poll_inbox_job(due_now_ns)).expect("poll job should not fail");
+
+        let room_poll = stable::room_poll_state();
+        assert_eq!(room_poll.last_seen_seq, Some(15));
+        assert_eq!(room_poll.last_attempted_at_ns, Some(due_now_ns));
+        assert_eq!(room_poll.last_succeeded_at_ns, Some(due_now_ns));
+        assert_eq!(room_poll.last_known_latest_seq, Some(15));
+        assert_eq!(room_poll.last_batch_count, 1);
+        assert_eq!(room_poll.consecutive_failures, 0);
+        assert!(room_poll.last_error.is_none());
+
+        crate::features::factory_room::clear_mock_factory_room_call();
+    }
+
+    #[test]
+    fn poll_inbox_job_room_poll_tracks_room_head_when_filtered_page_is_empty() {
+        crate::features::factory_room::clear_mock_factory_room_call();
+        stable::init_storage();
+        configure_factory_room_access();
+        stable::record_room_poll_success(500, Some(9), Some(12), 1);
+
+        crate::features::factory_room::set_mock_factory_room_call(
+            move |canister_id, method, encoded_args| {
+                assert_eq!(canister_id, test_factory_principal());
+                assert_eq!(method, "list_my_room_messages");
+                let (after_seq, limit): (Option<u64>, Option<u64>) =
+                    candid::decode_args(encoded_args).expect("query args should decode");
+                assert_eq!(after_seq, Some(9));
+                assert_eq!(limit, Some(ROOM_POLL_PAGE_LIMIT));
+
+                candid::encode_one(crate::features::factory_room::FactoryRoomCallResult::Ok(
+                    RoomMessagePage {
+                        messages: Vec::new(),
+                        next_after_seq: None,
+                        latest_seq: Some(15),
+                    },
+                ))
+                .map_err(|error| error.to_string())
+            },
+        );
+
+        let due_now_ns = 500 + ROOM_POLL_INTERVAL_SECS.saturating_mul(1_000_000_000);
+        block_on_with_spin(run_poll_inbox_job(due_now_ns)).expect("poll job should not fail");
+
+        let room_poll = stable::room_poll_state();
+        assert_eq!(room_poll.last_seen_seq, Some(15));
+        assert_eq!(room_poll.last_attempted_at_ns, Some(due_now_ns));
+        assert_eq!(room_poll.last_succeeded_at_ns, Some(due_now_ns));
+        assert_eq!(room_poll.last_known_latest_seq, Some(15));
+        assert_eq!(room_poll.last_batch_count, 0);
+        assert_eq!(room_poll.consecutive_failures, 0);
+        assert!(room_poll.last_error.is_none());
+
+        crate::features::factory_room::clear_mock_factory_room_call();
+    }
+
+    #[test]
+    fn poll_inbox_job_skips_room_poll_until_interval_elapses() {
+        crate::features::factory_room::clear_mock_factory_room_call();
+        stable::init_storage();
+        configure_factory_room_access();
+        stable::record_room_poll_success(1_000, Some(9), Some(12), 1);
+
+        let call_count = Rc::new(Cell::new(0u32));
+        let call_count_for_mock = Rc::clone(&call_count);
+        crate::features::factory_room::set_mock_factory_room_call(
+            move |_canister_id, _method, _encoded_args| {
+                call_count_for_mock.set(call_count_for_mock.get().saturating_add(1));
+                Err("room poll should not have been attempted".to_string())
+            },
+        );
+
+        let not_due_now_ns = 1_000 + ROOM_POLL_INTERVAL_SECS.saturating_mul(1_000_000_000) - 1;
+        block_on_with_spin(run_poll_inbox_job(not_due_now_ns)).expect("poll job should not fail");
+
+        let room_poll = stable::room_poll_state();
+        assert_eq!(call_count.get(), 0);
+        assert_eq!(room_poll.last_seen_seq, Some(9));
+        assert_eq!(room_poll.last_attempted_at_ns, Some(1_000));
+        assert_eq!(room_poll.last_succeeded_at_ns, Some(1_000));
+        assert_eq!(room_poll.last_known_latest_seq, Some(12));
+        assert_eq!(room_poll.last_batch_count, 1);
+        assert_eq!(room_poll.consecutive_failures, 0);
+        assert!(room_poll.last_error.is_none());
+
+        crate::features::factory_room::clear_mock_factory_room_call();
+    }
+
+    #[test]
+    fn poll_inbox_job_room_read_failures_are_non_fatal() {
+        crate::features::factory_room::clear_mock_factory_room_call();
+        stable::init_storage();
+        configure_factory_room_access();
+        stable::record_room_poll_success(500, Some(9), Some(12), 1);
+
+        crate::features::factory_room::set_mock_factory_room_call(
+            move |canister_id, method, encoded_args| {
+                assert_eq!(canister_id, test_factory_principal());
+                assert_eq!(method, "list_my_room_messages");
+                let (after_seq, limit): (Option<u64>, Option<u64>) =
+                    candid::decode_args(encoded_args).expect("query args should decode");
+                assert_eq!(after_seq, Some(9));
+                assert_eq!(limit, Some(ROOM_POLL_PAGE_LIMIT));
+                Err(
+                    "factory room call rejected: code=5 msg=temporary room read failure"
+                        .to_string(),
+                )
+            },
+        );
+
+        let due_now_ns = 500 + ROOM_POLL_INTERVAL_SECS.saturating_mul(1_000_000_000);
+        block_on_with_spin(run_poll_inbox_job(due_now_ns)).expect("poll job should not fail");
+
+        let room_poll = stable::room_poll_state();
+        assert_eq!(room_poll.last_seen_seq, Some(9));
+        assert_eq!(room_poll.last_attempted_at_ns, Some(due_now_ns));
+        assert_eq!(room_poll.last_succeeded_at_ns, Some(500));
+        assert_eq!(room_poll.last_known_latest_seq, Some(12));
+        assert_eq!(room_poll.last_batch_count, 0);
+        assert_eq!(room_poll.consecutive_failures, 1);
+        assert_eq!(
+            room_poll.last_error.as_deref(),
+            Some("factory room call rejected: code=5 msg=temporary room read failure")
+        );
+
+        crate::features::factory_room::clear_mock_factory_room_call();
     }
 }

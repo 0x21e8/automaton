@@ -915,15 +915,15 @@ function buildHelpLines() {
         cls: "system",
       },
       {
-        text: "  steward-model <variant>    Set inference model variant (signed command)",
+        text: "  steward-model <model>      Set inference model name (signed command)",
         cls: "system",
       },
       {
-        text: "       variants: flash|mini  flash->google/gemini-3-flash-preview",
+        text: "       example: google/gemini-3-flash-preview",
         cls: "system dim",
       },
       {
-        text: "                              mini->openai/gpt-4o-mini",
+        text: "                openai/gpt-4o-mini",
         cls: "system dim",
       },
       {
@@ -2133,10 +2133,10 @@ async function cmdStewardSend(args) {
 async function cmdStewardModel(positional) {
   printEmpty();
 
-  const variant = String(positional?.[0] ?? "").trim().toLowerCase();
-  if (!variant) {
-    printError("Usage: steward-model <variant>");
-    printLine("Variants: flash | mini", "system dim");
+  const model = positional.map((part) => String(part ?? "")).join(" ").trim();
+  if (!model) {
+    printError("Usage: steward-model <model>");
+    printLine("Example: steward-model google/gemini-3-flash-preview", "system dim");
     printEmpty();
     return;
   }
@@ -2147,17 +2147,16 @@ async function cmdStewardModel(positional) {
 
   const signed = await runSignedStewardCommand({
     preparePath: "/api/steward/model/prepare",
-    prepareBody: { variant },
+    prepareBody: { model },
     executePath: "/api/steward/model/execute",
     commandName: "SetInferenceModel",
     describePrepared: (prepared, proofTemplate) => [
-      `VARIANT: ${String(prepared?.variant ?? variant)}`,
-      `MODEL: ${String(prepared?.model ?? "")}`,
+      `MODEL: ${String(prepared?.model ?? model)}`,
       `NONCE: ${proofTemplate.nonce ?? "?"}`,
       `EXPIRES AT (ns): ${proofTemplate.expires_at_ns ?? "?"}`,
     ],
     buildExecutePayload: (_prepared, proofTemplate, signature) => ({
-      variant,
+      model,
       proof: {
         ...proofTemplate,
         signature,

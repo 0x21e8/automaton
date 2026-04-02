@@ -17,6 +17,7 @@ pub mod canister_call;
 pub mod cycle_topup;
 pub mod cycle_topup_host;
 pub mod evm;
+pub mod factory_room;
 pub mod http_fetch;
 pub mod inference;
 pub mod signer;

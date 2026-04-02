@@ -24,6 +24,7 @@ struct SpawnBootstrapArgs {
     steward_address: String,
     session_id: String,
     parent_id: Option<String>,
+    factory_principal: Principal,
     risk: u8,
     strategies: Vec<String>,
     skills: Vec<String>,
@@ -98,6 +99,17 @@ struct RuntimeView {
     inference_model: String,
 }
 
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct SpawnBootstrapView {
+    session_id: Option<String>,
+    parent_id: Option<String>,
+    factory_principal: Option<Principal>,
+    risk: Option<u8>,
+    strategies: Vec<String>,
+    skills: Vec<String>,
+    version_commit: Option<String>,
+}
+
 fn assert_wasm_artifact_present() -> Vec<u8> {
     for path in WASM_PATHS {
         if Path::new(path).exists() {
@@ -151,6 +163,8 @@ fn init_spawn_bootstrap_sets_steward_and_persists_factory_metadata() {
             steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             parent_id: Some("parent-automaton".to_string()),
+            factory_principal: Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                .expect("factory principal should parse"),
             risk: 4,
             strategies: vec!["carry".to_string()],
             skills: vec!["messaging".to_string()],
@@ -168,6 +182,8 @@ fn init_spawn_bootstrap_sets_steward_and_persists_factory_metadata() {
 
     let steward_status: StewardStatusView = call_query(&pic, canister_id, "get_steward_status");
     let runtime_view: RuntimeView = call_query(&pic, canister_id, "get_runtime_view");
+    let bootstrap_view: SpawnBootstrapView =
+        call_query(&pic, canister_id, "get_spawn_bootstrap_view");
 
     let steward = steward_status
         .active_steward
@@ -185,4 +201,19 @@ fn init_spawn_bootstrap_sets_steward_and_persists_factory_metadata() {
         InferenceProvider::OpenRouter
     );
     assert_eq!(runtime_view.inference_model, "openai/gpt-4o-mini");
+    assert_eq!(
+        bootstrap_view,
+        SpawnBootstrapView {
+            session_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            parent_id: Some("parent-automaton".to_string()),
+            factory_principal: Some(
+                Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                    .expect("factory principal should parse"),
+            ),
+            risk: Some(4),
+            strategies: vec!["carry".to_string()],
+            skills: vec!["messaging".to_string()],
+            version_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        }
+    );
 }
