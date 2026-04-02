@@ -9,9 +9,14 @@ import { themeTokens } from "../../theme/tokens";
 const CELL_SIZE = 10;
 const CELL_GAP = 1;
 const CELL_FULL = CELL_SIZE + CELL_GAP;
-const BASE_LAYOUT_WIDTH = 880;
-const BASE_LAYOUT_HEIGHT = 520;
-const MAX_LAYOUT_SCALE = 1.15;
+const DEFAULT_CAMERA_ZOOM = 0.95;
+const MIN_CAMERA_ZOOM = 0.35;
+const MAX_CAMERA_ZOOM = 1.8;
+const MIN_NODE_RADIUS_PX = 26;
+const NODE_COLLISION_PADDING_PX = 12;
+const NODE_COLLISION_ITERATIONS = 18;
+const CAMERA_SPRING_FACTOR = 0.08;
+const CLICK_DRAG_THRESHOLD_PX = 6;
 
 interface AutomatonCanvasProps {
   automatons: readonly AutomatonSummary[];
@@ -41,13 +46,28 @@ interface RenderNode {
   cx: number;
   cy: number;
   radiusCells: number;
+  radiusPixels: number;
 }
 
-export function getCanvasLayoutScale(width: number, height: number): number {
-  return Math.min(
-    Math.min(width / BASE_LAYOUT_WIDTH, height / BASE_LAYOUT_HEIGHT),
-    MAX_LAYOUT_SCALE
-  );
+interface CameraState {
+  centerX: number;
+  centerY: number;
+  zoom: number;
+}
+
+interface ViewportSnapshot {
+  width: number;
+  height: number;
+}
+
+interface ProjectedNode {
+  automaton: AutomatonSummary;
+  baseCx: number;
+  baseCy: number;
+  cx: number;
+  cy: number;
+  radiusCells: number;
+  radiusPixels: number;
 }
 
 function hexToRgba(hex: string, alpha: number): string {
@@ -167,40 +187,156 @@ function buildCoreCells(
   return [...cells.values()];
 }
 
-function buildRenderNodes(
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function getAutomatonWorldPosition(automaton: AutomatonSummary) {
+  return {
+    x: automaton.gridPosition.x * CELL_FULL,
+    y: automaton.gridPosition.y * CELL_FULL
+  };
+}
+
+function hashString(value: string): number {
+  let hash = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash << 5) - hash + value.charCodeAt(index);
+    hash |= 0;
+  }
+
+  return Math.abs(hash);
+}
+
+function createProjectedNodes(
   automatons: readonly AutomatonSummary[],
-  width: number,
-  height: number
-): RenderNode[] {
+  camera: CameraState,
+  viewport: ViewportSnapshot
+): ProjectedNode[] {
   if (automatons.length === 0) {
     return [];
   }
 
-  const xs = automatons.map((entry) => entry.gridPosition.x);
-  const ys = automatons.map((entry) => entry.gridPosition.y);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
-  const padding = 8 * CELL_FULL;
-  const gridWidth = Math.max(maxX - minX + 14, 24);
-  const gridHeight = Math.max(maxY - minY + 14, 18);
-  const scale = Math.min(
-    Math.min(
-      (width - padding * 2) / (gridWidth * CELL_FULL),
-      (height - padding * 2) / (gridHeight * CELL_FULL)
-    ),
-    MAX_LAYOUT_SCALE
-  );
-  const offsetX = (width - gridWidth * CELL_FULL * scale) / 2;
-  const offsetY = (height - gridHeight * CELL_FULL * scale) / 2;
+  return [...automatons]
+    .sort((left, right) => left.canisterId.localeCompare(right.canisterId))
+    .map((automaton) => {
+      const radiusCells = computeRadiusCells(automaton);
+      const radiusPixels = Math.max(
+        radiusCells * CELL_FULL * camera.zoom,
+        MIN_NODE_RADIUS_PX
+      );
+      const worldPosition = getAutomatonWorldPosition(automaton);
+      const cx =
+        viewport.width / 2 + (worldPosition.x - camera.centerX) * camera.zoom;
+      const cy =
+        viewport.height / 2 + (worldPosition.y - camera.centerY) * camera.zoom;
 
-  return automatons.map((automaton) => ({
-    automaton,
-    cx: offsetX + (automaton.gridPosition.x - minX + 7) * CELL_FULL * scale,
-    cy: offsetY + (automaton.gridPosition.y - minY + 7) * CELL_FULL * scale,
-    radiusCells: computeRadiusCells(automaton)
+      return {
+        automaton,
+        baseCx: cx,
+        baseCy: cy,
+        cx,
+        cy,
+        radiusCells,
+        radiusPixels
+      };
+    });
+}
+
+function resolveProjectedNodeOverlaps(
+  projectedNodes: readonly ProjectedNode[]
+): RenderNode[] {
+  const resolvedNodes = projectedNodes.map((node) => ({ ...node }));
+
+  for (let iteration = 0; iteration < NODE_COLLISION_ITERATIONS; iteration += 1) {
+    for (const node of resolvedNodes) {
+      node.cx += (node.baseCx - node.cx) * CAMERA_SPRING_FACTOR;
+      node.cy += (node.baseCy - node.cy) * CAMERA_SPRING_FACTOR;
+    }
+
+    for (let index = 0; index < resolvedNodes.length; index += 1) {
+      const current = resolvedNodes[index];
+
+      for (
+        let otherIndex = index + 1;
+        otherIndex < resolvedNodes.length;
+        otherIndex += 1
+      ) {
+        const other = resolvedNodes[otherIndex];
+        const dx = other.cx - current.cx;
+        const dy = other.cy - current.cy;
+        const distance = Math.hypot(dx, dy);
+        const minimumDistance =
+          current.radiusPixels + other.radiusPixels + NODE_COLLISION_PADDING_PX;
+
+        if (distance >= minimumDistance) {
+          continue;
+        }
+
+        let normalX = 0;
+        let normalY = 0;
+
+        if (distance < 0.001) {
+          const angle =
+            ((hashString(`${current.automaton.canisterId}:${other.automaton.canisterId}`) %
+              360) *
+              Math.PI) /
+            180;
+          normalX = Math.cos(angle);
+          normalY = Math.sin(angle);
+        } else {
+          normalX = dx / distance;
+          normalY = dy / distance;
+        }
+
+        const push = (minimumDistance - Math.max(distance, 1)) / 2;
+
+        current.cx -= normalX * push;
+        current.cy -= normalY * push;
+        other.cx += normalX * push;
+        other.cy += normalY * push;
+      }
+    }
+  }
+
+  return resolvedNodes.map((node) => ({
+    automaton: node.automaton,
+    cx: node.cx,
+    cy: node.cy,
+    radiusCells: node.radiusCells,
+    radiusPixels: node.radiusPixels
   }));
+}
+
+function getViewportCenter(
+  automatons: readonly AutomatonSummary[]
+): Pick<CameraState, "centerX" | "centerY"> {
+  if (automatons.length === 0) {
+    return {
+      centerX: 0,
+      centerY: 0
+    };
+  }
+
+  const positions = automatons.map(getAutomatonWorldPosition);
+  const xs = positions.map((position) => position.x);
+  const ys = positions.map((position) => position.y);
+
+  return {
+    centerX: (Math.min(...xs) + Math.max(...xs)) / 2,
+    centerY: (Math.min(...ys) + Math.max(...ys)) / 2
+  };
+}
+
+export function buildRenderNodes(
+  automatons: readonly AutomatonSummary[],
+  camera: CameraState,
+  viewport: ViewportSnapshot
+): RenderNode[] {
+  return resolveProjectedNodeOverlaps(
+    createProjectedNodes(automatons, camera, viewport)
+  );
 }
 
 function drawManhattanPath(
@@ -226,13 +362,47 @@ export function AutomatonCanvas({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const hitAreasRef = useRef<HitArea[]>([]);
+  const cameraRef = useRef<CameraState>({
+    centerX: 0,
+    centerY: 0,
+    zoom: DEFAULT_CAMERA_ZOOM
+  });
+  const cameraInitializedRef = useRef(false);
+  const interactionRef = useRef<{
+    pointerId: number | null;
+    lastClientX: number;
+    lastClientY: number;
+    totalMovement: number;
+    suppressClick: boolean;
+  }>({
+    pointerId: null,
+    lastClientX: 0,
+    lastClientY: 0,
+    totalMovement: 0,
+    suppressClick: false
+  });
   const [hoveredCanisterId, setHoveredCanisterId] = useState<string | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
   const [tooltip, setTooltip] = useState<TooltipState>({
     left: 0,
     top: 0,
     label: "",
     visible: false
   });
+
+  useEffect(() => {
+    if (cameraInitializedRef.current || automatons.length === 0) {
+      return;
+    }
+
+    const center = getViewportCenter(automatons);
+    cameraRef.current = {
+      centerX: center.centerX,
+      centerY: center.centerY,
+      zoom: DEFAULT_CAMERA_ZOOM
+    };
+    cameraInitializedRef.current = true;
+  }, [automatons]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -282,16 +452,26 @@ export function AutomatonCanvas({
     const render = (time: number) => {
       const timeSeconds = time / 1000;
       drawingContext.clearRect(0, 0, width, height);
-      const layoutScale = getCanvasLayoutScale(width, height);
+      const camera = cameraRef.current;
+      const scaledCell = CELL_FULL * camera.zoom;
+      const gridStepMultiplier = Math.max(
+        1,
+        Math.ceil(14 / Math.max(scaledCell, 1))
+      );
+      const gridSpacing = scaledCell * gridStepMultiplier;
+      const gridOffsetX =
+        ((width / 2 - camera.centerX * camera.zoom) % gridSpacing) + gridSpacing;
+      const gridOffsetY =
+        ((height / 2 - camera.centerY * camera.zoom) % gridSpacing) + gridSpacing;
 
       drawingContext.fillStyle = themeTokens.colors.gridDot;
-      for (let y = 0; y < height; y += CELL_FULL) {
-        for (let x = 0; x < width; x += CELL_FULL) {
+      for (let y = gridOffsetY % gridSpacing; y < height; y += gridSpacing) {
+        for (let x = gridOffsetX % gridSpacing; x < width; x += gridSpacing) {
           drawingContext.fillRect(x + 3, y + 3, 3, 3);
         }
       }
 
-      const nodes = buildRenderNodes(automatons, width, height);
+      const nodes = buildRenderNodes(automatons, camera, { width, height });
       const nodeById = new Map(
         nodes.map((node) => [node.automaton.canisterId, node] as const)
       );
@@ -321,10 +501,7 @@ export function AutomatonCanvas({
         const selected = selectedCanisterId === node.automaton.canisterId;
         const color = getTierColor(node.automaton.tier);
         const pulse = 0.55 + Math.sin(timeSeconds * 2 + node.cx * 0.01) * 0.18;
-        const radiusPixels = Math.max(
-          node.radiusCells * CELL_FULL * layoutScale,
-          26
-        );
+        const radiusPixels = node.radiusPixels;
 
         nextHitAreas.push({
           canisterId: node.automaton.canisterId,
@@ -349,9 +526,9 @@ export function AutomatonCanvas({
         for (const cell of liveCells) {
           const alpha = cell.isCore ? 0.82 : pulse * 0.72;
           const jitter = cell.isCore ? 0 : Math.sin(timeSeconds * 4 + cell.dx * 2 + cell.dy) * 0.4;
-          const size = Math.max(2, (CELL_SIZE + jitter) * layoutScale);
-          const x = node.cx + cell.dx * CELL_FULL * layoutScale - size / 2;
-          const y = node.cy + cell.dy * CELL_FULL * layoutScale - size / 2;
+          const size = Math.max(2, (CELL_SIZE + jitter) * camera.zoom);
+          const x = node.cx + cell.dx * CELL_FULL * camera.zoom - size / 2;
+          const y = node.cy + cell.dy * CELL_FULL * camera.zoom - size / 2;
 
           drawingContext.fillStyle = hexToRgba(color, alpha);
           drawingContext.fillRect(x, y, size, size);
@@ -427,8 +604,13 @@ export function AutomatonCanvas({
     <div className="canvas-shell">
       <div
         aria-label="Automaton grid"
-        className="canvas-wrap"
+        className={`canvas-wrap${isPanning ? " is-panning" : ""}`}
         onClick={(event) => {
+          if (interactionRef.current.suppressClick) {
+            interactionRef.current.suppressClick = false;
+            return;
+          }
+
           const hit = findHit(event.clientX, event.clientY);
 
           if (hit !== undefined) {
@@ -436,19 +618,104 @@ export function AutomatonCanvas({
           }
         }}
         onMouseLeave={() => {
+          if (interactionRef.current.pointerId !== null) {
+            return;
+          }
+
           setHoveredCanisterId(null);
           setTooltip((previous) => ({ ...previous, visible: false }));
         }}
         onMouseMove={(event) => {
+          if (interactionRef.current.pointerId !== null) {
+            return;
+          }
+
           updateHover(event.clientX, event.clientY);
+        }}
+        onPointerCancel={() => {
+          interactionRef.current.pointerId = null;
+          interactionRef.current.suppressClick =
+            interactionRef.current.totalMovement > CLICK_DRAG_THRESHOLD_PX;
+          setIsPanning(false);
+        }}
+        onPointerDown={(event) => {
+          if (event.button !== 0) {
+            return;
+          }
+
+          interactionRef.current.pointerId = event.pointerId;
+          interactionRef.current.lastClientX = event.clientX;
+          interactionRef.current.lastClientY = event.clientY;
+          interactionRef.current.totalMovement = 0;
+          interactionRef.current.suppressClick = false;
+          setIsPanning(true);
+          setHoveredCanisterId(null);
+          setTooltip((previous) => ({ ...previous, visible: false }));
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          if (interactionRef.current.pointerId !== event.pointerId) {
+            return;
+          }
+
+          const deltaX = event.clientX - interactionRef.current.lastClientX;
+          const deltaY = event.clientY - interactionRef.current.lastClientY;
+
+          interactionRef.current.lastClientX = event.clientX;
+          interactionRef.current.lastClientY = event.clientY;
+          interactionRef.current.totalMovement += Math.hypot(deltaX, deltaY);
+
+          cameraRef.current = {
+            ...cameraRef.current,
+            centerX: cameraRef.current.centerX - deltaX / cameraRef.current.zoom,
+            centerY: cameraRef.current.centerY - deltaY / cameraRef.current.zoom
+          };
+        }}
+        onPointerUp={(event) => {
+          if (interactionRef.current.pointerId !== event.pointerId) {
+            return;
+          }
+
+          interactionRef.current.pointerId = null;
+          interactionRef.current.suppressClick =
+            interactionRef.current.totalMovement > CLICK_DRAG_THRESHOLD_PX;
+          setIsPanning(false);
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        onWheel={(event) => {
+          event.preventDefault();
+
+          const rect = event.currentTarget.getBoundingClientRect();
+          const pointerX = event.clientX - rect.left;
+          const pointerY = event.clientY - rect.top;
+          const { centerX, centerY, zoom } = cameraRef.current;
+          const nextZoom = clamp(
+            zoom * Math.exp(-event.deltaY * 0.0014),
+            MIN_CAMERA_ZOOM,
+            MAX_CAMERA_ZOOM
+          );
+
+          const worldX = centerX + (pointerX - rect.width / 2) / zoom;
+          const worldY = centerY + (pointerY - rect.height / 2) / zoom;
+
+          cameraRef.current = {
+            centerX: worldX - (pointerX - rect.width / 2) / nextZoom,
+            centerY: worldY - (pointerY - rect.height / 2) / nextZoom,
+            zoom: nextZoom
+          };
+          setTooltip((previous) => ({ ...previous, visible: false }));
         }}
         ref={containerRef}
       >
         <canvas className="automaton-canvas" ref={canvasRef} />
         <button
           className="canvas-spawn-button"
-          onClick={() => {
+          onClick={(event) => {
+            event.stopPropagation();
             onSpawn();
+          }}
+          onPointerDown={(event) => {
+            event.stopPropagation();
           }}
           type="button"
         >

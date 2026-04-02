@@ -384,7 +384,8 @@ h2 {
   margin-inline: auto;
   overflow: hidden;
   background: var(--color-bg, #f0ece4);
-  cursor: crosshair;
+  cursor: grab;
+  touch-action: none;
 }
 
 .canvas-wrap::before {
@@ -395,6 +396,10 @@ h2 {
   background:
     radial-gradient(circle at center, rgba(230, 51, 18, 0.035), transparent 55%),
     linear-gradient(180deg, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0));
+}
+
+.canvas-wrap.is-panning {
+  cursor: grabbing;
 }
 
 .automaton-canvas {
