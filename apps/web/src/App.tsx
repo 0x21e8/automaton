@@ -18,6 +18,7 @@ export default function App() {
   const [selectedCanisterId, setSelectedCanisterId] = useState<string | null>(
     null
   );
+  const [focusedCanisterId, setFocusedCanisterId] = useState<string | null>(null);
   const [spawnWizardOpen, setSpawnWizardOpen] = useState(false);
   const wallet = useWalletSession();
   const playground = usePlayground();
@@ -60,6 +61,18 @@ export default function App() {
       setSelectedCanisterId(null);
     }
   }, [selectedCanisterId, visibleAutomatons]);
+
+  useEffect(() => {
+    if (
+      focusedCanisterId === null ||
+      !visibleAutomatons.some((entry) => entry.canisterId === focusedCanisterId)
+    ) {
+      return;
+    }
+
+    setSelectedCanisterId(focusedCanisterId);
+    setFocusedCanisterId(null);
+  }, [focusedCanisterId, visibleAutomatons]);
 
   useEffect(() => {
     if (selectedCanisterId === null) {
@@ -149,6 +162,7 @@ export default function App() {
         <div className="shell-stage">
           <AutomatonCanvas
             automatons={visibleAutomatons}
+            focusCanisterId={focusedCanisterId}
             onSpawn={() => {
               setSpawnWizardOpen(true);
             }}
@@ -186,7 +200,9 @@ export default function App() {
         onClose={() => {
           setSpawnWizardOpen(false);
         }}
-        onSpawned={() => {
+        onSpawned={(canisterId) => {
+          setSpawnWizardOpen(false);
+          setFocusedCanisterId(canisterId);
           refreshAutomatons();
         }}
         playgroundError={playground.error}

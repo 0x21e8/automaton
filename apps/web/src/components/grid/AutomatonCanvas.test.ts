@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AutomatonSummary } from "@ic-automaton/shared";
 
-import { buildRenderNodes } from "./AutomatonCanvas";
+import { buildRenderNodes, createFocusCameraState } from "./AutomatonCanvas";
 
 function createAutomaton(
   canisterId: string,
@@ -71,5 +71,23 @@ describe("buildRenderNodes", () => {
     expect(distance).toBeGreaterThanOrEqual(
       nodes[0].radiusPixels + nodes[1].radiusPixels + 11.5
     );
+  });
+});
+
+describe("createFocusCameraState", () => {
+  it("centers the camera on the requested automaton and zooms in for the focus animation", () => {
+    const camera = createFocusCameraState(createAutomaton("gamma", 12, 7, "8000"), 0.7);
+
+    expect(camera).toEqual({
+      centerX: 132,
+      centerY: 77,
+      zoom: 1.2
+    });
+  });
+
+  it("preserves a tighter manual zoom when focusing a new automaton", () => {
+    const camera = createFocusCameraState(createAutomaton("delta", 4, 9, "8000"), 1.5);
+
+    expect(camera.zoom).toBe(1.5);
   });
 });

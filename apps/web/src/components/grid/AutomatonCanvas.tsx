@@ -10,6 +10,7 @@ const CELL_SIZE = 10;
 const CELL_GAP = 1;
 const CELL_FULL = CELL_SIZE + CELL_GAP;
 const DEFAULT_CAMERA_ZOOM = 0.95;
+const FOCUS_CAMERA_ZOOM = 1.2;
 const MIN_CAMERA_ZOOM = 0.35;
 const MAX_CAMERA_ZOOM = 1.8;
 const MIN_NODE_RADIUS_PX = 26;
@@ -20,6 +21,7 @@ const CLICK_DRAG_THRESHOLD_PX = 6;
 
 interface AutomatonCanvasProps {
   automatons: readonly AutomatonSummary[];
+  focusCanisterId?: string | null;
   onSpawn: () => void;
   selectedCanisterId: string | null;
   statusNotice: string | null;
@@ -191,10 +193,25 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
-function getAutomatonWorldPosition(automaton: AutomatonSummary) {
+function getAutomatonWorldPosition(
+  automaton: Pick<AutomatonSummary, "gridPosition">
+) {
   return {
     x: automaton.gridPosition.x * CELL_FULL,
     y: automaton.gridPosition.y * CELL_FULL
+  };
+}
+
+export function createFocusCameraState(
+  automaton: Pick<AutomatonSummary, "gridPosition">,
+  currentZoom: number
+): CameraState {
+  const worldPosition = getAutomatonWorldPosition(automaton);
+
+  return {
+    centerX: worldPosition.x,
+    centerY: worldPosition.y,
+    zoom: clamp(Math.max(currentZoom, FOCUS_CAMERA_ZOOM), MIN_CAMERA_ZOOM, MAX_CAMERA_ZOOM)
   };
 }
 
@@ -353,6 +370,7 @@ function drawManhattanPath(
 
 export function AutomatonCanvas({
   automatons,
+  focusCanisterId = null,
   onSpawn,
   selectedCanisterId,
   statusNotice,
@@ -363,6 +381,11 @@ export function AutomatonCanvas({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const hitAreasRef = useRef<HitArea[]>([]);
   const cameraRef = useRef<CameraState>({
+    centerX: 0,
+    centerY: 0,
+    zoom: DEFAULT_CAMERA_ZOOM
+  });
+  const cameraTargetRef = useRef<CameraState>({
     centerX: 0,
     centerY: 0,
     zoom: DEFAULT_CAMERA_ZOOM
@@ -391,18 +414,45 @@ export function AutomatonCanvas({
   });
 
   useEffect(() => {
-    if (cameraInitializedRef.current || automatons.length === 0) {
+    if (
+      cameraInitializedRef.current ||
+      automatons.length === 0 ||
+      focusCanisterId !== null
+    ) {
       return;
     }
 
     const center = getViewportCenter(automatons);
-    cameraRef.current = {
+    const nextCamera = {
       centerX: center.centerX,
       centerY: center.centerY,
       zoom: DEFAULT_CAMERA_ZOOM
     };
+    cameraRef.current = nextCamera;
+    cameraTargetRef.current = nextCamera;
     cameraInitializedRef.current = true;
-  }, [automatons]);
+  }, [automatons, focusCanisterId]);
+
+  useEffect(() => {
+    if (focusCanisterId === null) {
+      return;
+    }
+
+    const focusedAutomaton = automatons.find(
+      (entry) => entry.canisterId === focusCanisterId
+    );
+
+    if (focusedAutomaton === undefined) {
+      return;
+    }
+
+    cameraTargetRef.current = createFocusCameraState(
+      focusedAutomaton,
+      cameraTargetRef.current.zoom
+    );
+    cameraInitializedRef.current = true;
+    setTooltip((previous) => ({ ...previous, visible: false }));
+  }, [automatons, focusCanisterId]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -453,6 +503,24 @@ export function AutomatonCanvas({
       const timeSeconds = time / 1000;
       drawingContext.clearRect(0, 0, width, height);
       const camera = cameraRef.current;
+      const cameraTarget = cameraTargetRef.current;
+
+      camera.centerX += (cameraTarget.centerX - camera.centerX) * CAMERA_SPRING_FACTOR;
+      camera.centerY += (cameraTarget.centerY - camera.centerY) * CAMERA_SPRING_FACTOR;
+      camera.zoom += (cameraTarget.zoom - camera.zoom) * CAMERA_SPRING_FACTOR;
+
+      if (Math.abs(cameraTarget.centerX - camera.centerX) < 0.1) {
+        camera.centerX = cameraTarget.centerX;
+      }
+
+      if (Math.abs(cameraTarget.centerY - camera.centerY) < 0.1) {
+        camera.centerY = cameraTarget.centerY;
+      }
+
+      if (Math.abs(cameraTarget.zoom - camera.zoom) < 0.001) {
+        camera.zoom = cameraTarget.zoom;
+      }
+
       const scaledCell = CELL_FULL * camera.zoom;
       const gridStepMultiplier = Math.max(
         1,
@@ -670,6 +738,7 @@ export function AutomatonCanvas({
             centerX: cameraRef.current.centerX - deltaX / cameraRef.current.zoom,
             centerY: cameraRef.current.centerY - deltaY / cameraRef.current.zoom
           };
+          cameraTargetRef.current = cameraRef.current;
         }}
         onPointerUp={(event) => {
           if (interactionRef.current.pointerId !== event.pointerId) {
@@ -698,11 +767,13 @@ export function AutomatonCanvas({
           const worldX = centerX + (pointerX - rect.width / 2) / zoom;
           const worldY = centerY + (pointerY - rect.height / 2) / zoom;
 
-          cameraRef.current = {
+          const nextCamera = {
             centerX: worldX - (pointerX - rect.width / 2) / nextZoom,
             centerY: worldY - (pointerY - rect.height / 2) / nextZoom,
             zoom: nextZoom
           };
+          cameraRef.current = nextCamera;
+          cameraTargetRef.current = nextCamera;
           setTooltip((previous) => ({ ...previous, visible: false }));
         }}
         ref={containerRef}
