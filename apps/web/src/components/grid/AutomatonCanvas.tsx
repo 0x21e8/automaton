@@ -499,6 +499,35 @@ export function AutomatonCanvas({
 
     observer.observe(containerElement);
 
+    const handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+
+      const rect = containerElement.getBoundingClientRect();
+      const pointerX = event.clientX - rect.left;
+      const pointerY = event.clientY - rect.top;
+      const { centerX, centerY, zoom } = cameraRef.current;
+      const nextZoom = clamp(
+        zoom * Math.exp(-event.deltaY * 0.0014),
+        MIN_CAMERA_ZOOM,
+        MAX_CAMERA_ZOOM
+      );
+
+      const worldX = centerX + (pointerX - rect.width / 2) / zoom;
+      const worldY = centerY + (pointerY - rect.height / 2) / zoom;
+
+      const nextCamera = {
+        centerX: worldX - (pointerX - rect.width / 2) / nextZoom,
+        centerY: worldY - (pointerY - rect.height / 2) / nextZoom,
+        zoom: nextZoom
+      };
+
+      cameraRef.current = nextCamera;
+      cameraTargetRef.current = nextCamera;
+      setTooltip((previous) => ({ ...previous, visible: false }));
+    };
+
+    containerElement.addEventListener("wheel", handleWheel, { passive: false });
+
     const render = (time: number) => {
       const timeSeconds = time / 1000;
       drawingContext.clearRect(0, 0, width, height);
@@ -621,6 +650,7 @@ export function AutomatonCanvas({
     animationFrame = window.requestAnimationFrame(render);
 
     return () => {
+      containerElement.removeEventListener("wheel", handleWheel);
       observer.disconnect();
       window.cancelAnimationFrame(animationFrame);
     };
@@ -750,31 +780,6 @@ export function AutomatonCanvas({
             interactionRef.current.totalMovement > CLICK_DRAG_THRESHOLD_PX;
           setIsPanning(false);
           event.currentTarget.releasePointerCapture(event.pointerId);
-        }}
-        onWheel={(event) => {
-          event.preventDefault();
-
-          const rect = event.currentTarget.getBoundingClientRect();
-          const pointerX = event.clientX - rect.left;
-          const pointerY = event.clientY - rect.top;
-          const { centerX, centerY, zoom } = cameraRef.current;
-          const nextZoom = clamp(
-            zoom * Math.exp(-event.deltaY * 0.0014),
-            MIN_CAMERA_ZOOM,
-            MAX_CAMERA_ZOOM
-          );
-
-          const worldX = centerX + (pointerX - rect.width / 2) / zoom;
-          const worldY = centerY + (pointerY - rect.height / 2) / zoom;
-
-          const nextCamera = {
-            centerX: worldX - (pointerX - rect.width / 2) / nextZoom,
-            centerY: worldY - (pointerY - rect.height / 2) / nextZoom,
-            zoom: nextZoom
-          };
-          cameraRef.current = nextCamera;
-          cameraTargetRef.current = nextCamera;
-          setTooltip((previous) => ({ ...previous, visible: false }));
         }}
         ref={containerRef}
       >
