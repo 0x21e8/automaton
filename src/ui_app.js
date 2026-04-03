@@ -2133,8 +2133,8 @@ async function cmdStewardSend(args) {
 async function cmdStewardModel(positional) {
   printEmpty();
 
-  const model = positional.map((part) => String(part ?? "")).join(" ").trim();
-  if (!model) {
+  const requestedModel = positional.map((part) => String(part ?? "")).join(" ").trim();
+  if (!requestedModel) {
     printError("Usage: steward-model <model>");
     printLine("Example: steward-model google/gemini-3-flash-preview", "system dim");
     printEmpty();
@@ -2147,16 +2147,16 @@ async function cmdStewardModel(positional) {
 
   const signed = await runSignedStewardCommand({
     preparePath: "/api/steward/model/prepare",
-    prepareBody: { model },
+    prepareBody: { model: requestedModel },
     executePath: "/api/steward/model/execute",
     commandName: "SetInferenceModel",
     describePrepared: (prepared, proofTemplate) => [
-      `MODEL: ${String(prepared?.model ?? model)}`,
+      `MODEL: ${String(prepared?.model ?? requestedModel)}`,
       `NONCE: ${proofTemplate.nonce ?? "?"}`,
       `EXPIRES AT (ns): ${proofTemplate.expires_at_ns ?? "?"}`,
     ],
     buildExecutePayload: (_prepared, proofTemplate, signature) => ({
-      model,
+      model: requestedModel,
       proof: {
         ...proofTemplate,
         signature,
@@ -2169,9 +2169,9 @@ async function cmdStewardModel(positional) {
 
   printEmpty();
   printSuccess("Steward model command applied.");
-  const model = String(signed.prepared?.model ?? "").trim();
-  if (model) {
-    printLine(`Model: ${model}`, "system dim");
+  const appliedModel = String(signed.prepared?.model ?? "").trim();
+  if (appliedModel) {
+    printLine(`Model: ${appliedModel}`, "system dim");
   }
   if (signed.result?.result) {
     printLine(`Result: ${signed.result.result}`, "system dim");
