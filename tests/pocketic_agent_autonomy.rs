@@ -1542,6 +1542,63 @@ fn invalid_autonomy_decision_envelope_falls_back_to_noop_in_pocketic() {
 }
 
 #[test]
+fn no_input_continuation_inference_error_records_inference_noop_in_pocketic() {
+    let (pic, canister_id) = with_backend_canister();
+    configure_only_agent_turn(&pic, canister_id, 60);
+
+    let updated = update_prompt_layer_admin(
+        &pic,
+        canister_id,
+        6,
+        "## Layer 6: Economic Decision Loop\n- request_continuation_error:true",
+    )
+    .expect("prompt layer update should succeed");
+    assert_eq!(updated.layer_id, 6);
+    assert!(updated.content.contains("request_continuation_error:true"));
+
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    let decisions = get_recent_decisions(&pic, canister_id);
+    assert_eq!(decisions.len(), 1);
+    let decision = &decisions[0];
+    assert_eq!(decision.policy_version, 1);
+    assert_eq!(decision.trigger, DecisionTrigger::ScheduledReview);
+    assert_eq!(
+        decision.outcome,
+        DecisionOutcome::NoOp {
+            reason: "inference_error".to_string(),
+        }
+    );
+    assert!(
+        decision
+            .explanation
+            .contains("deterministic continuation inference failed after tool execution"),
+        "turn should preserve the continuation inference failure for auditability"
+    );
+
+    let turns = list_turns(&pic, canister_id, 5);
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.contains("inference_round_count: 2")),
+        "continuation inference failures after tools should stop after the degraded continuation round"
+    );
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.contains("continuation inference degraded after tool execution")),
+        "turn log should preserve the degraded continuation reason"
+    );
+    assert!(
+        turns
+            .iter()
+            .all(|turn| !turn.contains("decision envelope invalid")),
+        "inference failures after tools must not be relabeled as invalid decision envelopes"
+    );
+}
+
+#[test]
 fn non_controller_cannot_mutate_inference_config_or_control_plane() {
     let (pic, canister_id) = with_backend_canister();
     let outsider = non_controller_principal();

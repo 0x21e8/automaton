@@ -253,15 +253,17 @@ fn run_deterministic_inference(
         || input
             .context_snippet
             .contains("request_market_fetch_missing_extract_probe:true");
+    let assembled_prompt = prompt::assemble_system_prompt(&input.context_snippet);
     let continuation_loop_request = input.input.contains("request_continuation_loop:true")
         || input
             .context_snippet
-            .contains("request_continuation_loop:true");
+            .contains("request_continuation_loop:true")
+        || assembled_prompt.contains("request_continuation_loop:true");
     let continuation_error_request = input.input.contains("request_continuation_error:true")
         || input
             .context_snippet
-            .contains("request_continuation_error:true");
-    let assembled_prompt = prompt::assemble_system_prompt(&input.context_snippet);
+            .contains("request_continuation_error:true")
+        || assembled_prompt.contains("request_continuation_error:true");
     let autonomy_decision_invalid_request = input
         .input
         .contains("request_autonomy_decision_invalid:true")

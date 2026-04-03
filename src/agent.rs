@@ -2486,6 +2486,9 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                             }
                         }
                     } else if executed_any_tool {
+                        if !has_external_input {
+                            autonomy_inference_error = Some(reason.clone());
+                        }
                         append_inner_dialogue(
                             &mut inner_dialogue,
                             &format!(
@@ -5183,6 +5186,61 @@ mod tests {
         assert!(
             !outbox[0].body.contains("result: tools"),
             "outbox reply must not expose internal tool execution summaries"
+        );
+    }
+
+    #[test]
+    fn no_input_continuation_inference_error_records_inference_noop() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_memory_fact(&MemoryFact {
+            key: "config.trigger.continuation_error_probe".to_string(),
+            value: "request_continuation_error:true".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-seed".to_string(),
+        })
+        .expect("probe trigger fact should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "scheduled no-input continuation inference failures should degrade to a recorded no-op"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].error.is_none(),
+            "degraded autonomy continuation failures must not fault the turn"
+        );
+        assert_eq!(
+            turns[0].continuation_stop_reason,
+            ContinuationStopReason::InferenceError
+        );
+        let inner_dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(
+            inner_dialogue.contains("continuation inference degraded after tool execution"),
+            "turn dialogue should preserve the continuation inference failure"
+        );
+        assert!(
+            !inner_dialogue.contains("decision envelope invalid"),
+            "inference failures after tools should not be relabeled as invalid decision envelopes"
+        );
+
+        let decisions = stable::list_recent_decisions(1);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].trigger, DecisionTrigger::ScheduledReview);
+        assert_eq!(
+            decisions[0].outcome,
+            DecisionOutcome::NoOp {
+                reason: "inference_error".to_string(),
+            }
+        );
+        assert!(
+            decisions[0]
+                .explanation
+                .contains("deterministic continuation inference failed after tool execution"),
+            "decision audit record should preserve the continuation inference error context"
         );
     }
 
