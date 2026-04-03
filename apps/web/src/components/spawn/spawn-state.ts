@@ -1,7 +1,4 @@
-import type {
-  SkillCatalogEntry,
-  StrategyCatalogEntry
-} from "../../../../../packages/shared/src/catalog.js";
+import type { RepositoryStrategyRecord } from "@ic-automaton/shared";
 import {
   MINIMUM_GROSS_PAYMENT_USD,
   type SpawnAsset,
@@ -33,7 +30,6 @@ export interface SpawnWizardState {
   skills: string[];
   openRouterApiKey: string;
   selectedModelId: string;
-  customModelId: string;
   braveSearchApiKey: string;
   asset: SpawnAsset;
   grossAmountInput: string;
@@ -120,105 +116,14 @@ export const riskProfiles: RiskProfile[] = [
   }
 ];
 
-export const strategyCatalog: StrategyCatalogEntry[] = [
-  {
-    id: "yield-farming",
-    name: "Yield Farming",
-    description: "Provide liquidity and rotate between fee-bearing pools.",
-    category: "defi",
-    chains: ["base"],
-    riskLevel: 3,
-    stats: {
-      apy: 14.2,
-      tvl: 12_400_000
-    },
-    status: "available"
-  },
-  {
-    id: "lending",
-    name: "Lending",
-    description: "Supply idle assets to lending protocols for interest income.",
-    category: "defi",
-    chains: ["base"],
-    riskLevel: 2,
-    stats: {
-      apy: 5.1,
-      tvl: 48_200_000
-    },
-    status: "available"
-  },
-  {
-    id: "arbitrage",
-    name: "Arbitrage",
-    description: "Exploit temporary dislocations across venues and routes.",
-    category: "defi",
-    chains: ["base"],
-    riskLevel: 5,
-    stats: {
-      apy: null,
-      tvl: null
-    },
-    status: "available"
-  },
-  {
-    id: "cycle-management",
-    name: "Cycle Management",
-    description: "Reserve runway for canister operations and cycle replenishment.",
-    category: "operations",
-    chains: ["base"],
-    riskLevel: 1,
-    stats: {
-      apy: null,
-      tvl: null
-    },
-    status: "available"
-  }
-];
-
-export const skillCatalog: SkillCatalogEntry[] = [
-  {
-    id: "spawn-children",
-    name: "Spawn Children",
-    description: "Create descendant automatons when capital and policy allow.",
-    dependencies: [],
-    category: "coordination",
-    status: "available"
-  },
-  {
-    id: "messaging",
-    name: "Messaging",
-    description: "Exchange packets with peer and parent automatons.",
-    dependencies: [],
-    category: "coordination",
-    status: "available"
-  },
-  {
-    id: "portfolio-reporting",
-    name: "Portfolio Reporting",
-    description: "Publish periodic holdings and P&L snapshots to the steward.",
-    dependencies: [],
-    category: "observability",
-    status: "available"
-  },
-  {
-    id: "emergency-shutdown",
-    name: "Emergency Shutdown",
-    description: "Hold a controlled exit path when the steward intervenes.",
-    dependencies: [],
-    category: "safety",
-    status: "available"
-  }
-];
-
 export function createInitialSpawnWizardState(): SpawnWizardState {
   return {
     chain: "base",
     risk: 3,
-    strategies: ["yield-farming", "cycle-management"],
-    skills: ["spawn-children"],
+    strategies: [],
+    skills: [],
     openRouterApiKey: "",
     selectedModelId: "",
-    customModelId: "",
     braveSearchApiKey: "",
     asset: "usdc",
     grossAmountInput: "100"
@@ -240,6 +145,26 @@ export function toggleSelection(
   return values.includes(candidate)
     ? values.filter((value) => value !== candidate)
     : [...values, candidate];
+}
+
+export function listSelectableRepositoryStrategies(
+  strategies: RepositoryStrategyRecord[],
+  chain: SpawnChain
+): RepositoryStrategyRecord[] {
+  return strategies
+    .filter(
+      (strategy) =>
+        strategy.status === "active" && strategy.compatibleSpawnChains.includes(chain)
+    )
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export function normalizeSelectedRepositoryStrategyIds(
+  selectedIds: string[],
+  strategies: RepositoryStrategyRecord[]
+): string[] {
+  const availableIds = new Set(strategies.map((strategy) => strategy.strategyId));
+  return selectedIds.filter((strategyId) => availableIds.has(strategyId));
 }
 
 function parseGrossAmount(rawValue: string): number {
@@ -302,12 +227,6 @@ export function getFundingPreview(state: SpawnWizardState): FundingPreview {
 }
 
 export function getSelectedModel(state: SpawnWizardState): string | null {
-  const trimmedCustomModel = state.customModelId.trim();
-
-  if (trimmedCustomModel !== "") {
-    return trimmedCustomModel;
-  }
-
   return state.selectedModelId.trim() === "" ? null : state.selectedModelId.trim();
 }
 

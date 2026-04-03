@@ -147,9 +147,109 @@ pub struct AutomatonChildInitArgs {
 pub struct SpawnConfig {
     pub chain: SpawnChain,
     pub risk: u8,
+    /// Repository-owned strategy IDs, not free-form labels.
     pub strategies: Vec<String>,
     pub skills: Vec<String>,
     pub provider: ProviderConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub enum RepositoryStrategyStatus {
+    Active,
+    Deprecated,
+    Revoked,
+}
+
+impl RepositoryStrategyStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Deprecated => "deprecated",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RepositoryStrategySource {
+    pub source_path: String,
+    pub source_commit: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RepositoryStrategyMetadata {
+    pub strategy_id: String,
+    pub name: String,
+    pub description: String,
+    pub canonical_chain: SpawnChain,
+    pub canonical_chain_id: u64,
+    pub compatible_spawn_chains: Vec<SpawnChain>,
+    pub protocol: String,
+    pub primitive: String,
+    pub source: RepositoryStrategySource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RepositoryStrategyRecord {
+    pub metadata: RepositoryStrategyMetadata,
+    pub recipe_json: String,
+    pub status: RepositoryStrategyStatus,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub deprecated_at: Option<u64>,
+    pub revoked_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RepositoryStrategySessionSnapshot {
+    pub strategy_id: String,
+    pub source_status: RepositoryStrategyStatus,
+    pub name: String,
+    pub description: String,
+    pub canonical_chain: SpawnChain,
+    pub canonical_chain_id: u64,
+    pub requested_spawn_chain: SpawnChain,
+    pub resolved_chain_id: Option<u64>,
+    pub protocol: String,
+    pub primitive: String,
+    pub recipe_json: String,
+    pub source: RepositoryStrategySource,
+    pub selected_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct AddRepositoryStrategyRequest {
+    pub metadata: RepositoryStrategyMetadata,
+    pub recipe_json: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct DeprecateRepositoryStrategyRequest {
+    pub strategy_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RevokeRepositoryStrategyRequest {
+    pub strategy_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RepositoryStrategyMutationResponse {
+    pub strategy: RepositoryStrategyRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct ListRepositoryStrategiesResponse {
+    pub items: Vec<RepositoryStrategyRecord>,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct GetRepositoryStrategyResponse {
+    pub item: Option<RepositoryStrategyRecord>,
+    pub updated_at: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
@@ -385,6 +485,8 @@ pub struct SpawnSession {
     pub release_broadcast: Option<ReleaseBroadcastRecord>,
     pub parent_id: Option<String>,
     pub child_ids: Vec<String>,
+    #[serde(default)]
+    pub selected_strategies: Vec<RepositoryStrategySessionSnapshot>,
     pub config: SpawnConfig,
     pub created_at: u64,
     pub updated_at: u64,
@@ -757,6 +859,22 @@ pub enum FactoryError {
     RegistryRecordNotFound {
         canister_id: String,
     },
+    RepositoryStrategyNotFound {
+        strategy_id: String,
+    },
+    RepositoryStrategyAlreadyExists {
+        strategy_id: String,
+    },
+    RepositoryStrategyDeprecated {
+        strategy_id: String,
+    },
+    RepositoryStrategyRevoked {
+        strategy_id: String,
+    },
+    RepositoryStrategyIncompatibleChain {
+        strategy_id: String,
+        requested_chain: SpawnChain,
+    },
     UnauthorizedAdmin {
         caller: String,
     },
@@ -784,6 +902,10 @@ pub enum FactoryError {
     },
     InvalidPaginationLimit {
         limit: usize,
+    },
+    InvalidRepositoryStrategy {
+        field: String,
+        message: String,
     },
     QuoteTermsHashMismatch {
         expected: String,
@@ -889,6 +1011,28 @@ impl Display for FactoryError {
             Self::RegistryRecordNotFound { canister_id } => {
                 write!(f, "registry record not found: {canister_id}")
             }
+            Self::RepositoryStrategyNotFound { strategy_id } => {
+                write!(f, "repository strategy not found: {strategy_id}")
+            }
+            Self::RepositoryStrategyAlreadyExists { strategy_id } => {
+                write!(f, "repository strategy already exists: {strategy_id}")
+            }
+            Self::RepositoryStrategyDeprecated { strategy_id } => {
+                write!(f, "repository strategy is deprecated: {strategy_id}")
+            }
+            Self::RepositoryStrategyRevoked { strategy_id } => {
+                write!(f, "repository strategy is revoked: {strategy_id}")
+            }
+            Self::RepositoryStrategyIncompatibleChain {
+                strategy_id,
+                requested_chain,
+            } => {
+                write!(
+                    f,
+                    "repository strategy {strategy_id} is incompatible with spawn chain {}",
+                    requested_chain.as_str()
+                )
+            }
             Self::UnauthorizedAdmin { caller } => {
                 write!(f, "caller is not an admin: {caller}")
             }
@@ -931,6 +1075,9 @@ impl Display for FactoryError {
             }
             Self::InvalidPaginationLimit { limit } => {
                 write!(f, "pagination limit must be positive: {limit}")
+            }
+            Self::InvalidRepositoryStrategy { field, message } => {
+                write!(f, "invalid repository strategy field {field}: {message}")
             }
             Self::QuoteTermsHashMismatch { expected, received } => {
                 write!(

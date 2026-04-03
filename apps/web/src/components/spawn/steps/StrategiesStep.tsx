@@ -1,36 +1,58 @@
-import type { StrategyCatalogEntry } from "../../../../../../packages/shared/src/catalog.js";
+import type { RepositoryStrategyRecord } from "@ic-automaton/shared";
 
 interface StrategiesStepProps {
-  catalog: StrategyCatalogEntry[];
+  chainLabel: string;
+  errorMessage: string | null;
+  isLoading: boolean;
+  strategies: RepositoryStrategyRecord[];
   selectedIds: string[];
   onToggle: (id: string) => void;
 }
 
 export function StrategiesStep({
-  catalog,
+  chainLabel,
+  errorMessage,
+  isLoading,
+  strategies,
   selectedIds,
   onToggle
 }: StrategiesStepProps) {
   return (
     <section className="spawn-step">
-      <p className="section-label">Step 3</p>
+      <p className="section-label">Step 2</p>
       <h3 className="spawn-step-title">Strategies</h3>
       <p className="spawn-step-copy">
-        The strategy catalog is mocked locally in this milestone, but the UI is
-        shaped like the later API-driven checklist surface.
+        Choose concrete repository-backed templates for this {chainLabel} spawn.
+        The wizard only shows active templates compatible with the selected chain.
       </p>
 
+      {isLoading ? (
+        <p className="spawn-step-copy">Loading repository strategies.</p>
+      ) : null}
+
+      {errorMessage !== null ? (
+        <p className="spawn-session-error" role="alert">
+          {errorMessage}
+        </p>
+      ) : null}
+
+      {!isLoading && errorMessage === null && strategies.length === 0 ? (
+        <p className="spawn-step-copy">
+          No active repository strategies are currently available for {chainLabel}.
+        </p>
+      ) : null}
+
       <div className="spawn-checklist">
-        {catalog.map((strategy) => {
-          const checked = selectedIds.includes(strategy.id);
+        {strategies.map((strategy) => {
+          const checked = selectedIds.includes(strategy.strategyId);
 
           return (
             <button
               aria-pressed={checked}
               className={`spawn-check-item${checked ? " is-checked" : ""}`}
-              key={strategy.id}
+              key={strategy.strategyId}
               onClick={() => {
-                onToggle(strategy.id);
+                onToggle(strategy.strategyId);
               }}
               type="button"
             >
@@ -39,7 +61,9 @@ export function StrategiesStep({
                 <span className="spawn-check-title">{strategy.name}</span>
                 <span className="spawn-check-copy">{strategy.description}</span>
               </span>
-              <span className="spawn-check-meta">Risk {strategy.riskLevel}/5</span>
+              <span className="spawn-check-meta">
+                {strategy.protocol} · {strategy.primitive}
+              </span>
             </button>
           );
         })}

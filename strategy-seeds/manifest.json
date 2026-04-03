@@ -1,0 +1,58 @@
+{
+  "format": "launchpad.strategy-seed-manifest.v1",
+  "source_repository": {
+    "name": "ic-automaton",
+    "commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
+    "base_path": "docs/strategies"
+  },
+  "strategies": [
+    {
+      "strategy_id": "base-aave-usdc-reserve-01",
+      "display_name": "Base Aave USDC Reserve",
+      "description": "Low-complexity Base reserve strategy for parking surplus USDC on Aave V3 and withdrawing it when survival runway or reallocation policy requires.",
+      "canonical_chain": "base",
+      "canonical_chain_id": 8453,
+      "compatible_spawn_chains": [
+        "base"
+      ],
+      "protocol": "aave-v3",
+      "primitive": "lend_supply",
+      "status": "active",
+      "recipe_file": "base-aave-usdc-reserve-01.recipe.json",
+      "source_path": "docs/strategies/base-aave-usdc-reserve-01/recipe.json",
+      "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+    },
+    {
+      "strategy_id": "base-moonwell-usdc-reserve-01",
+      "display_name": "Base Moonwell USDC Reserve",
+      "description": "Low-complexity Base reserve strategy for parking surplus USDC in Moonwell and withdrawing it when survival runway or reallocation policy requires.",
+      "canonical_chain": "base",
+      "canonical_chain_id": 8453,
+      "compatible_spawn_chains": [
+        "base"
+      ],
+      "protocol": "moonwell-v2",
+      "primitive": "lend_supply",
+      "status": "active",
+      "recipe_file": "base-moonwell-usdc-reserve-01.recipe.json",
+      "source_path": "docs/strategies/base-moonwell-usdc-reserve-01/recipe.json",
+      "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+    },
+    {
+      "strategy_id": "base-usdc-carry-cbbtc-01",
+      "display_name": "Base Morpho USDC Carry",
+      "description": "Example carry strategy registered via a single Morpho recipe JSON.",
+      "canonical_chain": "base",
+      "canonical_chain_id": 8453,
+      "compatible_spawn_chains": [
+        "base"
+      ],
+      "protocol": "morpho-v1",
+      "primitive": "lend_supply",
+      "status": "active",
+      "recipe_file": "base-usdc-carry-cbbtc-01.recipe.json",
+      "source_path": "docs/strategies/base-usdc-carry-cbbtc-01/recipe.json",
+      "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+    }
+  ]
+}

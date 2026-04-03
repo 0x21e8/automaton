@@ -1,3 +1,5 @@
+import type { SpawnSessionStrategySnapshot } from "./spawn.js";
+
 export const SUPPORTED_CHAIN_SLUGS = [
   "base",
   "ethereum",
@@ -50,6 +52,12 @@ export interface SkillSelection {
   name: string;
   description: string;
   enabled: boolean;
+}
+
+export interface AutomatonSpawnSelection {
+  sessionId: string;
+  requestedStrategyIds: string[];
+  selectedStrategies: SpawnSessionStrategySnapshot[];
 }
 
 export interface StewardIdentity {
@@ -182,6 +190,7 @@ export interface AutomatonDetail extends AutomatonSummary {
   skills: SkillSelection[];
   promptLayers: string[];
   monologue: MonologueEntry[];
+  spawnSelection?: AutomatonSpawnSelection | null;
   childIds: string[];
   lastPolledAt: number;
 }

@@ -268,10 +268,11 @@ mod tests {
             release_broadcast: None,
             parent_id: None,
             child_ids: Vec::new(),
+            selected_strategies: Vec::new(),
             config: SpawnConfig {
                 chain: SpawnChain::Base,
                 risk: 7,
-                strategies: vec!["trend".to_string()],
+                strategies: vec!["base-aave-usdc-reserve-01".to_string()],
                 skills: vec!["search".to_string()],
                 provider: ProviderConfig {
                     open_router_api_key: None,

@@ -1,6 +1,9 @@
 import type {
   CreateSpawnSessionRequest,
   CreateSpawnSessionResponse,
+  RepositoryStrategyGetResponse,
+  RepositoryStrategyListResponse,
+  RepositoryStrategyRecord,
   RoomMessagePage,
   RefundSpawnResponse,
   RetrySpawnResponse,
@@ -46,6 +49,8 @@ export interface FactoryAdapter {
     cursor: string | undefined,
     limit: number
   ): Promise<SpawnedAutomatonRegistryPage>;
+  listRepositoryStrategies(): Promise<RepositoryStrategyListResponse>;
+  getRepositoryStrategy(strategyId: string): Promise<RepositoryStrategyGetResponse>;
   listRoomMessages(
     afterSeq: number | undefined,
     limit: number
@@ -84,6 +89,20 @@ class UnconfiguredFactoryAdapter implements FactoryAdapter {
     return {
       items: [],
       nextCursor: null
+    };
+  }
+
+  async listRepositoryStrategies(): Promise<RepositoryStrategyListResponse> {
+    return {
+      items: [],
+      updatedAt: 0
+    };
+  }
+
+  async getRepositoryStrategy(): Promise<RepositoryStrategyGetResponse> {
+    return {
+      item: null,
+      updatedAt: 0
     };
   }
 
@@ -127,12 +146,24 @@ function redactProviderSecrets(
   };
 }
 
+function normalizeSelectedStrategies(
+  selectedStrategies: SpawnSessionStatusResponse["session"]["selectedStrategies"]
+): SpawnSessionStatusResponse["session"]["selectedStrategies"] {
+  return selectedStrategies.map((strategy) => ({
+    ...strategy,
+    source: {
+      ...strategy.source
+    }
+  }));
+}
+
 function normalizeSession(
   session: SpawnSessionStatusResponse["session"]
 ): SpawnSessionStatusResponse["session"] {
   return {
     ...session,
     childIds: [...session.childIds],
+    selectedStrategies: normalizeSelectedStrategies(session.selectedStrategies),
     config: redactProviderSecrets(session.config)
   };
 }
@@ -184,6 +215,18 @@ function normalizeRoomMessagePage(page: RoomMessagePage): RoomMessagePage {
     })),
     nextAfterSeq: page.nextAfterSeq,
     latestSeq: page.latestSeq
+  };
+}
+
+function normalizeRepositoryStrategy(
+  record: RepositoryStrategyRecord
+): RepositoryStrategyRecord {
+  return {
+    ...record,
+    compatibleSpawnChains: [...record.compatibleSpawnChains],
+    source: {
+      ...record.source
+    }
   };
 }
 
@@ -265,6 +308,27 @@ export class FactoryClient {
         };
       }),
       nextCursor: page.nextCursor
+    };
+  }
+
+  async listRepositoryStrategies(): Promise<RepositoryStrategyListResponse> {
+    const response = await this.adapter.listRepositoryStrategies();
+
+    return {
+      items: response.items.map(normalizeRepositoryStrategy),
+      updatedAt: response.updatedAt
+    };
+  }
+
+  async getRepositoryStrategy(
+    strategyId: string
+  ): Promise<RepositoryStrategyGetResponse> {
+    const response = await this.adapter.getRepositoryStrategy(strategyId);
+
+    return {
+      item:
+        response.item === null ? null : normalizeRepositoryStrategy(response.item),
+      updatedAt: response.updatedAt
     };
   }
 

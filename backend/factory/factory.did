@@ -145,6 +145,14 @@ type FactoryError = variant {
   NoPendingArtifactUpload;
   QuoteTermsHashMismatch : record { expected : text; received : text };
   RegistryRecordNotFound : record { canister_id : text };
+  RepositoryStrategyNotFound : record { strategy_id : text };
+  RepositoryStrategyAlreadyExists : record { strategy_id : text };
+  RepositoryStrategyDeprecated : record { strategy_id : text };
+  RepositoryStrategyRevoked : record { strategy_id : text };
+  RepositoryStrategyIncompatibleChain : record {
+    strategy_id : text;
+    requested_chain : SpawnChain;
+  };
   InvalidAmount : record { value : text };
   InvalidSha256 : record { value : text };
   InvalidVersionCommit : record { value : text };
@@ -187,6 +195,7 @@ type FactoryError = variant {
   AutomatonRuntimeNotFound : record { canister_id : text };
   MissingChildRuntimeConfig : record { field : text };
   InvalidPaginationLimit : record { limit : nat64 };
+  InvalidRepositoryStrategy : record { field : text; message : text };
   SessionNotReadyForSpawn : record {
     session_id : text;
     state : SpawnSessionState;
@@ -301,6 +310,7 @@ type Result_15 = variant { Ok : AutomatonChildRuntimeConfig; Err : FactoryError 
 type Result_16 = variant { Ok : FactoryOperationalConfig; Err : FactoryError };
 type Result_17 = variant { Ok : RoomMessage; Err : FactoryError };
 type Result_18 = variant { Ok : RoomMessagePage; Err : FactoryError };
+type Result_19 = variant { Ok : RepositoryStrategyMutationResponse; Err : FactoryError };
 type SchedulerFailureAction = variant { Retry; Backoff; Skip; Terminal };
 type SchedulerFailureSource = variant {
   MissingConfig;
@@ -367,6 +377,69 @@ type SpawnConfig = record {
   skills : vec text;
   strategies : vec text;
 };
+type RepositoryStrategyStatus = variant { Active; Deprecated; Revoked };
+type RepositoryStrategySource = record {
+  source_path : text;
+  source_commit : text;
+};
+type RepositoryStrategyMetadata = record {
+  strategy_id : text;
+  name : text;
+  description : text;
+  canonical_chain : SpawnChain;
+  canonical_chain_id : nat64;
+  compatible_spawn_chains : vec SpawnChain;
+  protocol : text;
+  primitive : text;
+  source : RepositoryStrategySource;
+};
+type RepositoryStrategyRecord = record {
+  metadata : RepositoryStrategyMetadata;
+  recipe_json : text;
+  status : RepositoryStrategyStatus;
+  created_at : nat64;
+  updated_at : nat64;
+  deprecated_at : opt nat64;
+  revoked_at : opt nat64;
+};
+type RepositoryStrategySessionSnapshot = record {
+  strategy_id : text;
+  source_status : RepositoryStrategyStatus;
+  name : text;
+  description : text;
+  canonical_chain : SpawnChain;
+  canonical_chain_id : nat64;
+  requested_spawn_chain : SpawnChain;
+  resolved_chain_id : opt nat64;
+  protocol : text;
+  primitive : text;
+  recipe_json : text;
+  source : RepositoryStrategySource;
+  selected_at : nat64;
+};
+type AddRepositoryStrategyRequest = record {
+  metadata : RepositoryStrategyMetadata;
+  recipe_json : text;
+};
+type DeprecateRepositoryStrategyRequest = record {
+  strategy_id : text;
+  reason : opt text;
+};
+type RevokeRepositoryStrategyRequest = record {
+  strategy_id : text;
+  reason : opt text;
+};
+type RepositoryStrategyMutationResponse = record {
+  strategy : RepositoryStrategyRecord;
+};
+type ListRepositoryStrategiesResponse = record {
+  items : vec RepositoryStrategyRecord;
+  updated_at : nat64;
+};
+type GetRepositoryStrategyResponse = record {
+  item : opt RepositoryStrategyRecord;
+  updated_at : nat64;
+};
 type SpawnPaymentInstructions = record {
   asset : SpawnAsset;
   session_id : text;
@@ -410,6 +483,7 @@ type SpawnSession = record {
   retryable : bool;
   expires_at : nat64;
   child_ids : vec text;
+  selected_strategies : vec RepositoryStrategySessionSnapshot;
   steward_address : text;
   gross_amount : text;
   release_tx_hash : opt text;
@@ -447,24 +521,29 @@ type SpawnedAutomatonRegistryPage = record {
   items : vec SpawnedAutomatonRecord;
 };
 service : (opt FactoryInitArgs) -> {
+  add_repository_strategy : (AddRepositoryStrategyRequest) -> (Result_19);
   append_artifact_chunk : (vec nat8) -> (Result_14);
   begin_artifact_upload : (text, text, nat64) -> (Result_14);
   claim_spawn_refund : (text) -> (Result);
   commit_artifact_upload : () -> (Result_11);
   create_spawn_session : (CreateSpawnSessionRequest) -> (Result_1);
+  deprecate_repository_strategy : (DeprecateRepositoryStrategyRequest) -> (Result_19);
   derive_factory_evm_address : () -> (Result_10);
   get_artifact_upload_status : () -> (Result_14) query;
   get_factory_config : () -> (Result_2) query;
   get_factory_health : () -> (FactoryHealthSnapshot) query;
   get_factory_runtime : (nat64) -> (Result_13) query;
+  get_repository_strategy : (text) -> (GetRepositoryStrategyResponse) query;
   get_session_admin : (text) -> (Result_3) query;
   get_spawn_session : (text) -> (Result_4) query;
   get_spawned_automaton : (text) -> (Result_5) query;
   list_messages_for_automaton : (text, opt nat64, opt nat64) -> (Result_18) query;
   list_my_room_messages : (opt nat64, opt nat64) -> (Result_18) query;
+  list_repository_strategies : () -> (ListRepositoryStrategiesResponse) query;
   list_room_messages : (opt nat64, opt nat64) -> (Result_18) query;
   list_spawned_automatons : (opt text, nat64) -> (Result_6) query;
   post_room_message : (PostRoomMessageRequest) -> (Result_17);
+  revoke_repository_strategy : (RevokeRepositoryStrategyRequest) -> (Result_19);
   retry_session_admin : (text) -> (Result_4);
   retry_spawn_session : (text) -> (Result_4);
   set_child_runtime_config : (AutomatonChildRuntimeConfig) -> (Result_15);

@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   CreateSpawnSessionRequest,
   PlaygroundMetadata,
+  RepositoryStrategyRecord,
   SpawnSession
 } from "@ic-automaton/shared";
 
@@ -10,16 +11,17 @@ import {
   type PlaygroundFaucetClaimResponse
 } from "../../api/playground";
 import { fetchOpenRouterModels } from "../../api/openrouter";
+import { fetchRepositoryStrategies } from "../../api/indexer";
 import { formatPlaygroundTimestamp } from "../../hooks/usePlayground";
 import {
   describeSpawnSessionProgress,
-  formatSpawnSessionStateLabel,
   useSpawnSession
 } from "../../hooks/useSpawnSession";
 import {
   defaultModelOptions,
   type ProviderModelOption
 } from "../../lib/default-models";
+import { getErrorMessage } from "../../lib/errors";
 import {
   connectWalletToSpawnChain,
   executeSpawnPayment,
@@ -44,14 +46,17 @@ import {
   getFundingPreview,
   getSelectedModel,
   getRiskProfile,
+  listSelectableRepositoryStrategies,
+  normalizeSelectedRepositoryStrategyIds,
   TOTAL_SPAWN_STEPS,
+  toggleSelection,
   type SpawnWizardState
 } from "./spawn-state";
 import type { WalletSession } from "../../wallet/useWalletSession";
-import { ChainStep } from "./steps/ChainStep";
 import { FundStep } from "./steps/FundStep";
 import { ProviderConfigStep } from "./steps/ProviderConfigStep";
 import { RiskStep } from "./steps/RiskStep";
+import { StrategiesStep } from "./steps/StrategiesStep";
 
 interface SpawnWizardProps {
   isOpen: boolean;
@@ -89,8 +94,8 @@ interface SpawnJourneyProgress {
 }
 
 const stepTitles = [
-  "Select chain",
   "Risk appetite",
+  "Strategies",
   "Provider config",
   "Fund"
 ] as const;
@@ -685,6 +690,18 @@ function buildExplorerTransactionUrl(
   }
 }
 
+function summarizeSelectedStrategies(strategies: RepositoryStrategyRecord[]): string {
+  if (strategies.length === 0) {
+    return "None selected";
+  }
+
+  if (strategies.length <= 2) {
+    return strategies.map((strategy) => strategy.name).join(", ");
+  }
+
+  return `${strategies[0]?.name ?? "Strategy"} +${strategies.length - 1} more`;
+}
+
 export function SpawnWizard({
   isOpen,
   onClose,
@@ -701,12 +718,14 @@ export function SpawnWizard({
   const [reportedCompletionSessionId, setReportedCompletionSessionId] = useState<
     string | null
   >(null);
+  const [repositoryStrategies, setRepositoryStrategies] = useState<
+    RepositoryStrategyRecord[]
+  >([]);
+  const [repositoryError, setRepositoryError] = useState<string | null>(null);
+  const [isLoadingRepositoryStrategies, setIsLoadingRepositoryStrategies] =
+    useState(false);
   const [modelOptions, setModelOptions] =
     useState<ProviderModelOption[]>(defaultModelOptions);
-  const [isLoadingModels, setIsLoadingModels] = useState(false);
-  const [modelStatusMessage, setModelStatusMessage] = useState(
-    "Using curated fallback models until the live catalog is requested."
-  );
   const [isSubmittingPayment, setIsSubmittingPayment] = useState(false);
   const [paymentError, setPaymentError] = useState<string | null>(null);
   const [paymentResult, setPaymentResult] =
@@ -726,8 +745,10 @@ export function SpawnWizard({
     createEmptyWalletBalanceState()
   );
   const [balanceRefreshToken, setBalanceRefreshToken] = useState(0);
+  const [shouldFocusLiveUpdates, setShouldFocusLiveUpdates] = useState(false);
   const spawnSession = useSpawnSession();
   const viewerAddress = walletSession.address;
+  const liveUpdatesSectionRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (!isOpen) {
@@ -736,22 +757,47 @@ export function SpawnWizard({
 
     const controller = new AbortController();
 
-    setIsLoadingModels(true);
-    setModelStatusMessage("Loading live OpenRouter models.");
-
     void fetchOpenRouterModels(controller.signal)
       .then((models) => {
         setModelOptions(models);
-        setModelStatusMessage("Loaded live OpenRouter models.");
       })
       .catch(() => {
         setModelOptions(defaultModelOptions);
-        setModelStatusMessage(
-          "OpenRouter catalog unavailable, using curated fallback models."
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    const controller = new AbortController();
+
+    setIsLoadingRepositoryStrategies(true);
+    setRepositoryError(null);
+
+    void fetchRepositoryStrategies(controller.signal)
+      .then((response) => {
+        setRepositoryStrategies(response.items);
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        setRepositoryStrategies([]);
+        setRepositoryError(
+          getErrorMessage(error, "Unable to load repository strategies.")
         );
       })
       .finally(() => {
-        setIsLoadingModels(false);
+        if (!controller.signal.aborted) {
+          setIsLoadingRepositoryStrategies(false);
+        }
       });
 
     return () => {
@@ -779,6 +825,13 @@ export function SpawnWizard({
 
   const fundingPreview = getFundingPreview(state);
   const validationMessage = describeFundingValidation(fundingPreview);
+  const availableStrategies = listSelectableRepositoryStrategies(
+    repositoryStrategies,
+    state.chain
+  );
+  const selectedStrategyRecords = availableStrategies.filter((strategy) =>
+    state.strategies.includes(strategy.strategyId)
+  );
   const hasTrackedSession = spawnSession.sessionId !== null;
   const activeSession = spawnSession.session;
   const paymentInstructions = spawnSession.paymentInstructions;
@@ -807,11 +860,37 @@ export function SpawnWizard({
     viewerAddress !== null &&
     walletOnExpectedChain &&
     state.chain === "base" &&
+    !isLoadingRepositoryStrategies &&
+    repositoryError === null &&
+    selectedStrategyRecords.length > 0 &&
     fundingPreview.minimumMet &&
     fundingPreview.grossAmount > 0 &&
     !spawnSession.isCreating &&
     !playgroundMetadata?.maintenance &&
     !hasKnownFundingShortfall;
+
+  useEffect(() => {
+    const compatibleStrategies = listSelectableRepositoryStrategies(
+      repositoryStrategies,
+      state.chain
+    );
+
+    setState((current) => {
+      const nextStrategies = normalizeSelectedRepositoryStrategyIds(
+        current.strategies,
+        compatibleStrategies
+      );
+
+      if (nextStrategies.length === current.strategies.length) {
+        return current;
+      }
+
+      return {
+        ...current,
+        strategies: nextStrategies
+      };
+    });
+  }, [repositoryStrategies, state.chain]);
 
   useEffect(() => {
     if (
@@ -950,11 +1029,8 @@ export function SpawnWizard({
     setStepIndex(0);
     setState(createInitialSpawnWizardState());
     setModelOptions(defaultModelOptions);
-    setModelStatusMessage(
-      "Using curated fallback models until the live catalog is requested."
-    );
-    setIsLoadingModels(false);
     setIsSubmittingPayment(false);
+    setShouldFocusLiveUpdates(false);
     setPaymentError(null);
     setPaymentResult(null);
     setIsSwitchingNetwork(false);
@@ -1077,6 +1153,7 @@ export function SpawnWizard({
       return;
     }
 
+    setShouldFocusLiveUpdates(true);
     const response = await spawnSession.create(request);
 
     if (response === null) {
@@ -1101,8 +1178,6 @@ export function SpawnWizard({
     paymentAvailability.canSubmit &&
     paymentSubmissionLockReason === null &&
     !isSubmittingPayment;
-  const paymentActionDisabledReason =
-    paymentSubmissionLockReason ?? paymentAvailability.disabledReason;
   const showPaymentAction =
     paymentInstructions !== null &&
     (paymentAvailability.canSubmit || isSubmittingPayment);
@@ -1125,6 +1200,26 @@ export function SpawnWizard({
   const progressPercent =
     spawnJourney?.progressPercent ??
     ((stepIndex + 1) / TOTAL_SPAWN_STEPS) * 100;
+
+  useEffect(() => {
+    if (!shouldFocusLiveUpdates || spawnJourney === null) {
+      return;
+    }
+
+    const liveUpdatesSection = liveUpdatesSectionRef.current;
+    if (liveUpdatesSection === null) {
+      return;
+    }
+
+    liveUpdatesSection.scrollIntoView({
+      behavior: "smooth",
+      block: "start"
+    });
+    liveUpdatesSection.focus({
+      preventScroll: true
+    });
+    setShouldFocusLiveUpdates(false);
+  }, [shouldFocusLiveUpdates, spawnJourney]);
 
   async function handlePayment() {
     if (
@@ -1326,23 +1421,24 @@ export function SpawnWizard({
         className="spawn-wizard"
         role="dialog"
       >
-        <button
-          aria-label="Close spawn wizard"
-          className="spawn-close"
-          onClick={closeWizard}
-          type="button"
-        >
-          &times;
-        </button>
-
         <header className="spawn-header">
           <div>
             <p className="section-label">Spawn wizard</p>
             <h2 className="spawn-heading">Spawn Automaton</h2>
           </div>
-          <div className="spawn-header-meta">
-            <span>{headerMetaLabel}</span>
-            <strong>{headerMetaTitle}</strong>
+          <div className="spawn-header-actions">
+            <div className="spawn-header-meta">
+              <span>{headerMetaLabel}</span>
+              <strong>{headerMetaTitle}</strong>
+            </div>
+            <button
+              aria-label="Close spawn wizard"
+              className="spawn-close"
+              onClick={closeWizard}
+              type="button"
+            >
+              &times;
+            </button>
           </div>
         </header>
 
@@ -1357,18 +1453,6 @@ export function SpawnWizard({
 
         <div className="spawn-body">
           {stepIndex === 0 ? (
-            <ChainStep
-              onChange={(chain) => {
-                setState((current) => ({
-                  ...current,
-                  chain
-                }));
-              }}
-              value={state.chain}
-            />
-          ) : null}
-
-          {stepIndex === 1 ? (
             <RiskStep
               onChange={(risk) => {
                 setState((current) => ({
@@ -1380,23 +1464,30 @@ export function SpawnWizard({
             />
           ) : null}
 
+          {stepIndex === 1 ? (
+            <StrategiesStep
+              chainLabel={getActiveChainLabel(state.chain)}
+              errorMessage={repositoryError}
+              isLoading={isLoadingRepositoryStrategies}
+              onToggle={(strategyId) => {
+                setState((current) => ({
+                  ...current,
+                  strategies: toggleSelection(current.strategies, strategyId)
+                }));
+              }}
+              selectedIds={state.strategies}
+              strategies={availableStrategies}
+            />
+          ) : null}
+
           {stepIndex === 2 ? (
             <ProviderConfigStep
               braveSearchApiKey={state.braveSearchApiKey}
-              customModelId={state.customModelId}
-              isLoadingModels={isLoadingModels}
               modelOptions={modelOptions}
-              modelStatusMessage={modelStatusMessage}
               onBraveSearchApiKeyChange={(value) => {
                 setState((current) => ({
                   ...current,
                   braveSearchApiKey: value
-                }));
-              }}
-              onCustomModelChange={(value) => {
-                setState((current) => ({
-                  ...current,
-                  customModelId: value
                 }));
               }}
               onOpenRouterApiKeyChange={(value) => {
@@ -1491,8 +1582,7 @@ export function SpawnWizard({
                   chainOptions.find((option) => option.id === state.chain)?.label ??
                   getActiveChainLabel(state.chain),
                 risk: getRiskProfile(state.risk).label,
-                strategies: state.strategies.length,
-                skills: state.skills.length,
+                strategies: summarizeSelectedStrategies(selectedStrategyRecords),
                 providerModel: buildProviderSummary(state),
                 braveConfigured: state.braveSearchApiKey.trim() !== ""
               }}
@@ -1511,7 +1601,12 @@ export function SpawnWizard({
           ) : null}
 
           {spawnJourney !== null ? (
-            <section className="spawn-session-status" aria-live="polite">
+            <section
+              aria-live="polite"
+              className="spawn-session-status"
+              ref={liveUpdatesSectionRef}
+              tabIndex={-1}
+            >
               <div className="spawn-session-header">
                 <div>
                   <p className="section-label">Live spawn progress</p>
@@ -1598,13 +1693,6 @@ export function SpawnWizard({
                     </div>
                   ) : null}
 
-                  {showPaymentAction ? (
-                    <p className="spawn-session-meta">
-                      {paymentActionDisabledReason ??
-                        "This submits a USDC approval followed by the escrow deposit transaction from the connected wallet. Wallets may still show 0 ETH because the payment value is carried in contract calldata, not as native ETH."}
-                    </p>
-                  ) : null}
-
                   {activeSession.state === "awaiting_payment" &&
                   paymentResult === null ? (
                     <p className="spawn-session-error" role="alert">
@@ -1613,18 +1701,6 @@ export function SpawnWizard({
                       queue and confirm both the USDC approval and the escrow
                       deposit on {playgroundChainName} (chain{" "}
                       {playgroundMetadata?.chain.id ?? "pending"}).
-                    </p>
-                  ) : null}
-
-                  {activeSession.state === "awaiting_payment" &&
-                  activeSession.paymentStatus === "unpaid" &&
-                  paymentResult !== null &&
-                  effectivePendingReceipts.length === 0 ? (
-                    <p className="spawn-session-meta">
-                      Wallet transactions were confirmed on {playgroundChainName}{" "}
-                      (chain {playgroundMetadata?.chain.id ?? "pending"}), but
-                      the factory has not marked this session as paid yet. Leave
-                      this session open while the indexer catches up.
                     </p>
                   ) : null}
 
@@ -1704,7 +1780,15 @@ export function SpawnWizard({
               </button>
               <button
                 className="spawn-nav-button is-primary"
-                disabled={stepIndex === TOTAL_SPAWN_STEPS - 1 ? !canSubmit : false}
+                disabled={
+                  stepIndex === TOTAL_SPAWN_STEPS - 1
+                    ? !canSubmit
+                    : stepIndex === 1
+                      ? isLoadingRepositoryStrategies ||
+                        repositoryError !== null ||
+                        selectedStrategyRecords.length === 0
+                      : false
+                }
                 onClick={
                   stepIndex === TOTAL_SPAWN_STEPS - 1
                     ? () => {

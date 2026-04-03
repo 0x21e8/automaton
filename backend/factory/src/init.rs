@@ -1,8 +1,9 @@
 use candid::Encode;
+use serde_json::Value;
 
 use crate::types::{
     AutomatonChildInitArgs, AutomatonChildRuntimeConfig, AutomatonRuntimeState,
-    AutomatonSpawnBootstrapArgs, FactoryError, SpawnSession,
+    AutomatonSpawnBootstrapArgs, FactoryError, RepositoryStrategySessionSnapshot, SpawnSession,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +89,128 @@ pub fn validate_automaton_child_runtime_config(
     })
 }
 
+fn strategy_install_error(
+    snapshot: &RepositoryStrategySessionSnapshot,
+    message: impl Into<String>,
+) -> FactoryError {
+    FactoryError::ManagementCallFailed {
+        method: "register_strategy_admin".to_string(),
+        message: format!("strategy {}: {}", snapshot.strategy_id, message.into()),
+    }
+}
+
+fn expect_strategy_recipe_object<'a>(
+    snapshot: &RepositoryStrategySessionSnapshot,
+    value: &'a mut Value,
+) -> Result<&'a mut serde_json::Map<String, Value>, FactoryError> {
+    value.as_object_mut().ok_or_else(|| {
+        strategy_install_error(
+            snapshot,
+            "session snapshot recipe must decode to a JSON object",
+        )
+    })
+}
+
+fn expect_strategy_recipe_string(
+    snapshot: &RepositoryStrategySessionSnapshot,
+    recipe: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<String, FactoryError> {
+    recipe
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            strategy_install_error(
+                snapshot,
+                format!("session snapshot recipe field {field} must be a string"),
+            )
+        })
+}
+
+fn expect_strategy_recipe_u64(
+    snapshot: &RepositoryStrategySessionSnapshot,
+    recipe: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<u64, FactoryError> {
+    recipe.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        strategy_install_error(
+            snapshot,
+            format!("session snapshot recipe field {field} must be a u64"),
+        )
+    })
+}
+
+pub fn build_strategy_install_recipe(
+    snapshot: &RepositoryStrategySessionSnapshot,
+) -> Result<String, FactoryError> {
+    let mut recipe: Value = serde_json::from_str(snapshot.recipe_json.trim()).map_err(|error| {
+        strategy_install_error(
+            snapshot,
+            format!("invalid session snapshot recipe JSON: {error}"),
+        )
+    })?;
+    let recipe_object = expect_strategy_recipe_object(snapshot, &mut recipe)?;
+
+    let template_id = expect_strategy_recipe_string(snapshot, recipe_object, "template_id")?;
+    if template_id != snapshot.strategy_id {
+        return Err(strategy_install_error(
+            snapshot,
+            format!(
+                "session snapshot recipe template_id mismatch: expected {}, got {}",
+                snapshot.strategy_id, template_id
+            ),
+        ));
+    }
+
+    let protocol = expect_strategy_recipe_string(snapshot, recipe_object, "protocol")?;
+    if protocol != snapshot.protocol {
+        return Err(strategy_install_error(
+            snapshot,
+            format!(
+                "session snapshot recipe protocol mismatch: expected {}, got {}",
+                snapshot.protocol, protocol
+            ),
+        ));
+    }
+
+    let primitive = expect_strategy_recipe_string(snapshot, recipe_object, "primitive")?;
+    if primitive != snapshot.primitive {
+        return Err(strategy_install_error(
+            snapshot,
+            format!(
+                "session snapshot recipe primitive mismatch: expected {}, got {}",
+                snapshot.primitive, primitive
+            ),
+        ));
+    }
+
+    let canonical_chain_id = expect_strategy_recipe_u64(snapshot, recipe_object, "chain_id")?;
+    if canonical_chain_id != snapshot.canonical_chain_id {
+        return Err(strategy_install_error(
+            snapshot,
+            format!(
+                "session snapshot recipe chain_id mismatch: expected canonical {}, got {}",
+                snapshot.canonical_chain_id, canonical_chain_id
+            ),
+        ));
+    }
+
+    let resolved_chain_id = snapshot
+        .resolved_chain_id
+        .unwrap_or(snapshot.canonical_chain_id);
+    if resolved_chain_id != canonical_chain_id {
+        recipe_object.insert("chain_id".to_string(), Value::from(resolved_chain_id));
+    }
+
+    serde_json::to_string(&recipe).map_err(|error| {
+        strategy_install_error(
+            snapshot,
+            format!("failed to encode adapted child strategy recipe JSON: {error}"),
+        )
+    })
+}
+
 pub fn build_automaton_install_args(
     session: &SpawnSession,
     factory_principal: candid::Principal,
@@ -157,10 +280,14 @@ pub fn initialize_automaton(
 mod tests {
     use candid::{decode_args, Principal};
 
-    use super::{build_automaton_install_args, validate_automaton_child_runtime_config};
+    use super::{
+        build_automaton_install_args, build_strategy_install_recipe,
+        validate_automaton_child_runtime_config,
+    };
     use crate::types::{
         AutomatonChildInitArgs, AutomatonChildRuntimeConfig, CreateSpawnSessionRequest,
-        ProviderConfig, SpawnAsset, SpawnChain, SpawnConfig,
+        ProviderConfig, RepositoryStrategySessionSnapshot, RepositoryStrategySource,
+        RepositoryStrategyStatus, SpawnAsset, SpawnChain, SpawnConfig,
     };
 
     fn sample_request() -> CreateSpawnSessionRequest {
@@ -171,7 +298,7 @@ mod tests {
             config: SpawnConfig {
                 chain: SpawnChain::Base,
                 risk: 7,
-                strategies: vec![" trend ".to_string(), "".to_string()],
+                strategies: vec!["base-aave-usdc-reserve-01".to_string()],
                 skills: vec![" search ".to_string()],
                 provider: ProviderConfig {
                     open_router_api_key: Some(" sk-or-test ".to_string()),
@@ -180,6 +307,37 @@ mod tests {
                 },
             },
             parent_id: Some("parent-automaton".to_string()),
+        }
+    }
+
+    fn sample_strategy_snapshot() -> RepositoryStrategySessionSnapshot {
+        RepositoryStrategySessionSnapshot {
+            strategy_id: "base-aave-usdc-reserve-01".to_string(),
+            source_status: RepositoryStrategyStatus::Active,
+            name: "Base Aave USDC Reserve".to_string(),
+            description: "Example strategy".to_string(),
+            canonical_chain: SpawnChain::Base,
+            canonical_chain_id: 8_453,
+            requested_spawn_chain: SpawnChain::Base,
+            resolved_chain_id: Some(31_337),
+            protocol: "aave-v3".to_string(),
+            primitive: "lend_supply".to_string(),
+            recipe_json: r#"{
+                "protocol":"aave-v3",
+                "primitive":"lend_supply",
+                "chain_id":8453,
+                "template_id":"base-aave-usdc-reserve-01",
+                "contracts":[],
+                "actions":[],
+                "max_value_wei_per_call":"0",
+                "template_budget_wei":"0"
+            }"#
+            .to_string(),
+            source: RepositoryStrategySource {
+                source_path: "docs/strategies/base-aave-usdc-reserve-01/recipe.json".to_string(),
+                source_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            },
+            selected_at: 1,
         }
     }
 
@@ -278,7 +436,44 @@ mod tests {
                 .spawn_bootstrap
                 .as_ref()
                 .map(|bootstrap| bootstrap.strategies.clone()),
-            Some(vec![" trend ".to_string(), "".to_string()])
+            Some(vec!["base-aave-usdc-reserve-01".to_string()])
         );
+    }
+
+    #[test]
+    fn rewrites_strategy_install_recipe_chain_id_for_child_runtime() {
+        let adapted = build_strategy_install_recipe(&sample_strategy_snapshot())
+            .expect("strategy recipe should adapt");
+        let decoded: serde_json::Value =
+            serde_json::from_str(&adapted).expect("adapted recipe should decode");
+
+        assert_eq!(
+            decoded
+                .get("template_id")
+                .and_then(serde_json::Value::as_str),
+            Some("base-aave-usdc-reserve-01")
+        );
+        assert_eq!(
+            decoded.get("chain_id").and_then(serde_json::Value::as_u64),
+            Some(31_337)
+        );
+    }
+
+    #[test]
+    fn rejects_strategy_install_recipe_when_snapshot_and_recipe_diverge() {
+        let mut snapshot = sample_strategy_snapshot();
+        snapshot.recipe_json = snapshot
+            .recipe_json
+            .replace("base-aave-usdc-reserve-01", "different-template");
+
+        let error = build_strategy_install_recipe(&snapshot)
+            .expect_err("mismatched session snapshot recipe should fail");
+
+        assert!(matches!(
+            error,
+            crate::FactoryError::ManagementCallFailed { ref method, ref message }
+                if method == "register_strategy_admin"
+                    && message.contains("template_id mismatch")
+        ));
     }
 }

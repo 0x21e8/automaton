@@ -5,10 +5,11 @@ use crate::expiry::expire_spawn_session;
 use crate::retry::retry_failed_session;
 use crate::scheduler::enqueue_payment_poll;
 use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent};
-use crate::state::{read_state, write_state};
+use crate::state::{read_state, write_state, FactoryState};
 use crate::types::{
     amount_to_string, derive_claim_id, hash_quote_terms, parse_amount, CreateSpawnSessionRequest,
     CreateSpawnSessionResponse, FactoryError, PostRoomMessageRequest, RefundSpawnResponse,
+    RepositoryStrategyRecord, RepositoryStrategySessionSnapshot, RepositoryStrategyStatus,
     RoomContentType, RoomMessage, RoomMessagePage, SessionAuditActor, SpawnPaymentInstructions,
     SpawnQuote, SpawnSession, SpawnSessionState, SpawnSessionStatusResponse,
     SpawnedAutomatonRegistryPage, DEFAULT_ROOM_READ_LIMIT, MAX_ROOM_BODY_BYTES, MAX_ROOM_MENTIONS,
@@ -93,6 +94,79 @@ fn normalize_room_body(body: &str) -> Result<String, FactoryError> {
     }
 
     Ok(trimmed)
+}
+
+fn strategy_status_error(
+    strategy_id: &str,
+    status: &RepositoryStrategyStatus,
+) -> Option<FactoryError> {
+    match status {
+        RepositoryStrategyStatus::Active => None,
+        RepositoryStrategyStatus::Deprecated => Some(FactoryError::RepositoryStrategyDeprecated {
+            strategy_id: strategy_id.to_string(),
+        }),
+        RepositoryStrategyStatus::Revoked => Some(FactoryError::RepositoryStrategyRevoked {
+            strategy_id: strategy_id.to_string(),
+        }),
+    }
+}
+
+fn strategy_resolved_chain_id(state: &FactoryState, record: &RepositoryStrategyRecord) -> u64 {
+    state
+        .child_runtime
+        .evm_chain_id
+        .unwrap_or(record.metadata.canonical_chain_id)
+}
+
+fn snapshot_selected_repository_strategies(
+    state: &FactoryState,
+    request: &CreateSpawnSessionRequest,
+    now_ms: u64,
+) -> Result<Vec<RepositoryStrategySessionSnapshot>, FactoryError> {
+    let mut selected_strategies = Vec::with_capacity(request.config.strategies.len());
+
+    for strategy_id in &request.config.strategies {
+        let record = state
+            .repository_strategies
+            .get(strategy_id)
+            .ok_or_else(|| FactoryError::RepositoryStrategyNotFound {
+                strategy_id: strategy_id.clone(),
+            })?;
+
+        if let Some(error) = strategy_status_error(strategy_id, &record.status) {
+            return Err(error);
+        }
+
+        if !record
+            .metadata
+            .compatible_spawn_chains
+            .iter()
+            .any(|chain| chain == &request.config.chain)
+        {
+            return Err(FactoryError::RepositoryStrategyIncompatibleChain {
+                strategy_id: strategy_id.clone(),
+                requested_chain: request.config.chain.clone(),
+            });
+        }
+
+        selected_strategies.push(RepositoryStrategySessionSnapshot {
+            strategy_id: record.metadata.strategy_id.clone(),
+            source_status: record.status.clone(),
+            name: record.metadata.name.clone(),
+            description: record.metadata.description.clone(),
+            canonical_chain: record.metadata.canonical_chain.clone(),
+            canonical_chain_id: record.metadata.canonical_chain_id,
+            requested_spawn_chain: request.config.chain.clone(),
+            resolved_chain_id: Some(strategy_resolved_chain_id(state, record)),
+            protocol: record.metadata.protocol.clone(),
+            primitive: record.metadata.primitive.clone(),
+            recipe_json: record.recipe_json.clone(),
+            source: record.metadata.source.clone(),
+            selected_at: now_ms,
+        });
+    }
+
+    Ok(selected_strategies)
 }
 
 fn validate_room_body(content_type: &RoomContentType, body: &str) -> Result<(), FactoryError> {
@@ -239,6 +313,8 @@ pub(crate) fn create_spawn_session_with_session_id(
             return Err(FactoryError::FactoryPaused { pause: true });
         }
 
+        let selected_strategies = snapshot_selected_repository_strategies(state, &request, now_ms)?;
+
         let gross_amount_value = parse_amount(&request.gross_amount)?;
         let platform_fee_value = parse_amount(state.fee_config.amount_for(&request.asset))?;
         let creation_cost_value =
@@ -303,6 +379,7 @@ pub(crate) fn create_spawn_session_with_session_id(
             release_broadcast: None,
             parent_id: request.parent_id.clone(),
             child_ids: Vec::new(),
+            selected_strategies,
             config: request.config.clone(),
             created_at: now_ms,
             updated_at: now_ms,

@@ -73,6 +73,7 @@ export function createAutomatonDetailFixture(
     skills: [],
     promptLayers: ["constitution"],
     monologue: [],
+    spawnSelection: null,
     childIds: [],
     lastPolledAt: 1_709_912_347_000
   };
@@ -260,10 +261,30 @@ export function createSpawnSessionDetailFixture(
     releaseBroadcastAt: registryRecord ? 1_709_912_359_000 : null,
     parentId: null,
     childIds: [],
+    selectedStrategies: [
+      {
+        strategyId: "base-aave-usdc-reserve-01",
+        sourceStatus: "active",
+        name: "Base Aave USDC Reserve",
+        description: "Park surplus Base USDC on Aave V3.",
+        canonicalChain: "base",
+        canonicalChainId: 8453,
+        requestedSpawnChain: "base",
+        resolvedChainId: 8453,
+        protocol: "aave-v3",
+        primitive: "lend_supply",
+        recipeJson: "{\"template_id\":\"base-aave-usdc-reserve-01\"}",
+        source: {
+          sourcePath: "docs/strategies/base-aave-usdc-reserve-01/recipe.json",
+          sourceCommit: "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+        },
+        selectedAt: 1_709_912_345_000
+      }
+    ],
     config: {
       chain: "base",
       risk: 3,
-      strategies: ["yield-farming"],
+      strategies: ["base-aave-usdc-reserve-01"],
       skills: ["portfolio-reporting"],
       provider: {
         openRouterApiKey: null,

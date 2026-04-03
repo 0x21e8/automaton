@@ -13,12 +13,12 @@ use serde::{Deserialize, Serialize};
 use crate::types::{
     AutomatonChildRuntimeConfig, AutomatonRuntimeState, CreationCostQuote, EscrowClaim,
     FactoryError, FactoryInitArgs, FeeConfig, PendingArtifactUpload, ReleaseBroadcastConfig,
-    RoomMessage, RoomState, SchedulerJob, SchedulerRuntime, SessionAuditActor, SessionAuditEntry,
-    SpawnSession, SpawnSessionState, SpawnedAutomatonRecord,
+    RepositoryStrategyRecord, RoomMessage, RoomState, SchedulerJob, SchedulerRuntime,
+    SessionAuditActor, SessionAuditEntry, SpawnSession, SpawnSessionState, SpawnedAutomatonRecord,
 };
 
-const STORAGE_SCHEMA_VERSION: u32 = 3;
-const PREVIOUS_STORAGE_SCHEMA_VERSION: u32 = 2;
+const STORAGE_SCHEMA_VERSION: u32 = 4;
+const PREVIOUS_STORAGE_SCHEMA_VERSION: u32 = 3;
 const STORAGE_METADATA_MEMORY_ID: u8 = 0;
 const FACTORY_CONFIG_MEMORY_ID: u8 = 1;
 const SESSIONS_MEMORY_ID: u8 = 2;
@@ -30,6 +30,7 @@ const SCHEDULER_RUNTIME_MEMORY_ID: u8 = 7;
 const SCHEDULER_JOBS_MEMORY_ID: u8 = 8;
 const ROOM_STATE_MEMORY_ID: u8 = 9;
 const ROOM_MESSAGES_MEMORY_ID: u8 = 10;
+const STRATEGY_REPOSITORY_MEMORY_ID: u8 = 11;
 
 type StableMemory<M> = VirtualMemory<M>;
 
@@ -55,6 +56,7 @@ macro_rules! impl_candid_storable {
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct FactoryState {
+    pub repository_strategies: BTreeMap<String, RepositoryStrategyRecord>,
     pub sessions: BTreeMap<String, SpawnSession>,
     pub escrow_claims: BTreeMap<String, EscrowClaim>,
     pub registry: BTreeMap<String, SpawnedAutomatonRecord>,
@@ -151,6 +153,7 @@ impl Default for FactoryState {
         admin_principals.insert("admin".to_string());
 
         Self {
+            repository_strategies: crate::strategy_repository::seed_repository_records(0),
             sessions: BTreeMap::new(),
             escrow_claims: BTreeMap::new(),
             registry: BTreeMap::new(),
@@ -235,6 +238,7 @@ impl FactoryStableConfig {
     #[allow(clippy::too_many_arguments)]
     fn into_state(
         self,
+        repository_strategies: BTreeMap<String, RepositoryStrategyRecord>,
         sessions: BTreeMap<String, SpawnSession>,
         escrow_claims: BTreeMap<String, EscrowClaim>,
         registry: BTreeMap<String, SpawnedAutomatonRecord>,
@@ -246,6 +250,7 @@ impl FactoryStableConfig {
         audit_log: BTreeMap<String, Vec<SessionAuditEntry>>,
     ) -> FactoryState {
         FactoryState {
+            repository_strategies,
             sessions,
             escrow_claims,
             registry,
@@ -287,6 +292,7 @@ impl_candid_storable!(SpawnSession);
 impl_candid_storable!(EscrowClaim);
 impl_candid_storable!(SpawnedAutomatonRecord);
 impl_candid_storable!(AutomatonRuntimeState);
+impl_candid_storable!(RepositoryStrategyRecord);
 impl_candid_storable!(StorageMetadata);
 impl_candid_storable!(FactoryStableConfig);
 impl_candid_storable!(StableAuditEntries);
@@ -301,6 +307,7 @@ struct FactoryStableStorage<M: Memory> {
     config: StableCell<FactoryStableConfig, StableMemory<M>>,
     scheduler_runtime: StableCell<SchedulerRuntime, StableMemory<M>>,
     room_state: StableCell<RoomState, StableMemory<M>>,
+    repository_strategies: StableBTreeMap<String, RepositoryStrategyRecord, StableMemory<M>>,
     sessions: StableBTreeMap<String, SpawnSession, StableMemory<M>>,
     escrow_claims: StableBTreeMap<String, EscrowClaim, StableMemory<M>>,
     registry: StableBTreeMap<String, SpawnedAutomatonRecord, StableMemory<M>>,
@@ -339,6 +346,9 @@ impl<M: Memory> FactoryStableStorage<M> {
             config,
             scheduler_runtime,
             room_state,
+            repository_strategies: StableBTreeMap::init(
+                memory_manager.get(MemoryId::new(STRATEGY_REPOSITORY_MEMORY_ID)),
+            ),
             sessions: StableBTreeMap::init(memory_manager.get(MemoryId::new(SESSIONS_MEMORY_ID))),
             escrow_claims: StableBTreeMap::init(
                 memory_manager.get(MemoryId::new(ESCROW_CLAIMS_MEMORY_ID)),
@@ -375,6 +385,7 @@ impl<M: Memory> FactoryStableStorage<M> {
         self.assert_supported_schema();
 
         self.config.get().clone().into_state(
+            load_collection(&self.repository_strategies),
             load_collection(&self.sessions),
             load_collection(&self.escrow_claims),
             load_collection(&self.registry),
@@ -424,6 +435,11 @@ impl<M: Memory> FactoryStableStorage<M> {
             self.room_state.set(next.room_state.clone());
         }
 
+        sync_collection(
+            &mut self.repository_strategies,
+            &current.repository_strategies,
+            &next.repository_strategies,
+        );
         sync_collection(&mut self.sessions, &current.sessions, &next.sessions);
         sync_collection(
             &mut self.escrow_claims,

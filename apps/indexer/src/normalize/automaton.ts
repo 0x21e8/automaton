@@ -220,6 +220,7 @@ function defaultDetail(
     skills: [],
     promptLayers: [],
     monologue: [],
+    spawnSelection: null,
     childIds: registryRecord?.childIds ?? [],
     lastPolledAt: now
   };

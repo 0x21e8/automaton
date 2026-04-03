@@ -19,7 +19,7 @@ const BetterSqlite3 = require("better-sqlite3") as {
   new (path: string): {
     close(): void;
     exec(sql: string): void;
-    prepare<T>(sql: string): { all(): T[] };
+    prepare<T>(sql: string): { all(): T[]; run(...parameters: unknown[]): void };
   };
 };
 const tempPaths: string[] = [];

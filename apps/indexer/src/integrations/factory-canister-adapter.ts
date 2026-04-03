@@ -9,6 +9,9 @@ import type {
   CreateSpawnSessionRequest,
   CreateSpawnSessionResponse,
   PaymentStatus,
+  RepositoryStrategyGetResponse,
+  RepositoryStrategyListResponse,
+  RepositoryStrategyRecord,
   RefundSpawnResponse,
   RoomContentType,
   RoomMessagePage,
@@ -43,6 +46,7 @@ type CandidSpawnSessionState = CandidVariant<
 >;
 type CandidPaymentStatus = CandidVariant<"Unpaid" | "Partial" | "Paid" | "Refunded">;
 type CandidSessionAuditActor = CandidVariant<"System" | "User" | "Admin">;
+type CandidRepositoryStrategyStatus = CandidVariant<"Active" | "Deprecated" | "Revoked">;
 
 interface CandidProviderConfig {
   brave_search_api_key: Optional<string>;
@@ -90,6 +94,49 @@ interface CandidSpawnQuote {
   session_id: string;
 }
 
+interface CandidRepositoryStrategySource {
+  source_commit: string;
+  source_path: string;
+}
+
+interface CandidRepositoryStrategyMetadata {
+  canonical_chain: CandidSpawnChain;
+  canonical_chain_id: bigint;
+  compatible_spawn_chains: CandidSpawnChain[];
+  description: string;
+  name: string;
+  primitive: string;
+  protocol: string;
+  source: CandidRepositoryStrategySource;
+  strategy_id: string;
+}
+
+interface CandidRepositoryStrategyRecord {
+  created_at: bigint;
+  deprecated_at: Optional<bigint>;
+  metadata: CandidRepositoryStrategyMetadata;
+  recipe_json: string;
+  revoked_at: Optional<bigint>;
+  status: CandidRepositoryStrategyStatus;
+  updated_at: bigint;
+}
+
+interface CandidRepositoryStrategySessionSnapshot {
+  canonical_chain: CandidSpawnChain;
+  canonical_chain_id: bigint;
+  description: string;
+  name: string;
+  primitive: string;
+  protocol: string;
+  recipe_json: string;
+  requested_spawn_chain: CandidSpawnChain;
+  resolved_chain_id: Optional<bigint>;
+  selected_at: bigint;
+  source: CandidRepositoryStrategySource;
+  source_status: CandidRepositoryStrategyStatus;
+  strategy_id: string;
+}
+
 interface CandidSpawnSession {
   asset: CandidSpawnAsset;
   automaton_canister_id: Optional<string>;
@@ -111,6 +158,7 @@ interface CandidSpawnSession {
   release_broadcast_at: Optional<bigint>;
   release_tx_hash: Optional<string>;
   retryable: boolean;
+  selected_strategies: CandidRepositoryStrategySessionSnapshot[];
   session_id: string;
   state: CandidSpawnSessionState;
   steward_address: string;
@@ -147,6 +195,16 @@ interface CandidSpawnedAutomatonRecord {
 interface CandidSpawnedAutomatonRegistryPage {
   items: CandidSpawnedAutomatonRecord[];
   next_cursor: Optional<string>;
+}
+
+interface CandidListRepositoryStrategiesResponse {
+  items: CandidRepositoryStrategyRecord[];
+  updated_at: bigint;
+}
+
+interface CandidGetRepositoryStrategyResponse {
+  item: Optional<CandidRepositoryStrategyRecord>;
+  updated_at: bigint;
 }
 
 type CandidRoomContentType = CandidVariant<"TextPlain" | "ApplicationJson">;
@@ -204,6 +262,13 @@ interface CandidFactoryHealthSnapshot {
 type CandidFactoryError =
   | CandidVariant<"SessionNotFound", { session_id: string }>
   | CandidVariant<"RegistryRecordNotFound", { canister_id: string }>
+  | CandidVariant<"RepositoryStrategyNotFound", { strategy_id: string }>
+  | CandidVariant<"RepositoryStrategyDeprecated", { strategy_id: string }>
+  | CandidVariant<"RepositoryStrategyRevoked", { strategy_id: string }>
+  | CandidVariant<
+      "RepositoryStrategyIncompatibleChain",
+      { strategy_id: string; requested_chain: CandidSpawnChain }
+    >
   | Record<string, unknown>;
 
 type CandidResult<T> = {
@@ -221,8 +286,10 @@ interface FactoryCanisterActor {
     }>
   >;
   get_factory_health: ActorMethod<[], CandidFactoryHealthSnapshot>;
+  get_repository_strategy: ActorMethod<[string], CandidGetRepositoryStrategyResponse>;
   get_spawn_session: ActorMethod<[string], CandidResult<CandidSpawnSessionStatusResponse>>;
   get_spawned_automaton: ActorMethod<[string], CandidResult<CandidSpawnedAutomatonRecord>>;
+  list_repository_strategies: ActorMethod<[], CandidListRepositoryStrategiesResponse>;
   list_messages_for_automaton: ActorMethod<
     [string, Optional<bigint>, Optional<bigint>],
     CandidResult<CandidRoomMessagePage>
@@ -306,6 +373,58 @@ function createFactoryIdl() {
       creation_cost: candid.Text,
       platform_fee: candid.Text
     });
+    const RepositoryStrategyStatus = candid.Variant({
+      Active: candid.Null,
+      Deprecated: candid.Null,
+      Revoked: candid.Null
+    });
+    const RepositoryStrategySource = candid.Record({
+      source_path: candid.Text,
+      source_commit: candid.Text
+    });
+    const RepositoryStrategyMetadata = candid.Record({
+      strategy_id: candid.Text,
+      name: candid.Text,
+      description: candid.Text,
+      canonical_chain: SpawnChain,
+      canonical_chain_id: candid.Nat64,
+      compatible_spawn_chains: candid.Vec(SpawnChain),
+      protocol: candid.Text,
+      primitive: candid.Text,
+      source: RepositoryStrategySource
+    });
+    const RepositoryStrategyRecord = candid.Record({
+      metadata: RepositoryStrategyMetadata,
+      recipe_json: candid.Text,
+      status: RepositoryStrategyStatus,
+      created_at: candid.Nat64,
+      updated_at: candid.Nat64,
+      deprecated_at: candid.Opt(candid.Nat64),
+      revoked_at: candid.Opt(candid.Nat64)
+    });
+    const ListRepositoryStrategiesResponse = candid.Record({
+      items: candid.Vec(RepositoryStrategyRecord),
+      updated_at: candid.Nat64
+    });
+    const GetRepositoryStrategyResponse = candid.Record({
+      item: candid.Opt(RepositoryStrategyRecord),
+      updated_at: candid.Nat64
+    });
+    const RepositoryStrategySessionSnapshot = candid.Record({
+      strategy_id: candid.Text,
+      source_status: RepositoryStrategyStatus,
+      name: candid.Text,
+      description: candid.Text,
+      canonical_chain: SpawnChain,
+      canonical_chain_id: candid.Nat64,
+      requested_spawn_chain: SpawnChain,
+      resolved_chain_id: candid.Opt(candid.Nat64),
+      protocol: candid.Text,
+      primitive: candid.Text,
+      recipe_json: candid.Text,
+      source: RepositoryStrategySource,
+      selected_at: candid.Nat64
+    });
     const SpawnSession = candid.Record({
       updated_at: candid.Nat64,
       asset: SpawnAsset,
@@ -326,6 +445,7 @@ function createFactoryIdl() {
       retryable: candid.Bool,
       expires_at: candid.Nat64,
       child_ids: candid.Vec(candid.Text),
+      selected_strategies: candid.Vec(RepositoryStrategySessionSnapshot),
       steward_address: candid.Text,
       gross_amount: candid.Text,
       release_tx_hash: candid.Opt(candid.Text),
@@ -417,6 +537,13 @@ function createFactoryIdl() {
       ArtifactHashMismatch: candid.Record({ expected: candid.Text, actual: candid.Text }),
       QuoteTermsHashMismatch: candid.Record({ expected: candid.Text, received: candid.Text }),
       RegistryRecordNotFound: candid.Record({ canister_id: candid.Text }),
+      RepositoryStrategyNotFound: candid.Record({ strategy_id: candid.Text }),
+      RepositoryStrategyDeprecated: candid.Record({ strategy_id: candid.Text }),
+      RepositoryStrategyRevoked: candid.Record({ strategy_id: candid.Text }),
+      RepositoryStrategyIncompatibleChain: candid.Record({
+        strategy_id: candid.Text,
+        requested_chain: SpawnChain
+      }),
       InvalidAmount: candid.Record({ value: candid.Text }),
       InvalidSha256: candid.Record({ value: candid.Text }),
       InvalidVersionCommit: candid.Record({ value: candid.Text }),
@@ -482,8 +609,18 @@ function createFactoryIdl() {
       claim_spawn_refund: candid.Func([candid.Text], [ResultRefund], []),
       create_spawn_session: candid.Func([CreateSpawnSessionRequest], [ResultCreate], []),
       get_factory_health: candid.Func([], [FactoryHealthSnapshot], ["query"]),
+      get_repository_strategy: candid.Func(
+        [candid.Text],
+        [GetRepositoryStrategyResponse],
+        ["query"]
+      ),
       get_spawn_session: candid.Func([candid.Text], [ResultSession], ["query"]),
       get_spawned_automaton: candid.Func([candid.Text], [ResultRecord], ["query"]),
+      list_repository_strategies: candid.Func(
+        [],
+        [ListRepositoryStrategiesResponse],
+        ["query"]
+      ),
       list_messages_for_automaton: candid.Func(
         [candid.Text, candid.Opt(candid.Nat64), candid.Opt(candid.Nat64)],
         [ResultRoomPage],
@@ -529,6 +666,29 @@ function isFactoryErrorVariant(
 }
 
 function formatFactoryError(error: CandidFactoryError) {
+  if ("RepositoryStrategyNotFound" in error) {
+    const detail = error.RepositoryStrategyNotFound as { strategy_id: string };
+    return `Selected strategy ${detail.strategy_id} was not found in the repository.`;
+  }
+  if ("RepositoryStrategyDeprecated" in error) {
+    const detail = error.RepositoryStrategyDeprecated as { strategy_id: string };
+    return `Selected strategy ${detail.strategy_id} is deprecated and cannot be used for new spawn sessions.`;
+  }
+  if ("RepositoryStrategyRevoked" in error) {
+    const detail = error.RepositoryStrategyRevoked as { strategy_id: string };
+    return `Selected strategy ${detail.strategy_id} has been revoked and cannot be used for new spawn sessions.`;
+  }
+  if ("RepositoryStrategyIncompatibleChain" in error) {
+    const detail = error.RepositoryStrategyIncompatibleChain as {
+      strategy_id: string;
+      requested_chain: CandidSpawnChain;
+    };
+    const requestedChain = mapChain(
+      detail.requested_chain
+    );
+    return `Selected strategy ${detail.strategy_id} is incompatible with the requested ${requestedChain} spawn chain.`;
+  }
+
   const [name, detail] = Object.entries(error)[0] ?? ["Unknown", null];
   return `Factory canister call failed with ${name}: ${JSON.stringify(detail)}`;
 }
@@ -592,6 +752,53 @@ function mapPaymentStatus(status: CandidPaymentStatus): PaymentStatus {
   throw new Error(`Unsupported payment status variant: ${JSON.stringify(status)}`);
 }
 
+function mapRepositoryStrategyStatus(
+  status: CandidRepositoryStrategyStatus
+): RepositoryStrategyRecord["status"] {
+  if ("Active" in status) {
+    return "active";
+  }
+  if ("Deprecated" in status) {
+    return "deprecated";
+  }
+  if ("Revoked" in status) {
+    return "revoked";
+  }
+
+  throw new Error(`Unsupported repository strategy status: ${JSON.stringify(status)}`);
+}
+
+function mapRepositoryStrategyRecord(
+  strategy: CandidRepositoryStrategyRecord
+): RepositoryStrategyRecord {
+  return {
+    strategyId: strategy.metadata.strategy_id,
+    name: strategy.metadata.name,
+    description: strategy.metadata.description,
+    canonicalChain: mapChain(strategy.metadata.canonical_chain),
+    canonicalChainId: toNumber(strategy.metadata.canonical_chain_id),
+    compatibleSpawnChains: strategy.metadata.compatible_spawn_chains.map(mapChain),
+    protocol: strategy.metadata.protocol,
+    primitive: strategy.metadata.primitive,
+    recipeJson: strategy.recipe_json,
+    status: mapRepositoryStrategyStatus(strategy.status),
+    source: {
+      sourcePath: strategy.metadata.source.source_path,
+      sourceCommit: strategy.metadata.source.source_commit
+    },
+    createdAt: toNumber(strategy.created_at),
+    updatedAt: toNumber(strategy.updated_at),
+    deprecatedAt:
+      unwrapOptional(strategy.deprecated_at) === null
+        ? null
+        : toNumber(unwrapOptional(strategy.deprecated_at) as bigint),
+    revokedAt:
+      unwrapOptional(strategy.revoked_at) === null
+        ? null
+        : toNumber(unwrapOptional(strategy.revoked_at) as bigint)
+  };
+}
+
 function mapAuditActor(actor: CandidSessionAuditActor): SessionAuditActor {
   if ("System" in actor) {
     return "system";
@@ -639,6 +846,32 @@ function mapSpawnPaymentInstructions(
   };
 }
 
+function mapSelectedStrategy(
+  strategy: CandidRepositoryStrategySessionSnapshot
+): SpawnSessionStatusResponse["session"]["selectedStrategies"][number] {
+  return {
+    strategyId: strategy.strategy_id,
+    sourceStatus: mapRepositoryStrategyStatus(strategy.source_status),
+    name: strategy.name,
+    description: strategy.description,
+    canonicalChain: mapChain(strategy.canonical_chain),
+    canonicalChainId: toNumber(strategy.canonical_chain_id),
+    requestedSpawnChain: mapChain(strategy.requested_spawn_chain),
+    resolvedChainId:
+      unwrapOptional(strategy.resolved_chain_id) === null
+        ? null
+        : toNumber(unwrapOptional(strategy.resolved_chain_id) as bigint),
+    protocol: strategy.protocol,
+    primitive: strategy.primitive,
+    recipeJson: strategy.recipe_json,
+    source: {
+      sourcePath: strategy.source.source_path,
+      sourceCommit: strategy.source.source_commit
+    },
+    selectedAt: toNumber(strategy.selected_at)
+  };
+}
+
 function mapSpawnSession(session: CandidSpawnSession): SpawnSessionStatusResponse["session"] {
   return {
     asset: mapAsset(session.asset),
@@ -664,6 +897,7 @@ function mapSpawnSession(session: CandidSpawnSession): SpawnSessionStatusRespons
         : toNumber(unwrapOptional(session.release_broadcast_at) as bigint),
     releaseTxHash: unwrapOptional(session.release_tx_hash),
     retryable: session.retryable,
+    selectedStrategies: session.selected_strategies.map(mapSelectedStrategy),
     sessionId: session.session_id,
     state: mapSessionState(session.state),
     stewardAddress: session.steward_address,
@@ -811,6 +1045,29 @@ function mapRegistryPage(
   };
 }
 
+function mapListRepositoryStrategiesResponse(
+  response: CandidListRepositoryStrategiesResponse
+): RepositoryStrategyListResponse {
+  return {
+    items: response.items.map(mapRepositoryStrategyRecord),
+    updatedAt: toNumber(response.updated_at)
+  };
+}
+
+function mapGetRepositoryStrategyResponse(
+  response: CandidGetRepositoryStrategyResponse
+): RepositoryStrategyGetResponse {
+  return {
+    item:
+      unwrapOptional(response.item) === null
+        ? null
+        : mapRepositoryStrategyRecord(
+            unwrapOptional(response.item) as CandidRepositoryStrategyRecord
+          ),
+    updatedAt: toNumber(response.updated_at)
+  };
+}
+
 function mapFactoryHealth(snapshot: CandidFactoryHealthSnapshot): FactoryHealthSnapshot {
   const awaitingPayment = toNumber(snapshot.active_sessions.awaiting_payment);
   const broadcastingRelease = toNumber(snapshot.active_sessions.broadcasting_release);
@@ -908,6 +1165,22 @@ export class CanisterFactoryAdapter implements FactoryAdapter {
     const actor = await this.getActor();
     return mapRegistryPage(
       expectOk(await actor.list_spawned_automatons(cursor ? [cursor] : [], BigInt(limit)))
+    );
+  }
+
+  async listRepositoryStrategies(): Promise<RepositoryStrategyListResponse> {
+    const actor = await this.getActor();
+    return mapListRepositoryStrategiesResponse(
+      await actor.list_repository_strategies()
+    );
+  }
+
+  async getRepositoryStrategy(
+    strategyId: string
+  ): Promise<RepositoryStrategyGetResponse> {
+    const actor = await this.getActor();
+    return mapGetRepositoryStrategyResponse(
+      await actor.get_repository_strategy(strategyId)
     );
   }
 

@@ -7,7 +7,11 @@ import {
   MONOLOGUE_ENTRY_TYPES,
   type AutomatonListResponse
 } from "../src/automaton.ts";
-import { CATALOG_ENTRY_STATUSES } from "../src/catalog.ts";
+import {
+  CATALOG_ENTRY_STATUSES,
+  REPOSITORY_STRATEGY_STATUSES,
+  type RepositoryStrategyRecord
+} from "../src/catalog.ts";
 import {
   AUTOMATON_EVENT_TYPES,
   SPAWN_EVENT_TYPES,
@@ -29,6 +33,7 @@ import {
   SESSION_AUDIT_ACTORS,
   SPAWN_SESSION_STATES,
   SUPPORTED_SPAWN_ASSETS,
+  type SpawnSessionStrategySnapshot,
   type SpawnSessionDetail,
   type SpawnSessionStatusResponse
 } from "../src/spawn.ts";
@@ -74,6 +79,11 @@ describe("shared contracts", () => {
     ]);
     expect(SESSION_AUDIT_ACTORS).toEqual(["system", "user", "admin"]);
     expect(CATALOG_ENTRY_STATUSES).toEqual(["available", "coming_soon"]);
+    expect(REPOSITORY_STRATEGY_STATUSES).toEqual([
+      "active",
+      "deprecated",
+      "revoked"
+    ]);
   });
 
   it("defines the locked realtime event names", () => {
@@ -171,6 +181,41 @@ describe("shared contracts", () => {
   it("keeps the shared API shapes compilable for later milestones", () => {
     const sessionId = "550e8400-e29b-41d4-a716-446655440000";
     const claimId = "0x2f779c94a35dceba72fe536ce28c5fea7566753044cdf9da29f6402ea964b7f9";
+    const repositoryRecord: RepositoryStrategyRecord = {
+      strategyId: "base-aave-usdc-reserve-01",
+      name: "Base Aave USDC Reserve",
+      description: "Park surplus Base USDC on Aave V3.",
+      canonicalChain: "base",
+      canonicalChainId: 8_453,
+      compatibleSpawnChains: ["base"],
+      protocol: "aave-v3",
+      primitive: "lend_supply",
+      recipeJson: "{\"template_id\":\"base-aave-usdc-reserve-01\"}",
+      status: "active",
+      source: {
+        sourcePath: "docs/strategies/base-aave-usdc-reserve-01/recipe.json",
+        sourceCommit: "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+      },
+      createdAt: 1_710_000_000_000,
+      updatedAt: 1_710_000_000_000,
+      deprecatedAt: null,
+      revokedAt: null
+    };
+    const selectedStrategy: SpawnSessionStrategySnapshot = {
+      strategyId: repositoryRecord.strategyId,
+      sourceStatus: repositoryRecord.status,
+      name: repositoryRecord.name,
+      description: repositoryRecord.description,
+      canonicalChain: repositoryRecord.canonicalChain,
+      canonicalChainId: repositoryRecord.canonicalChainId,
+      requestedSpawnChain: "base",
+      resolvedChainId: 8_453,
+      protocol: repositoryRecord.protocol,
+      primitive: repositoryRecord.primitive,
+      recipeJson: repositoryRecord.recipeJson,
+      source: repositoryRecord.source,
+      selectedAt: 1_710_000_000_000
+    };
     const status: SpawnSessionStatusResponse = {
       session: {
         sessionId,
@@ -194,10 +239,11 @@ describe("shared contracts", () => {
         releaseBroadcastAt: null,
         parentId: null,
         childIds: [],
+        selectedStrategies: [selectedStrategy],
         config: {
           chain: "base",
           risk: 3,
-          strategies: ["yield-farming"],
+          strategies: [selectedStrategy.strategyId],
           skills: ["portfolio-reporting"],
           provider: {
             openRouterApiKey: null,
@@ -229,6 +275,11 @@ describe("shared contracts", () => {
         }
       ]
     };
+
+    expect(status.session.config.strategies).toEqual([
+      "base-aave-usdc-reserve-01"
+    ]);
+    expect(selectedStrategy.resolvedChainId).toBe(8_453);
     const detail: SpawnSessionDetail = {
       ...status,
       registryRecord: {

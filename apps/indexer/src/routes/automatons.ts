@@ -34,6 +34,25 @@ function chainIdFromChain(chain: ChainSlug, fallback: number) {
   return fallback;
 }
 
+function buildSpawnSelection(
+  spawnSession: SpawnSessionDetail | null
+) {
+  if (spawnSession === null) {
+    return null;
+  }
+
+  return {
+    sessionId: spawnSession.session.sessionId,
+    requestedStrategyIds: [...spawnSession.session.config.strategies],
+    selectedStrategies: spawnSession.session.selectedStrategies.map((strategy) => ({
+      ...strategy,
+      source: {
+        ...strategy.source
+      }
+    }))
+  };
+}
+
 export const automatonRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get("/api/automatons", async (request) => {
     const query = request.query as {
@@ -109,7 +128,8 @@ export const automatonRoutes: FastifyPluginAsync = async (fastify) => {
       childIds:
         automaton.childIds.length > 0 ? automaton.childIds : registryRecord?.childIds ?? [],
       createdAt: registryRecord?.createdAt ?? automaton.createdAt,
-      model: automaton.model ?? spawnSession?.session.config.provider.model ?? null
+      model: automaton.model ?? spawnSession?.session.config.provider.model ?? null,
+      spawnSelection: buildSpawnSelection(spawnSession)
     };
   });
 

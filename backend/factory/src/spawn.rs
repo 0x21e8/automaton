@@ -1,3 +1,6 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::BTreeMap;
+
 use crate::base_rpc::configured_rpc_endpoints;
 #[cfg(target_arch = "wasm32")]
 use crate::controllers::complete_controller_handoff_live;
@@ -12,7 +15,9 @@ use crate::evm::derive_child_evm_address_for_key_name;
 use crate::expiry::expire_spawn_session;
 #[cfg(target_arch = "wasm32")]
 use crate::init::build_automaton_install_args;
-use crate::init::{initialize_automaton, validate_automaton_child_runtime_config};
+use crate::init::{
+    build_strategy_install_recipe, initialize_automaton, validate_automaton_child_runtime_config,
+};
 use crate::retry::mark_session_failed_in_state;
 use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent};
 use crate::state::{clear_provider_secrets, read_state, write_state, FactoryState};
@@ -20,8 +25,9 @@ use crate::state::{clear_provider_secrets, read_state, write_state, FactoryState
 use crate::types::{amount_to_string, parse_amount};
 use crate::types::{
     AutomatonBootstrapEvidence, AutomatonBootstrapVerification, AutomatonRuntimeState,
-    FactoryError, PaymentStatus, ReleaseBroadcastRecord, SessionAuditActor, SpawnExecutionReceipt,
-    SpawnSession, SpawnSessionState, SpawnedAutomatonRecord, CONTROLLER_FIELD,
+    FactoryError, PaymentStatus, ReleaseBroadcastRecord, RepositoryStrategySessionSnapshot,
+    SessionAuditActor, SpawnExecutionReceipt, SpawnSession, SpawnSessionState,
+    SpawnedAutomatonRecord, CONTROLLER_FIELD,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -233,6 +239,290 @@ struct ChildStewardStatusView {
 enum ChildDerivedAddressResult {
     Ok(String),
     Err(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, candid::CandidType, serde::Deserialize)]
+struct ChildStrategyTemplateKey {
+    protocol: String,
+    primitive: String,
+    chain_id: u64,
+    template_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, candid::CandidType, serde::Deserialize)]
+enum ChildStrategyTemplateStatus {
+    Draft,
+    Active,
+    Deprecated,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, candid::CandidType, serde::Deserialize)]
+struct ChildStrategyTemplate {
+    key: ChildStrategyTemplateKey,
+    status: ChildStrategyTemplateStatus,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Debug, candid::CandidType, serde::Deserialize)]
+enum ChildRegisterStrategyAdminResult {
+    Ok(ChildStrategyTemplate),
+    Err(String),
+}
+
+fn child_strategy_key(snapshot: &RepositoryStrategySessionSnapshot) -> ChildStrategyTemplateKey {
+    ChildStrategyTemplateKey {
+        protocol: snapshot.protocol.clone(),
+        primitive: snapshot.primitive.clone(),
+        chain_id: snapshot
+            .resolved_chain_id
+            .unwrap_or(snapshot.canonical_chain_id),
+        template_id: snapshot.strategy_id.clone(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn child_strategy_template_lookup_key(key: &ChildStrategyTemplateKey) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        key.protocol, key.primitive, key.chain_id, key.template_id
+    )
+}
+
+fn strategy_install_error(
+    method: &str,
+    snapshot: &RepositoryStrategySessionSnapshot,
+    message: impl Into<String>,
+) -> FactoryError {
+    FactoryError::ManagementCallFailed {
+        method: method.to_string(),
+        message: format!("strategy {}: {}", snapshot.strategy_id, message.into()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn child_strategy_template_from_recipe(
+    snapshot: &RepositoryStrategySessionSnapshot,
+    recipe_json: &str,
+) -> Result<ChildStrategyTemplate, FactoryError> {
+    let recipe: serde_json::Value = serde_json::from_str(recipe_json).map_err(|error| {
+        strategy_install_error(
+            "register_strategy_admin",
+            snapshot,
+            format!("invalid adapted recipe JSON: {error}"),
+        )
+    })?;
+    let recipe_object = recipe.as_object().ok_or_else(|| {
+        strategy_install_error(
+            "register_strategy_admin",
+            snapshot,
+            "adapted recipe must decode to a JSON object",
+        )
+    })?;
+    let protocol = recipe_object
+        .get("protocol")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            strategy_install_error(
+                "register_strategy_admin",
+                snapshot,
+                "adapted recipe field protocol must be a string",
+            )
+        })?;
+    let primitive = recipe_object
+        .get("primitive")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            strategy_install_error(
+                "register_strategy_admin",
+                snapshot,
+                "adapted recipe field primitive must be a string",
+            )
+        })?;
+    let chain_id = recipe_object
+        .get("chain_id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            strategy_install_error(
+                "register_strategy_admin",
+                snapshot,
+                "adapted recipe field chain_id must be a u64",
+            )
+        })?;
+    let template_id = recipe_object
+        .get("template_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            strategy_install_error(
+                "register_strategy_admin",
+                snapshot,
+                "adapted recipe field template_id must be a string",
+            )
+        })?;
+
+    Ok(ChildStrategyTemplate {
+        key: ChildStrategyTemplateKey {
+            protocol: protocol.to_string(),
+            primitive: primitive.to_string(),
+            chain_id,
+            template_id: template_id.to_string(),
+        },
+        status: ChildStrategyTemplateStatus::Active,
+    })
+}
+
+fn verify_child_strategy_template(
+    method: &str,
+    snapshot: &RepositoryStrategySessionSnapshot,
+    template: Option<&ChildStrategyTemplate>,
+) -> Result<(), FactoryError> {
+    let template = template.ok_or_else(|| {
+        strategy_install_error(
+            method,
+            snapshot,
+            "template is missing from the child after registration",
+        )
+    })?;
+    let expected_key = child_strategy_key(snapshot);
+
+    if template.key != expected_key {
+        return Err(strategy_install_error(
+            method,
+            snapshot,
+            format!(
+                "template key mismatch after registration: expected {}:{}:{}:{}, got {}:{}:{}:{}",
+                expected_key.protocol,
+                expected_key.primitive,
+                expected_key.chain_id,
+                expected_key.template_id,
+                template.key.protocol,
+                template.key.primitive,
+                template.key.chain_id,
+                template.key.template_id,
+            ),
+        ));
+    }
+
+    if !matches!(template.status, ChildStrategyTemplateStatus::Active) {
+        return Err(strategy_install_error(
+            method,
+            snapshot,
+            "template is not active after registration",
+        ));
+    }
+
+    Ok(())
+}
+
+fn prepare_retryable_runtime_after_strategy_failure(
+    runtime: &AutomatonRuntimeState,
+) -> AutomatonRuntimeState {
+    let mut retryable_runtime = runtime.clone();
+    retryable_runtime.install_succeeded_at = None;
+    retryable_runtime.last_funded_at = None;
+    retryable_runtime.funded_amount = "0".to_string();
+    retryable_runtime.controller_handoff_completed_at = None;
+    retryable_runtime
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_snapped_strategies_sync(session: &SpawnSession) -> Result<(), FactoryError> {
+    let mut installed_templates = BTreeMap::new();
+
+    for snapshot in &session.selected_strategies {
+        let adapted_recipe_json = build_strategy_install_recipe(snapshot)?;
+        let installed_template =
+            child_strategy_template_from_recipe(snapshot, &adapted_recipe_json)?;
+        installed_templates.insert(
+            child_strategy_template_lookup_key(&installed_template.key),
+            installed_template,
+        );
+    }
+
+    for snapshot in &session.selected_strategies {
+        let expected_key = child_strategy_key(snapshot);
+        let installed = installed_templates.get(&child_strategy_template_lookup_key(&expected_key));
+        verify_child_strategy_template("list_strategy_templates", snapshot, installed)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn install_snapped_strategies_into_child(
+    canister_id: &str,
+    strategies: &[RepositoryStrategySessionSnapshot],
+) -> Result<(), FactoryError> {
+    async fn call_child_canister_tuple_with_arg<A, R>(
+        principal: &candid::Principal,
+        method: &'static str,
+        arg: &A,
+    ) -> Result<R, FactoryError>
+    where
+        A: candid::CandidType,
+        R: for<'de> candid::utils::ArgumentDecoder<'de>,
+    {
+        let response = Call::unbounded_wait(*principal, method)
+            .with_arg(arg)
+            .await
+            .map_err(|error| FactoryError::ManagementCallFailed {
+                method: method.to_string(),
+                message: rejection_message(error),
+            })?;
+        response
+            .candid_tuple()
+            .map_err(|error| FactoryError::ManagementCallFailed {
+                method: method.to_string(),
+                message: rejection_message(error),
+            })
+    }
+
+    use candid::Principal;
+
+    let principal =
+        Principal::from_text(canister_id).map_err(|error| FactoryError::ManagementCallFailed {
+            method: "parse_canister_id".to_string(),
+            message: error.to_string(),
+        })?;
+
+    for snapshot in strategies {
+        let adapted_recipe_json = build_strategy_install_recipe(snapshot)?;
+        let (registration_result,): (ChildRegisterStrategyAdminResult,) =
+            call_child_canister_tuple_with_arg(
+                &principal,
+                "register_strategy_admin",
+                &adapted_recipe_json,
+            )
+            .await?;
+        let registered_template = match registration_result {
+            ChildRegisterStrategyAdminResult::Ok(template) => template,
+            ChildRegisterStrategyAdminResult::Err(message) => {
+                return Err(strategy_install_error(
+                    "register_strategy_admin",
+                    snapshot,
+                    message,
+                ));
+            }
+        };
+        verify_child_strategy_template(
+            "register_strategy_admin",
+            snapshot,
+            Some(&registered_template),
+        )?;
+
+        let expected_key = child_strategy_key(snapshot);
+        let list_args = (Some(expected_key.clone()), 1_u32);
+        let (listed_templates,): (Vec<ChildStrategyTemplate>,) =
+            call_child_canister_tuple_with_arg(&principal, "list_strategy_templates", &list_args)
+                .await?;
+        verify_child_strategy_template(
+            "list_strategy_templates",
+            snapshot,
+            listed_templates.first(),
+        )?;
+    }
+
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -536,6 +826,21 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
         runtime.funded_amount = amount_to_string(net_forward_amount);
         runtime.last_funded_at = Some(now_ms);
         runtime.install_succeeded_at = Some(now_ms);
+        if let Err(error) = install_snapped_strategies_sync(&session_snapshot) {
+            let retryable_runtime = prepare_retryable_runtime_after_strategy_failure(&runtime);
+            state.runtimes.insert(
+                retryable_runtime.canister_id.clone(),
+                retryable_runtime.clone(),
+            );
+            let _ = mark_session_failed_in_state(
+                state,
+                session_id,
+                SessionAuditActor::System,
+                now_ms,
+                &failure_audit_reason("strategy registration failed", &error),
+            )?;
+            return Err(error);
+        }
         runtime.bootstrap_verification = Some(verify_spawned_automaton_bootstrap_sync(
             &session_snapshot,
             &runtime,
@@ -1128,6 +1433,22 @@ pub async fn execute_spawn(
         .await;
     }
 
+    if let Err(error) =
+        install_snapped_strategies_into_child(&canister_id, &session_snapshot.selected_strategies)
+            .await
+    {
+        let retryable_runtime = prepare_retryable_runtime_after_strategy_failure(&runtime);
+        return fail_spawn_session(
+            session_id,
+            current_time_ms(),
+            "strategy registration failed",
+            Some(&canister_id),
+            Some(&retryable_runtime),
+            error,
+        )
+        .await;
+    }
+
     if let Err(error) = complete_controller_handoff_live(&canister_id).await {
         return fail_spawn_session(
             session_id,
@@ -1281,10 +1602,11 @@ mod tests {
             release_broadcast: None,
             parent_id: Some("parent-1".to_string()),
             child_ids: Vec::new(),
+            selected_strategies: Vec::new(),
             config: SpawnConfig {
                 chain: SpawnChain::Base,
                 risk: 7,
-                strategies: vec![" trend ".to_string()],
+                strategies: vec!["base-aave-usdc-reserve-01".to_string()],
                 skills: vec![" search ".to_string()],
                 provider: ProviderConfig {
                     open_router_api_key: Some("or-key".to_string()),
@@ -1316,7 +1638,7 @@ mod tests {
                         .expect("test factory principal should parse"),
                 ),
                 bootstrap_risk: Some(session.config.risk),
-                bootstrap_strategies: vec!["trend".to_string()],
+                bootstrap_strategies: vec!["base-aave-usdc-reserve-01".to_string()],
                 bootstrap_skills: vec!["search".to_string()],
                 bootstrap_version_commit: Some(
                     "0123456789abcdef0123456789abcdef01234567".to_string(),

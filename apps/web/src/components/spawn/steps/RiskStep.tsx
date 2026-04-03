@@ -10,7 +10,7 @@ export function RiskStep({ value, onChange }: RiskStepProps) {
 
   return (
     <section className="spawn-step">
-      <p className="section-label">Step 2</p>
+      <p className="section-label">Step 1</p>
       <h3 className="spawn-step-title">Risk Appetite</h3>
       <p className="spawn-step-copy">
         Choose how aggressively the automaton should pursue opportunity. The

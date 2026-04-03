@@ -3,14 +3,10 @@ import type { ProviderModelOption } from "../../../lib/default-models";
 interface ProviderConfigStepProps {
   openRouterApiKey: string;
   selectedModelId: string;
-  customModelId: string;
   braveSearchApiKey: string;
   modelOptions: ProviderModelOption[];
-  isLoadingModels: boolean;
-  modelStatusMessage: string;
   onOpenRouterApiKeyChange: (value: string) => void;
   onSelectedModelChange: (value: string) => void;
-  onCustomModelChange: (value: string) => void;
   onBraveSearchApiKeyChange: (value: string) => void;
 }
 
@@ -69,19 +65,15 @@ function formatModelPricing(model: ProviderModelOption): string {
 export function ProviderConfigStep({
   openRouterApiKey,
   selectedModelId,
-  customModelId,
   braveSearchApiKey,
   modelOptions,
-  isLoadingModels,
-  modelStatusMessage,
   onOpenRouterApiKeyChange,
   onSelectedModelChange,
-  onCustomModelChange,
   onBraveSearchApiKeyChange
 }: ProviderConfigStepProps) {
   return (
     <section className="spawn-step">
-      <p className="section-label">Step 3</p>
+      <p className="section-label">Step 2</p>
       <h3 className="spawn-step-title">Model &amp; External APIs</h3>
       <p className="spawn-step-copy">
         OpenRouter and Brave are optional. Leave either field blank to keep that
@@ -122,35 +114,6 @@ export function ProviderConfigStep({
             ))}
           </select>
         </label>
-
-        <label className="spawn-field">
-          <span className="spawn-field-label">Manual model override</span>
-          <input
-            className="spawn-input"
-            onChange={(event) => {
-              onCustomModelChange(event.currentTarget.value);
-            }}
-            placeholder="anthropic/claude-..."
-            type="text"
-            value={customModelId}
-          />
-        </label>
-
-        <p className="spawn-inline-note">
-          {isLoadingModels
-            ? "Loading live OpenRouter models."
-            : modelStatusMessage}
-        </p>
-
-        <ul className="provider-model-list">
-          {modelOptions.slice(0, 4).map((model) => (
-            <li key={model.id}>
-              <strong>{model.label}</strong>
-              <span>{model.description}</span>
-              <span className="provider-model-price">{formatModelPricing(model)}</span>
-            </li>
-          ))}
-        </ul>
 
         <label className="spawn-field">
           <span className="spawn-field-label">Brave Search API key</span>

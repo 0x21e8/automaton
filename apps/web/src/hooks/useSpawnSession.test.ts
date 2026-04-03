@@ -38,6 +38,7 @@ function createSession(overrides: Partial<SpawnSession> = {}): SpawnSession {
     releaseBroadcastAt: null,
     parentId: null,
     childIds: [],
+    selectedStrategies: [],
     config: {
       chain: "base",
       risk: 3,

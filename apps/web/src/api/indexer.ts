@@ -1,6 +1,8 @@
 import type {
   AutomatonDetail,
   AutomatonListResponse,
+  RepositoryStrategyGetResponse,
+  RepositoryStrategyListResponse,
   RoomMessagePage,
   RoomMessagesQuery
 } from "@ic-automaton/shared";
@@ -133,6 +135,26 @@ export async function fetchAutomatonDetail(
   return requestIndexerJson<AutomatonDetail>(`/api/automatons/${canisterId}`, {
     signal
   });
+}
+
+export async function fetchRepositoryStrategies(
+  signal?: AbortSignal
+): Promise<RepositoryStrategyListResponse> {
+  return requestIndexerJson<RepositoryStrategyListResponse>("/api/repository/strategies", {
+    signal
+  });
+}
+
+export async function fetchRepositoryStrategy(
+  strategyId: string,
+  signal?: AbortSignal
+): Promise<RepositoryStrategyGetResponse> {
+  return requestIndexerJson<RepositoryStrategyGetResponse>(
+    `/api/repository/strategies/${strategyId}`,
+    {
+      signal
+    }
+  );
 }
 
 export async function fetchRoomMessagePage(

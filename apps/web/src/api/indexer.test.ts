@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { fetchRoomHistory } from "./indexer";
+import { fetchRepositoryStrategies, fetchRoomHistory } from "./indexer";
 
 describe("fetchRoomHistory", () => {
   afterEach(() => {
@@ -85,6 +85,58 @@ describe("fetchRoomHistory", () => {
       ],
       nextAfterSeq: null,
       latestSeq: 12
+    });
+  });
+});
+
+describe("fetchRepositoryStrategies", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reads repository-backed strategy listings from the indexer", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          items: [
+            {
+              strategyId: "base-aave-usdc-reserve-01",
+              name: "Base Aave USDC Reserve",
+              description: "Park surplus Base USDC on Aave V3.",
+              canonicalChain: "base",
+              canonicalChainId: 8453,
+              compatibleSpawnChains: ["base"],
+              protocol: "aave-v3",
+              primitive: "lend_supply",
+              recipeJson: "{}",
+              status: "active",
+              source: {
+                sourcePath: "docs/strategies/base-aave-usdc-reserve-01/recipe.json",
+                sourceCommit: "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+              },
+              createdAt: 1,
+              updatedAt: 1,
+              deprecatedAt: null,
+              revokedAt: null
+            }
+          ],
+          updatedAt: 1
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json"
+          }
+        }
+      )
+    );
+
+    const response = await fetchRepositoryStrategies();
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/repository/strategies", expect.any(Object));
+    expect(response.items[0]).toMatchObject({
+      strategyId: "base-aave-usdc-reserve-01",
+      status: "active"
     });
   });
 });

@@ -6,8 +6,7 @@ import type { FundingPreview } from "../spawn-state";
 interface FundSummary {
   chain: string;
   risk: string;
-  strategies: number;
-  skills: number;
+  strategies: string;
   providerModel: string;
   braveConfigured: boolean;
 }
@@ -110,6 +109,34 @@ export function FundStep({
   playground,
   wallet
 }: FundStepProps) {
+  const balancesReady =
+    !balances.isLoading &&
+    balances.errorMessage === null &&
+    balances.ethStatus === "Ready for gas" &&
+    balances.usdcStatus === "Ready for payment";
+  const showWalletCard =
+    wallet.address === null || wallet.isConnecting || wallet.errorMessage !== null;
+  const showNetworkCard =
+    wallet.address !== null &&
+    (network.errorMessage !== null || network.isPending || !network.disabled);
+  const showBalancesCard =
+    wallet.address !== null &&
+    !showNetworkCard &&
+    (balances.isLoading || balances.errorMessage !== null || !balancesReady);
+  const showFaucetCard =
+    wallet.address !== null &&
+    !showNetworkCard &&
+    (
+      faucet.errorMessage !== null ||
+      faucet.isPending ||
+      faucet.txLinks.length > 0 ||
+      (!balances.isLoading &&
+        balances.errorMessage === null &&
+        !balancesReady)
+    );
+  const showOnboardingGrid =
+    showWalletCard || showNetworkCard || showFaucetCard || showBalancesCard;
+
   return (
     <section className="spawn-step">
       <p className="section-label">Step 4</p>
@@ -160,174 +187,184 @@ export function FundStep({
           ) : null}
         </article>
 
-        <div className="spawn-onboarding-grid">
-          <article className="spawn-onboarding-card">
-            <div className="spawn-onboarding-header">
-              <div>
-                <p className="section-label">Wallet</p>
-                <h4 className="spawn-onboarding-title">Choose provider</h4>
-              </div>
-            </div>
+        {showOnboardingGrid ? (
+          <div className="spawn-onboarding-grid">
+            {showWalletCard ? (
+              <article className="spawn-onboarding-card">
+                <div className="spawn-onboarding-header">
+                  <div>
+                    <p className="section-label">Wallet</p>
+                    <h4 className="spawn-onboarding-title">Choose provider</h4>
+                  </div>
+                </div>
 
-            {wallet.providerOptions.length > 1 ? (
-              <label className="spawn-field">
-                <span className="spawn-field-label">Detected wallets</span>
-                <select
-                  className="spawn-select"
-                  onChange={(event) => {
-                    onProviderChange(event.currentTarget.value);
-                  }}
-                  value={
-                    wallet.selectedProviderId ??
-                    wallet.providerOptions[0]?.id ??
-                    ""
+                {wallet.providerOptions.length > 1 ? (
+                  <label className="spawn-field">
+                    <span className="spawn-field-label">Detected wallets</span>
+                    <select
+                      className="spawn-select"
+                      onChange={(event) => {
+                        onProviderChange(event.currentTarget.value);
+                      }}
+                      value={
+                        wallet.selectedProviderId ??
+                        wallet.providerOptions[0]?.id ??
+                        ""
+                      }
+                    >
+                      {wallet.providerOptions.map((provider) => (
+                        <option key={provider.id} value={provider.id}>
+                          {provider.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
+
+                <p className="spawn-inline-note">{wallet.statusMessage}</p>
+                {wallet.address !== null ? (
+                  <p className="spawn-inline-note">
+                    Connected wallet: {wallet.address}
+                  </p>
+                ) : null}
+
+                <button
+                  className="spawn-nav-button is-primary"
+                  disabled={
+                    !wallet.hasProvider || wallet.isConnecting || wallet.address !== null
                   }
+                  onClick={onConnectWallet}
+                  type="button"
                 >
-                  {wallet.providerOptions.map((provider) => (
-                    <option key={provider.id} value={provider.id}>
-                      {provider.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                  {wallet.isConnecting ? "Connecting wallet..." : wallet.connectLabel}
+                </button>
+
+                {wallet.errorMessage !== null ? (
+                  <p className="spawn-session-error" role="alert">
+                    {wallet.errorMessage}
+                  </p>
+                ) : null}
+              </article>
             ) : null}
 
-            <p className="spawn-inline-note">{wallet.statusMessage}</p>
-            {wallet.address !== null ? (
-              <p className="spawn-inline-note">
-                Connected wallet: {wallet.address}
-              </p>
-            ) : null}
-
-            <button
-              className="spawn-nav-button is-primary"
-              disabled={
-                !wallet.hasProvider || wallet.isConnecting || wallet.address !== null
-              }
-              onClick={onConnectWallet}
-              type="button"
-            >
-              {wallet.isConnecting ? "Connecting wallet..." : wallet.connectLabel}
-            </button>
-
-            {wallet.errorMessage !== null ? (
-              <p className="spawn-session-error" role="alert">
-                {wallet.errorMessage}
-              </p>
-            ) : null}
-          </article>
-
-          <article className="spawn-onboarding-card">
-            <div className="spawn-onboarding-header">
-              <div>
-                <p className="section-label">Network</p>
-                <h4 className="spawn-onboarding-title">Add / switch network</h4>
-              </div>
-            </div>
-
-            <p className="spawn-inline-note">{network.statusMessage}</p>
-
-            <button
-              className="spawn-nav-button is-primary"
-              disabled={network.disabled || network.isPending}
-              onClick={onNetworkAction}
-              type="button"
-            >
-              {network.isPending ? "Updating network..." : network.actionLabel}
-            </button>
-
-            {network.errorMessage !== null ? (
-              <p className="spawn-session-error" role="alert">
-                {network.errorMessage}
-              </p>
-            ) : null}
-          </article>
-
-          <article className="spawn-onboarding-card">
-            <div className="spawn-onboarding-header">
-              <div>
-                <p className="section-label">Faucet</p>
-                <h4 className="spawn-onboarding-title">Get test funds</h4>
-              </div>
-            </div>
-
-            <p className="spawn-inline-note">{faucet.statusMessage}</p>
-
-            <button
-              className="spawn-nav-button is-primary"
-              disabled={faucet.disabledReason !== null || faucet.isPending}
-              onClick={onClaimFaucet}
-              type="button"
-            >
-              {faucet.isPending ? "Funding wallet..." : faucet.actionLabel}
-            </button>
-
-            {faucet.disabledReason !== null ? (
-              <p className="spawn-inline-note">{faucet.disabledReason}</p>
-            ) : null}
-
-            {faucet.errorMessage !== null ? (
-              <p className="spawn-session-error" role="alert">
-                {faucet.errorMessage}
-              </p>
-            ) : null}
-
-            {faucet.txLinks.length > 0 ? (
-              <ul className="spawn-link-list">
-                {faucet.txLinks.map((transaction) => (
-                  <li key={`${transaction.asset}:${transaction.hash}`}>
-                    <span>{transaction.asset.toUpperCase()}</span>
-                    {transaction.href === null ? (
-                      <strong>{transaction.hash}</strong>
-                    ) : (
-                      <a href={transaction.href} rel="noreferrer" target="_blank">
-                        {transaction.hash}
-                      </a>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            ) : null}
-          </article>
-
-          <article className="spawn-onboarding-card">
-            <div className="spawn-onboarding-header">
-              <div>
-                <p className="section-label">Balances</p>
-                <h4 className="spawn-onboarding-title">Playground wallet state</h4>
-              </div>
-            </div>
-
-            {balances.isLoading ? (
-              <p className="spawn-inline-note">Checking playground balances.</p>
-            ) : (
-              <div className="spawn-onboarding-meta">
-                <div className="spawn-onboarding-row">
-                  <span>ETH</span>
-                  <strong>{balances.ethBalance}</strong>
+            {showNetworkCard ? (
+              <article className="spawn-onboarding-card">
+                <div className="spawn-onboarding-header">
+                  <div>
+                    <p className="section-label">Network</p>
+                    <h4 className="spawn-onboarding-title">Add / switch network</h4>
+                  </div>
                 </div>
-                <div className="spawn-onboarding-row">
-                  <span>Status</span>
-                  <strong>{balances.ethStatus}</strong>
-                </div>
-                <div className="spawn-onboarding-row">
-                  <span>USDC</span>
-                  <strong>{balances.usdcBalance}</strong>
-                </div>
-                <div className="spawn-onboarding-row">
-                  <span>Status</span>
-                  <strong>{balances.usdcStatus}</strong>
-                </div>
-              </div>
-            )}
 
-            {balances.errorMessage !== null ? (
-              <p className="spawn-session-error" role="alert">
-                {balances.errorMessage}
-              </p>
+                <p className="spawn-inline-note">{network.statusMessage}</p>
+
+                <button
+                  className="spawn-nav-button is-primary"
+                  disabled={network.disabled || network.isPending}
+                  onClick={onNetworkAction}
+                  type="button"
+                >
+                  {network.isPending ? "Updating network..." : network.actionLabel}
+                </button>
+
+                {network.errorMessage !== null ? (
+                  <p className="spawn-session-error" role="alert">
+                    {network.errorMessage}
+                  </p>
+                ) : null}
+              </article>
             ) : null}
-          </article>
-        </div>
+
+            {showFaucetCard ? (
+              <article className="spawn-onboarding-card">
+                <div className="spawn-onboarding-header">
+                  <div>
+                    <p className="section-label">Faucet</p>
+                    <h4 className="spawn-onboarding-title">Get test funds</h4>
+                  </div>
+                </div>
+
+                <p className="spawn-inline-note">{faucet.statusMessage}</p>
+
+                <button
+                  className="spawn-nav-button is-primary"
+                  disabled={faucet.disabledReason !== null || faucet.isPending}
+                  onClick={onClaimFaucet}
+                  type="button"
+                >
+                  {faucet.isPending ? "Funding wallet..." : faucet.actionLabel}
+                </button>
+
+                {faucet.disabledReason !== null ? (
+                  <p className="spawn-inline-note">{faucet.disabledReason}</p>
+                ) : null}
+
+                {faucet.errorMessage !== null ? (
+                  <p className="spawn-session-error" role="alert">
+                    {faucet.errorMessage}
+                  </p>
+                ) : null}
+
+                {faucet.txLinks.length > 0 ? (
+                  <ul className="spawn-link-list">
+                    {faucet.txLinks.map((transaction) => (
+                      <li key={`${transaction.asset}:${transaction.hash}`}>
+                        <span>{transaction.asset.toUpperCase()}</span>
+                        {transaction.href === null ? (
+                          <strong>{transaction.hash}</strong>
+                        ) : (
+                          <a href={transaction.href} rel="noreferrer" target="_blank">
+                            {transaction.hash}
+                          </a>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </article>
+            ) : null}
+
+            {showBalancesCard ? (
+              <article className="spawn-onboarding-card">
+                <div className="spawn-onboarding-header">
+                  <div>
+                    <p className="section-label">Balances</p>
+                    <h4 className="spawn-onboarding-title">Playground wallet state</h4>
+                  </div>
+                </div>
+
+                {balances.isLoading ? (
+                  <p className="spawn-inline-note">Checking playground balances.</p>
+                ) : (
+                  <div className="spawn-onboarding-meta">
+                    <div className="spawn-onboarding-row">
+                      <span>ETH</span>
+                      <strong>{balances.ethBalance}</strong>
+                    </div>
+                    <div className="spawn-onboarding-row">
+                      <span>Status</span>
+                      <strong>{balances.ethStatus}</strong>
+                    </div>
+                    <div className="spawn-onboarding-row">
+                      <span>USDC</span>
+                      <strong>{balances.usdcBalance}</strong>
+                    </div>
+                    <div className="spawn-onboarding-row">
+                      <span>Status</span>
+                      <strong>{balances.usdcStatus}</strong>
+                    </div>
+                  </div>
+                )}
+
+                {balances.errorMessage !== null ? (
+                  <p className="spawn-session-error" role="alert">
+                    {balances.errorMessage}
+                  </p>
+                ) : null}
+              </article>
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
       <div className="fund-shell">
@@ -403,16 +440,12 @@ export function FundStep({
               <strong>{summary.risk}</strong>
             </div>
             <div className="fund-summary-row">
-              <span>Strategies</span>
-              <strong>{summary.strategies} selected</strong>
-            </div>
-            <div className="fund-summary-row">
-              <span>Skills</span>
-              <strong>{summary.skills} selected</strong>
-            </div>
-            <div className="fund-summary-row">
               <span>Model</span>
               <strong>{summary.providerModel}</strong>
+            </div>
+            <div className="fund-summary-row">
+              <span>Strategies</span>
+              <strong>{summary.strategies}</strong>
             </div>
             <div className="fund-summary-row">
               <span>Brave Search</span>

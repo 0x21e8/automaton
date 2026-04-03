@@ -14,6 +14,7 @@ pub mod scheduler;
 pub mod session_transitions;
 pub mod spawn;
 pub mod state;
+pub mod strategy_repository;
 pub mod types;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -30,6 +31,11 @@ pub use api::public::{
     list_messages_for_automaton, list_my_room_messages, list_room_messages,
     list_spawned_automatons, post_room_message, retry_spawn_session,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use api::repository::{
+    add_repository_strategy, deprecate_repository_strategy, get_repository_strategy,
+    list_repository_strategies, revoke_repository_strategy,
+};
 pub use escrow::{
     claim_escrow_refund, get_escrow_claim, next_payment_scan_plan, reconcile_escrow_payments,
     register_escrow_claim,
@@ -45,14 +51,18 @@ pub use state::{
     FactoryStateSnapshot,
 };
 pub use types::{
-    derive_claim_id, ArtifactUploadStatus, AutomatonChildRuntimeConfig, AutomatonRuntimeState,
-    CreateSpawnSessionRequest, CreateSpawnSessionResponse, CreationCostQuote, EscrowClaim,
+    derive_claim_id, AddRepositoryStrategyRequest, ArtifactUploadStatus,
+    AutomatonChildRuntimeConfig, AutomatonRuntimeState, CreateSpawnSessionRequest,
+    CreateSpawnSessionResponse, CreationCostQuote, DeprecateRepositoryStrategyRequest, EscrowClaim,
     FactoryArtifactSnapshot, FactoryConfigSnapshot, FactoryError, FactoryHealthSnapshot,
     FactoryInitArgs, FactoryOperationalConfig, FactoryRuntimeSnapshot,
     FactorySchedulerHealthSnapshot, FactorySchedulerJobCounts, FactorySessionHealthCounts,
-    FeeConfig, PaymentStatus, PostRoomMessageRequest, ProviderConfig, RefundSpawnResponse,
-    ReleaseBroadcastConfig, ReleaseBroadcastFailure, ReleaseBroadcastRecord, ReleaseBroadcastStage,
-    ReleaseSignatureRecord, RoomContentType, RoomMessage, RoomMessagePage, RoomState,
+    FeeConfig, GetRepositoryStrategyResponse, ListRepositoryStrategiesResponse, PaymentStatus,
+    PostRoomMessageRequest, ProviderConfig, RefundSpawnResponse, ReleaseBroadcastConfig,
+    ReleaseBroadcastFailure, ReleaseBroadcastRecord, ReleaseBroadcastStage, ReleaseSignatureRecord,
+    RepositoryStrategyMetadata, RepositoryStrategyMutationResponse, RepositoryStrategyRecord,
+    RepositoryStrategySessionSnapshot, RepositoryStrategySource, RepositoryStrategyStatus,
+    RevokeRepositoryStrategyRequest, RoomContentType, RoomMessage, RoomMessagePage, RoomState,
     SchedulerFailureAction, SchedulerFailureSource, SchedulerJob, SchedulerJobFailure,
     SchedulerJobKind, SchedulerJobStatus, SchedulerRuntime, SessionAdminView, SessionAuditActor,
     SessionAuditEntry, SpawnAsset, SpawnChain, SpawnConfig, SpawnExecutionReceipt,
@@ -171,6 +181,18 @@ fn get_spawn_session(session_id: String) -> Result<SpawnSessionStatusResponse, F
 #[ic_cdk::query]
 fn get_spawned_automaton(canister_id: String) -> Result<SpawnedAutomatonRecord, FactoryError> {
     api::public::get_spawned_automaton(&canister_id)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::query]
+fn list_repository_strategies() -> ListRepositoryStrategiesResponse {
+    api::repository::list_repository_strategies()
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::query]
+fn get_repository_strategy(strategy_id: String) -> GetRepositoryStrategyResponse {
+    api::repository::get_repository_strategy(&strategy_id)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -311,6 +333,42 @@ fn set_pause(paused: bool) -> Result<bool, FactoryError> {
 
 #[cfg(target_arch = "wasm32")]
 #[ic_cdk::update]
+fn add_repository_strategy(
+    request: AddRepositoryStrategyRequest,
+) -> Result<RepositoryStrategyMutationResponse, FactoryError> {
+    api::repository::add_repository_strategy(
+        &ic_cdk::api::msg_caller().to_text(),
+        request,
+        now_ms(),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
+fn deprecate_repository_strategy(
+    request: DeprecateRepositoryStrategyRequest,
+) -> Result<RepositoryStrategyMutationResponse, FactoryError> {
+    api::repository::deprecate_repository_strategy(
+        &ic_cdk::api::msg_caller().to_text(),
+        request,
+        now_ms(),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
+fn revoke_repository_strategy(
+    request: RevokeRepositoryStrategyRequest,
+) -> Result<RepositoryStrategyMutationResponse, FactoryError> {
+    api::repository::revoke_repository_strategy(
+        &ic_cdk::api::msg_caller().to_text(),
+        request,
+        now_ms(),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
 fn update_artifact(
     wasm_bytes: Vec<u8>,
     expected_sha256: String,
@@ -363,20 +421,24 @@ ic_cdk::export_candid!();
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{
-        append_artifact_chunk, apply_factory_init_args, auto_run_spawn_scheduler,
-        begin_artifact_upload, bootstrap_status, claim_spawn_refund, commit_artifact_upload,
-        create_spawn_session, derive_claim_id, execute_spawn, expire_spawn_session,
-        get_artifact_upload_status, get_escrow_claim, get_factory_config, get_factory_health,
-        get_factory_runtime, get_session_admin, get_spawn_session, get_spawned_automaton,
+        add_repository_strategy, append_artifact_chunk, apply_factory_init_args,
+        auto_run_spawn_scheduler, begin_artifact_upload, bootstrap_status, claim_spawn_refund,
+        commit_artifact_upload, create_spawn_session, deprecate_repository_strategy,
+        derive_claim_id, execute_spawn, expire_spawn_session, get_artifact_upload_status,
+        get_escrow_claim, get_factory_config, get_factory_health, get_factory_runtime,
+        get_repository_strategy, get_session_admin, get_spawn_session, get_spawned_automaton,
         insert_spawned_automaton_record, list_messages_for_automaton, list_my_room_messages,
-        list_room_messages, list_spawned_automatons, mark_session_failed, next_payment_scan_plan,
-        post_room_message, reconcile_escrow_payments, restore_state, retry_session_admin,
-        retry_spawn_session, set_child_runtime_config, set_creation_cost_quote, set_fee_config,
+        list_repository_strategies, list_room_messages, list_spawned_automatons,
+        mark_session_failed, next_payment_scan_plan, post_room_message, reconcile_escrow_payments,
+        restore_state, retry_session_admin, retry_spawn_session, revoke_repository_strategy,
+        set_child_runtime_config, set_creation_cost_quote, set_fee_config,
         set_mock_canister_balance, set_operational_config, set_pause, set_release_broadcast_config,
-        snapshot_state, update_artifact, write_state, AutomatonChildRuntimeConfig,
-        CreateSpawnSessionRequest, CreationCostQuote, FactoryError, FactoryInitArgs,
+        snapshot_state, update_artifact, write_state, AddRepositoryStrategyRequest,
+        AutomatonChildRuntimeConfig, CreateSpawnSessionRequest, CreationCostQuote,
+        DeprecateRepositoryStrategyRequest, FactoryError, FactoryInitArgs,
         FactoryOperationalConfig, FactoryStateSnapshot, FeeConfig, PaymentStatus,
-        PostRoomMessageRequest, ProviderConfig, ReleaseBroadcastConfig, RoomContentType,
+        PostRoomMessageRequest, ProviderConfig, ReleaseBroadcastConfig, RepositoryStrategyMetadata,
+        RepositoryStrategySource, RevokeRepositoryStrategyRequest, RoomContentType,
         SchedulerFailureAction, SchedulerFailureSource, SchedulerJob, SchedulerJobFailure,
         SchedulerJobKind, SchedulerJobStatus, SchedulerRuntime, SessionAuditActor, SpawnAsset,
         SpawnChain, SpawnConfig, SpawnSessionState, SpawnedAutomatonRecord, MAX_ROOM_BODY_BYTES,
@@ -443,7 +505,10 @@ mod tests {
         format!("mock://success/deposit-log/{claim_id}/{amount}/{block_number}")
     }
 
-    fn sample_request(gross_amount: &str) -> CreateSpawnSessionRequest {
+    fn sample_request_with_strategies(
+        gross_amount: &str,
+        strategies: &[&str],
+    ) -> CreateSpawnSessionRequest {
         CreateSpawnSessionRequest {
             steward_address: "0xsteward".to_string(),
             asset: SpawnAsset::Usdc,
@@ -451,7 +516,10 @@ mod tests {
             config: SpawnConfig {
                 chain: SpawnChain::Base,
                 risk: 7,
-                strategies: vec!["trend".to_string()],
+                strategies: strategies
+                    .iter()
+                    .map(|strategy| (*strategy).to_string())
+                    .collect(),
                 skills: vec!["search".to_string()],
                 provider: ProviderConfig {
                     open_router_api_key: Some("or-key".to_string()),
@@ -461,6 +529,10 @@ mod tests {
             },
             parent_id: None,
         }
+    }
+
+    fn sample_request(gross_amount: &str) -> CreateSpawnSessionRequest {
+        sample_request_with_strategies(gross_amount, &["base-aave-usdc-reserve-01"])
     }
 
     fn sample_spawned_automaton_record(
@@ -478,6 +550,28 @@ mod tests {
             child_ids: Vec::new(),
             created_at,
             version_commit: SHA40.to_string(),
+        }
+    }
+
+    fn sample_repository_add_request(strategy_id: &str) -> AddRepositoryStrategyRequest {
+        AddRepositoryStrategyRequest {
+            metadata: RepositoryStrategyMetadata {
+                strategy_id: strategy_id.to_string(),
+                name: "Custom Base Aave Reserve".to_string(),
+                description: "A custom launchpad-owned reserve recipe.".to_string(),
+                canonical_chain: SpawnChain::Base,
+                canonical_chain_id: 8_453,
+                compatible_spawn_chains: vec![SpawnChain::Base],
+                protocol: "aave-v3".to_string(),
+                primitive: "lend_supply".to_string(),
+                source: RepositoryStrategySource {
+                    source_path: "docs/strategies/custom/recipe.json".to_string(),
+                    source_commit: "03961659ec3b86f8586ac07e5f295084bb6f6ffa".to_string(),
+                },
+            },
+            recipe_json: format!(
+                r#"{{"template_id":"{strategy_id}","chain_id":8453,"protocol":"aave-v3","primitive":"lend_supply","contracts":[],"actions":[],"max_value_wei_per_call":"0","template_budget_wei":"0"}}"#
+            ),
         }
     }
 
@@ -596,6 +690,122 @@ mod tests {
     }
 
     #[test]
+    fn seeds_repository_strategies_and_exposes_public_queries() {
+        reset_factory_state();
+
+        let list = list_repository_strategies();
+        let item = get_repository_strategy("base-aave-usdc-reserve-01");
+
+        assert_eq!(list.items.len(), 3);
+        assert_eq!(
+            list.items
+                .iter()
+                .map(|record| record.metadata.strategy_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "base-aave-usdc-reserve-01",
+                "base-moonwell-usdc-reserve-01",
+                "base-usdc-carry-cbbtc-01"
+            ]
+        );
+        assert_eq!(list.updated_at, 0);
+        assert_eq!(
+            item.item
+                .as_ref()
+                .map(|record| record.metadata.name.as_str()),
+            Some("Base Aave USDC Reserve")
+        );
+        assert!(item
+            .item
+            .as_ref()
+            .expect("seed strategy should exist")
+            .recipe_json
+            .contains("\"template_id\": \"base-aave-usdc-reserve-01\""));
+    }
+
+    #[test]
+    fn manages_repository_strategy_lifecycle_via_admin_surface() {
+        reset_factory_state();
+
+        let created = add_repository_strategy(
+            "admin",
+            sample_repository_add_request("custom-aave-01"),
+            100,
+        )
+        .expect("admin can add repository strategy");
+        let deprecated = deprecate_repository_strategy(
+            "admin",
+            DeprecateRepositoryStrategyRequest {
+                strategy_id: "custom-aave-01".to_string(),
+                reason: Some("Prefer a newer revision".to_string()),
+            },
+            200,
+        )
+        .expect("admin can deprecate repository strategy");
+        let revoked = revoke_repository_strategy(
+            "admin",
+            RevokeRepositoryStrategyRequest {
+                strategy_id: "custom-aave-01".to_string(),
+                reason: Some("Unsafe template".to_string()),
+            },
+            300,
+        )
+        .expect("admin can revoke repository strategy");
+
+        assert_eq!(created.strategy.created_at, 100);
+        assert_eq!(created.strategy.updated_at, 100);
+        assert!(matches!(
+            deprecated.strategy.status,
+            crate::types::RepositoryStrategyStatus::Deprecated
+        ));
+        assert_eq!(deprecated.strategy.deprecated_at, Some(200));
+        assert!(matches!(
+            revoked.strategy.status,
+            crate::types::RepositoryStrategyStatus::Revoked
+        ));
+        assert_eq!(revoked.strategy.revoked_at, Some(300));
+        assert_eq!(
+            get_repository_strategy("custom-aave-01")
+                .item
+                .expect("added strategy should remain readable")
+                .updated_at,
+            300
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_repository_strategy_ingest() {
+        reset_factory_state();
+
+        let duplicate = add_repository_strategy(
+            "admin",
+            sample_repository_add_request("base-aave-usdc-reserve-01"),
+            100,
+        )
+        .expect_err("seed ids should not be overwritten");
+        assert!(matches!(
+            duplicate,
+            FactoryError::RepositoryStrategyAlreadyExists { ref strategy_id }
+                if strategy_id == "base-aave-usdc-reserve-01"
+        ));
+
+        let invalid = add_repository_strategy(
+            "admin",
+            AddRepositoryStrategyRequest {
+                recipe_json: r#"{"template_id":"different-id","chain_id":8453,"protocol":"aave-v3","primitive":"lend_supply"}"#.to_string(),
+                ..sample_repository_add_request("custom-aave-02")
+            },
+            100,
+        )
+        .expect_err("recipe metadata mismatches should fail");
+        assert!(matches!(
+            invalid,
+            FactoryError::InvalidRepositoryStrategy { ref field, .. }
+                if field == "recipe_json.template_id"
+        ));
+    }
+
+    #[test]
     fn creates_sessions_with_fixed_quote_terms_and_audit_log() {
         reset_factory_state();
 
@@ -618,6 +828,15 @@ mod tests {
             response.quote.quote_terms_hash
         );
         assert_eq!(response.session.net_forward_amount, "10000000");
+        assert_eq!(response.session.selected_strategies.len(), 1);
+        assert_eq!(
+            response.session.selected_strategies[0].strategy_id,
+            "base-aave-usdc-reserve-01"
+        );
+        assert!(matches!(
+            response.session.selected_strategies[0].source_status,
+            crate::types::RepositoryStrategyStatus::Active
+        ));
 
         let status = get_spawn_session(&response.session.session_id).expect("session should load");
         assert_eq!(status.audit.len(), 1);
@@ -627,6 +846,122 @@ mod tests {
 
         let after = snapshot_state();
         assert_eq!(before.sessions.len() + 1, after.sessions.len());
+    }
+
+    #[test]
+    fn rejects_missing_deprecated_and_revoked_repository_strategies() {
+        reset_factory_state();
+
+        let missing = create_spawn_session(
+            sample_request_with_strategies("60000000", &["missing-strategy"]),
+            1_700_000,
+        )
+        .expect_err("unknown strategy ids should be rejected");
+        assert!(matches!(
+            missing,
+            FactoryError::RepositoryStrategyNotFound { ref strategy_id }
+                if strategy_id == "missing-strategy"
+        ));
+
+        deprecate_repository_strategy(
+            "admin",
+            DeprecateRepositoryStrategyRequest {
+                strategy_id: "base-aave-usdc-reserve-01".to_string(),
+                reason: Some("superseded".to_string()),
+            },
+            1_700_100,
+        )
+        .expect("seed strategy can be deprecated");
+        let deprecated = create_spawn_session(sample_request("60000000"), 1_700_200)
+            .expect_err("deprecated strategies should be rejected");
+        assert!(matches!(
+            deprecated,
+            FactoryError::RepositoryStrategyDeprecated { ref strategy_id }
+                if strategy_id == "base-aave-usdc-reserve-01"
+        ));
+
+        reset_factory_state();
+        revoke_repository_strategy(
+            "admin",
+            RevokeRepositoryStrategyRequest {
+                strategy_id: "base-aave-usdc-reserve-01".to_string(),
+                reason: Some("unsafe".to_string()),
+            },
+            1_700_300,
+        )
+        .expect("seed strategy can be revoked");
+        let revoked = create_spawn_session(sample_request("60000000"), 1_700_400)
+            .expect_err("revoked strategies should be rejected");
+        assert!(matches!(
+            revoked,
+            FactoryError::RepositoryStrategyRevoked { ref strategy_id }
+                if strategy_id == "base-aave-usdc-reserve-01"
+        ));
+        assert!(snapshot_state().sessions.is_empty());
+    }
+
+    #[test]
+    fn snapshots_selected_repository_strategies_immutably_per_session() {
+        reset_factory_state();
+
+        write_state(|state| {
+            state.child_runtime.evm_chain_id = Some(31_337);
+        });
+        let created = create_spawn_session(
+            sample_request_with_strategies(
+                "75000000",
+                &["base-aave-usdc-reserve-01", "base-moonwell-usdc-reserve-01"],
+            ),
+            30_000,
+        )
+        .expect("session should be created");
+
+        assert_eq!(created.session.selected_strategies.len(), 2);
+        assert_eq!(
+            created
+                .session
+                .selected_strategies
+                .iter()
+                .map(|strategy| strategy.strategy_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["base-aave-usdc-reserve-01", "base-moonwell-usdc-reserve-01"]
+        );
+        assert_eq!(
+            created.session.selected_strategies[0].resolved_chain_id,
+            Some(31_337)
+        );
+        assert_eq!(
+            created.session.selected_strategies[0].canonical_chain_id,
+            8_453
+        );
+
+        revoke_repository_strategy(
+            "admin",
+            RevokeRepositoryStrategyRequest {
+                strategy_id: "base-aave-usdc-reserve-01".to_string(),
+                reason: Some("later repository change".to_string()),
+            },
+            31_000,
+        )
+        .expect("repository lifecycle can change after session creation");
+        write_state(|state| {
+            state.child_runtime.evm_chain_id = Some(8_453);
+        });
+
+        let reloaded =
+            get_spawn_session(&created.session.session_id).expect("session should still load");
+        assert_eq!(
+            reloaded.session.selected_strategies,
+            created.session.selected_strategies
+        );
+        assert!(matches!(
+            reloaded.session.selected_strategies[0].source_status,
+            crate::types::RepositoryStrategyStatus::Active
+        ));
+        assert_eq!(
+            reloaded.session.selected_strategies[0].resolved_chain_id,
+            Some(31_337)
+        );
     }
 
     #[test]
@@ -1527,6 +1862,118 @@ mod tests {
                 .evm_address,
             receipt.automaton_evm_address
         );
+    }
+
+    #[test]
+    fn fails_spawn_atomically_when_strategy_registration_fails() {
+        reset_factory_state();
+        upload_test_artifact();
+        write_state(|state| {
+            state.base_rpc_endpoint = Some("https://base.example".to_string());
+        });
+
+        let response = create_spawn_session(sample_request("75000000"), 9_000)
+            .expect("session should be created");
+        write_state(|state| {
+            let session = state
+                .sessions
+                .get_mut(&response.session.session_id)
+                .expect("session should exist");
+            session.selected_strategies[0].recipe_json = "{".to_string();
+        });
+        reconcile_escrow_payments(
+            &[base_deposit_log(
+                &response.session.session_id,
+                "75000000",
+                1_500,
+            )],
+            1_500,
+            10_000,
+        )
+        .expect("claim should become paid");
+
+        let error = execute_spawn(&response.session.session_id, 11_000)
+            .expect_err("strategy registration should fail");
+        let session = get_spawn_session(&response.session.session_id).expect("session should load");
+        let canister_id = session
+            .session
+            .automaton_canister_id
+            .clone()
+            .expect("failed session should still record the attempted child");
+        let runtime = snapshot_state()
+            .runtimes
+            .get(&canister_id)
+            .cloned()
+            .expect("failed runtime should persist");
+
+        assert!(matches!(
+            error,
+            FactoryError::ManagementCallFailed { ref method, ref message }
+                if method == "register_strategy_admin"
+                    && message.contains("invalid session snapshot recipe JSON")
+        ));
+        assert_eq!(session.session.state, SpawnSessionState::Failed);
+        assert!(session.session.retryable);
+        assert!(snapshot_state().registry.is_empty());
+        assert!(runtime.install_succeeded_at.is_none());
+        assert!(runtime.controller_handoff_completed_at.is_none());
+        assert_eq!(runtime.funded_amount, "0");
+        assert!(session
+            .audit
+            .last()
+            .expect("failure audit should exist")
+            .reason
+            .contains("strategy registration failed"));
+    }
+
+    #[test]
+    fn retries_from_session_snapshots_even_after_repository_revocation() {
+        reset_factory_state();
+        upload_test_artifact();
+
+        let response = create_spawn_session(sample_request("75000000"), 9_000)
+            .expect("session should be created");
+        reconcile_escrow_payments(
+            &[base_deposit_log(
+                &response.session.session_id,
+                "75000000",
+                1_500,
+            )],
+            1_500,
+            10_000,
+        )
+        .expect("claim should become paid");
+
+        let first_error =
+            execute_spawn(&response.session.session_id, 11_000).expect_err("spawn should fail");
+        assert!(matches!(
+            first_error,
+            FactoryError::ManagementCallFailed { ref method, ref message }
+                if method == "http_request"
+                    && message == "base RPC endpoint is not configured"
+        ));
+
+        revoke_repository_strategy(
+            "admin",
+            RevokeRepositoryStrategyRequest {
+                strategy_id: "base-aave-usdc-reserve-01".to_string(),
+                reason: Some("repository changed after session creation".to_string()),
+            },
+            11_500,
+        )
+        .expect("repository strategy can be revoked after the session was created");
+        write_state(|state| {
+            state.base_rpc_endpoint = Some("https://base.example".to_string());
+        });
+
+        retry_spawn_session("0xsteward", &response.session.session_id, 12_000)
+            .expect("retry should succeed");
+        let receipt =
+            execute_spawn(&response.session.session_id, 13_000).expect("retry should complete");
+        let session = get_spawn_session(&response.session.session_id).expect("session should load");
+
+        assert_eq!(session.session.state, SpawnSessionState::Complete);
+        assert_eq!(receipt.session_id, response.session.session_id);
     }
 
     #[test]

@@ -1,3 +1,9 @@
+import type {
+  RepositoryStrategyRecord,
+  RepositoryStrategySourceProvenance,
+  RepositoryStrategyStatus
+} from "./catalog.js";
+
 export const SUPPORTED_SPAWN_CHAINS = ["base"] as const;
 export const SUPPORTED_SPAWN_ASSETS = ["usdc"] as const;
 
@@ -32,6 +38,7 @@ export type SpawnAsset = (typeof SUPPORTED_SPAWN_ASSETS)[number];
 export type SpawnSessionState = (typeof SPAWN_SESSION_STATES)[number];
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 export type SessionAuditActor = (typeof SESSION_AUDIT_ACTORS)[number];
+export type StrategyRepositoryId = RepositoryStrategyRecord["strategyId"];
 
 export interface ProviderConfig {
   openRouterApiKey: string | null;
@@ -39,10 +46,27 @@ export interface ProviderConfig {
   braveSearchApiKey: string | null;
 }
 
+export interface SpawnSessionStrategySnapshot {
+  strategyId: StrategyRepositoryId;
+  sourceStatus: RepositoryStrategyStatus;
+  name: string;
+  description: string;
+  canonicalChain: RepositoryStrategyRecord["canonicalChain"];
+  canonicalChainId: number;
+  requestedSpawnChain: SpawnChain;
+  resolvedChainId: number | null;
+  protocol: string;
+  primitive: string;
+  recipeJson: string;
+  source: RepositoryStrategySourceProvenance;
+  selectedAt: number;
+}
+
 export interface SpawnConfig {
   chain: SpawnChain;
   risk: number;
-  strategies: string[];
+  // Repository-owned strategy IDs, not free-form labels.
+  strategies: StrategyRepositoryId[];
   skills: string[];
   provider: ProviderConfig;
 }
@@ -95,6 +119,7 @@ export interface SpawnSession {
   releaseBroadcastAt: number | null;
   parentId: string | null;
   childIds: string[];
+  selectedStrategies: SpawnSessionStrategySnapshot[];
   config: SpawnConfig;
   createdAt: number;
   updatedAt: number;

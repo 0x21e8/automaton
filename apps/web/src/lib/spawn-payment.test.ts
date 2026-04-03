@@ -13,21 +13,6 @@ import {
   getSpawnPaymentAvailability
 } from "./spawn-payment";
 
-function mockSuccessfulReceiptFetch() {
-  return vi
-    .spyOn(globalThis, "fetch")
-    .mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        jsonrpc: "2.0",
-        id: 1,
-        result: {
-          status: "0x1"
-        }
-      })
-    } as Response);
-}
-
 function createSession(overrides: Partial<SpawnSession> = {}): SpawnSession {
   const sessionId = overrides.sessionId ?? "session-1";
 
@@ -53,6 +38,7 @@ function createSession(overrides: Partial<SpawnSession> = {}): SpawnSession {
     releaseBroadcastAt: null,
     parentId: null,
     childIds: [],
+    selectedStrategies: [],
     config: {
       chain: "base",
       risk: 3,

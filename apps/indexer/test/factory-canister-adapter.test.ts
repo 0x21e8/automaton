@@ -24,7 +24,7 @@ function createSession(sessionId = "550e8400-e29b-41d4-a716-446655440000") {
       },
       risk: 7,
       skills: ["search"],
-      strategies: ["trend"]
+      strategies: ["base-aave-usdc-reserve-01"]
     },
     created_at: 1_709_912_345_000n,
     creation_cost: "2000000",
@@ -41,6 +41,26 @@ function createSession(sessionId = "550e8400-e29b-41d4-a716-446655440000") {
       "0x1111111111111111111111111111111111111111111111111111111111111111"
     ],
     retryable: false,
+    selected_strategies: [
+      {
+        canonical_chain: BASE,
+        canonical_chain_id: 8453n,
+        description: "Park surplus Base USDC on Aave V3.",
+        name: "Base Aave USDC Reserve",
+        primitive: "lend_supply",
+        protocol: "aave-v3",
+        recipe_json: "{\"template_id\":\"base-aave-usdc-reserve-01\"}",
+        requested_spawn_chain: BASE,
+        resolved_chain_id: [31337n],
+        selected_at: 1_709_912_345_000n,
+        source: {
+          source_commit: "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
+          source_path: "docs/strategies/base-aave-usdc-reserve-01/recipe.json"
+        },
+        source_status: { Active: null },
+        strategy_id: "base-aave-usdc-reserve-01"
+      }
+    ],
     session_id: sessionId,
     state: { Complete: null },
     steward_address: "0x0000000000000000000000000000000000000002",
@@ -83,6 +103,31 @@ function createRegistryRecord() {
     session_id: "550e8400-e29b-41d4-a716-446655440000",
     steward_address: "0x0000000000000000000000000000000000000002",
     version_commit: "abcdef1234567890abcdef1234567890abcdef12"
+  };
+}
+
+function createRepositoryStrategyRecord() {
+  return {
+    metadata: {
+      strategy_id: "base-aave-usdc-reserve-01",
+      name: "Base Aave USDC Reserve",
+      description: "Park surplus Base USDC on Aave V3.",
+      canonical_chain: BASE,
+      canonical_chain_id: 8453n,
+      compatible_spawn_chains: [BASE],
+      protocol: "aave-v3",
+      primitive: "lend_supply",
+      source: {
+        source_commit: "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
+        source_path: "docs/strategies/base-aave-usdc-reserve-01/recipe.json"
+      }
+    },
+    recipe_json: "{\"template_id\":\"base-aave-usdc-reserve-01\"}",
+    status: { Active: null },
+    created_at: 1_709_912_345_000n,
+    updated_at: 1_709_912_360_000n,
+    deprecated_at: [],
+    revoked_at: []
   };
 }
 
@@ -144,6 +189,11 @@ function createActor() {
       }
     })),
     get_factory_health: vi.fn(async () => createHealthSnapshot()),
+    get_repository_strategy: vi.fn(async (strategyId: string) => ({
+      item:
+        strategyId === "missing-strategy" ? [] : [createRepositoryStrategyRecord()],
+      updated_at: 1_709_912_360_000n
+    })),
     get_spawn_session: vi.fn(async (sessionId: string) => {
       if (sessionId === "missing-session") {
         return {
@@ -201,6 +251,10 @@ function createActor() {
         next_cursor: cursor.length === 0 && limit === 25n ? ["next-cursor"] : []
       }
     })),
+    list_repository_strategies: vi.fn(async () => ({
+      items: [createRepositoryStrategyRecord()],
+      updated_at: 1_709_912_360_000n
+    })),
     list_room_messages: vi.fn(async (_afterSeq: [] | [bigint], limit: [] | [bigint]) => ({
       Ok: {
         ...createRoomPage(),
@@ -250,7 +304,7 @@ describe("CanisterFactoryAdapter", () => {
       config: {
         chain: "base",
         risk: 7,
-        strategies: ["trend"],
+        strategies: ["base-aave-usdc-reserve-01"],
         skills: ["search"],
         provider: {
           openRouterApiKey: "openrouter-key",
@@ -266,6 +320,11 @@ describe("CanisterFactoryAdapter", () => {
     const registry = await adapter.getSpawnedAutomaton("ryjl3-tyaaa-aaaaa-aaaba-cai");
     const missingRegistry = await adapter.getSpawnedAutomaton("missing-canister");
     const page = await adapter.listSpawnedAutomatons(undefined, 25);
+    const repository = await adapter.listRepositoryStrategies();
+    const repositoryItem = await adapter.getRepositoryStrategy(
+      "base-aave-usdc-reserve-01"
+    );
+    const missingRepositoryItem = await adapter.getRepositoryStrategy("missing-strategy");
     const roomPage = await adapter.listRoomMessages(undefined, 50);
     const relevantRoomPage = await adapter.listMessagesForAutomaton(
       "txyno-ch777-77776-aaaaq-cai",
@@ -288,7 +347,7 @@ describe("CanisterFactoryAdapter", () => {
         },
         risk: 7,
         skills: ["search"],
-        strategies: ["trend"]
+        strategies: ["base-aave-usdc-reserve-01"]
       },
       gross_amount: "1000000000",
       parent_id: [],
@@ -300,6 +359,12 @@ describe("CanisterFactoryAdapter", () => {
         state: "complete",
         paymentStatus: "paid",
         releaseBroadcastAt: 1_709_912_359_000,
+        selectedStrategies: [
+          expect.objectContaining({
+            strategyId: "base-aave-usdc-reserve-01",
+            resolvedChainId: 31337
+          })
+        ],
         config: {
           provider: {
             openRouterApiKey: "openrouter-key",
@@ -318,7 +383,13 @@ describe("CanisterFactoryAdapter", () => {
     expect(session).toMatchObject({
       session: {
         sessionId: "550e8400-e29b-41d4-a716-446655440000",
-        state: "complete"
+        state: "complete",
+        selectedStrategies: [
+          expect.objectContaining({
+            strategyId: "base-aave-usdc-reserve-01",
+            sourceStatus: "active"
+          })
+        ]
       },
       audit: [
         {
@@ -346,6 +417,27 @@ describe("CanisterFactoryAdapter", () => {
         })
       ],
       nextCursor: "next-cursor"
+    });
+    expect(repository).toEqual({
+      items: [
+        expect.objectContaining({
+          strategyId: "base-aave-usdc-reserve-01",
+          compatibleSpawnChains: ["base"],
+          status: "active"
+        })
+      ],
+      updatedAt: 1_709_912_360_000
+    });
+    expect(repositoryItem).toEqual({
+      item: expect.objectContaining({
+        strategyId: "base-aave-usdc-reserve-01",
+        canonicalChainId: 8453
+      }),
+      updatedAt: 1_709_912_360_000
+    });
+    expect(missingRepositoryItem).toEqual({
+      item: null,
+      updatedAt: 1_709_912_360_000
     });
     expect(roomPage).toEqual({
       messages: [
@@ -410,8 +502,16 @@ describe("CanisterFactoryAdapter", () => {
           claim_spawn_refund: vi.fn(),
           create_spawn_session: vi.fn(),
           get_factory_health: vi.fn(async () => createHealthSnapshot()),
+          get_repository_strategy: vi.fn(async () => ({
+            item: [],
+            updated_at: 0n
+          })),
           get_spawn_session: vi.fn(),
           get_spawned_automaton: vi.fn(),
+          list_repository_strategies: vi.fn(async () => ({
+            items: [],
+            updated_at: 0n
+          })),
           list_messages_for_automaton: vi.fn(),
           list_my_room_messages: vi.fn(),
           list_room_messages: vi.fn(),

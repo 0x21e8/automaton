@@ -22,6 +22,14 @@ const requiredMethodExports = [
   {
     methodName: "derive_automaton_evm_address",
     exportLabels: ["canister_update derive_automaton_evm_address"]
+  },
+  {
+    methodName: "register_strategy_admin",
+    exportLabels: ["canister_update register_strategy_admin"]
+  },
+  {
+    methodName: "list_strategy_templates",
+    exportLabels: ["canister_query list_strategy_templates"]
   }
 ];
 

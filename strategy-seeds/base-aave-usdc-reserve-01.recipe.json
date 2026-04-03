@@ -1,0 +1,85 @@
+{
+  "protocol": "aave-v3",
+  "primitive": "lend_supply",
+  "chain_id": 8453,
+  "template_id": "base-aave-usdc-reserve-01",
+  "contracts": [
+    {
+      "role": "usdc",
+      "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "abi_json": "[{\"type\":\"function\",\"name\":\"approve\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"name\":\"spender\",\"type\":\"address\"},{\"name\":\"value\",\"type\":\"uint256\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\"}]}]",
+      "source_ref": "https://raw.githubusercontent.com/bgd-labs/aave-address-book/main/src/AaveV3Base.sol"
+    },
+    {
+      "role": "aave_pool",
+      "address": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+      "abi_json": "[{\"type\":\"function\",\"name\":\"supply\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"name\":\"asset\",\"type\":\"address\"},{\"name\":\"amount\",\"type\":\"uint256\"},{\"name\":\"onBehalfOf\",\"type\":\"address\"},{\"name\":\"referralCode\",\"type\":\"uint16\"}],\"outputs\":[]},{\"type\":\"function\",\"name\":\"withdraw\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"name\":\"asset\",\"type\":\"address\"},{\"name\":\"amount\",\"type\":\"uint256\"},{\"name\":\"to\",\"type\":\"address\"}],\"outputs\":[{\"name\":\"\",\"type\":\"uint256\"}]}]",
+      "source_ref": "https://raw.githubusercontent.com/bgd-labs/aave-address-book/main/src/AaveV3Base.sol"
+    }
+  ],
+  "actions": [
+    {
+      "action_id": "approve_usdc",
+      "calls": [
+        {
+          "role": "usdc",
+          "function": "approve"
+        }
+      ],
+      "preconditions": [
+        "wallet_usdc_balance_gte_requested_approval_amount"
+      ],
+      "postconditions": [
+        "usdc_allowance_for_aave_pool_gte_requested_amount"
+      ],
+      "risk_checks": [
+        "spender_equals_aave_pool",
+        "asset_equals_base_usdc"
+      ]
+    },
+    {
+      "action_id": "enter_supply",
+      "calls": [
+        {
+          "role": "aave_pool",
+          "function": "supply"
+        }
+      ],
+      "preconditions": [
+        "wallet_usdc_reserve_after_trade_gte_survival_floor",
+        "aave_usdc_pool_not_paused"
+      ],
+      "postconditions": [
+        "aave_usdc_position_increased",
+        "survival_floor_preserved"
+      ],
+      "risk_checks": [
+        "asset_equals_base_usdc",
+        "on_behalf_of_equals_automaton_wallet",
+        "referral_code_zero"
+      ]
+    },
+    {
+      "action_id": "exit_supply",
+      "calls": [
+        {
+          "role": "aave_pool",
+          "function": "withdraw"
+        }
+      ],
+      "preconditions": [
+        "aave_usdc_position_gte_requested_exit_amount"
+      ],
+      "postconditions": [
+        "wallet_usdc_delta_positive_expected",
+        "survival_floor_preserved"
+      ],
+      "risk_checks": [
+        "asset_equals_base_usdc",
+        "withdraw_receiver_equals_automaton_wallet"
+      ]
+    }
+  ],
+  "max_value_wei_per_call": "0",
+  "template_budget_wei": "0"
+}

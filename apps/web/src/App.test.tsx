@@ -17,7 +17,7 @@ describe("App", () => {
     expect(markup).toContain("No indexed room messages yet.");
     expect(markup).toContain("Spawn Automaton");
     expect(markup).toContain("Step 1 of 4");
-    expect(markup).toContain("Select Chain");
+    expect(markup).toContain("Risk Appetite");
     expect(markup).toContain("Select an automaton");
     expect(markup).toContain("Command Surface");
     expect(markup).not.toContain(">Strategies<");

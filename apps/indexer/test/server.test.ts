@@ -234,6 +234,18 @@ describe("indexer server", () => {
               nextCursor: null
             };
           },
+          async listRepositoryStrategies() {
+            return {
+              items: [],
+              updatedAt: 0
+            };
+          },
+          async getRepositoryStrategy() {
+            return {
+              item: null,
+              updatedAt: 0
+            };
+          },
           async listRoomMessages() {
             return {
               messages: [],
@@ -557,6 +569,18 @@ describe("indexer server", () => {
                 })
               ],
               nextCursor: null
+            };
+          },
+          async listRepositoryStrategies() {
+            return {
+              items: [],
+              updatedAt: 0
+            };
+          },
+          async getRepositoryStrategy() {
+            return {
+              item: null,
+              updatedAt: 0
             };
           },
           async listRoomMessages() {
@@ -968,6 +992,62 @@ describe("indexer server", () => {
               nextCursor: null
             };
           },
+          async listRepositoryStrategies() {
+            return {
+              items: [
+                {
+                  strategyId: "base-aave-usdc-reserve-01",
+                  name: "Base Aave USDC Reserve",
+                  description: "Park surplus Base USDC on Aave V3.",
+                  canonicalChain: "base",
+                  canonicalChainId: 8453,
+                  compatibleSpawnChains: ["base"],
+                  protocol: "aave-v3",
+                  primitive: "lend_supply",
+                  recipeJson: "{}",
+                  status: "active",
+                  source: {
+                    sourcePath: "docs/strategies/base-aave-usdc-reserve-01/recipe.json",
+                    sourceCommit: "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+                  },
+                  createdAt: 1_709_912_345_000,
+                  updatedAt: 1_709_912_360_000,
+                  deprecatedAt: null,
+                  revokedAt: null
+                }
+              ],
+              updatedAt: 1_709_912_360_000
+            };
+          },
+          async getRepositoryStrategy(strategyId) {
+            return {
+              item:
+                strategyId === "base-aave-usdc-reserve-01"
+                  ? {
+                      strategyId,
+                      name: "Base Aave USDC Reserve",
+                      description: "Park surplus Base USDC on Aave V3.",
+                      canonicalChain: "base",
+                      canonicalChainId: 8453,
+                      compatibleSpawnChains: ["base"],
+                      protocol: "aave-v3",
+                      primitive: "lend_supply",
+                      recipeJson: "{}",
+                      status: "active",
+                      source: {
+                        sourcePath:
+                          "docs/strategies/base-aave-usdc-reserve-01/recipe.json",
+                        sourceCommit: "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+                      },
+                      createdAt: 1_709_912_345_000,
+                      updatedAt: 1_709_912_360_000,
+                      deprecatedAt: null,
+                      revokedAt: null
+                    }
+                  : null,
+              updatedAt: 1_709_912_360_000
+            };
+          },
           async listRoomMessages() {
             return {
               messages: [],
@@ -1066,6 +1146,14 @@ describe("indexer server", () => {
       method: "GET",
       url: `/api/spawned-automatons/${registryRecord.canisterId}`
     });
+    const repositoryResponse = await app.inject({
+      method: "GET",
+      url: "/api/repository/strategies"
+    });
+    const repositoryItemResponse = await app.inject({
+      method: "GET",
+      url: "/api/repository/strategies/base-aave-usdc-reserve-01"
+    });
     const automatonListResponse = await app.inject({
       method: "GET",
       url: "/api/automatons"
@@ -1140,12 +1228,176 @@ describe("indexer server", () => {
     expect(registryRecordResponse.statusCode).toBe(200);
     expect(registryRecordResponse.json()).toEqual(registryRecord);
 
+    expect(repositoryResponse.statusCode).toBe(200);
+    expect(repositoryResponse.json()).toMatchObject({
+      items: [
+        {
+          strategyId: "base-aave-usdc-reserve-01",
+          status: "active"
+        }
+      ],
+      updatedAt: 1_709_912_360_000
+    });
+
+    expect(repositoryItemResponse.statusCode).toBe(200);
+    expect(repositoryItemResponse.json()).toMatchObject({
+      item: {
+        strategyId: "base-aave-usdc-reserve-01",
+        canonicalChainId: 8453
+      },
+      updatedAt: 1_709_912_360_000
+    });
+
     expect(automatonListResponse.statusCode).toBe(200);
     expect(automatonListResponse.json()).toEqual({
       automatons: [],
       total: 0,
       prices: {
         ethUsd: null
+      }
+    });
+
+    await app.close();
+  });
+
+  it("enriches automaton detail with spawn-session strategy snapshots when available", async () => {
+    const registryRecord = createSpawnedAutomatonRecordFixture();
+    const sessionDetail = createSpawnSessionDetailFixture({
+      registryRecord
+    });
+    const automatonDetail = createAutomatonDetailFixture({
+      canisterId: registryRecord.canisterId,
+      strategies: [
+        {
+          key: {
+            protocol: "aave-v3",
+            primitive: "lend_supply",
+            templateId: "base-aave-usdc-reserve-01",
+            chainId: 8453
+          },
+          status: "active"
+        }
+      ]
+    });
+    const app = buildServer({
+      config: {
+        databasePath: await createDatabasePath(),
+        factoryCanisterId: "factory-canister-id"
+      },
+      factoryClient: new FactoryClient({
+        configured: true,
+        adapter: {
+          async createSpawnSession() {
+            throw new Error("not used in this test");
+          },
+          async getSpawnSession(sessionId) {
+            return sessionId === sessionDetail.session.sessionId
+              ? {
+                  session: sessionDetail.session,
+                  payment: sessionDetail.payment,
+                  audit: sessionDetail.audit
+                }
+              : null;
+          },
+          async retrySpawnSession() {
+            throw new Error("not used in this test");
+          },
+          async claimSpawnRefund() {
+            throw new Error("not used in this test");
+          },
+          async listSpawnedAutomatons() {
+            return {
+              items: [],
+              nextCursor: null
+            };
+          },
+          async listRepositoryStrategies() {
+            return {
+              items: [],
+              updatedAt: 0
+            };
+          },
+          async getRepositoryStrategy() {
+            return {
+              item: null,
+              updatedAt: 0
+            };
+          },
+          async listRoomMessages() {
+            return {
+              messages: [],
+              nextAfterSeq: null,
+              latestSeq: null
+            };
+          },
+          async listMessagesForAutomaton() {
+            return {
+              messages: [],
+              nextAfterSeq: null,
+              latestSeq: null
+            };
+          },
+          async getSpawnedAutomaton(canisterId) {
+            return canisterId === registryRecord.canisterId ? registryRecord : null;
+          },
+          async getFactoryHealth() {
+            return {
+              activeSessions: {
+                activeTotal: 0,
+                awaitingPayment: 0,
+                broadcastingRelease: 0,
+                paymentDetected: 0,
+                retryableFailed: 0,
+                spawning: 0
+              },
+              artifact: {
+                loaded: true,
+                versionCommit: registryRecord.versionCommit,
+                wasmSha256: null,
+                wasmSizeBytes: null
+              },
+              currentCanisterBalance: "0",
+              cyclesPerSpawn: 0,
+              escrowContractAddress: "0x00000000000000000000000000000000000000aa",
+              estimatedOutcallCyclesPerInterval: 0,
+              factoryEvmAddress: null,
+              minPoolBalance: 0,
+              pause: false
+            };
+          }
+        }
+      })
+    });
+
+    await app.ready();
+    await app.indexerStore.upsertAutomaton(automatonDetail);
+    await app.indexerStore.upsertSpawnedAutomatonRegistry([registryRecord]);
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/automatons/${registryRecord.canisterId}`
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      canisterId: registryRecord.canisterId,
+      strategies: [
+        {
+          key: {
+            templateId: "base-aave-usdc-reserve-01"
+          },
+          status: "active"
+        }
+      ],
+      spawnSelection: {
+        sessionId: sessionDetail.session.sessionId,
+        requestedStrategyIds: ["base-aave-usdc-reserve-01"],
+        selectedStrategies: [
+          {
+            strategyId: "base-aave-usdc-reserve-01",
+            name: "Base Aave USDC Reserve"
+          }
+        ]
       }
     });
 
