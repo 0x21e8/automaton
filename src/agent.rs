@@ -3326,7 +3326,13 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 break;
             }
             let executed = manager
-                .execute_actions(&state, &executable_tool_calls, signer.as_ref(), &turn_id)
+                .execute_actions_with_history(
+                    &state,
+                    &executable_tool_calls,
+                    signer.as_ref(),
+                    &turn_id,
+                    &all_tool_calls,
+                )
                 .await;
             if stop_for_turn_deadline_if_elapsed(
                 &turn_id,

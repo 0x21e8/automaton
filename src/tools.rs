@@ -43,7 +43,8 @@ use async_trait::async_trait;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -580,6 +581,12 @@ pub struct ToolManager {
     policies: HashMap<String, ToolPolicy>,
 }
 
+#[derive(Clone, Copy)]
+struct ToolExecutionHistory<'a> {
+    prior_same_turn: &'a [ToolCallRecord],
+    current_batch: &'a [ToolCallRecord],
+}
+
 pub fn tool_allowed_in_scope(tool: &str, scope: InferenceToolScope) -> bool {
     let normalized = canonicalize_tool_name(tool);
     match scope {
@@ -820,7 +827,7 @@ impl ToolManager {
         signer: &dyn SignerPort,
         turn_id: &str,
     ) -> Vec<ToolCallRecord> {
-        self.execute_actions_with_broadcaster(state, calls, signer, None, turn_id)
+        self.execute_actions_with_broadcaster_and_history(state, calls, signer, None, turn_id, &[])
             .await
     }
 
@@ -837,6 +844,48 @@ impl ToolManager {
         broadcaster: Option<&dyn EvmBroadcastPort>,
         turn_id: &str,
     ) -> Vec<ToolCallRecord> {
+        self.execute_actions_with_broadcaster_and_history(
+            state,
+            calls,
+            signer,
+            broadcaster,
+            turn_id,
+            &[],
+        )
+        .await
+    }
+
+    /// Execute tool calls with access to successful/failing records from earlier
+    /// rounds in the same turn.
+    pub async fn execute_actions_with_history(
+        &mut self,
+        state: &AgentState,
+        calls: &[ToolCall],
+        signer: &dyn SignerPort,
+        turn_id: &str,
+        prior_same_turn_history: &[ToolCallRecord],
+    ) -> Vec<ToolCallRecord> {
+        self.execute_actions_with_broadcaster_and_history(
+            state,
+            calls,
+            signer,
+            None,
+            turn_id,
+            prior_same_turn_history,
+        )
+        .await
+    }
+
+    /// Execute a batch of tool calls with optional broadcaster and prior same-turn history.
+    pub async fn execute_actions_with_broadcaster_and_history(
+        &mut self,
+        state: &AgentState,
+        calls: &[ToolCall],
+        signer: &dyn SignerPort,
+        broadcaster: Option<&dyn EvmBroadcastPort>,
+        turn_id: &str,
+        prior_same_turn_history: &[ToolCallRecord],
+    ) -> Vec<ToolCallRecord> {
         let mut records = Vec::with_capacity(calls.len());
         let mut index = 0;
         while index < calls.len() {
@@ -852,7 +901,10 @@ impl ToolManager {
                                 signer,
                                 broadcaster,
                                 turn_id,
-                                &records
+                                ToolExecutionHistory {
+                                    prior_same_turn: prior_same_turn_history,
+                                    current_batch: &records,
+                                }
                             ),
                             self.execute_single_call_record(
                                 state,
@@ -860,7 +912,10 @@ impl ToolManager {
                                 signer,
                                 broadcaster,
                                 turn_id,
-                                &records
+                                ToolExecutionHistory {
+                                    prior_same_turn: prior_same_turn_history,
+                                    current_batch: &records,
+                                }
                             ),
                         );
                         records.push(first);
@@ -874,7 +929,10 @@ impl ToolManager {
                                 signer,
                                 broadcaster,
                                 turn_id,
-                                &records,
+                                ToolExecutionHistory {
+                                    prior_same_turn: prior_same_turn_history,
+                                    current_batch: &records,
+                                },
                             )
                             .await,
                         );
@@ -892,7 +950,10 @@ impl ToolManager {
                     signer,
                     broadcaster,
                     turn_id,
-                    &records,
+                    ToolExecutionHistory {
+                        prior_same_turn: prior_same_turn_history,
+                        current_batch: &records,
+                    },
                 )
                 .await,
             );
@@ -908,7 +969,7 @@ impl ToolManager {
         signer: &dyn SignerPort,
         broadcaster: Option<&dyn EvmBroadcastPort>,
         turn_id: &str,
-        history: &[ToolCallRecord],
+        history: ToolExecutionHistory<'_>,
     ) -> ToolCallRecord {
         let mut normalized_call = call.clone();
         normalized_call.tool = canonicalize_tool_name(&normalized_call.tool);
@@ -991,7 +1052,7 @@ impl ToolManager {
         signer: &dyn SignerPort,
         broadcaster: Option<&dyn EvmBroadcastPort>,
         turn_id: &str,
-        history: &[ToolCallRecord],
+        history: ToolExecutionHistory<'_>,
     ) -> Result<String, String> {
         match call.tool.as_str() {
             "sign_message" => {
@@ -1127,8 +1188,13 @@ impl ToolManager {
                             .to_string(),
                     )
                 } else {
-                    let result =
-                        execute_strategy_action_tool(&call.args_json, signer, history).await;
+                    let result = execute_strategy_action_tool(
+                        &call.args_json,
+                        signer,
+                        history.prior_same_turn,
+                        history.current_batch,
+                    )
+                    .await;
                     if let Err(error) = &result {
                         let failed_class = classify_execute_strategy_action_failure(error);
                         record_survival_operation_failure_for_class(&failed_class, now_ns);
@@ -1603,11 +1669,13 @@ fn percent_encode_market_component(value: &str) -> String {
     out
 }
 
+#[derive(Debug)]
 struct PreparedMarketHttpFetchArgs {
     effective_args_json: String,
     handshake: Option<MarketFetchHandshake>,
 }
 
+#[derive(Debug)]
 struct MarketFetchHandshake {
     endpoint_key: String,
     endpoint_origin: String,
@@ -1615,6 +1683,14 @@ struct MarketFetchHandshake {
     failure_count_key: String,
     extract_key: String,
     extract_signature: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct MarketExtractValidationScope {
+    provider: String,
+    endpoint: String,
+    requested_root_label: &'static str,
+    allowed_root_keys: BTreeMap<String, String>,
 }
 
 fn market_endpoint_fact_keys(
@@ -1659,13 +1735,23 @@ fn prepare_market_fetch_handshake(
     let status = stable::get_memory_fact(&status_key)
         .map(|fact| fact.value.trim().to_ascii_lowercase())
         .unwrap_or_else(|| "unverified".to_string());
+    let extract_validation_scope = market_scope
+        .filter(|(scope_provider, _)| *scope_provider == provider.id)
+        .map(|(_, endpoint)| build_market_extract_validation_scope(provider.id, endpoint, suffix))
+        .transpose()?
+        .flatten();
     let stored_extract = stable::get_memory_fact(&extract_key)
         .map(|fact| fact.value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let mut extract_signature = parse_market_extract_signature(args_object);
+    let mut extract_signature =
+        parse_market_extract_signature(args_object, extract_validation_scope.as_ref())?;
     let verified = status == "verified" && stored_extract.is_some();
     if extract_signature.is_none() && verified {
         if let Some(stored) = stored_extract.clone() {
+            let stored = validate_stored_market_extract_signature(
+                &stored,
+                extract_validation_scope.as_ref(),
+            )?;
             inject_market_extract_signature(args_object, &stored)?;
             extract_signature = Some(stored);
         }
@@ -1681,6 +1767,9 @@ fn prepare_market_fetch_handshake(
     } else {
         format!("{}{}", endpoint_origin.trim_end_matches('/'), suffix)
     };
+    if let Some(signature) = extract_signature.as_deref() {
+        inject_market_extract_signature(args_object, signature)?;
+    }
     args_object.insert("url".to_string(), serde_json::Value::String(rewritten_url));
     Ok(MarketFetchHandshake {
         endpoint_key,
@@ -1788,25 +1877,57 @@ fn upsert_memory_fact(key: &str, value: &str, turn_id: &str) -> Result<(), Strin
 
 fn parse_market_extract_signature(
     args_object: &serde_json::Map<String, serde_json::Value>,
-) -> Option<String> {
-    let extract = args_object.get("extract")?.as_object()?;
-    let mode = extract.get("mode")?.as_str()?.trim().to_ascii_lowercase();
+    validation_scope: Option<&MarketExtractValidationScope>,
+) -> Result<Option<String>, String> {
+    let Some(extract) = args_object.get("extract") else {
+        return Ok(None);
+    };
+    let extract = extract
+        .as_object()
+        .ok_or_else(|| "invalid market extract: expected object".to_string())?;
+    let mode = extract
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "invalid market extract: missing required field: extract.mode".to_string()
+        })?;
     match mode.as_str() {
         "json_path" => {
-            let path = extract.get("path")?.as_str()?.trim();
-            if path.is_empty() {
-                return None;
-            }
-            Some(format!("json_path:{path}"))
+            let path = extract
+                .get("path")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    "invalid market extract: missing required field: extract.path".to_string()
+                })?;
+            let canonical_path = if let Some(scope) = validation_scope {
+                canonicalize_endpoint_market_json_path(path, scope)?
+            } else {
+                canonicalize_market_json_path(path)?
+            };
+            Ok(Some(format!("json_path:{canonical_path}")))
         }
         "regex" => {
-            let pattern = extract.get("pattern")?.as_str()?.trim();
-            if pattern.is_empty() {
-                return None;
+            if let Some(scope) = validation_scope {
+                return Err(format!(
+                    "market_fetch[{}:{}] extract must use json_path",
+                    scope.provider, scope.endpoint
+                ));
             }
-            Some(format!("regex:{pattern}"))
+            let pattern = extract
+                .get("pattern")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .ok_or_else(|| {
+                    "invalid market extract: missing required field: extract.pattern".to_string()
+                })?;
+            if pattern.is_empty() {
+                return Err("invalid market extract: pattern must be non-empty".to_string());
+            }
+            Ok(Some(format!("regex:{pattern}")))
         }
-        _ => None,
+        _ => Err(format!("invalid market extract mode `{mode}`")),
     }
 }
 
@@ -1833,6 +1954,181 @@ fn inject_market_extract_signature(
             }),
         );
         return Ok(());
+    }
+    Err("invalid stored market extract signature".to_string())
+}
+
+fn build_market_extract_validation_scope(
+    provider: &str,
+    endpoint: &str,
+    suffix: &str,
+) -> Result<Option<MarketExtractValidationScope>, String> {
+    match (provider, endpoint) {
+        ("coingecko", "simple_price") => {
+            let ids = parse_market_query_csv_roots(suffix, "ids")?;
+            Ok(Some(MarketExtractValidationScope {
+                provider: provider.to_string(),
+                endpoint: endpoint.to_string(),
+                requested_root_label: "ids",
+                allowed_root_keys: ids,
+            }))
+        }
+        ("coingecko", "token_price") => {
+            let addresses = parse_market_query_csv_roots(suffix, "contract_addresses")?;
+            Ok(Some(MarketExtractValidationScope {
+                provider: provider.to_string(),
+                endpoint: endpoint.to_string(),
+                requested_root_label: "contract_addresses",
+                allowed_root_keys: addresses,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_market_query_csv_roots(
+    suffix: &str,
+    key: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let query_value = extract_market_query_param_value(suffix, key)?
+        .ok_or_else(|| format!("market endpoint query is missing required `{key}` parameter"))?;
+    let mut allowed = BTreeMap::new();
+    for item in query_value.split(',') {
+        let normalized = item.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        allowed.insert(normalized.clone(), normalized);
+    }
+    if allowed.is_empty() {
+        return Err(format!(
+            "market endpoint query parameter `{key}` must contain at least one value"
+        ));
+    }
+    Ok(allowed)
+}
+
+fn extract_market_query_param_value(suffix: &str, key: &str) -> Result<Option<String>, String> {
+    let Some((_, query)) = suffix.split_once('?') else {
+        return Ok(None);
+    };
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let decoded_key = percent_decode_market_component(raw_key)?;
+        if decoded_key != key {
+            continue;
+        }
+        return Ok(Some(percent_decode_market_component(raw_value)?));
+    }
+    Ok(None)
+}
+
+fn percent_decode_market_component(value: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return Err("invalid percent-encoding in market query".to_string());
+                }
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                    .map_err(|_| "invalid percent-encoding in market query".to_string())?;
+                let decoded = u8::from_str_radix(hex, 16)
+                    .map_err(|_| "invalid percent-encoding in market query".to_string())?;
+                out.push(char::from(decoded));
+                index += 3;
+            }
+            b'+' => {
+                out.push(' ');
+                index += 1;
+            }
+            byte => {
+                out.push(char::from(byte));
+                index += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn canonicalize_market_json_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    let canonical = trimmed
+        .strip_prefix("$.")
+        .or_else(|| trimmed.strip_prefix('$'))
+        .unwrap_or(trimmed)
+        .trim();
+    if canonical.is_empty() {
+        return Err("invalid market extract: path must be non-empty".to_string());
+    }
+    Ok(canonical.to_string())
+}
+
+fn canonicalize_endpoint_market_json_path(
+    path: &str,
+    scope: &MarketExtractValidationScope,
+) -> Result<String, String> {
+    let canonical = canonicalize_market_json_path(path)?;
+    let (root, remainder) = split_market_json_path_root(&canonical).ok_or_else(|| {
+        format!(
+            "market_fetch[{}:{}] extract path must start with a {} root key",
+            scope.provider, scope.endpoint, scope.requested_root_label
+        )
+    })?;
+    let normalized_root = root.trim().to_ascii_lowercase();
+    let canonical_root = scope
+        .allowed_root_keys
+        .get(&normalized_root)
+        .ok_or_else(|| {
+            format!(
+                "market_fetch[{}:{}] extract root `{}` must match requested {}",
+                scope.provider, scope.endpoint, root, scope.requested_root_label
+            )
+        })?;
+    Ok(format!("{canonical_root}{remainder}"))
+}
+
+fn split_market_json_path_root(path: &str) -> Option<(&str, &str)> {
+    if path.is_empty() || path.starts_with('[') {
+        return None;
+    }
+    for (index, ch) in path.char_indices() {
+        if ch == '.' || ch == '[' {
+            return Some((&path[..index], &path[index..]));
+        }
+    }
+    Some((path, ""))
+}
+
+fn validate_stored_market_extract_signature(
+    signature: &str,
+    validation_scope: Option<&MarketExtractValidationScope>,
+) -> Result<String, String> {
+    if let Some(path) = signature.strip_prefix("json_path:") {
+        let canonical = if let Some(scope) = validation_scope {
+            canonicalize_endpoint_market_json_path(path, scope)?
+        } else {
+            canonicalize_market_json_path(path)?
+        };
+        return Ok(format!("json_path:{canonical}"));
+    }
+    if let Some(scope) = validation_scope {
+        return Err(format!(
+            "market_fetch[{}:{}] stored extract is invalid for the requested {}; include extract to re-verify a canonical json_path",
+            scope.provider, scope.endpoint, scope.requested_root_label
+        ));
+    }
+    if let Some(pattern) = signature.strip_prefix("regex:") {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return Err("invalid stored market extract signature".to_string());
+        }
+        return Ok(format!("regex:{pattern}"));
     }
     Err("invalid stored market extract signature".to_string())
 }
@@ -2666,7 +2962,8 @@ fn simulate_strategy_action_tool(args_json: &str) -> Result<String, String> {
 async fn execute_strategy_action_tool(
     args_json: &str,
     signer: &dyn SignerPort,
-    history: &[ToolCallRecord],
+    prior_same_turn_history: &[ToolCallRecord],
+    current_batch_history: &[ToolCallRecord],
 ) -> Result<String, String> {
     let intent = parse_strategy_intent_args(args_json)?;
     let now_ns = current_time_ns();
@@ -2746,7 +3043,14 @@ async fn execute_strategy_action_tool(
         return Err(format!("strategy validation failed: {error}"));
     }
 
-    enforce_strategy_execution_policy(&policy, &plan, history, args_json)?;
+    enforce_strategy_execution_policy(
+        &policy,
+        &intent,
+        &plan,
+        prior_same_turn_history,
+        current_batch_history,
+        args_json,
+    )?;
 
     log!(
         StrategyToolLogPriority::Info,
@@ -2806,14 +3110,17 @@ async fn execute_strategy_action_tool(
 
 fn enforce_strategy_execution_policy(
     policy: &AutonomyPolicy,
+    intent: &StrategyExecutionIntent,
     plan: &ExecutionPlan,
-    history: &[ToolCallRecord],
+    prior_same_turn_history: &[ToolCallRecord],
+    current_batch_history: &[ToolCallRecord],
     args_json: &str,
 ) -> Result<(), String> {
     if !policy.execution_authority.require_simulation_first {
         return Ok(());
     }
-    if !strategy_simulation_succeeded(history, plan) {
+    if !strategy_simulation_succeeded(prior_same_turn_history, current_batch_history, intent, plan)
+    {
         return Err("execute_strategy_action blocked: simulation_first_required".to_string());
     }
 
@@ -2980,16 +3287,118 @@ fn plan_total_value_wei(plan: &ExecutionPlan) -> Result<U256, String> {
     })
 }
 
-fn strategy_simulation_succeeded(history: &[ToolCallRecord], plan: &ExecutionPlan) -> bool {
-    history.iter().any(|record| {
-        if !record.success || record.tool != "simulate_strategy_action" {
-            return false;
+fn strategy_simulation_succeeded(
+    prior_same_turn_history: &[ToolCallRecord],
+    current_batch_history: &[ToolCallRecord],
+    intent: &StrategyExecutionIntent,
+    plan: &ExecutionPlan,
+) -> bool {
+    let current_typed_params_digest = canonical_typed_params_digest(&intent.typed_params_json).ok();
+    let current_plan_digest = execution_plan_digest(plan).ok();
+    prior_same_turn_history
+        .iter()
+        .chain(current_batch_history.iter())
+        .any(|record| {
+            if !record.success || record.tool != "simulate_strategy_action" {
+                return false;
+            }
+            let Ok(simulated_intent) = parse_strategy_intent_args(&record.args_json) else {
+                return false;
+            };
+            if simulated_intent.key != plan.key
+                || simulated_intent.action_id.trim() != plan.action_id
+            {
+                return false;
+            }
+
+            let prior_typed_params_digest =
+                canonical_typed_params_digest(&simulated_intent.typed_params_json).ok();
+            let typed_params_match = current_typed_params_digest
+                .as_ref()
+                .zip(prior_typed_params_digest.as_ref())
+                .is_some_and(|(current, prior)| current == prior);
+            if typed_params_match {
+                return true;
+            }
+
+            let prior_plan_digest =
+                simulated_execution_plan_digest_from_output(&record.output).ok();
+            current_plan_digest
+                .as_ref()
+                .zip(prior_plan_digest.as_ref())
+                .is_some_and(|(current, prior)| current == prior)
+        })
+}
+
+fn canonical_typed_params_digest(typed_params_json: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(typed_params_json)
+        .map_err(|error| format!("invalid typed_params_json for digest: {error}"))?;
+    canonical_json_digest(&value)
+}
+
+fn execution_plan_digest(plan: &ExecutionPlan) -> Result<String, String> {
+    let value = serde_json::to_value(plan)
+        .map_err(|error| format!("failed to serialize execution plan for digest: {error}"))?;
+    canonical_json_digest(&value)
+}
+
+fn simulated_execution_plan_digest_from_output(output: &str) -> Result<String, String> {
+    let value: Value = serde_json::from_str(output)
+        .map_err(|error| format!("invalid simulation output json: {error}"))?;
+    let plan = value
+        .get("plan")
+        .ok_or_else(|| "simulation output missing plan".to_string())?;
+    canonical_json_digest(plan)
+}
+
+fn canonical_json_digest(value: &Value) -> Result<String, String> {
+    let canonical = canonical_json_string(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn canonical_json_string(value: &Value) -> Result<String, String> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            serde_json::to_string(value)
+                .map_err(|error| format!("failed to canonicalize json value: {error}"))
         }
-        parse_strategy_intent_args(&record.args_json)
-            .ok()
-            .map(|intent| intent.key == plan.key && intent.action_id == plan.action_id)
-            .unwrap_or(false)
-    })
+        Value::Array(items) => {
+            let mut out = String::from("[");
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&canonical_json_string(item)?);
+            }
+            out.push(']');
+            Ok(out)
+        }
+        Value::Object(object) => {
+            let sorted_keys = object.keys().collect::<BTreeSet<_>>();
+            let mut out = String::from("{");
+            let mut first = true;
+            for key in sorted_keys.iter() {
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(
+                    &serde_json::to_string(key)
+                        .map_err(|error| format!("failed to canonicalize json key: {error}"))?,
+                );
+                out.push(':');
+                out.push_str(&canonical_json_string(
+                    object
+                        .get(*key)
+                        .ok_or_else(|| "missing canonical json object value".to_string())?,
+                )?);
+            }
+            out.push('}');
+            Ok(out)
+        }
+    }
 }
 
 fn strategy_id_from_key(key: &StrategyTemplateKey) -> String {
@@ -4423,6 +4832,168 @@ mod tests {
     }
 
     #[test]
+    fn execute_strategy_action_accepts_prior_same_turn_simulation_with_canonical_params() {
+        stable::init_storage();
+        stable::set_evm_chain_id(8453).expect("chain id should be configurable");
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).expect("key name should set");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should set");
+        seed_strategy_template_and_artifact();
+
+        struct HexSigner;
+        #[async_trait(?Send)]
+        impl SignerPort for HexSigner {
+            async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+                Ok(format!("0x{}", "11".repeat(64)))
+            }
+        }
+
+        let state = AgentState::ExecutingActions;
+        let signer = HexSigner;
+        let mut manager = ToolManager::new();
+        let prior_round_calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "simulate_strategy_action".to_string(),
+            args_json: serde_json::json!({
+                "key": sample_strategy_key(),
+                "action_id": "transfer",
+                "typed_params_json": "{\"calls\":[{\"value_wei\":\"1\",\"args\":{\"amount\":\"1\",\"to\":\"0x3333333333333333333333333333333333333333\"}}]}"
+            })
+            .to_string(),
+        }];
+        let prior_round_records = block_on_with_spin(manager.execute_actions(
+            &state,
+            &prior_round_calls,
+            &signer,
+            "turn-cross-round",
+        ));
+        assert_eq!(prior_round_records.len(), 1);
+        assert!(prior_round_records[0].success);
+
+        let execute_calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "execute_strategy_action".to_string(),
+            args_json: serde_json::json!({
+                "key": sample_strategy_key(),
+                "action_id": "transfer",
+                "typed_params": {
+                    "calls": [{
+                        "value_wei": "1",
+                        "args": {
+                            "to": "0x3333333333333333333333333333333333333333",
+                            "amount": "1"
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        }];
+        let execute_records = block_on_with_spin(manager.execute_actions_with_history(
+            &state,
+            &execute_calls,
+            &signer,
+            "turn-cross-round",
+            &prior_round_records,
+        ));
+        assert_eq!(execute_records.len(), 1);
+        assert!(
+            execute_records[0].success,
+            "execution should accept prior same-turn simulation: {:?}",
+            execute_records[0]
+        );
+        assert!(execute_records[0].output.contains("\"tx_hashes\""));
+    }
+
+    #[test]
+    fn execute_strategy_action_rejects_prior_same_turn_simulation_with_mismatched_params() {
+        stable::init_storage();
+        stable::set_evm_chain_id(8453).expect("chain id should be configurable");
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).expect("key name should set");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("evm address should set");
+        seed_strategy_template_and_artifact();
+
+        struct HexSigner;
+        #[async_trait(?Send)]
+        impl SignerPort for HexSigner {
+            async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+                Ok(format!("0x{}", "11".repeat(64)))
+            }
+        }
+
+        let state = AgentState::ExecutingActions;
+        let signer = HexSigner;
+        let mut manager = ToolManager::new();
+        let prior_round_calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "simulate_strategy_action".to_string(),
+            args_json: serde_json::json!({
+                "key": sample_strategy_key(),
+                "action_id": "transfer",
+                "typed_params": {
+                    "calls": [{
+                        "value_wei": "1",
+                        "args": {
+                            "to": "0x3333333333333333333333333333333333333333",
+                            "amount": "1"
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        }];
+        let prior_round_records = block_on_with_spin(manager.execute_actions(
+            &state,
+            &prior_round_calls,
+            &signer,
+            "turn-cross-round-mismatch",
+        ));
+        assert_eq!(prior_round_records.len(), 1);
+        assert!(prior_round_records[0].success);
+
+        let execute_calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "execute_strategy_action".to_string(),
+            args_json: serde_json::json!({
+                "key": sample_strategy_key(),
+                "action_id": "transfer",
+                "typed_params": {
+                    "calls": [{
+                        "value_wei": "1",
+                        "args": {
+                            "to": "0x3333333333333333333333333333333333333333",
+                            "amount": "2"
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        }];
+        let execute_records = block_on_with_spin(manager.execute_actions_with_history(
+            &state,
+            &execute_calls,
+            &signer,
+            "turn-cross-round-mismatch",
+            &prior_round_records,
+        ));
+        assert_eq!(execute_records.len(), 1);
+        assert!(!execute_records[0].success);
+        assert!(execute_records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("simulation_first_required"));
+    }
+
+    #[test]
     fn execute_strategy_action_tool_success_clears_all_survival_backoffs() {
         let _time_guard = with_fixed_time_ns(10_000_000_000);
         stable::init_storage();
@@ -5764,6 +6335,104 @@ mod tests {
                 .expect("endpoint-scoped extract fact should be stored")
                 .value,
             "regex:stub"
+        );
+    }
+
+    #[test]
+    fn market_fetch_coingecko_simple_price_persists_canonical_json_path_extract() {
+        stable::init_storage();
+
+        let prepared = prepare_market_fetch_http_fetch_args(
+            r#"{"provider":"coingecko","endpoint":"simple_price","params":{"ids":"bitcoin","vs_currencies":"usd"},"extract":{"mode":"json_path","path":"$.BITCOIN.usd"}}"#,
+        )
+        .expect("simple_price extract should canonicalize");
+        let handshake = prepared
+            .handshake
+            .as_ref()
+            .expect("market fetch should produce handshake");
+        assert_eq!(
+            handshake.extract_signature.as_deref(),
+            Some("json_path:bitcoin.usd")
+        );
+
+        let effective_args: serde_json::Value = serde_json::from_str(&prepared.effective_args_json)
+            .expect("effective args should be valid json");
+        assert_eq!(
+            effective_args
+                .get("extract")
+                .and_then(|extract| extract.get("path"))
+                .and_then(|value| value.as_str()),
+            Some("bitcoin.usd")
+        );
+
+        persist_market_fetch_handshake_success(handshake, "turn-simple-price")
+            .expect("canonical extract should persist");
+        assert_eq!(
+            stable::get_memory_fact("config.endpoint.coingecko.simple_price.extract.latest")
+                .expect("canonical extract fact should persist")
+                .value,
+            "json_path:bitcoin.usd"
+        );
+    }
+
+    #[test]
+    fn market_fetch_coingecko_simple_price_rejects_extract_with_wrong_root() {
+        stable::init_storage();
+
+        let error = prepare_market_fetch_http_fetch_args(
+            r#"{"provider":"coingecko","endpoint":"simple_price","params":{"ids":"bitcoin","vs_currencies":"usd"},"extract":{"mode":"json_path","path":"ethereum.usd"}}"#,
+        )
+        .expect_err("simple_price should reject mismatched extract root");
+        assert!(error.contains("extract root `ethereum`"));
+        assert!(error.contains("requested ids"));
+    }
+
+    #[test]
+    fn market_fetch_refuses_reuse_of_poisoned_stored_coingecko_extract() {
+        stable::init_storage();
+        upsert_memory_fact(
+            "config.endpoint.coingecko.simple_price.status.latest",
+            "verified",
+            "turn-0",
+        )
+        .expect("status should seed");
+        upsert_memory_fact(
+            "config.endpoint.coingecko.simple_price.extract.latest",
+            "json_path:ethereum.usd",
+            "turn-0",
+        )
+        .expect("poisoned extract should seed");
+
+        let error = prepare_market_fetch_http_fetch_args(
+            r#"{"provider":"coingecko","endpoint":"simple_price","params":{"ids":"bitcoin","vs_currencies":"usd"}}"#,
+        )
+        .expect_err("poisoned stored extract should not be reused");
+        assert!(error.contains("extract root `ethereum`"));
+        assert!(error.contains("requested ids"));
+    }
+
+    #[test]
+    fn market_fetch_coingecko_token_price_lowercases_address_root_before_persisting() {
+        stable::init_storage();
+
+        let prepared = prepare_market_fetch_http_fetch_args(
+            r#"{"provider":"coingecko","endpoint":"token_price","params":{"platform_id":"base","contract_addresses":"0x833589FCD6eDb6E08f4c7C32D4F71b54bdA02913","vs_currencies":"usd"},"extract":{"mode":"json_path","path":"$.0x833589FCD6eDb6E08f4c7C32D4F71b54bdA02913.usd"}}"#,
+        )
+        .expect("token_price extract should canonicalize");
+        let handshake = prepared
+            .handshake
+            .as_ref()
+            .expect("market fetch should produce handshake");
+        let expected_path = "json_path:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.usd";
+        assert_eq!(handshake.extract_signature.as_deref(), Some(expected_path));
+
+        persist_market_fetch_handshake_success(handshake, "turn-token-price")
+            .expect("canonical token_price extract should persist");
+        assert_eq!(
+            stable::get_memory_fact("config.endpoint.coingecko.token_price.extract.latest")
+                .expect("token_price extract fact should persist")
+                .value,
+            expected_path
         );
     }
 

@@ -1249,7 +1249,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                     IcLlmProperty {
                         type_: "object".to_string(),
                         name: "extract".to_string(),
-                        description: Some("Extraction config. JSON mode: {\"mode\":\"json_path\",\"path\":\"...\"}. Regex mode: {\"mode\":\"regex\",\"pattern\":\"...\"}. Include this until the provider+endpoint pair has been verified; afterwards the runtime can reuse the stored extract.".to_string()),
+                        description: Some("Extraction config. JSON mode: {\"mode\":\"json_path\",\"path\":\"...\"}. Regex mode: {\"mode\":\"regex\",\"pattern\":\"...\"}. Include this until the provider+endpoint pair has been verified; afterwards the runtime can reuse the stored extract. Endpoint-specific copyable examples: coingecko:simple_price => params {\"ids\":\"bitcoin\",\"vs_currencies\":\"usd\"}, extract {\"mode\":\"json_path\",\"path\":\"bitcoin.usd\"}; coingecko:token_price => params {\"platform_id\":\"base\",\"contract_addresses\":\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\"vs_currencies\":\"usd\"}, extract {\"mode\":\"json_path\",\"path\":\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.usd\"}; dexscreener:search_pairs => params {\"q\":\"ethereum\"}, extract {\"mode\":\"json_path\",\"path\":\"pairs[0].priceUsd\"}.".to_string()),
                         enum_values: None,
                     },
                 ]),
@@ -1658,13 +1658,19 @@ fn web_search_ic_tool() -> IcLlmTool {
                 IcLlmProperty {
                     type_: "string".to_string(),
                     name: "query".to_string(),
-                    description: Some("Search query. Be specific.".to_string()),
+                    description: Some(
+                        "Search query, max 320 chars. Be specific and avoid stuffing many domains or keywords."
+                            .to_string(),
+                    ),
                     enum_values: None,
                 },
                 IcLlmProperty {
                     type_: "integer".to_string(),
                     name: "count".to_string(),
-                    description: Some("Optional result count from 1 to 10. Default 5.".to_string()),
+                    description: Some(
+                        "Optional result count from 1 to 6. Default 3. If the provider response is too large, the runtime may retry once with count 3 and no domain filters."
+                            .to_string(),
+                    ),
                     enum_values: None,
                 },
                 IcLlmProperty {
@@ -4189,6 +4195,44 @@ mod tests {
             assert!(
                 params_description.contains(expected),
                 "params description must contain {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn ic_llm_market_fetch_schema_includes_endpoint_specific_extract_examples() {
+        let market_fetch_tool = ic_llm_tools()
+            .into_iter()
+            .find(
+                |tool| {
+                    matches!(tool, IcLlmTool::Function(function) if function.name == "market_fetch")
+                },
+            )
+            .expect("market_fetch tool should exist");
+
+        let IcLlmTool::Function(function) = market_fetch_tool;
+        let parameters = function
+            .parameters
+            .expect("market_fetch schema should have parameters");
+        let properties = parameters
+            .properties
+            .expect("market_fetch schema should have properties");
+        let extract_property = properties
+            .iter()
+            .find(|property| property.name == "extract")
+            .expect("extract property should be present");
+        let extract_description = extract_property.description.as_deref().unwrap_or_default();
+
+        for expected in [
+            "\"ids\":\"bitcoin\"",
+            "\"path\":\"bitcoin.usd\"",
+            "\"contract_addresses\":\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\"",
+            "\"path\":\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.usd\"",
+            "\"path\":\"pairs[0].priceUsd\"",
+        ] {
+            assert!(
+                extract_description.contains(expected),
+                "extract description must contain {expected}"
             );
         }
     }

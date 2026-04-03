@@ -546,13 +546,105 @@ fn response_body_for_openrouter_request(request: &CanisterHttpRequest) -> Vec<u8
     serde_json::to_vec(&response).expect("failed to encode mock openrouter response")
 }
 
-fn drive_openrouter_strategy_turn(pic: &PocketIc, canister_id: Principal) -> String {
+fn response_body_for_cross_round_openrouter_request(request: &CanisterHttpRequest) -> Vec<u8> {
+    let request_json: Value = serde_json::from_slice(&request.body)
+        .unwrap_or_else(|error| panic!("failed to decode openrouter request body: {error}"));
+    let messages = request_json
+        .get("messages")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("openrouter request missing messages array"));
+    let tool_message_count = messages
+        .iter()
+        .filter(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "tool")
+        })
+        .count();
+
+    let response = match tool_message_count {
+        0 => json!({
+            "choices": [{
+                "message": {
+                    "content": "simulate first",
+                    "tool_calls": [{
+                        "id": "call-simulate",
+                        "type": "function",
+                        "function": {
+                            "name": "simulate_strategy_action",
+                            "arguments": json!({
+                                "key": sample_key(),
+                                "action_id": "transfer",
+                                "typed_params": {
+                                    "calls": [{
+                                        "value_wei": "1",
+                                        "args": [
+                                            "0x3333333333333333333333333333333333333333",
+                                            "1"
+                                        ]
+                                    }]
+                                }
+                            })
+                            .to_string()
+                        }
+                    }]
+                }
+            }]
+        }),
+        1 => json!({
+            "choices": [{
+                "message": {
+                    "content": "execute after same-turn simulation",
+                    "tool_calls": [{
+                        "id": "call-execute",
+                        "type": "function",
+                        "function": {
+                            "name": "execute_strategy_action",
+                            "arguments": json!({
+                                "key": sample_key(),
+                                "action_id": "transfer",
+                                "typed_params_json": "{\"calls\":[{\"value_wei\":\"1\",\"args\":{\"amount\":\"1\",\"to\":\"0x3333333333333333333333333333333333333333\"}}]}"
+                            })
+                            .to_string()
+                        }
+                    }]
+                }
+            }]
+        }),
+        _ => json!({
+            "choices": [{
+                "message": {
+                    "content": json!({
+                        "trigger": "ScheduledReview",
+                        "candidates_summary": "same-turn verified intent complete",
+                        "outcome": {
+                            "NoOp": {
+                                "reason": "finalized"
+                            }
+                        },
+                        "explanation": "cross-round strategy turn complete"
+                    })
+                    .to_string()
+                }
+            }]
+        }),
+    };
+
+    serde_json::to_vec(&response).expect("failed to encode mock openrouter response")
+}
+
+fn drive_openrouter_strategy_turn_with_responder(
+    pic: &PocketIc,
+    canister_id: Principal,
+    responder: fn(&CanisterHttpRequest) -> Vec<u8>,
+) -> String {
     let starting_turn_counter = get_runtime_view(pic, canister_id).turn_counter;
     for _ in 0..64 {
         let pending_http = pic.get_canister_http();
         if !pending_http.is_empty() {
             for request in pending_http {
-                let body = response_body_for_openrouter_request(&request);
+                let body = responder(&request);
                 pic.mock_canister_http_response(MockCanisterHttpResponse {
                     subnet_id: request.subnet_id,
                     request_id: request.request_id,
@@ -583,6 +675,49 @@ fn drive_openrouter_strategy_turn(pic: &PocketIc, canister_id: Principal) -> Str
     }
 
     panic!("autonomous strategy turn did not complete in expected ticks");
+}
+
+fn drive_openrouter_strategy_turn(pic: &PocketIc, canister_id: Principal) -> String {
+    drive_openrouter_strategy_turn_with_responder(
+        pic,
+        canister_id,
+        response_body_for_openrouter_request,
+    )
+}
+
+fn wait_for_turn_tool_calls_with_responder(
+    pic: &PocketIc,
+    canister_id: Principal,
+    target_turn_id: &str,
+    responder: fn(&CanisterHttpRequest) -> Vec<u8>,
+) -> String {
+    for _ in 0..64 {
+        let pending_http = pic.get_canister_http();
+        if !pending_http.is_empty() {
+            for request in pending_http {
+                let body = responder(&request);
+                pic.mock_canister_http_response(MockCanisterHttpResponse {
+                    subnet_id: request.subnet_id,
+                    request_id: request.request_id,
+                    response: CanisterHttpResponse::CanisterHttpReply(CanisterHttpReply {
+                        status: 200,
+                        headers: vec![],
+                        body,
+                    }),
+                    additional_responses: vec![],
+                });
+            }
+        }
+
+        pic.advance_time(Duration::from_secs(1));
+        pic.tick();
+
+        if !get_tool_calls_for_turn(pic, canister_id, target_turn_id).is_empty() {
+            return target_turn_id.to_string();
+        }
+    }
+
+    panic!("turn {target_turn_id} did not produce tool calls in expected ticks");
 }
 
 fn register_strategy_admin(
@@ -869,6 +1004,75 @@ fn autonomous_strategy_turn_blocks_execution_when_authority_is_disabled() {
     assert_eq!(
         get_exposure_reconciliation_status(&pic, canister_id),
         ExposureReconciliationStatus::default()
+    );
+}
+
+#[test]
+fn autonomous_strategy_turn_accepts_same_turn_verified_intent_across_rounds() {
+    let (pic, canister_id) = with_backend_canister();
+
+    let registered = register_strategy_admin(&pic, canister_id, sample_recipe_json())
+        .expect("strategy registration should succeed");
+    assert_eq!(registered.key, sample_key());
+
+    set_inference_provider(&pic, canister_id, InferenceProvider::OpenRouter);
+    set_inference_model(&pic, canister_id, "openai/gpt-4o-mini");
+    set_openrouter_api_key(&pic, canister_id, Some("sk-or-test".to_string()));
+    configure_only_agent_turn(&pic, canister_id, 60);
+
+    let policy = AutonomyPolicy {
+        version: 11,
+        reserve_policy: ReservePolicy {
+            min_cycles_runway_hours: 72,
+            min_inference_usdc_6dp: Some(10_000_000),
+            min_gas_wei: Some(3_000_000_000_000_000),
+        },
+        risk_limits: RiskLimits {
+            max_total_exposure_bps: 3_000,
+            max_single_action_bps: 1_000,
+            max_protocol_concentration_bps: 1_500,
+        },
+        execution_authority: ExecutionAuthority {
+            autonomous_execution_enabled: true,
+            require_simulation_first: true,
+            per_action_value_limit_wei: Some(50_000_000_000_000_000),
+        },
+        escalation_rules: EscalationRules {
+            escalate_on_missing_policy: true,
+            escalate_on_authority_exceeded: true,
+            escalate_on_repeated_failure: true,
+            failure_quarantine_threshold: 1,
+        },
+        updated_at_ns: 100_123,
+    };
+    update_autonomy_policy(&pic, canister_id, policy).expect("policy update should succeed");
+
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+    let turn_id = wait_for_turn_tool_calls_with_responder(
+        &pic,
+        canister_id,
+        "turn-1",
+        response_body_for_cross_round_openrouter_request,
+    );
+
+    let tool_calls = get_tool_calls_for_turn(&pic, canister_id, &turn_id);
+    assert!(
+        tool_calls
+            .iter()
+            .any(|call| call.tool == "simulate_strategy_action" && call.success),
+        "cross-round turn should include a successful simulation"
+    );
+    assert!(
+        tool_calls
+            .iter()
+            .any(|call| call.tool == "execute_strategy_action"
+                && !call
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("simulation_first_required")),
+        "same-turn execute should not be blocked by the simulation-first gate once prior same-turn simulate succeeded"
     );
 }
 
