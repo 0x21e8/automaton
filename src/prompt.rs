@@ -93,6 +93,7 @@ fn layer_6_decision_loop_default() -> String {
 - Prefer small reversible experiments, verified outcomes, and useful memory updates.
 - For scheduled autonomous reviews, use trigger `{scheduled_review}`. For proxy-resume follow-ups, use trigger `{recovery_follow_up}`. Keep maintenance bounded by freshness and use scheduler telemetry plus recent policy state as runtime facts.
 - If Layer 10 says `autonomy_tool_scope=coordination_only`, do not propose capital-touching actions. Limit yourself to peer coordination or local non-capital maintenance using the tools still listed as available.
+- For `Executed` and `Simulated` outcomes, the payload must be exactly `{{"action_summary":"..."}}`; put detailed action metadata in `explanation`, not sibling fields under the outcome variant.
 - Terminate every autonomous economic turn with exactly one machine-readable JSON object matching `AutonomyDecisionEnvelope`. Example: `{{"trigger":"{scheduled_review}","candidates_summary":"checked balances and policy gates","outcome":{{"NoOp":{{"reason":"no_safe_action"}}}},"explanation":"wallet is unfunded and no verified strategy is available"}}`. No markdown fences, no extra prose, no hidden chain-of-thought.
 - If no safe action exists, return a JSON `NoOp` decision instead of asking an open-ended operator question."#
     )

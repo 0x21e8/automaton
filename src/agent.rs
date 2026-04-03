@@ -49,6 +49,7 @@ use crate::tools::{tool_allowed_in_scope, SignerPort, ToolManager};
 use alloy_primitives::U256;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha3::{Digest, Keccak256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -2188,10 +2189,131 @@ fn parse_autonomy_decision_envelope(
     if trimmed.is_empty() {
         return Err("decision envelope output was empty".to_string());
     }
-    let envelope: AutonomyDecisionEnvelope = serde_json::from_str(trimmed)
-        .map_err(|error| format!("decision envelope parse failed: {error}"))?;
+    let envelope: AutonomyDecisionEnvelope = match serde_json::from_str(trimmed) {
+        Ok(envelope) => envelope,
+        Err(parse_error) => {
+            let value: JsonValue = serde_json::from_str(trimmed)
+                .map_err(|error| format!("decision envelope parse failed: {error}"))?;
+            parse_legacy_autonomy_decision_envelope(&value)
+                .map_err(|_| format!("decision envelope parse failed: {parse_error}"))?
+        }
+    };
     validate_decision_envelope(&envelope, expected_trigger)?;
     Ok(envelope)
+}
+
+fn parse_legacy_autonomy_decision_envelope(
+    value: &JsonValue,
+) -> Result<AutonomyDecisionEnvelope, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "decision envelope must be a json object".to_string())?;
+    let trigger: DecisionTrigger = serde_json::from_value(
+        object
+            .get("trigger")
+            .cloned()
+            .ok_or_else(|| "missing field `trigger`".to_string())?,
+    )
+    .map_err(|error| format!("invalid field `trigger`: {error}"))?;
+    let candidates_summary = object
+        .get("candidates_summary")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "missing field `candidates_summary`".to_string())?
+        .to_string();
+    let outcome = parse_legacy_decision_envelope_outcome(
+        object
+            .get("outcome")
+            .ok_or_else(|| "missing field `outcome`".to_string())?,
+    )?;
+    let explanation = object
+        .get("explanation")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "missing field `explanation`".to_string())?
+        .to_string();
+    Ok(AutonomyDecisionEnvelope {
+        trigger,
+        candidates_summary,
+        outcome,
+        explanation,
+    })
+}
+
+fn parse_legacy_decision_envelope_outcome(
+    value: &JsonValue,
+) -> Result<DecisionEnvelopeOutcome, String> {
+    if let Ok(outcome) = serde_json::from_value::<DecisionEnvelopeOutcome>(value.clone()) {
+        return Ok(outcome);
+    }
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| "field `outcome` must be a json object".to_string())?;
+    if object.len() != 1 {
+        return Err("field `outcome` must contain exactly one variant".to_string());
+    }
+    let (variant, payload) = object
+        .iter()
+        .next()
+        .ok_or_else(|| "field `outcome` must contain exactly one variant".to_string())?;
+    match variant.as_str() {
+        "Executed" => Ok(DecisionEnvelopeOutcome::Executed {
+            action_summary: synthesize_legacy_action_summary(payload)
+                .ok_or_else(|| "missing field `action_summary`".to_string())?,
+        }),
+        "Simulated" => Ok(DecisionEnvelopeOutcome::Simulated {
+            action_summary: synthesize_legacy_action_summary(payload)
+                .ok_or_else(|| "missing field `action_summary`".to_string())?,
+        }),
+        _ => serde_json::from_value::<DecisionEnvelopeOutcome>(value.clone())
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn synthesize_legacy_action_summary(payload: &JsonValue) -> Option<String> {
+    let object = payload.as_object()?;
+    if let Some(action_summary) = object.get("action_summary").and_then(JsonValue::as_str) {
+        let trimmed = action_summary.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let action = legacy_json_string_field(object, "action");
+    let protocol = legacy_json_string_field(object, "protocol");
+    let template = legacy_json_string_field(object, "template");
+    let tx_hash = legacy_json_string_field(object, "tx_hash");
+    let amount_usdc = legacy_json_string_field(object, "amount_usdc");
+
+    let action = action?;
+    let mut parts = Vec::new();
+    parts.push(action);
+    match (protocol, template) {
+        (Some(protocol), Some(template)) => parts.push(format!("on {protocol}/{template}")),
+        (Some(protocol), None) => parts.push(format!("on {protocol}")),
+        (None, Some(template)) => parts.push(format!("template {template}")),
+        (None, None) => {}
+    }
+    if let Some(amount_usdc) = amount_usdc {
+        parts.push(format!("amount_usdc={amount_usdc}"));
+    }
+    if let Some(tx_hash) = tx_hash {
+        parts.push(format!("tx={tx_hash}"));
+    }
+
+    let summary = parts.join(" ");
+    (!summary.trim().is_empty()).then_some(summary)
+}
+
+fn legacy_json_string_field(object: &JsonMap<String, JsonValue>, key: &str) -> Option<String> {
+    let value = object.get(key)?;
+    match value {
+        JsonValue::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then_some(trimmed.to_string())
+        }
+        JsonValue::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
 }
 
 fn decision_record_from_envelope(
@@ -4947,6 +5069,57 @@ mod tests {
             }
         );
         assert_eq!(decisions[0].policy_version, 1);
+    }
+
+    #[test]
+    fn parse_autonomy_decision_envelope_accepts_legacy_executed_payload() {
+        let raw = r#"{
+            "trigger":"ScheduledReview",
+            "candidates_summary":"reviewed wallet balances and found a Moonwell candidate",
+            "outcome":{
+                "Executed":{
+                    "action":"enter_supply",
+                    "protocol":"moonwell-v2",
+                    "template":"base-moonwell-usdc-reserve-01",
+                    "tx_hash":"0x5aa1952db4bd1edb2a13e76c87cf9f46a6c70801d2fccdbf96c70575774c9eb7",
+                    "amount_usdc":"1000000"
+                }
+            },
+            "explanation":"executed a small supply step"
+        }"#;
+
+        let envelope = parse_autonomy_decision_envelope(raw, &DecisionTrigger::ScheduledReview)
+            .expect("legacy executed payload should normalize");
+
+        assert_eq!(envelope.trigger, DecisionTrigger::ScheduledReview);
+        assert_eq!(
+            envelope.outcome,
+            DecisionEnvelopeOutcome::Executed {
+                action_summary: "enter_supply on moonwell-v2/base-moonwell-usdc-reserve-01 amount_usdc=1000000 tx=0x5aa1952db4bd1edb2a13e76c87cf9f46a6c70801d2fccdbf96c70575774c9eb7".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_autonomy_decision_envelope_rejects_legacy_executed_payload_without_summary_fields() {
+        let raw = r#"{
+            "trigger":"ScheduledReview",
+            "candidates_summary":"reviewed candidates",
+            "outcome":{
+                "Executed":{
+                    "protocol":"moonwell-v2"
+                }
+            },
+            "explanation":"missing action details"
+        }"#;
+
+        let error = parse_autonomy_decision_envelope(raw, &DecisionTrigger::ScheduledReview)
+            .expect_err("legacy payload without action summary should remain invalid");
+
+        assert!(
+            error.contains("missing field `action_summary`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
