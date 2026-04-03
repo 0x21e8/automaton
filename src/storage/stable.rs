@@ -1154,6 +1154,9 @@ pub fn set_task_enabled(kind: &TaskKind, enabled: bool) {
     let mut config = get_task_config(kind).unwrap_or_else(|| TaskScheduleConfig::default_for(kind));
     config.enabled = enabled;
     upsert_task_config(config);
+    if !enabled {
+        clear_pending_job_for_disabled_task(kind);
+    }
 }
 
 /// Returns the schedule runtime for `kind`.  Falls back to a freshly-initialised
@@ -1177,6 +1180,32 @@ pub fn get_task_runtime(kind: &TaskKind) -> TaskScheduleRuntime {
 
 fn get_task_runtime_if_any(kind: &TaskKind) -> Option<TaskScheduleRuntime> {
     sqlite::read_task_runtime(kind).ok().flatten()
+}
+
+fn clear_pending_job_for_disabled_task(kind: &TaskKind) {
+    let Some(mut runtime) = get_task_runtime_if_any(kind) else {
+        return;
+    };
+    let Some(job_id) = runtime.pending_job_id.clone() else {
+        return;
+    };
+    let Some(job) = sqlite::get_job(&job_id).ok().flatten() else {
+        runtime.pending_job_id = None;
+        save_task_runtime(kind, &runtime);
+        return;
+    };
+    if job.status != JobStatus::Pending {
+        return;
+    }
+    let _ = sqlite::delete_job(&job_id);
+    runtime.pending_job_id = None;
+    save_task_runtime(kind, &runtime);
+    log!(
+        SchedulerStorageLogPriority::Info,
+        "scheduler_pending_job_cleared kind={:?} job_id={} reason=task_disabled",
+        kind,
+        job_id
+    );
 }
 
 /// Persists the schedule runtime for `kind`.
@@ -5939,6 +5968,41 @@ mod tests {
         assert!(
             runtime_snapshot().turn_in_flight,
             "turn lock must remain while lease is active"
+        );
+    }
+
+    #[test]
+    fn disabling_task_clears_pending_job_reference_and_queue_entry() {
+        init_storage();
+
+        let job_id = enqueue_job_if_absent(
+            TaskKind::AgentTurn,
+            TaskLane::Mutating,
+            "AgentTurn:disable-clears-pending".to_string(),
+            0,
+            0,
+        )
+        .expect("agent turn job should enqueue");
+        assert!(
+            sqlite::get_job(&job_id)
+                .expect("job lookup should succeed")
+                .is_some(),
+            "pending job should exist before disabling task"
+        );
+
+        set_task_enabled(&TaskKind::AgentTurn, false);
+
+        assert!(
+            sqlite::get_job(&job_id)
+                .expect("job lookup should succeed")
+                .is_none(),
+            "disabling task should delete pending queued job"
+        );
+        assert!(
+            get_task_runtime(&TaskKind::AgentTurn)
+                .pending_job_id
+                .is_none(),
+            "task runtime should clear pending job reference"
         );
     }
 }

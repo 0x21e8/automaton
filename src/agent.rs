@@ -3569,7 +3569,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         }
 
         let should_finalize_autonomy_decision =
-            !has_external_input && !proxy_callback_buffered_turn;
+            !has_external_input && !proxy_callback_buffered_turn && !inference_deferred;
 
         if last_error.is_none() && should_finalize_autonomy_decision {
             let mut decision_envelope = runtime_autonomy_decision_envelope.or_else(|| {
