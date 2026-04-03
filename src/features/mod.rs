@@ -22,6 +22,7 @@ pub mod http_fetch;
 pub mod inference;
 pub mod signer;
 pub mod skills;
+pub mod strategy_discovery;
 pub mod threshold_signer;
 pub mod web_search;
 

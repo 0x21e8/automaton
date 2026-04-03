@@ -6,10 +6,10 @@
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, ActiveExposure, AutonomyPolicy, ConversationEntry,
     ConversationLog, DecisionRecord, ExposureReconciliationStatus, InboxMessage, MemoryFact,
-    OutboxMessage, ReflectionMemoryRecord, RuntimeSnapshot, ScheduledJob, SchedulerRuntime,
-    SkillRecord, StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
-    TaskKind, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord,
-    TurnRecord,
+    OutboxMessage, PendingStrategyDiscoveryJob, ReflectionMemoryRecord, RuntimeSnapshot,
+    ScheduledJob, SchedulerRuntime, SkillRecord, StrategyDiscoveryCallbackRecord,
+    StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass, TaskKind,
+    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use crate::features::cycle_topup::TopUpStage;
 #[cfg(target_arch = "wasm32")]
@@ -291,11 +291,48 @@ CREATE TABLE IF NOT EXISTS exposure_reconciliation_status (
 );
 "#;
 
+const MIGRATION_006_STRATEGY_DISCOVERY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS strategy_discovery_pending_jobs (
+    job_id TEXT PRIMARY KEY,
+    submitted_at_ns INTEGER NOT NULL,
+    objective TEXT NOT NULL,
+    watchlist_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_discovery_pending_jobs_submitted
+    ON strategy_discovery_pending_jobs(submitted_at_ns);
+
+CREATE TABLE IF NOT EXISTS strategy_discovery_results (
+    job_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    accepted_at_ns INTEGER NOT NULL,
+    validated_at_ns INTEGER,
+    completed_at_ns INTEGER NOT NULL,
+    objective TEXT NOT NULL,
+    watchlist_hash TEXT NOT NULL,
+    result_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_discovery_results_status_validated
+    ON strategy_discovery_results(status, validated_at_ns);
+CREATE INDEX IF NOT EXISTS idx_strategy_discovery_results_accepted
+    ON strategy_discovery_results(accepted_at_ns);
+
+CREATE TABLE IF NOT EXISTS strategy_discovery_completed_callback_jobs (
+    job_id TEXT PRIMARY KEY,
+    accepted_at_ns INTEGER NOT NULL,
+    result_hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_discovery_completed_callback_jobs_accepted
+    ON strategy_discovery_completed_callback_jobs(accepted_at_ns);
+"#;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
     use super::{
         MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
         MIGRATION_004_REFLECTION_MEMORY_SCHEMA, MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA,
+        MIGRATION_006_STRATEGY_DISCOVERY_SCHEMA,
     };
     use rusqlite::{params, Connection};
     use std::cell::RefCell;
@@ -350,6 +387,8 @@ mod backend {
             .map_err(|err| err.to_string())?;
         conn.execute_batch(MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA)
             .map_err(|err| err.to_string())?;
+        conn.execute_batch(MIGRATION_006_STRATEGY_DISCOVERY_SCHEMA)
+            .map_err(|err| err.to_string())?;
         let version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -358,7 +397,7 @@ mod backend {
             )
             .map_err(|err| err.to_string())?;
         let now = crate::timing::current_time_ns() as i64;
-        for v in (version + 1)..=5 {
+        for v in (version + 1)..=6 {
             conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
                 params![v, now],
@@ -374,6 +413,7 @@ mod backend {
     use super::{
         MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
         MIGRATION_004_REFLECTION_MEMORY_SCHEMA, MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA,
+        MIGRATION_006_STRATEGY_DISCOVERY_SCHEMA,
     };
 
     pub type SqlResult<T> = Result<T, String>;
@@ -390,6 +430,8 @@ mod backend {
                 .map_err(|err| err.to_string())?;
             conn.execute_batch(MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA)
                 .map_err(|err| err.to_string())?;
+            conn.execute_batch(MIGRATION_006_STRATEGY_DISCOVERY_SCHEMA)
+                .map_err(|err| err.to_string())?;
             let version: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -398,7 +440,7 @@ mod backend {
                 )
                 .map_err(|err| err.to_string())?;
             let now = crate::timing::current_time_ns() as i64;
-            for v in (version + 1)..=5 {
+            for v in (version + 1)..=6 {
                 conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
                     [v, now],
@@ -1383,6 +1425,261 @@ pub fn abi_artifact(key: &AbiArtifactKey) -> Result<Option<AbiArtifact>, String>
     })
 }
 
+pub fn upsert_strategy_discovery_pending_job(
+    job: &PendingStrategyDiscoveryJob,
+    watchlist_hash: &str,
+) -> Result<(), String> {
+    let payload_json = row_payload(job)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO strategy_discovery_pending_jobs(job_id, submitted_at_ns, objective, watchlist_hash, payload_json)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            (
+                &job.job_id,
+                job.submitted_at_ns as i64,
+                &job.objective,
+                watchlist_hash,
+                payload_json,
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn strategy_discovery_pending_job(
+    job_id: &str,
+) -> Result<Option<PendingStrategyDiscoveryJob>, String> {
+    let trimmed = job_id.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM strategy_discovery_pending_jobs WHERE job_id = ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([trimmed], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn list_strategy_discovery_pending_jobs(
+    limit: usize,
+) -> Result<Vec<PendingStrategyDiscoveryJob>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let keep = bounded_limit(limit, 25, 500);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM strategy_discovery_pending_jobs
+                 ORDER BY submitted_at_ns DESC
+                 LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn strategy_discovery_pending_jobs_count() -> Result<u64, String> {
+    backend::with_connection(|conn| {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM strategy_discovery_pending_jobs",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(count.max(0) as u64)
+    })
+}
+
+pub fn delete_strategy_discovery_pending_job(job_id: &str) -> Result<(), String> {
+    let trimmed = job_id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    backend::with_connection(|conn| {
+        conn.execute(
+            "DELETE FROM strategy_discovery_pending_jobs WHERE job_id = ?1",
+            [trimmed],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn upsert_strategy_discovery_result(
+    record: &StrategyDiscoveryCallbackRecord,
+    status_key: &str,
+    watchlist_hash: &str,
+) -> Result<(), String> {
+    let payload_json = row_payload(record)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO strategy_discovery_results(job_id, status, accepted_at_ns, validated_at_ns, completed_at_ns, objective, watchlist_hash, result_hash, payload_json)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            (
+                &record.job_id,
+                status_key,
+                record.accepted_at_ns as i64,
+                record.validated_at_ns.map(|value| value as i64),
+                record.completed_at_ns as i64,
+                &record.objective,
+                watchlist_hash,
+                &record.result_hash,
+                payload_json,
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn strategy_discovery_result(
+    job_id: &str,
+) -> Result<Option<StrategyDiscoveryCallbackRecord>, String> {
+    let trimmed = job_id.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM strategy_discovery_results WHERE job_id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([trimmed], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn list_strategy_discovery_results(
+    limit: usize,
+) -> Result<Vec<StrategyDiscoveryCallbackRecord>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let keep = bounded_limit(limit, 25, 500);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM strategy_discovery_results
+                 ORDER BY accepted_at_ns DESC
+                 LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn strategy_discovery_results_count() -> Result<u64, String> {
+    backend::with_connection(|conn| {
+        let count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM strategy_discovery_results", [], |row| {
+                row.get(0)
+            })
+            .map_err(|err| err.to_string())?;
+        Ok(count.max(0) as u64)
+    })
+}
+
+pub fn freshest_validated_strategy_discovery_result(
+) -> Result<Option<StrategyDiscoveryCallbackRecord>, String> {
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM strategy_discovery_results
+                 WHERE status = 'validated' AND validated_at_ns IS NOT NULL
+                 ORDER BY validated_at_ns DESC, accepted_at_ns DESC
+                 LIMIT 1",
+            )
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn remember_strategy_discovery_completed_callback_job(
+    job_id: &str,
+    accepted_at_ns: u64,
+    result_hash: &str,
+) -> Result<(), String> {
+    let trimmed = job_id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO strategy_discovery_completed_callback_jobs(job_id, accepted_at_ns, result_hash)
+             VALUES(?1, ?2, ?3)",
+            (trimmed, accepted_at_ns as i64, result_hash),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn strategy_discovery_completed_callback_job(
+    job_id: &str,
+) -> Result<Option<(u64, String)>, String> {
+    let trimmed = job_id.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT accepted_at_ns, result_hash
+                 FROM strategy_discovery_completed_callback_jobs
+                 WHERE job_id = ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([trimmed], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => {
+                let (accepted_at_ns, result_hash) = row.map_err(|err| err.to_string())?;
+                Ok(Some((accepted_at_ns.max(0) as u64, result_hash)))
+            }
+            None => Ok(None),
+        }
+    })
+}
+
 pub fn sql_query_read_only(query: &str, row_limit: usize) -> Result<String, String> {
     let normalized_query = normalized_sql_query(query)?;
     let enforced_limit = bounded_limit(row_limit, 100, 500);
@@ -1441,6 +1738,9 @@ pub fn table_count(table: &str) -> Result<u64, String> {
         | "skills"
         | "strategy_templates"
         | "abi_artifacts"
+        | "strategy_discovery_pending_jobs"
+        | "strategy_discovery_results"
+        | "strategy_discovery_completed_callback_jobs"
         | "hot_runtime_snapshot"
         | "hot_scheduler_runtime"
         | "hot_task_configs"
@@ -3071,7 +3371,7 @@ mod tests {
     fn migrations_reach_version_one() {
         close_storage().expect("close before migration test");
         init_storage().expect("init sqlite");
-        assert_eq!(schema_version().expect("schema version"), 5);
+        assert_eq!(schema_version().expect("schema version"), 6);
     }
 
     #[test]

@@ -267,6 +267,65 @@ pub struct EvmStewardProof {
     pub signature: String,
 }
 
+/// Typed protocol coordinate configured for worker-assisted strategy discovery.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ProtocolWatchlistEntry {
+    pub id: String,
+    pub chain_id: u64,
+    pub pool_address: String,
+    pub market_data_api_url: String,
+    pub abi_api_url: String,
+}
+
+/// Runtime configuration for the strategy-discovery async worker path.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyDiscoveryWorkerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub worker_base_url: String,
+    #[serde(default)]
+    pub worker_api_key: Option<String>,
+    #[serde(default)]
+    pub trusted_callback_principal: Option<Principal>,
+    #[serde(default = "default_strategy_discovery_result_ttl_secs")]
+    pub result_ttl_secs: u64,
+    #[serde(default)]
+    pub objective: String,
+    #[serde(default)]
+    pub protocol_watchlist: Vec<ProtocolWatchlistEntry>,
+}
+
+impl Default for StrategyDiscoveryWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            worker_base_url: String::new(),
+            worker_api_key: None,
+            trusted_callback_principal: None,
+            result_ttl_secs: default_strategy_discovery_result_ttl_secs(),
+            objective: String::new(),
+            protocol_watchlist: Vec::new(),
+        }
+    }
+}
+
+/// Manual enqueue input for discovery jobs.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct EnqueueStrategyDiscoveryJobArgs {
+    #[serde(default)]
+    pub objective: Option<String>,
+    #[serde(default)]
+    pub watchlist: Option<Vec<ProtocolWatchlistEntry>>,
+}
+
+/// Promotion selector for staged protocol artifacts.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PromoteDiscoveryProtocolArtifactsArgs {
+    pub job_id: String,
+    pub bundle_id: String,
+}
+
 /// Runtime command variants executable by the active EVM steward.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum StewardCommand {
@@ -302,6 +361,9 @@ pub enum StewardCommand {
     },
     SetInferenceProxyConfig {
         config: OpenRouterProxyWorkerConfig,
+    },
+    SetStrategyDiscoveryWorkerConfig {
+        config: StrategyDiscoveryWorkerConfig,
     },
     SetWelcomeMessage {
         message: String,
@@ -380,6 +442,12 @@ pub enum StewardCommand {
     },
     UpsertSkill {
         skill: SkillRecord,
+    },
+    EnqueueStrategyDiscoveryJob {
+        args: EnqueueStrategyDiscoveryJobArgs,
+    },
+    PromoteDiscoveryProtocolArtifacts {
+        args: PromoteDiscoveryProtocolArtifactsArgs,
     },
     RegisterStrategy {
         recipe_json: String,
@@ -884,6 +952,8 @@ pub struct RuntimeSnapshot {
     #[serde(default)]
     pub openrouter_proxy: OpenRouterProxyWorkerConfig,
     #[serde(default)]
+    pub strategy_discovery_worker: StrategyDiscoveryWorkerConfig,
+    #[serde(default)]
     pub installed_version_commit: Option<String>,
     #[serde(default)]
     pub ecdsa_key_name: String,
@@ -957,6 +1027,7 @@ impl Default for RuntimeSnapshot {
             openrouter_max_response_bytes: default_openrouter_max_response_bytes(),
             openrouter_reasoning_level: OpenRouterReasoningLevel::default(),
             openrouter_proxy: OpenRouterProxyWorkerConfig::default(),
+            strategy_discovery_worker: StrategyDiscoveryWorkerConfig::default(),
             installed_version_commit: None,
             ecdsa_key_name: String::new(),
             evm_address: None,
@@ -2249,6 +2320,223 @@ pub struct InferenceProxyStatusView {
     pub expired_jobs: u64,
 }
 
+/// Normalized provenance source type for strategy-discovery evidence.
+#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StrategyDiscoverySourceType {
+    OfficialDocs,
+    BlockExplorer,
+    ProtocolApi,
+    MarketDataApi,
+    #[default]
+    Other,
+}
+
+/// Relative trust tier for worker-returned evidence.
+#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StrategyDiscoverySourceTrustTier {
+    Official,
+    Secondary,
+    #[default]
+    BestEffort,
+}
+
+/// Individual external source fetched by the strategy-discovery worker.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct SourceRecord {
+    pub source_id: String,
+    #[serde(default)]
+    pub source_type: StrategyDiscoverySourceType,
+    pub url: String,
+    pub fetched_at_ns: u64,
+    pub content_hash: String,
+    #[serde(default)]
+    pub trust_tier: StrategyDiscoverySourceTrustTier,
+}
+
+/// Normalized ABI/spec artifact returned by the discovery worker.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ProtocolArtifactBundle {
+    pub bundle_id: String,
+    pub protocol_id: String,
+    pub chain_id: u64,
+    pub role: String,
+    pub contract_address: String,
+    pub abi_json: String,
+    pub source_ref: String,
+    #[serde(default)]
+    pub codehash: Option<String>,
+    #[serde(default)]
+    pub selector_assertions: Vec<AbiSelectorAssertion>,
+    #[serde(default)]
+    pub spec_summary: String,
+    #[serde(default)]
+    pub risk_notes: Vec<String>,
+}
+
+/// Typed market snapshot for one watchlist protocol.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ProtocolMarketSnapshot {
+    pub protocol_id: String,
+    pub chain_id: u64,
+    pub pool_address: String,
+    #[serde(default)]
+    pub tvl_usd: Option<String>,
+    #[serde(default)]
+    pub supply_apy_bps: Option<u64>,
+    #[serde(default)]
+    pub borrow_apy_bps: Option<u64>,
+    #[serde(default)]
+    pub utilization_bps: Option<u64>,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Compact market synthesis bundle returned by the discovery worker.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct MarketSynthesisBundle {
+    pub chain_id: u64,
+    pub generated_at_ns: u64,
+    #[serde(default)]
+    pub protocols: Vec<ProtocolMarketSnapshot>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Advisory candidate produced from worker-collected protocol and market data.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct StrategyCandidateBundle {
+    pub candidate_id: String,
+    pub objective: String,
+    pub protocol_id: String,
+    pub primitive: String,
+    pub chain_id: u64,
+    pub rationale: String,
+    #[serde(default)]
+    pub required_artifacts: Vec<String>,
+    #[serde(default)]
+    pub assumptions: Vec<String>,
+    #[serde(default)]
+    pub missing_inputs: Vec<String>,
+    pub confidence_label: String,
+    #[serde(default)]
+    pub freshness_deadline_ns: Option<u64>,
+    #[serde(default)]
+    pub suggested_template_shape: Option<String>,
+    #[serde(default)]
+    pub estimated_yield_bps: Option<u64>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Typed discovery callback payload nested inside callback args and records.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct StrategyDiscoveryResultPayload {
+    #[serde(default)]
+    pub protocol_artifacts: Vec<ProtocolArtifactBundle>,
+    #[serde(default)]
+    pub market: MarketSynthesisBundle,
+    #[serde(default)]
+    pub candidates: Vec<StrategyCandidateBundle>,
+    #[serde(default)]
+    pub source_records: Vec<SourceRecord>,
+}
+
+/// Durable pending discovery submission tracked until callback or expiry.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct PendingStrategyDiscoveryJob {
+    pub job_id: String,
+    pub submitted_at_ns: u64,
+    pub objective: String,
+    #[serde(default)]
+    pub watchlist: Vec<ProtocolWatchlistEntry>,
+    #[serde(default)]
+    pub exposure_summary: String,
+    #[serde(default)]
+    pub autonomy_summary: String,
+}
+
+/// Callback args accepted from the strategy-discovery worker.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct SubmitStrategyDiscoveryResultArgs {
+    pub job_id: String,
+    pub completed_at_ns: u64,
+    pub objective: String,
+    #[serde(default)]
+    pub watchlist: Vec<ProtocolWatchlistEntry>,
+    pub payload: StrategyDiscoveryResultPayload,
+}
+
+/// Validation result of a staged discovery callback.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum StrategyDiscoveryResultStatus {
+    Validated,
+    Rejected { reason: String },
+}
+
+/// Durable callback record for a strategy-discovery job.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyDiscoveryCallbackRecord {
+    pub job_id: String,
+    pub completed_at_ns: u64,
+    pub accepted_at_ns: u64,
+    #[serde(default)]
+    pub validated_at_ns: Option<u64>,
+    pub caller_principal: String,
+    pub objective: String,
+    #[serde(default)]
+    pub watchlist: Vec<ProtocolWatchlistEntry>,
+    pub result_hash: String,
+    pub status: StrategyDiscoveryResultStatus,
+    pub payload: StrategyDiscoveryResultPayload,
+}
+
+/// Public-safe status of strategy-discovery worker config and staged state.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct StrategyDiscoveryStatusView {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub worker_base_url: Option<String>,
+    #[serde(default)]
+    pub has_worker_api_key: bool,
+    #[serde(default)]
+    pub trusted_callback_principal: Option<String>,
+    #[serde(default)]
+    pub result_ttl_secs: u64,
+    #[serde(default)]
+    pub objective: Option<String>,
+    #[serde(default)]
+    pub protocol_watchlist_len: u64,
+    #[serde(default)]
+    pub pending_jobs: u64,
+    #[serde(default)]
+    pub result_records: u64,
+    #[serde(default)]
+    pub freshest_validated_job_id: Option<String>,
+    #[serde(default)]
+    pub freshest_validated_at_ns: Option<u64>,
+    #[serde(default)]
+    pub freshest_validated_age_secs: Option<u64>,
+    #[serde(default)]
+    pub freshest_validated_expired: bool,
+    #[serde(default)]
+    pub submit_accepted: u64,
+    #[serde(default)]
+    pub submit_failed: u64,
+    #[serde(default)]
+    pub callback_accepted: u64,
+    #[serde(default)]
+    pub callback_rejected: u64,
+    #[serde(default)]
+    pub callback_duplicates: u64,
+    #[serde(default)]
+    pub callback_auth_failures: u64,
+    #[serde(default)]
+    pub expired_jobs: u64,
+}
+
 /// The assembled prompt and context passed to the LLM at the start of a turn.
 #[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum InferenceToolScope {
@@ -2796,6 +3084,10 @@ fn default_openrouter_max_response_bytes() -> u64 {
     64 * 1024
 }
 
+fn default_strategy_discovery_result_ttl_secs() -> u64 {
+    60 * 60
+}
+
 fn default_evm_rpc_url() -> String {
     "https://base.publicnode.com".to_string()
 }
@@ -3038,10 +3330,15 @@ fn default_maintenance_interval_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutonomyPolicy, InferenceConfigView, InferenceProvider, MemoryRollup,
-        OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, RecoveryContext,
-        ReflectionMemoryRecord, ReflectionOrigin, ResponseLimitPolicy, RetentionConfig,
-        RetentionMaintenanceRuntime, RuntimeSnapshot, SessionSummary, TurnWindowSummary,
+        AutonomyPolicy, InferenceConfigView, InferenceProvider, MarketSynthesisBundle,
+        MemoryRollup, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel,
+        PendingStrategyDiscoveryJob, ProtocolArtifactBundle, ProtocolMarketSnapshot,
+        ProtocolWatchlistEntry, RecoveryContext, ReflectionMemoryRecord, ReflectionOrigin,
+        ResponseLimitPolicy, RetentionConfig, RetentionMaintenanceRuntime, RuntimeSnapshot,
+        SessionSummary, SourceRecord, StrategyCandidateBundle, StrategyDiscoveryCallbackRecord,
+        StrategyDiscoveryResultPayload, StrategyDiscoveryResultStatus,
+        StrategyDiscoverySourceTrustTier, StrategyDiscoverySourceType,
+        StrategyDiscoveryWorkerConfig, SubmitStrategyDiscoveryResultArgs, TurnWindowSummary,
         WalletBalanceSnapshot, WalletBalanceStatus, WalletBalanceSyncConfig,
         WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
     };
@@ -3158,6 +3455,15 @@ mod tests {
             .openrouter_proxy
             .trusted_callback_principal
             .is_none());
+        assert!(!snapshot.strategy_discovery_worker.enabled);
+        assert_eq!(
+            snapshot.strategy_discovery_worker.result_ttl_secs,
+            60 * 60
+        );
+        assert!(snapshot
+            .strategy_discovery_worker
+            .trusted_callback_principal
+            .is_none());
         assert_eq!(
             snapshot.cycle_topup.auto_topup_cycle_threshold,
             2_000_000_000_000
@@ -3243,6 +3549,123 @@ mod tests {
             view.openrouter_reasoning_level,
             OpenRouterReasoningLevel::High
         );
+    }
+
+    #[test]
+    fn strategy_discovery_types_roundtrip() {
+        let trusted = Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
+            .expect("test principal should parse");
+        let config = StrategyDiscoveryWorkerConfig {
+            enabled: true,
+            worker_base_url: "https://discovery.example.workers.dev".to_string(),
+            worker_api_key: Some("secret".to_string()),
+            trusted_callback_principal: Some(trusted),
+            result_ttl_secs: 3_600,
+            objective: "find low-risk Base carry opportunities".to_string(),
+            protocol_watchlist: vec![ProtocolWatchlistEntry {
+                id: "moonwell-usdc".to_string(),
+                chain_id: 8453,
+                pool_address: "0x1111111111111111111111111111111111111111".to_string(),
+                market_data_api_url: "https://api.example.com/market/moonwell".to_string(),
+                abi_api_url: "https://api.example.com/abi/moonwell".to_string(),
+            }],
+        };
+        let pending = PendingStrategyDiscoveryJob {
+            job_id: "sd-job-1".to_string(),
+            submitted_at_ns: 11,
+            objective: config.objective.clone(),
+            watchlist: config.protocol_watchlist.clone(),
+            exposure_summary: "USDC idle".to_string(),
+            autonomy_summary: "preserve runway".to_string(),
+        };
+        let payload = StrategyDiscoveryResultPayload {
+            protocol_artifacts: vec![ProtocolArtifactBundle {
+                bundle_id: "moonwell-main-pool".to_string(),
+                protocol_id: "moonwell".to_string(),
+                chain_id: 8453,
+                role: "pool".to_string(),
+                contract_address: "0x1111111111111111111111111111111111111111".to_string(),
+                abi_json: "[{\"type\":\"function\",\"name\":\"supply\",\"inputs\":[]}]".to_string(),
+                source_ref: "https://basescan.org/address/0x1111111111111111111111111111111111111111#code".to_string(),
+                codehash: Some("0xabc".to_string()),
+                selector_assertions: Vec::new(),
+                spec_summary: "Primary pool contract".to_string(),
+                risk_notes: vec!["guardian can pause market".to_string()],
+            }],
+            market: MarketSynthesisBundle {
+                chain_id: 8453,
+                generated_at_ns: 55,
+                protocols: vec![ProtocolMarketSnapshot {
+                    protocol_id: "moonwell".to_string(),
+                    chain_id: 8453,
+                    pool_address: "0x1111111111111111111111111111111111111111".to_string(),
+                    tvl_usd: Some("42000000".to_string()),
+                    supply_apy_bps: Some(420),
+                    borrow_apy_bps: Some(680),
+                    utilization_bps: Some(7100),
+                    summary: "USDC reserve remains liquid".to_string(),
+                    warnings: vec!["borrow demand spiking".to_string()],
+                }],
+                warnings: vec!["single-source market snapshot".to_string()],
+            },
+            candidates: vec![StrategyCandidateBundle {
+                candidate_id: "moonwell-usdc-carry".to_string(),
+                objective: "survival income".to_string(),
+                protocol_id: "moonwell".to_string(),
+                primitive: "reserve_supply".to_string(),
+                chain_id: 8453,
+                rationale: "Positive supply carry with deep liquidity".to_string(),
+                required_artifacts: vec!["moonwell-main-pool".to_string()],
+                assumptions: vec!["pause controls unchanged".to_string()],
+                missing_inputs: vec!["real-time oracle spread".to_string()],
+                confidence_label: "medium".to_string(),
+                freshness_deadline_ns: Some(9_999),
+                suggested_template_shape: Some("base-moonwell-usdc-reserve".to_string()),
+                estimated_yield_bps: Some(420),
+                warnings: vec!["monitor utilization".to_string()],
+            }],
+            source_records: vec![SourceRecord {
+                source_id: "market-1".to_string(),
+                source_type: StrategyDiscoverySourceType::MarketDataApi,
+                url: "https://api.example.com/market/moonwell".to_string(),
+                fetched_at_ns: 44,
+                content_hash: "0x1234".to_string(),
+                trust_tier: StrategyDiscoverySourceTrustTier::Official,
+            }],
+        };
+        let args = SubmitStrategyDiscoveryResultArgs {
+            job_id: pending.job_id.clone(),
+            completed_at_ns: 77,
+            objective: pending.objective.clone(),
+            watchlist: pending.watchlist.clone(),
+            payload: payload.clone(),
+        };
+        let args_json = serde_json::to_string(&args).expect("args should serialize");
+        let decoded_args: SubmitStrategyDiscoveryResultArgs =
+            serde_json::from_str(&args_json).expect("args should deserialize");
+        assert_eq!(decoded_args, args);
+        let record = StrategyDiscoveryCallbackRecord {
+            job_id: pending.job_id,
+            completed_at_ns: args.completed_at_ns,
+            accepted_at_ns: 88,
+            validated_at_ns: Some(88),
+            caller_principal: trusted.to_text(),
+            objective: args.objective.clone(),
+            watchlist: args.watchlist.clone(),
+            result_hash: "0x4567".to_string(),
+            status: StrategyDiscoveryResultStatus::Validated,
+            payload,
+        };
+
+        let config_json = serde_json::to_string(&config).expect("config should serialize");
+        let decoded_config: StrategyDiscoveryWorkerConfig =
+            serde_json::from_str(&config_json).expect("config should deserialize");
+        assert_eq!(decoded_config, config);
+
+        let record_json = serde_json::to_string(&record).expect("record should serialize");
+        let decoded_record: StrategyDiscoveryCallbackRecord =
+            serde_json::from_str(&record_json).expect("record should deserialize");
+        assert_eq!(decoded_record, record);
     }
 
     #[test]

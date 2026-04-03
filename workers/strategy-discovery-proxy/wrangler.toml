@@ -1,0 +1,12 @@
+name = "strategy-discovery-proxy"
+main = "src/worker.js"
+compatibility_date = "2026-04-03"
+
+[[queues.producers]]
+binding = "STRATEGY_DISCOVERY_QUEUE"
+queue = "strategy-discovery-jobs"
+
+[[queues.consumers]]
+queue = "strategy-discovery-jobs"
+max_batch_size = 5
+max_batch_timeout = 10

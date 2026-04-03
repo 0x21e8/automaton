@@ -133,6 +133,10 @@ type DecisionTrigger = variant {
   PositionMaintenance;
   RecoveryFollowUp;
 };
+type EnqueueStrategyDiscoveryJobArgs = record {
+  objective : opt text;
+  watchlist : opt vec ProtocolWatchlistEntry;
+};
 type EscalationClass = variant {
   MissingPolicy : record { what : text };
   CapabilityGap : record { what : text };
@@ -275,6 +279,12 @@ type JobStatus = variant {
   TimedOut;
   Pending;
 };
+type MarketSynthesisBundle = record {
+  protocols : vec ProtocolMarketSnapshot;
+  generated_at_ns : nat64;
+  warnings : vec text;
+  chain_id : nat64;
+};
 type MemoryFact = record {
   key : text;
   value : text;
@@ -336,6 +346,18 @@ type OutcallTimingStats = record {
   last_duration_ms : opt nat64;
   total_calls : nat64;
 };
+type PendingStrategyDiscoveryJob = record {
+  submitted_at_ns : nat64;
+  objective : text;
+  watchlist : vec ProtocolWatchlistEntry;
+  autonomy_summary : text;
+  job_id : text;
+  exposure_summary : text;
+};
+type PromoteDiscoveryProtocolArtifactsArgs = record {
+  bundle_id : text;
+  job_id : text;
+};
 type PromptLayer = record {
   content : text;
   updated_at_ns : nat64;
@@ -350,6 +372,37 @@ type PromptLayerView = record {
   version : opt nat32;
   updated_by_turn : opt text;
   layer_id : nat8;
+};
+type ProtocolArtifactBundle = record {
+  spec_summary : text;
+  bundle_id : text;
+  protocol_id : text;
+  role : text;
+  source_ref : text;
+  chain_id : nat64;
+  abi_json : text;
+  codehash : opt text;
+  contract_address : text;
+  risk_notes : vec text;
+  selector_assertions : vec AbiSelectorAssertion;
+};
+type ProtocolMarketSnapshot = record {
+  utilization_bps : opt nat64;
+  protocol_id : text;
+  tvl_usd : opt text;
+  summary : text;
+  warnings : vec text;
+  chain_id : nat64;
+  borrow_apy_bps : opt nat64;
+  pool_address : text;
+  supply_apy_bps : opt nat64;
+};
+type ProtocolWatchlistEntry = record {
+  id : text;
+  abi_api_url : text;
+  chain_id : nat64;
+  market_data_api_url : text;
+  pool_address : text;
 };
 type ReflectionMemoryRecord = record {
   key : text;
@@ -375,19 +428,21 @@ type ReservePolicy = record {
 };
 type Result = variant { Ok : TemplateActivationState; Err : text };
 type Result_1 = variant { Ok : text; Err : text };
-type Result_10 = variant { Ok : RetentionConfig; Err : text };
-type Result_11 = variant { Ok : StewardState; Err : text };
-type Result_12 = variant { Ok : AutonomyPolicy; Err : text };
-type Result_13 = variant { Ok : PromptLayer; Err : text };
-type Result_14 = variant { Ok; Err : text };
+type Result_10 = variant { Ok : OpenRouterProxyWorkerConfig; Err : text };
+type Result_11 = variant { Ok : RetentionConfig; Err : text };
+type Result_12 = variant { Ok : StewardState; Err : text };
+type Result_13 = variant { Ok : StrategyDiscoveryStatusView; Err : text };
+type Result_14 = variant { Ok : AutonomyPolicy; Err : text };
+type Result_15 = variant { Ok : PromptLayer; Err : text };
+type Result_16 = variant { Ok; Err : text };
 type Result_2 = variant { Ok : StrategyTemplate; Err : text };
-type Result_3 = variant { Ok : AbiArtifact; Err : text };
-type Result_4 = variant { Ok : vec text; Err : text };
-type Result_5 = variant { Ok : TemplateRevocationState; Err : text };
-type Result_6 = variant { Ok : AutonomySuppressionConfig; Err : text };
-type Result_7 = variant { Ok : nat64; Err : text };
-type Result_8 = variant { Ok : opt text; Err : text };
-type Result_9 = variant { Ok : OpenRouterProxyWorkerConfig; Err : text };
+type Result_3 = variant { Ok : PendingStrategyDiscoveryJob; Err : text };
+type Result_4 = variant { Ok : AbiArtifact; Err : text };
+type Result_5 = variant { Ok : vec text; Err : text };
+type Result_6 = variant { Ok : TemplateRevocationState; Err : text };
+type Result_7 = variant { Ok : AutonomySuppressionConfig; Err : text };
+type Result_8 = variant { Ok : nat64; Err : text };
+type Result_9 = variant { Ok : opt text; Err : text };
 type RetentionConfig = record {
   transitions_max_age_secs : nat64;
   memory_facts_max_age_secs : nat64;
@@ -525,6 +580,14 @@ type SkillRecord = record {
   mutable : bool;
   allowed_canister_calls : vec CanisterCallPermission;
 };
+type SourceRecord = record {
+  url : text;
+  fetched_at_ns : nat64;
+  trust_tier : StrategyDiscoverySourceTrustTier;
+  content_hash : text;
+  source_id : text;
+  source_type : StrategyDiscoverySourceType;
+};
 type SpawnBootstrapArgs = record {
   provider : SpawnProviderBootstrapArgs;
   session_id : text;
@@ -584,6 +647,9 @@ type StewardCommand = variant {
   SetHttpAllowedDomains : record { domains : vec text };
   UpdateSteward : record { enabled : bool; chain_id : nat64; address : text };
   SetRetentionConfig : record { config : RetentionConfig };
+  EnqueueStrategyDiscoveryJob : record {
+    args : EnqueueStrategyDiscoveryJobArgs;
+  };
   RevokeStrategyTemplate : record {
     key : StrategyTemplateKey;
     reason : opt text;
@@ -591,7 +657,13 @@ type StewardCommand = variant {
   DeriveAutomatonEvmAddress;
   SetOpenrouterReasoningLevel : record { level : OpenRouterReasoningLevel };
   ConfigureSearch : SearchConfigArgs;
+  PromoteDiscoveryProtocolArtifacts : record {
+    args : PromoteDiscoveryProtocolArtifactsArgs;
+  };
   SetSchedulerEnabled : record { enabled : bool };
+  SetStrategyDiscoveryWorkerConfig : record {
+    config : StrategyDiscoveryWorkerConfig;
+  };
   SetEvmRpcUrl : record { url : text };
   SetOpenrouterBaseUrl : record { base_url : text };
   SetAutonomySuppressionConfig : record { config : AutonomySuppressionConfig };
@@ -667,6 +739,87 @@ type StrategyAbiIngestArgs = record {
   codehash : opt text;
   selector_assertions : vec AbiSelectorAssertion;
 };
+type StrategyCandidateBundle = record {
+  suggested_template_shape : opt text;
+  primitive : text;
+  protocol_id : text;
+  objective : text;
+  estimated_yield_bps : opt nat64;
+  missing_inputs : vec text;
+  warnings : vec text;
+  chain_id : nat64;
+  required_artifacts : vec text;
+  rationale : text;
+  assumptions : vec text;
+  candidate_id : text;
+  confidence_label : text;
+  freshness_deadline_ns : opt nat64;
+};
+type StrategyDiscoveryCallbackRecord = record {
+  status : StrategyDiscoveryResultStatus;
+  result_hash : text;
+  completed_at_ns : nat64;
+  objective : text;
+  watchlist : vec ProtocolWatchlistEntry;
+  job_id : text;
+  validated_at_ns : opt nat64;
+  accepted_at_ns : nat64;
+  caller_principal : text;
+  payload : StrategyDiscoveryResultPayload;
+};
+type StrategyDiscoveryResultPayload = record {
+  protocol_artifacts : vec ProtocolArtifactBundle;
+  source_records : vec SourceRecord;
+  market : MarketSynthesisBundle;
+  candidates : vec StrategyCandidateBundle;
+};
+type StrategyDiscoveryResultStatus = variant {
+  Rejected : record { reason : text };
+  Validated;
+};
+type StrategyDiscoverySourceTrustTier = variant {
+  Secondary;
+  Official;
+  BestEffort;
+};
+type StrategyDiscoverySourceType = variant {
+  ProtocolApi;
+  OfficialDocs;
+  BlockExplorer;
+  MarketDataApi;
+  Other;
+};
+type StrategyDiscoveryStatusView = record {
+  has_worker_api_key : bool;
+  callback_auth_failures : nat64;
+  pending_jobs : nat64;
+  result_ttl_secs : nat64;
+  objective : opt text;
+  trusted_callback_principal : opt text;
+  freshest_validated_age_secs : opt nat64;
+  submit_failed : nat64;
+  enabled : bool;
+  freshest_validated_job_id : opt text;
+  callback_duplicates : nat64;
+  freshest_validated_at_ns : opt nat64;
+  submit_accepted : nat64;
+  protocol_watchlist_len : nat64;
+  result_records : nat64;
+  expired_jobs : nat64;
+  callback_rejected : nat64;
+  freshest_validated_expired : bool;
+  callback_accepted : nat64;
+  worker_base_url : opt text;
+};
+type StrategyDiscoveryWorkerConfig = record {
+  worker_api_key : opt text;
+  protocol_watchlist : vec ProtocolWatchlistEntry;
+  result_ttl_secs : nat64;
+  objective : text;
+  trusted_callback_principal : opt principal;
+  enabled : bool;
+  worker_base_url : text;
+};
 type StrategyOutcomeStats = record {
   key : StrategyTemplateKey;
   last_error : opt text;
@@ -706,6 +859,13 @@ type SubmitInferenceResultArgs = record {
   error : opt text;
   turn_id : text;
   job_id : text;
+};
+type SubmitStrategyDiscoveryResultArgs = record {
+  completed_at_ns : nat64;
+  objective : text;
+  watchlist : vec ProtocolWatchlistEntry;
+  job_id : text;
+  payload : StrategyDiscoveryResultPayload;
 };
 type SurvivalTier = variant { OutOfCycles; Normal; LowCycles; Critical };
 type TaskKind = variant {
@@ -852,6 +1012,10 @@ service : (InitArgs) -> {
   // Derives the canister's threshold-ECDSA EVM address from the configured key
   // and caches it in stable storage (controller only).
   derive_automaton_evm_address : () -> (Result_1);
+  // Manually submits a strategy-discovery job for ops/testing (controller only).
+  enqueue_strategy_discovery_job_admin : (EnqueueStrategyDiscoveryJobArgs) -> (
+      Result_3,
+    );
   // Returns the active strategy exposures tracked for autonomy policy enforcement.
   get_active_exposures : () -> (vec ActiveExposure) query;
   // Returns the automaton's derived EVM address, or `None` before first derivation.
@@ -901,6 +1065,9 @@ service : (InitArgs) -> {
   get_spawn_bootstrap_view : () -> (SpawnBootstrapView) query;
   // Returns the currently configured steward identity and next expected nonce.
   get_steward_status : () -> (StewardStatusView) query;
+  get_strategy_discovery_worker_status : () -> (
+      StrategyDiscoveryStatusView,
+    ) query;
   // Returns accumulated outcome statistics (success/failure counts, last outcome)
   // for the given template, or `None` if no executions have been recorded yet.
   get_strategy_outcome_stats : (StrategyTemplateKey) -> (
@@ -927,7 +1094,7 @@ service : (InitArgs) -> {
   // Deprecated: use `register_strategy_admin` instead.
   // Normalises and stores an ABI artifact, optionally verifying selector hashes
   // (controller only).
-  ingest_strategy_abi_artifact_admin : (StrategyAbiIngestArgs) -> (Result_3);
+  ingest_strategy_abi_artifact_admin : (StrategyAbiIngestArgs) -> (Result_4);
   // Deprecated: use `register_strategy_admin` instead.
   // Inserts or updates a strategy template (controller only).
   ingest_strategy_template_admin : (StrategyTemplate) -> (Result_2);
@@ -955,6 +1122,12 @@ service : (InitArgs) -> {
   list_session_summaries : (nat32) -> (vec SessionSummary) query;
   // Returns all registered skill records.
   list_skills : () -> (vec SkillRecord) query;
+  list_strategy_discovery_jobs : (nat32) -> (
+      vec PendingStrategyDiscoveryJob,
+    ) query;
+  list_strategy_discovery_results : (nat32) -> (
+      vec StrategyDiscoveryCallbackRecord,
+    ) query;
   // Lists strategy templates.  When `key` is supplied only templates matching
   // that key are returned; otherwise all templates are returned (up to `limit`).
   list_strategy_templates : (opt StrategyTemplateKey, nat32) -> (
@@ -971,12 +1144,16 @@ service : (InitArgs) -> {
   list_turn_window_summaries : (nat32) -> (vec TurnWindowSummary) query;
   // Returns up to `limit` recent agent turn records as debug strings.
   list_turns : (nat32) -> (vec text) query;
+  // Promotes a validated staged discovery artifact into the ABI registry (controller only).
+  promote_discovery_protocol_artifacts_admin : (
+      PromoteDiscoveryProtocolArtifactsArgs,
+    ) -> (Result_4);
   // Controller-only remediation endpoint to prune memory facts by prefix and/or age.
   // 
   // - `prefix`: optional key namespace filter (e.g. `"signal."`).
   // - `updated_before_ns`: optional inclusive timestamp cutoff.
   // - `limit`: max number of facts to remove in this call.
-  prune_memory_facts_admin : (opt text, opt nat64, nat32) -> (Result_4);
+  prune_memory_facts_admin : (opt text, opt nat64, nat32) -> (Result_5);
   // Register a strategy from a compact recipe (controller only).
   // 
   // Replaces the previous multi-step workflow (`ingest_strategy_template_admin` +
@@ -988,30 +1165,30 @@ service : (InitArgs) -> {
   // records an immutable revocation entry.  Use for security incidents
   // (controller only).
   revoke_strategy_template_admin : (StrategyTemplateKey, opt text) -> (
-      Result_5,
+      Result_6,
     );
   // Replaces autonomy suppression policy (dedupe window + failure cooldown
   // thresholds) (controller only).
-  set_autonomy_suppression_config : (AutonomySuppressionConfig) -> (Result_6);
+  set_autonomy_suppression_config : (AutonomySuppressionConfig) -> (Result_7);
   // Enables or disables autonomous tool-call dedupe without changing other
   // suppression controls (controller only).
   set_autonomy_tool_dedupe_enabled : (bool) -> (text);
   // Updates the EVM chain ID used for all on-chain operations (controller only).
-  set_evm_chain_id_admin : (nat64) -> (Result_7);
+  set_evm_chain_id_admin : (nat64) -> (Result_8);
   // Sets how many block confirmations must pass before an EVM event is
   // considered finalised (controller only).
-  set_evm_confirmation_depth_admin : (nat64) -> (Result_7);
+  set_evm_confirmation_depth_admin : (nat64) -> (Result_8);
   // Sets an optional fallback EVM RPC URL used when the primary is unavailable (controller only).
-  set_evm_rpc_fallback_url : (opt text) -> (Result_8);
+  set_evm_rpc_fallback_url : (opt text) -> (Result_9);
   // Caps the maximum response size (bytes) returned by EVM RPC outbound calls (controller only).
-  set_evm_rpc_max_response_bytes : (nat64) -> (Result_7);
+  set_evm_rpc_max_response_bytes : (nat64) -> (Result_8);
   // Updates the primary EVM JSON-RPC endpoint (controller only).
   set_evm_rpc_url : (text) -> (Result_1);
   // Replaces the HTTP outbound allowlist.  An empty slice disables the allowlist
   // and permits all domains (controller only).
-  set_http_allowed_domains : (vec text) -> (Result_4);
+  set_http_allowed_domains : (vec text) -> (Result_5);
   // Overrides the EVM inbox contract address (controller only).
-  set_inbox_contract_address_admin : (opt text) -> (Result_8);
+  set_inbox_contract_address_admin : (opt text) -> (Result_9);
   // Sets the inference model identifier (e.g. `"llama3.1:8b"` or `"openai/gpt-4o-mini"`)
   // (controller only).
   set_inference_model : (text) -> (Result_1);
@@ -1019,7 +1196,7 @@ service : (InitArgs) -> {
   // (controller only).
   set_inference_provider : (InferenceProvider) -> (text);
   // Stores OpenRouter proxy worker config used by async inference callbacks (controller only).
-  set_inference_proxy_config : (OpenRouterProxyWorkerConfig) -> (Result_9);
+  set_inference_proxy_config : (OpenRouterProxyWorkerConfig) -> (Result_10);
   // Enables or disables the autonomous agent loop (controller only).
   set_loop_enabled : (bool) -> (text);
   // Stores (or clears) the OpenRouter API key in stable storage.
@@ -1030,9 +1207,9 @@ service : (InitArgs) -> {
   // Sets the OpenRouter reasoning effort level for models that support it (controller only).
   set_openrouter_reasoning_level : (OpenRouterReasoningLevel) -> (text);
   // Replaces the conversation-retention policy (controller only).
-  set_retention_config : (RetentionConfig) -> (Result_10);
+  set_retention_config : (RetentionConfig) -> (Result_11);
   // Updates the scheduler timer base tick interval in seconds (controller only).
-  set_scheduler_base_tick_secs : (nat64) -> (Result_7);
+  set_scheduler_base_tick_secs : (nat64) -> (Result_8);
   // Enables or disables the scheduler (controller only).
   // Disabling prevents new jobs from being dispatched without stopping the timer.
   set_scheduler_enabled : (bool) -> (text);
@@ -1041,7 +1218,11 @@ service : (InitArgs) -> {
   set_scheduler_low_cycles_mode : (bool) -> (text);
   // Sets or rotates the active steward identity used for signed command authority
   // (controller recovery path).
-  set_steward_admin : (nat64, text, bool) -> (Result_11);
+  set_steward_admin : (nat64, text, bool) -> (Result_12);
+  // Stores strategy-discovery worker config used by async discovery callbacks (controller only).
+  set_strategy_discovery_worker_config : (StrategyDiscoveryWorkerConfig) -> (
+      Result_13,
+    );
   // Arms or disarms the kill switch for a strategy template.
   // When `enabled` is `true` the agent will refuse to execute any action for
   // that template (controller only).
@@ -1061,15 +1242,19 @@ service : (InitArgs) -> {
   steward_execute_ingress : (StewardCommand) -> (Result_1);
   // Callback endpoint used by the OpenRouter proxy worker to submit async results.
   submit_inference_result : (SubmitInferenceResultArgs) -> (Result_1);
+  // Callback endpoint used by the strategy-discovery worker to submit staged results.
+  submit_strategy_discovery_result : (SubmitStrategyDiscoveryResultArgs) -> (
+      Result_1,
+    );
   // Replaces the active autonomy policy (controller only).
-  update_autonomy_policy : (AutonomyPolicy) -> (Result_12);
+  update_autonomy_policy : (AutonomyPolicy) -> (Result_14);
   // Replaces the content of a prompt layer identified by `layer_id` (controller only).
-  update_prompt_layer_admin : (nat8, text) -> (Result_13);
+  update_prompt_layer_admin : (nat8, text) -> (Result_15);
   // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
   update_soul : (text) -> (Result_1);
   // Inserts or updates a skill record.
   // 
   // Only callable by a canister controller.  This is the runtime management
   // endpoint for adding new inter-canister call skills or modifying existing ones.
-  upsert_skill : (SkillRecord) -> (Result_14);
+  upsert_skill : (SkillRecord) -> (Result_16);
 }

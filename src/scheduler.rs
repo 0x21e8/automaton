@@ -335,7 +335,7 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<JobDispatchOutcome, String> 
             }
         }
         TaskKind::Reconcile => {
-            run_reconcile_job(current_time_ns())?;
+            run_reconcile_job(current_time_ns()).await?;
             Ok(JobDispatchOutcome::Completed)
         }
     }
@@ -343,7 +343,25 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<JobDispatchOutcome, String> 
 
 /// Runs the strategy reconciliation job: iterates registered templates, disabling
 /// stale or provenance-failed entries and activating those that pass dry-run compile.
-fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
+fn strategy_discovery_exposure_summary() -> String {
+    let exposures = stable::list_active_exposures();
+    if exposures.is_empty() {
+        return "no active exposures tracked".to_string();
+    }
+    format!("active_exposures={}", exposures.len())
+}
+
+fn strategy_discovery_autonomy_summary() -> String {
+    let telemetry = stable::cycle_telemetry();
+    format!(
+        "liquid_cycles={} total_cycles={} survival_tier={:?}",
+        telemetry.liquid_cycles,
+        telemetry.total_cycles,
+        stable::scheduler_survival_tier()
+    )
+}
+
+async fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
     let templates = crate::strategy::registry::list_all_templates(STRATEGY_RECONCILE_MAX_TEMPLATES);
     if templates.is_empty() {
         log!(
@@ -430,6 +448,39 @@ fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
         exposure_status.closed_exposures,
         exposure_status.drift_reason
     );
+
+    let discovery_config = stable::strategy_discovery_worker_config();
+    let expired_jobs =
+        stable::expire_strategy_discovery_pending_jobs(now_ns, discovery_config.result_ttl_secs);
+    if !expired_jobs.is_empty() {
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_reconcile_strategy_discovery_expired count={}",
+            expired_jobs.len()
+        );
+    }
+    if discovery_config.enabled
+        && discovery_config.worker_api_key.is_some()
+        && !discovery_config.worker_base_url.trim().is_empty()
+        && stable::pending_strategy_discovery_jobs_count() == 0
+        && stable::freshest_validated_strategy_discovery_result_for_config(&discovery_config, now_ns)
+            .is_none()
+    {
+        let pending = crate::features::strategy_discovery::submit_strategy_discovery_job(
+            &discovery_config,
+            discovery_config.objective.clone(),
+            discovery_config.protocol_watchlist.clone(),
+            strategy_discovery_exposure_summary(),
+            strategy_discovery_autonomy_summary(),
+        )
+        .await?;
+        log!(
+            SchedulerLogPriority::Info,
+            "scheduler_reconcile_strategy_discovery_submitted job_id={} watchlist_len={}",
+            pending.job_id,
+            pending.watchlist.len()
+        );
+    }
 
     Ok(())
 }
@@ -2537,7 +2588,8 @@ mod tests {
             "test setup should start without local exposure"
         );
 
-        run_reconcile_job(current_time_ns()).expect("reconcile job should succeed");
+        futures::executor::block_on(run_reconcile_job(current_time_ns()))
+            .expect("reconcile job should succeed");
 
         let exposure = stable::active_exposure(&strategy_id)
             .expect("reconcile job should rebuild the missing exposure");
