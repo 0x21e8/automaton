@@ -1074,6 +1074,23 @@ fn evm_read_shared_tool() -> SharedToolDefinition {
 fn ic_llm_tools() -> Vec<IcLlmTool> {
     let mut tools = vec![
         IcLlmTool::Function(IcLlmFunction {
+            name: "think".to_string(),
+            description: Some(
+                "Record your internal reasoning. Use this to work through observations, hypotheses, and decisions step by step before acting. The content stays in the turn transcript but is never sent externally. No side effects, no cost."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![IcLlmProperty {
+                    type_: "string".to_string(),
+                    name: "thought".to_string(),
+                    description: Some("Your internal reasoning, analysis, or plan.".to_string()),
+                    enum_values: None,
+                }]),
+                required: Some(vec!["thought".to_string()]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
             name: "sign_message".to_string(),
             description: Some(
                 "Sign a 32-byte message hash with the configured signer.".to_string(),
@@ -1391,7 +1408,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "list_strategy_templates".to_string(),
             description: Some(
-                "List strategy templates. Optional `key` filters by template namespace and `limit` controls result size."
+                "List strategy templates. Optional `key` filters by template namespace and `limit` controls result size. In returned `constraints_json`, `max_value_wei_per_call`, `max_total_value_wei`, and `template_budget_wei` cap native ETH `value_wei`, not ERC-20/token amount args."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -1489,7 +1506,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "describe_strategy_action".to_string(),
             description: Some(
-                "Describe a registered strategy action. Call this first for complex actions to get the canonical call list, named argument tree, preferred typed_params template, and workflow notes before simulating or executing."
+                "Describe a registered strategy action. Call this first for complex actions to get the canonical call list, named argument tree, preferred typed_params template, and workflow notes before simulating or executing. Use the notes to distinguish native ETH `value_wei` limits from ERC-20/token amount args."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -1517,7 +1534,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "simulate_strategy_action".to_string(),
             description: Some(
-                "Compile and validate a strategy action without broadcasting transactions. Call describe_strategy_action first for complex actions, then provide named-object args in typed_params.calls[*].args. Requires `key`, `action_id`, and one of `typed_params` or `typed_params_json`."
+                "Compile and validate a strategy action without broadcasting transactions. Call describe_strategy_action first for complex actions, then provide named-object args in typed_params.calls[*].args. Requires `key`, `action_id`, and one of `typed_params` or `typed_params_json`. A zero native `value_wei` budget on nonpayable calls does not block ERC-20/token amount args."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {

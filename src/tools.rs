@@ -444,7 +444,8 @@ fn strategy_action_error_is_malformed_input(normalized_error: &str) -> bool {
 fn is_parallel_read_only_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "record_signal"
+        "think"
+            | "record_signal"
             | "recall"
             | "memory_stats"
             | "sql_query"
@@ -593,7 +594,8 @@ pub fn tool_allowed_in_scope(tool: &str, scope: InferenceToolScope) -> bool {
         InferenceToolScope::Full => true,
         InferenceToolScope::CoordinationOnly => matches!(
             normalized.as_str(),
-            "record_signal"
+            "think"
+                | "record_signal"
                 | "remember"
                 | "recall"
                 | "memory_stats"
@@ -610,6 +612,13 @@ impl ToolManager {
     /// are restricted to `ExecutingActions`; read-only tools also allow `Inferring`.
     pub fn new() -> Self {
         let mut policies = HashMap::new();
+        policies.insert(
+            "think".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+            },
+        );
         policies.insert(
             "sign_message".to_string(),
             ToolPolicy {
@@ -1103,6 +1112,13 @@ impl ToolManager {
                 } else {
                     Err("broadcast adapter unavailable".to_string())
                 }
+            }
+            "think" => {
+                let thought = serde_json::from_str::<serde_json::Value>(&call.args_json)
+                    .ok()
+                    .and_then(|v| v.get("thought").and_then(|t| t.as_str()).map(String::from))
+                    .unwrap_or_default();
+                Ok(thought)
             }
             "record_signal" => Ok("recorded".to_string()),
             "remember" => remember_fact_tool(&call.args_json, turn_id),
@@ -2838,6 +2854,10 @@ fn describe_strategy_action_tool(args_json: &str) -> Result<String, String> {
             ),
             "Each value_wei must be a decimal string or 0x-prefixed hex quantity; use \"0\" when no native value is sent."
                 .to_string(),
+            "Constraint fields such as max_value_wei_per_call, max_total_value_wei, and template_budget_wei cap native ETH value_wei only; they do not cap ERC-20/token amount args encoded in calldata."
+                .to_string(),
+            "For nonpayable ERC-20 actions, a template constraint value of \"0\" is expected and does not by itself block simulation or execution."
+                .to_string(),
         ],
     })
     .map_err(|error| format!("failed to serialize describe_strategy_action result: {error}"))
@@ -4527,6 +4547,10 @@ mod tests {
         assert!(notes.iter().any(|note| {
             note.as_str()
                 .is_some_and(|value| value.contains("simulate_strategy_action"))
+        }));
+        assert!(notes.iter().any(|note| {
+            note.as_str()
+                .is_some_and(|value| value.contains("native ETH value_wei only"))
         }));
     }
 
