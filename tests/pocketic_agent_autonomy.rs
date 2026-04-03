@@ -1608,15 +1608,15 @@ fn autonomy_turn_round_trips_policy_and_persists_executed_decision() {
     assert_eq!(
         decision.outcome,
         DecisionOutcome::Executed {
-            action_summary: "record_signal(tick)".to_string(),
+            action_summary: "list_strategy_templates".to_string(),
         }
     );
-    assert_eq!(decision.candidates_summary, "policy-bounded autonomy turn");
+    assert_eq!(decision.candidates_summary, "completed a bounded exploration sweep");
     assert!(
         decision
             .explanation
-            .contains("deterministic autonomy decision envelope"),
-        "decision explanation should come from the deterministic retry path"
+            .contains("deterministic exploration action completed"),
+        "decision explanation should come from the deterministic exploration path"
     );
 
     assert!(get_active_exposures(&pic, canister_id).is_empty());
@@ -1630,8 +1630,8 @@ fn autonomy_turn_round_trips_policy_and_persists_executed_decision() {
     assert!(
         turns
             .iter()
-            .any(|turn| turn.contains("inference_round_count: 3")),
-        "scheduled autonomy turn should retry through the tool and decision-envelope phases before persisting"
+            .any(|turn| turn.contains("inference_round_count: 2")),
+        "scheduled autonomy turn should complete after the bounded exploration action and follow-up envelope"
     );
 }
 

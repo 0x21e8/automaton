@@ -76,6 +76,7 @@ const TOOL_SEQUENCE_VALIDATOR_BLOCK_PREFIX: &str = "tool sequence validator bloc
 const AUTONOMY_TOOL_SCOPE_BLOCK_PREFIX: &str = "autonomy tool scope blocked";
 const PROXY_WAIT_MAX_ATTEMPTS_FOR_STAGED_INBOX: u32 = 8;
 const PROXY_WAIT_FAIL_CLOSE_GRACE_SECS: u64 = 60;
+const HEALTHY_AUTONOMY_NOOP_STREAK_CONTEXT_LIMIT: usize = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScheduledTurnTrigger {
@@ -254,6 +255,75 @@ impl AutonomyRuntimeConstraint {
             },
             explanation: self.explanation(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AutonomyExplorationState {
+    active: bool,
+    quiet_noop_streak: usize,
+}
+
+impl AutonomyExplorationState {
+    fn mode_tag(self) -> &'static str {
+        if self.active {
+            "active"
+        } else {
+            "inactive"
+        }
+    }
+
+    fn should_request_bounded_action(self) -> bool {
+        self.active
+    }
+
+    fn explanation(self) -> &'static str {
+        if self.active {
+            "Runway is healthy and there is no external input. Perform at least one bounded discovery, validation, or coordination action before concluding the turn."
+        } else {
+            "Exploration pressure is inactive."
+        }
+    }
+}
+
+fn no_op_reason_counts_as_passive(reason: &str) -> bool {
+    !matches!(
+        reason.trim(),
+        "reserve_insufficient"
+            | "inference_deferred_survival_policy"
+            | "inference_deferred_low_cycles"
+            | "inference_provider_rejected"
+            | "inference_configuration_error"
+            | "invalid_decision_shape"
+    )
+}
+
+fn quiet_scheduled_noop_streak(decisions: &[DecisionRecord]) -> usize {
+    decisions
+        .iter()
+        .take_while(|decision| decision.trigger == DecisionTrigger::ScheduledReview)
+        .take_while(|decision| match &decision.outcome {
+            DecisionOutcome::NoOp { reason } => no_op_reason_counts_as_passive(reason),
+            _ => false,
+        })
+        .count()
+}
+
+fn autonomy_exploration_state_for_turn(
+    trigger: ScheduledTurnTrigger,
+    has_external_input: bool,
+    runtime_constraint: Option<&AutonomyRuntimeConstraint>,
+) -> AutonomyExplorationState {
+    if trigger != ScheduledTurnTrigger::Periodic || has_external_input || runtime_constraint.is_some()
+    {
+        return AutonomyExplorationState::default();
+    }
+
+    let quiet_noop_streak =
+        quiet_scheduled_noop_streak(&stable::list_recent_decisions(HEALTHY_AUTONOMY_NOOP_STREAK_CONTEXT_LIMIT));
+    AutonomyExplorationState {
+        active: true,
+        quiet_noop_streak,
     }
 }
 
@@ -1669,13 +1739,21 @@ fn stop_for_turn_deadline_if_elapsed(
 }
 
 /// Returns a compact context line describing why the current turn is running.
-fn current_turn_context_line(staged_message_count: usize, evm_events: usize) -> String {
+fn current_turn_context_line(
+    staged_message_count: usize,
+    evm_events: usize,
+    exploration_state: AutonomyExplorationState,
+) -> String {
     if staged_message_count > 0 {
         return format!("context: processing {staged_message_count} staged inbox message(s)");
     }
 
     if evm_events > 0 {
         return format!("context: processing {evm_events} newly observed EVM event(s)");
+    }
+
+    if exploration_state.active {
+        return "context: scheduled exploration review (scheduler, no external input)".to_string();
     }
 
     "context: scheduled review (scheduler, no external input)".to_string()
@@ -2341,6 +2419,7 @@ struct DynamicContextOptions<'a> {
     conversation_history_limit: usize,
     tool_scope: InferenceToolScope,
     runtime_constraint: Option<&'a AutonomyRuntimeConstraint>,
+    exploration_state: AutonomyExplorationState,
 }
 
 fn build_dynamic_context(
@@ -2363,6 +2442,7 @@ fn build_dynamic_context(
             conversation_history_limit,
             tool_scope: InferenceToolScope::Full,
             runtime_constraint: None,
+            exploration_state: AutonomyExplorationState::default(),
         },
     )
 }
@@ -2380,6 +2460,7 @@ fn build_dynamic_context_with_scope(
         conversation_history_limit,
         tool_scope,
         runtime_constraint,
+        exploration_state,
     } = options;
     let now_ns = current_time_ns();
     let cycles_balance = current_cycle_balance()
@@ -2517,6 +2598,7 @@ fn build_dynamic_context_with_scope(
         build_conversation_context(staged_messages, conversation_history_limit),
         memory_section,
     ];
+    sections.push(render_autonomy_exploration_section(exploration_state));
     if let Some(runtime_constraint) = runtime_constraint {
         sections.push(render_autonomy_runtime_constraints_section(
             runtime_constraint,
@@ -2529,6 +2611,24 @@ fn build_dynamic_context_with_scope(
         turn_id, tool_scope,
     ));
     sections.join("\n\n")
+}
+
+fn render_autonomy_exploration_section(exploration_state: AutonomyExplorationState) -> String {
+    let mut lines = vec![
+        "### Autonomy Exploration".to_string(),
+        format!("- exploration_mode: {}", exploration_state.mode_tag()),
+        format!(
+            "- quiet_scheduled_noop_streak: {}",
+            exploration_state.quiet_noop_streak
+        ),
+    ];
+    if exploration_state.should_request_bounded_action() {
+        lines.push(
+            "- directive: before final NoOp, perform at least one bounded discovery, validation, or coordination action using the available tools.".to_string(),
+        );
+    }
+    lines.push(format!("- explanation: {}", exploration_state.explanation()));
+    lines.join("\n")
 }
 
 fn render_autonomy_runtime_constraints_section(
@@ -2812,19 +2912,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     }
 
     if should_infer {
-        append_inner_dialogue(
-            &mut inner_dialogue,
-            &current_turn_context_line(staged_message_count, evm_events),
-        );
-
-        let inbox_preview = staged_messages
-            .iter()
-            .map(|message| frame_untrusted_content("inbox_message", message.body.as_str()))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let (memory_facts, memory_rollups) = stable::list_memory_for_context(20, 8);
-        let conversation_history_limit =
-            conversation_history_limit_for_provider(&snapshot.inference_provider);
         let policy = stable::autonomy_policy()
             .unwrap_or_else(|| AutonomyPolicy::conservative_default(started_at_ns));
         let autonomy_runtime_constraint = autonomy_runtime_constraint_for_turn(
@@ -2834,6 +2921,30 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             has_external_input,
             started_at_ns,
         );
+        let exploration_state = autonomy_exploration_state_for_turn(
+            trigger,
+            has_external_input,
+            autonomy_runtime_constraint.as_ref(),
+        );
+        append_inner_dialogue(
+            &mut inner_dialogue,
+            &current_turn_context_line(staged_message_count, evm_events, exploration_state),
+        );
+        if exploration_state.should_request_bounded_action() {
+            append_inner_dialogue(
+                &mut inner_dialogue,
+                "autonomy exploration pressure: bounded action required while runway is healthy",
+            );
+        }
+
+        let inbox_preview = staged_messages
+            .iter()
+            .map(|message| frame_untrusted_content("inbox_message", message.body.as_str()))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let (memory_facts, memory_rollups) = stable::list_memory_for_context(20, 8);
+        let conversation_history_limit =
+            conversation_history_limit_for_provider(&snapshot.inference_provider);
         if let Some(runtime_constraint) = autonomy_runtime_constraint.as_ref() {
             append_inner_dialogue(
                 &mut inner_dialogue,
@@ -2858,6 +2969,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 conversation_history_limit,
                 tool_scope,
                 runtime_constraint: autonomy_runtime_constraint.as_ref(),
+                exploration_state,
             },
         );
         let input = InferenceInput {
@@ -2865,6 +2977,8 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 format!("inbox:{inbox_preview}")
             } else if evm_events > 0 {
                 format!("poll:new_events={evm_events}")
+            } else if exploration_state.active {
+                "scheduled_review_explore".to_string()
             } else {
                 scheduled_turn_marker(trigger).to_string()
             },
@@ -5032,6 +5146,47 @@ mod tests {
     }
 
     #[test]
+    fn quiet_scheduled_noop_streak_counts_only_passive_scheduled_review_noops() {
+        let decisions = vec![
+            DecisionRecord {
+                turn_id: "turn-3".to_string(),
+                timestamp_ns: 3,
+                trigger: DecisionTrigger::ScheduledReview,
+                outcome: DecisionOutcome::NoOp {
+                    reason: "waiting_for_candidate".to_string(),
+                },
+                policy_version: 1,
+                candidates_summary: "none".to_string(),
+                explanation: "none".to_string(),
+            },
+            DecisionRecord {
+                turn_id: "turn-2".to_string(),
+                timestamp_ns: 2,
+                trigger: DecisionTrigger::ScheduledReview,
+                outcome: DecisionOutcome::NoOp {
+                    reason: "reserve_insufficient".to_string(),
+                },
+                policy_version: 1,
+                candidates_summary: "none".to_string(),
+                explanation: "none".to_string(),
+            },
+            DecisionRecord {
+                turn_id: "turn-1".to_string(),
+                timestamp_ns: 1,
+                trigger: DecisionTrigger::ScheduledReview,
+                outcome: DecisionOutcome::NoOp {
+                    reason: "watchful".to_string(),
+                },
+                policy_version: 1,
+                candidates_summary: "none".to_string(),
+                explanation: "none".to_string(),
+            },
+        ];
+
+        assert_eq!(quiet_scheduled_noop_streak(&decisions), 1);
+    }
+
+    #[test]
     fn invalid_autonomy_decision_shape_retries_then_noops() {
         reset_runtime(AgentState::Sleeping, true, false, 0);
         stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
@@ -5445,6 +5600,7 @@ mod tests {
                 conversation_history_limit: 5,
                 tool_scope: constraint.tool_scope,
                 runtime_constraint: Some(&constraint),
+                exploration_state: AutonomyExplorationState::default(),
             },
         );
 
@@ -5777,8 +5933,15 @@ mod tests {
             turn.inner_dialogue
                 .as_deref()
                 .unwrap_or_default()
-                .contains("context: scheduled review (scheduler, no external input)"),
+                .contains("context: scheduled exploration review (scheduler, no external input)"),
             "inner dialogue should include autonomy turn context"
+        );
+        assert!(
+            turn.inner_dialogue
+                .as_deref()
+                .unwrap_or_default()
+                .contains("autonomy exploration pressure"),
+            "healthy autonomy turn should record exploration pressure"
         );
         assert!(
             turn.inner_dialogue
@@ -5832,12 +5995,13 @@ mod tests {
             "inner dialogue should explain autonomous dedupe suppression"
         );
         assert!(
-            turns[0]
-                .inner_dialogue
-                .as_deref()
-                .unwrap_or_default()
-                .contains("deterministic continuation"),
-            "suppressed calls should still feed continuation inference"
+            stable::list_recent_decisions(1)
+                .first()
+                .is_some_and(|decision| matches!(
+                    decision.outcome,
+                    DecisionOutcome::Executed { .. }
+                )),
+            "healthy exploration turns should still complete with an executed bounded action summary"
         );
     }
 
@@ -6004,12 +6168,8 @@ mod tests {
             "suppressed autonomous calls should be persisted as synthetic skipped tool outputs"
         );
         assert!(
-            latest_turn
-                .inner_dialogue
-                .as_deref()
-                .unwrap_or_default()
-                .contains("deterministic continuation"),
-            "synthetic tool outputs must allow continuation inference to complete"
+            latest_turn.error.is_none(),
+            "synthetic tool outputs must still allow the turn to complete cleanly"
         );
     }
 

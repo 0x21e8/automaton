@@ -339,12 +339,35 @@ fn run_deterministic_inference(
             .context_snippet
             .contains("request_autonomy_decision_envelope:true")
         || assembled_prompt.contains("request_autonomy_decision_envelope:true");
+    let exploration_hint = input.input.contains("scheduled_review_explore")
+        || input.context_snippet.contains("- exploration_mode: active")
+        || assembled_prompt.contains("- exploration_mode: active");
     let coordination_room_post_request =
         input.input.contains("request_coordination_room_post:true")
             || input
                 .context_snippet
                 .contains("request_coordination_room_post:true")
             || assembled_prompt.contains("request_coordination_room_post:true");
+    let has_explicit_deterministic_request = explicit_sign_request
+        || update_prompt_layer_request
+        || layer_6_probe_request
+        || remember_capacity_probe_request
+        || remember_failure_loop_probe_request
+        || list_templates_malformed_probe_request
+        || remember_malformed_probe_request
+        || remember_empty_key_probe_request
+        || evm_read_malformed_probe_request
+        || evm_read_missing_address_probe_request
+        || evm_read_missing_calldata_probe_request
+        || market_fetch_missing_extract_probe_request
+        || continuation_loop_request
+        || continuation_error_request
+        || autonomy_decision_invalid_request
+        || autonomy_decision_invalid_persistent_request
+        || autonomy_decision_retry_request
+        || autonomy_decision_envelope_request
+        || coordination_room_post_request;
+    let exploration_active = exploration_hint && !has_explicit_deterministic_request;
 
     let has_tool_transcript = transcript
         .iter()
@@ -397,6 +420,23 @@ fn run_deterministic_inference(
                 .to_string(),
             }],
             format!("deterministic inference for {}", input.turn_id),
+        ));
+    }
+
+    if exploration_active && has_tool_transcript {
+        return Ok(InferenceOutput::text(
+            Vec::new(),
+            serde_json::json!({
+                "trigger": DecisionTrigger::ScheduledReview.as_wire_name(),
+                "candidates_summary": "completed a bounded exploration sweep",
+                "outcome": {
+                    "Executed": {
+                        "action_summary": deterministic_action_summary_from_transcript(transcript)
+                    }
+                },
+                "explanation": "deterministic exploration action completed under healthy-runway pressure"
+            })
+            .to_string(),
         ));
     }
 
@@ -509,6 +549,12 @@ fn run_deterministic_inference(
                 "content": DETERMINISTIC_LAYER_6_UPDATE_CONTENT
             })
             .to_string(),
+        }]
+    } else if exploration_active {
+        vec![ToolCall {
+            tool_call_id: None,
+            tool: "list_strategy_templates".to_string(),
+            args_json: r#"{"limit":5}"#.to_string(),
         }]
     } else {
         vec![ToolCall {
