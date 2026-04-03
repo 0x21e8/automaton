@@ -30,21 +30,22 @@ use crate::domain::types::{
     AgentEvent, AgentState, AutonomyDecisionEnvelope, AutonomyPolicy, AutonomySuppressionConfig,
     ContinuationStopReason, ConversationEntry, DecisionEnvelopeOutcome, DecisionOutcome,
     DecisionRecord, DecisionTrigger, InboxMessage, InboxProxyWaitState, InferenceInput,
-    InferenceProvider, MemoryFact, MemoryRollup, ReflectionOrigin, RuntimeSnapshot, ToolCall,
-    ToolCallOutcome, ToolCallRecord, ToolFailureKind, TurnRecord, WalletBalanceStatus,
+    InferenceProvider, InferenceToolScope, MemoryFact, MemoryRollup, ReflectionOrigin,
+    RuntimeSnapshot, SurvivalOperationClass, ToolCall, ToolCallOutcome, ToolCallRecord,
+    ToolFailureKind, TurnRecord, WalletBalanceStatus,
 };
 use crate::features::inference::canonicalize_tool_name;
 #[cfg(target_arch = "wasm32")]
 use crate::features::ThresholdSignerAdapter;
 use crate::features::{
     infer_with_provider, infer_with_provider_transcript, is_inference_proxy_deferred_output,
-    InferenceTranscriptMessage, MockSignerAdapter,
+    InferenceDeferredReason, InferenceTranscriptMessage, MockSignerAdapter,
 };
 use crate::sanitize::{
     extract_framed_untrusted_payload, frame_untrusted_content, ToolSequenceValidator,
 };
 use crate::storage::{sqlite, stable};
-use crate::tools::{SignerPort, ToolManager};
+use crate::tools::{tool_allowed_in_scope, SignerPort, ToolManager};
 use alloy_primitives::U256;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,7 @@ const AUTONOMY_DEDUPE_SKIP_REASON: &str = "skipped due to freshness dedupe";
 const AUTONOMY_FAILURE_COOLDOWN_SKIP_REASON: &str = "suppressed due to repeated failure cooldown";
 const AUTONOMY_CONSECUTIVE_DEGRADE_CAP: u32 = 3;
 const TOOL_SEQUENCE_VALIDATOR_BLOCK_PREFIX: &str = "tool sequence validator blocked";
+const AUTONOMY_TOOL_SCOPE_BLOCK_PREFIX: &str = "autonomy tool scope blocked";
 const PROXY_WAIT_MAX_ATTEMPTS_FOR_STAGED_INBOX: u32 = 8;
 const PROXY_WAIT_FAIL_CLOSE_GRACE_SECS: u64 = 60;
 
@@ -134,23 +136,24 @@ fn current_canister_id_text() -> Option<String> {
 /// Parses a hex quantity string and formats it as a decimal value with `decimals`
 /// fractional digits, trimming trailing zeroes without floating-point rounding.
 fn format_hex_quantity_with_decimals(hex_quantity: Option<&str>, decimals: usize) -> String {
-    let Some(raw) = hex_quantity
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(quantity) = parse_hex_quantity(hex_quantity) else {
         return "unknown".to_string();
     };
+    format_decimal_units(quantity, decimals)
+}
+
+fn parse_hex_quantity(hex_quantity: Option<&str>) -> Option<U256> {
+    let raw = hex_quantity
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
     let without_prefix = raw
         .strip_prefix("0x")
         .or_else(|| raw.strip_prefix("0X"))
         .unwrap_or(raw);
     if without_prefix.is_empty() {
-        return "unknown".to_string();
+        return None;
     }
-    let Ok(quantity) = U256::from_str_radix(without_prefix, 16) else {
-        return "unknown".to_string();
-    };
-    format_decimal_units(quantity, decimals)
+    U256::from_str_radix(without_prefix, 16).ok()
 }
 
 fn format_decimal_units(value: U256, decimals: usize) -> String {
@@ -184,6 +187,158 @@ fn format_decimal_units(value: U256, decimals: usize) -> String {
             format!("{whole}.{trimmed}")
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReserveShortfall {
+    resource_label: &'static str,
+    unit_label: &'static str,
+    actual_display: String,
+    minimum_display: String,
+}
+
+impl ReserveShortfall {
+    fn render(&self) -> String {
+        format!(
+            "{}: {} {} < {} {} minimum",
+            self.resource_label,
+            self.actual_display,
+            self.unit_label,
+            self.minimum_display,
+            self.unit_label,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AutonomyRuntimeConstraint {
+    machine_reason: &'static str,
+    tool_scope: InferenceToolScope,
+    coordination_actions_allowed: bool,
+    shortfalls: Vec<ReserveShortfall>,
+}
+
+impl AutonomyRuntimeConstraint {
+    fn checked_reserves_summary(&self) -> String {
+        "checked reserves against policy minimums".to_string()
+    }
+
+    fn explanation(&self) -> String {
+        let restriction_summary = if self.coordination_actions_allowed {
+            "capital-touching actions blocked by reserve shortfall; coordination-only mode active."
+        } else {
+            "capital-touching actions blocked by reserve shortfall; no safe peer coordination lane is available."
+        };
+        format!(
+            "{} {}",
+            restriction_summary,
+            self.shortfalls
+                .iter()
+                .map(ReserveShortfall::render)
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    }
+
+    fn should_attempt_restricted_inference(&self) -> bool {
+        self.coordination_actions_allowed
+    }
+
+    fn no_op_envelope(&self, trigger: DecisionTrigger) -> AutonomyDecisionEnvelope {
+        AutonomyDecisionEnvelope {
+            trigger,
+            candidates_summary: self.checked_reserves_summary(),
+            outcome: DecisionEnvelopeOutcome::NoOp {
+                reason: self.machine_reason.to_string(),
+            },
+            explanation: self.explanation(),
+        }
+    }
+}
+
+fn reserve_shortfall_from_wallet(
+    actual_hex: Option<&str>,
+    minimum_raw: U256,
+    decimals: usize,
+    resource_label: &'static str,
+    unit_label: &'static str,
+) -> Result<Option<ReserveShortfall>, ()> {
+    let Some(actual_raw) = parse_hex_quantity(actual_hex) else {
+        return Err(());
+    };
+    if actual_raw >= minimum_raw {
+        return Ok(None);
+    }
+
+    Ok(Some(ReserveShortfall {
+        resource_label,
+        unit_label,
+        actual_display: format_decimal_units(actual_raw, decimals),
+        minimum_display: format_decimal_units(minimum_raw, decimals),
+    }))
+}
+
+fn autonomy_runtime_constraint_for_turn(
+    snapshot: &RuntimeSnapshot,
+    policy: &AutonomyPolicy,
+    trigger: ScheduledTurnTrigger,
+    has_external_input: bool,
+    now_ns: u64,
+) -> Option<AutonomyRuntimeConstraint> {
+    if trigger != ScheduledTurnTrigger::Periodic || has_external_input {
+        return None;
+    }
+
+    let freshness = snapshot
+        .wallet_balance
+        .derive_freshness(now_ns, snapshot.wallet_balance_sync.freshness_window_secs);
+    if freshness.status != WalletBalanceStatus::Fresh {
+        return None;
+    }
+
+    let mut shortfalls = Vec::new();
+
+    if let Some(min_gas_wei) = policy.reserve_policy.min_gas_wei {
+        match reserve_shortfall_from_wallet(
+            snapshot.wallet_balance.eth_balance_wei_hex.as_deref(),
+            U256::from(min_gas_wei),
+            18,
+            "ETH gas reserve",
+            "ETH",
+        ) {
+            Ok(Some(shortfall)) => shortfalls.push(shortfall),
+            Ok(None) => {}
+            Err(()) => return None,
+        }
+    }
+
+    if let Some(min_inference_usdc_6dp) = policy.reserve_policy.min_inference_usdc_6dp {
+        match reserve_shortfall_from_wallet(
+            snapshot.wallet_balance.usdc_balance_raw_hex.as_deref(),
+            U256::from(min_inference_usdc_6dp),
+            usize::from(snapshot.wallet_balance.usdc_decimals),
+            "Inference USDC reserve",
+            "USDC",
+        ) {
+            Ok(Some(shortfall)) => shortfalls.push(shortfall),
+            Ok(None) => {}
+            Err(()) => return None,
+        }
+    }
+
+    if shortfalls.is_empty() {
+        return None;
+    }
+
+    let coordination_actions_allowed = snapshot.room_poll.configured
+        && stable::can_run_survival_operation(&SurvivalOperationClass::InterCanisterCall, now_ns);
+
+    Some(AutonomyRuntimeConstraint {
+        machine_reason: "reserve_insufficient",
+        tool_scope: InferenceToolScope::CoordinationOnly,
+        coordination_actions_allowed,
+        shortfalls,
+    })
 }
 
 /// Collapses whitespace and truncates `text` to `max_chars` characters,
@@ -490,6 +645,9 @@ enum PlannedToolCallExecution {
     SequenceBlocked {
         reason: String,
     },
+    RuntimeRestricted {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -526,6 +684,24 @@ fn synthetic_sequence_blocked_tool_record(
     reason: &str,
 ) -> ToolCallRecord {
     let message = format!("{TOOL_SEQUENCE_VALIDATOR_BLOCK_PREFIX}: {reason}");
+    ToolCallRecord {
+        turn_id: turn_id.to_string(),
+        tool: call.tool.clone(),
+        args_json: call.args_json.clone(),
+        output: message.clone(),
+        success: false,
+        outcome: ToolCallOutcome::BlockedSequence,
+        error: Some(message),
+        failure_kind: None,
+    }
+}
+
+fn synthetic_runtime_restricted_tool_record(
+    turn_id: &str,
+    call: &ToolCall,
+    reason: &str,
+) -> ToolCallRecord {
+    let message = format!("{AUTONOMY_TOOL_SCOPE_BLOCK_PREFIX}: {reason}");
     ToolCallRecord {
         turn_id: turn_id.to_string(),
         tool: call.tool.clone(),
@@ -1662,6 +1838,13 @@ fn build_conversation_context(staged_messages: &[InboxMessage], per_sender_limit
 /// Renders the `### Available Tools` section, annotating each enabled tool
 /// with how many times it has already been called in the current turn.
 fn build_available_tools_section(turn_id: &str) -> String {
+    build_available_tools_section_with_scope(turn_id, InferenceToolScope::Full)
+}
+
+fn build_available_tools_section_with_scope(
+    turn_id: &str,
+    tool_scope: InferenceToolScope,
+) -> String {
     let manager = ToolManager::new();
     let usage = sqlite::get_tools_for_turn(turn_id)
         .unwrap_or_else(|_| stable::get_tools_for_turn(turn_id))
@@ -1676,7 +1859,10 @@ fn build_available_tools_section(turn_id: &str) -> String {
     for (name, policy) in manager.list_tools() {
         // `broadcast_transaction` is an internal pipeline tool (used by `send_eth`)
         // and should not be advertised as directly callable by the LLM.
-        if !policy.enabled || name == "broadcast_transaction" {
+        if !policy.enabled
+            || name == "broadcast_transaction"
+            || !tool_allowed_in_scope(&name, tool_scope)
+        {
             continue;
         }
         let used = usage.get(&name).copied().unwrap_or_default();
@@ -1703,10 +1889,20 @@ fn render_autonomy_policy_section(policy: &AutonomyPolicy) -> String {
         .min_inference_usdc_6dp
         .map(|value| value.to_string())
         .unwrap_or_else(|| "none".to_string());
+    let reserve_min_inference_usdc_tokens = policy
+        .reserve_policy
+        .min_inference_usdc_6dp
+        .map(|value| format_decimal_units(U256::from(value), 6))
+        .unwrap_or_else(|| "none".to_string());
     let reserve_min_gas_wei = policy
         .reserve_policy
         .min_gas_wei
         .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let reserve_min_gas_eth = policy
+        .reserve_policy
+        .min_gas_wei
+        .map(|value| format_decimal_units(U256::from(value), 18))
         .unwrap_or_else(|| "none".to_string());
     let per_action_value_limit_wei = policy
         .execution_authority
@@ -1722,7 +1918,9 @@ fn render_autonomy_policy_section(policy: &AutonomyPolicy) -> String {
             policy.reserve_policy.min_cycles_runway_hours
         ),
         format!("- reserve_min_inference_usdc_6dp: {reserve_min_inference_usdc}"),
+        format!("- reserve_min_inference_usdc_tokens: {reserve_min_inference_usdc_tokens}"),
         format!("- reserve_min_gas_wei: {reserve_min_gas_wei}"),
+        format!("- reserve_min_gas_eth: {reserve_min_gas_eth}"),
         format!(
             "- max_total_exposure_bps: {}",
             policy.risk_limits.max_total_exposure_bps
@@ -1821,6 +2019,44 @@ fn render_decision_envelope_error_context(error: &str) -> String {
     )
 }
 
+fn autonomy_inner_dialogue_marker_for_inference_defer(
+    reason: InferenceDeferredReason,
+) -> &'static str {
+    match reason {
+        InferenceDeferredReason::LowCycles => "autonomy inference deferred: low cycles",
+        InferenceDeferredReason::SurvivalPolicy => "autonomy inference deferred: survival policy",
+        InferenceDeferredReason::ProxyCallbackPending => {
+            "autonomy inference deferred: awaiting proxy callback"
+        }
+    }
+}
+
+fn autonomy_noop_envelope_for_inference_defer(
+    reason: InferenceDeferredReason,
+    trigger: DecisionTrigger,
+) -> Option<AutonomyDecisionEnvelope> {
+    let (noop_reason, explanation) = match reason {
+        InferenceDeferredReason::SurvivalPolicy => (
+            "inference_deferred_survival_policy",
+            "autonomy inference deferred by survival policy before decision generation",
+        ),
+        InferenceDeferredReason::LowCycles => (
+            "inference_deferred_low_cycles",
+            "autonomy inference deferred because liquid cycles were insufficient",
+        ),
+        InferenceDeferredReason::ProxyCallbackPending => return None,
+    };
+
+    Some(AutonomyDecisionEnvelope {
+        trigger,
+        candidates_summary: "autonomy turn deferred before decision generation".to_string(),
+        outcome: DecisionEnvelopeOutcome::NoOp {
+            reason: noop_reason.to_string(),
+        },
+        explanation: explanation.to_string(),
+    })
+}
+
 fn autonomy_noop_envelope_for_inference_error(
     error: &str,
     trigger: DecisionTrigger,
@@ -1854,6 +2090,42 @@ fn autonomy_noop_envelope_for_inference_error(
             sanitize_preview(error, 180)
         ),
     }
+}
+
+fn autonomy_noop_envelope_for_provider_rejection_suppression(
+    trigger: DecisionTrigger,
+    remaining_secs: u64,
+    repeat_count: u32,
+) -> AutonomyDecisionEnvelope {
+    AutonomyDecisionEnvelope {
+        trigger,
+        candidates_summary: "autonomy inference suppressed during provider rejection cooldown"
+            .to_string(),
+        outcome: DecisionEnvelopeOutcome::NoOp {
+            reason: "inference_provider_rejected".to_string(),
+        },
+        explanation: format!(
+            "autonomy inference suppressed after repeated provider rejection failures: repeat_count={} cooldown_remaining_secs={}",
+            repeat_count, remaining_secs
+        ),
+    }
+}
+
+fn normalize_decision_envelope_for_runtime_constraint(
+    mut envelope: AutonomyDecisionEnvelope,
+    runtime_constraint: Option<&AutonomyRuntimeConstraint>,
+) -> AutonomyDecisionEnvelope {
+    let Some(runtime_constraint) = runtime_constraint else {
+        return envelope;
+    };
+
+    if let DecisionEnvelopeOutcome::NoOp { reason } = &mut envelope.outcome {
+        *reason = runtime_constraint.machine_reason.to_string();
+        envelope.candidates_summary = runtime_constraint.checked_reserves_summary();
+        envelope.explanation = runtime_constraint.explanation();
+    }
+
+    envelope
 }
 
 fn validate_decision_envelope(
@@ -1942,6 +2214,13 @@ fn decision_record_from_envelope(
 /// Assembles the full `## Layer 10: Dynamic Context` section injected into
 /// every turn prompt: current state, wallet balances, survival tier, pending
 /// inbox obligations, conversation history, memory facts/rollups, and tool usage.
+struct DynamicContextOptions<'a> {
+    turn_id: &'a str,
+    conversation_history_limit: usize,
+    tool_scope: InferenceToolScope,
+    runtime_constraint: Option<&'a AutonomyRuntimeConstraint>,
+}
+
 fn build_dynamic_context(
     snapshot: &crate::domain::types::RuntimeSnapshot,
     staged_messages: &[InboxMessage],
@@ -1951,6 +2230,35 @@ fn build_dynamic_context(
     turn_id: &str,
     conversation_history_limit: usize,
 ) -> String {
+    build_dynamic_context_with_scope(
+        snapshot,
+        staged_messages,
+        evm_events,
+        memory_facts,
+        memory_rollups,
+        DynamicContextOptions {
+            turn_id,
+            conversation_history_limit,
+            tool_scope: InferenceToolScope::Full,
+            runtime_constraint: None,
+        },
+    )
+}
+
+fn build_dynamic_context_with_scope(
+    snapshot: &crate::domain::types::RuntimeSnapshot,
+    staged_messages: &[InboxMessage],
+    evm_events: usize,
+    memory_facts: &[MemoryFact],
+    memory_rollups: &[MemoryRollup],
+    options: DynamicContextOptions<'_>,
+) -> String {
+    let DynamicContextOptions {
+        turn_id,
+        conversation_history_limit,
+        tool_scope,
+        runtime_constraint,
+    } = options;
     let now_ns = current_time_ns();
     let cycles_balance = current_cycle_balance()
         .map(|value| value.to_string())
@@ -2087,11 +2395,43 @@ fn build_dynamic_context(
         build_conversation_context(staged_messages, conversation_history_limit),
         memory_section,
     ];
+    if let Some(runtime_constraint) = runtime_constraint {
+        sections.push(render_autonomy_runtime_constraints_section(
+            runtime_constraint,
+        ));
+    }
     if let Some(reflection_section) = reflection_section {
         sections.push(reflection_section);
     }
-    sections.push(build_available_tools_section(turn_id));
+    sections.push(build_available_tools_section_with_scope(
+        turn_id, tool_scope,
+    ));
     sections.join("\n\n")
+}
+
+fn render_autonomy_runtime_constraints_section(
+    runtime_constraint: &AutonomyRuntimeConstraint,
+) -> String {
+    let mut lines = vec![
+        "### Autonomy Runtime Constraints".to_string(),
+        format!(
+            "- autonomy_tool_scope: {}",
+            runtime_constraint.tool_scope.as_tag()
+        ),
+        format!(
+            "- restriction_reason: {}",
+            runtime_constraint.machine_reason
+        ),
+        "- capital_touching_actions_allowed: false".to_string(),
+        format!(
+            "- coordination_actions_allowed: {}",
+            runtime_constraint.coordination_actions_allowed
+        ),
+    ];
+    for shortfall in &runtime_constraint.shortfalls {
+        lines.push(format!("- shortfall: {}", shortfall.render()));
+    }
+    lines.join("\n")
 }
 
 fn build_room_integration_section(snapshot: &RuntimeSnapshot) -> String {
@@ -2323,6 +2663,7 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
 
     let evm_events = 0usize;
     let has_external_input = staged_message_count > 0;
+    let decision_trigger = decision_trigger_for_turn(trigger, has_external_input);
     let staged_proxy_wait_state = if has_external_input
         && snapshot.inference_provider == InferenceProvider::OpenRouterProxyWorker
     {
@@ -2362,14 +2703,40 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         let (memory_facts, memory_rollups) = stable::list_memory_for_context(20, 8);
         let conversation_history_limit =
             conversation_history_limit_for_provider(&snapshot.inference_provider);
-        let context_summary = build_dynamic_context(
+        let policy = stable::autonomy_policy()
+            .unwrap_or_else(|| AutonomyPolicy::conservative_default(started_at_ns));
+        let autonomy_runtime_constraint = autonomy_runtime_constraint_for_turn(
+            &snapshot,
+            &policy,
+            trigger,
+            has_external_input,
+            started_at_ns,
+        );
+        if let Some(runtime_constraint) = autonomy_runtime_constraint.as_ref() {
+            append_inner_dialogue(
+                &mut inner_dialogue,
+                &format!(
+                    "autonomy reserve restriction: {}",
+                    sanitize_preview(&runtime_constraint.explanation(), 220)
+                ),
+            );
+        }
+        let tool_scope = autonomy_runtime_constraint
+            .as_ref()
+            .map(|constraint| constraint.tool_scope)
+            .unwrap_or(InferenceToolScope::Full);
+        let context_summary = build_dynamic_context_with_scope(
             &snapshot,
             &staged_messages,
             evm_events,
             &memory_facts,
             &memory_rollups,
-            &turn_id,
-            conversation_history_limit,
+            DynamicContextOptions {
+                turn_id: &turn_id,
+                conversation_history_limit,
+                tool_scope,
+                runtime_constraint: autonomy_runtime_constraint.as_ref(),
+            },
         );
         let input = InferenceInput {
             input: if staged_message_count > 0 {
@@ -2381,11 +2748,13 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             },
             context_snippet: context_summary,
             turn_id: turn_id.clone(),
+            tool_scope,
             proxy_resume_job_id: staged_proxy_wait_state
                 .as_ref()
                 .and_then(|state| state.pending_job_id.clone()),
             allow_global_proxy_callback_resume: !has_external_input,
         };
+        let mut runtime_autonomy_decision_envelope = None;
 
         #[cfg(target_arch = "wasm32")]
         let signer: Box<dyn SignerPort> = if snapshot.ecdsa_key_name.trim().is_empty() {
@@ -2408,7 +2777,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         let mut staged_external_input_handled = false;
         let mut executed_any_tool = false;
         let mut autonomy_inference_error: Option<String> = None;
-
         loop {
             if inference_round_count >= max_inference_rounds {
                 append_inner_dialogue(
@@ -2443,6 +2811,53 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 break;
             }
 
+            if !has_external_input && transcript.is_empty() {
+                if let Some(runtime_constraint) = autonomy_runtime_constraint.as_ref() {
+                    if !runtime_constraint.should_attempt_restricted_inference() {
+                        append_inner_dialogue(
+                            &mut inner_dialogue,
+                            "autonomy reserve no-op: no safe peer coordination lane available",
+                        );
+                        runtime_autonomy_decision_envelope =
+                            Some(runtime_constraint.no_op_envelope(decision_trigger.clone()));
+                        log!(
+                            AgentLogPriority::Info,
+                            "turn={} autonomy_reserve_noop reason={} coordination_actions_allowed=false",
+                            turn_id,
+                            runtime_constraint.machine_reason,
+                        );
+                        break;
+                    }
+                }
+
+                let now_ns = current_time_ns();
+                if let Some(suppression) = stable::autonomy_inference_suppression_active(now_ns) {
+                    let remaining_secs = suppression
+                        .suppression_until_ns
+                        .unwrap_or_default()
+                        .saturating_sub(now_ns)
+                        / 1_000_000_000;
+                    append_inner_dialogue(
+                        &mut inner_dialogue,
+                        "autonomy inference suppressed: provider rejected",
+                    );
+                    runtime_autonomy_decision_envelope =
+                        Some(autonomy_noop_envelope_for_provider_rejection_suppression(
+                            decision_trigger.clone(),
+                            remaining_secs,
+                            suppression.consecutive_failure_count,
+                        ));
+                    log!(
+                        AgentLogPriority::Info,
+                        "turn={} autonomy_inference_suppressed reason=provider_rejected remaining_secs={} repeat_count={}",
+                        turn_id,
+                        remaining_secs,
+                        suppression.consecutive_failure_count,
+                    );
+                    break;
+                }
+            }
+
             inference_round_count = inference_round_count.saturating_add(1);
             let inference_result = if transcript.is_empty() {
                 infer_with_provider(&snapshot, &input).await
@@ -2468,6 +2883,22 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                         if has_external_input {
                             last_error = Some(reason);
                         } else {
+                            if let Some(classification) =
+                                crate::features::inference::classify_autonomy_inference_suppression_failure(&reason)
+                            {
+                                let suppression = stable::record_autonomy_inference_suppression_failure(
+                                    current_time_ns(),
+                                    classification,
+                                );
+                                if suppression.suppression_until_ns.is_some() {
+                                    append_inner_dialogue(
+                                        &mut inner_dialogue,
+                                        "autonomy inference suppression armed: provider rejected",
+                                    );
+                                }
+                            } else {
+                                stable::clear_autonomy_inference_suppression_state();
+                            }
                             autonomy_inference_error = Some(reason.clone());
                             append_inner_dialogue(
                                 &mut inner_dialogue,
@@ -2510,6 +2941,21 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     break;
                 }
             };
+
+            if !has_external_input {
+                if let Some(reason) = inference.deferred_reason {
+                    append_inner_dialogue(
+                        &mut inner_dialogue,
+                        autonomy_inner_dialogue_marker_for_inference_defer(reason),
+                    );
+                    if let Some(envelope) =
+                        autonomy_noop_envelope_for_inference_defer(reason, decision_trigger.clone())
+                    {
+                        runtime_autonomy_decision_envelope = Some(envelope);
+                        break;
+                    }
+                }
+            }
 
             if is_inference_proxy_deferred_output(&inference) {
                 inference_deferred = true;
@@ -2827,6 +3273,17 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     continue;
                 }
 
+                if !tool_allowed_in_scope(&call.tool, tool_scope) {
+                    planned_execution.push(PlannedToolCallExecution::RuntimeRestricted {
+                        reason: format!(
+                            "tool `{}` is not available while autonomy_tool_scope={}",
+                            call.tool,
+                            tool_scope.as_tag()
+                        ),
+                    });
+                    continue;
+                }
+
                 match tool_sequence_validator.validate_next(&call.tool) {
                     Ok(()) => {
                         executable_tool_calls.push(call.clone());
@@ -2946,6 +3403,11 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                     }
                     PlannedToolCallExecution::SequenceBlocked { reason } => {
                         round_tool_records.push(synthetic_sequence_blocked_tool_record(
+                            &turn_id, call, reason,
+                        ));
+                    }
+                    PlannedToolCallExecution::RuntimeRestricted { reason } => {
+                        round_tool_records.push(synthetic_runtime_restricted_tool_record(
                             &turn_id, call, reason,
                         ));
                     }
@@ -3091,7 +3553,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 break;
             }
         }
-
         if last_error.is_none() && !inference_completed {
             if let Err(error) = advance_state(&mut state, &AgentEvent::InferenceCompleted, &turn_id)
             {
@@ -3111,11 +3572,10 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             !has_external_input && !proxy_callback_buffered_turn;
 
         if last_error.is_none() && should_finalize_autonomy_decision {
-            let decision_trigger = decision_trigger_for_turn(trigger, has_external_input);
-            let policy = stable::autonomy_policy()
-                .unwrap_or_else(|| AutonomyPolicy::conservative_default(current_time_ns()));
-            let mut decision_envelope = autonomy_inference_error.as_deref().map(|error| {
-                autonomy_noop_envelope_for_inference_error(error, decision_trigger.clone())
+            let mut decision_envelope = runtime_autonomy_decision_envelope.or_else(|| {
+                autonomy_inference_error.as_deref().map(|error| {
+                    autonomy_noop_envelope_for_inference_error(error, decision_trigger.clone())
+                })
             });
 
             if decision_envelope.is_none() {
@@ -3154,28 +3614,72 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 match infer_with_provider_transcript(&snapshot, &retry_input, &transcript).await {
                     Ok(retry_output) => {
                         inference_round_count = inference_round_count.saturating_add(1);
-                        let retry_reply = retry_output.explanation.trim().to_string();
-                        match parse_autonomy_decision_envelope(&retry_reply, &decision_trigger) {
-                            Ok(envelope) => {
-                                decision_envelope = Some(envelope);
-                            }
-                            Err(retry_error) => {
+                        if let Some(reason) = retry_output.deferred_reason {
+                            if let Some(envelope) = autonomy_noop_envelope_for_inference_defer(
+                                reason,
+                                decision_trigger.clone(),
+                            ) {
                                 append_inner_dialogue(
                                     &mut inner_dialogue,
-                                    &render_decision_envelope_error_context(&retry_error),
+                                    autonomy_inner_dialogue_marker_for_inference_defer(reason),
                                 );
-                                decision_envelope = Some(AutonomyDecisionEnvelope {
-                                    trigger: decision_trigger.clone(),
-                                    candidates_summary:
-                                        "invalid decision envelope after two attempts".to_string(),
-                                    outcome: DecisionEnvelopeOutcome::NoOp {
-                                        reason: "invalid_decision_shape".to_string(),
-                                    },
-                                    explanation: format!(
-                                        "decision envelope invalid after two attempts: {}",
-                                        sanitize_preview(&retry_error, 180)
-                                    ),
-                                });
+                                decision_envelope = Some(envelope);
+                            } else {
+                                let retry_reply = retry_output.explanation.trim().to_string();
+                                match parse_autonomy_decision_envelope(
+                                    &retry_reply,
+                                    &decision_trigger,
+                                ) {
+                                    Ok(envelope) => {
+                                        decision_envelope = Some(envelope);
+                                    }
+                                    Err(retry_error) => {
+                                        append_inner_dialogue(
+                                            &mut inner_dialogue,
+                                            &render_decision_envelope_error_context(&retry_error),
+                                        );
+                                        decision_envelope = Some(AutonomyDecisionEnvelope {
+                                            trigger: decision_trigger.clone(),
+                                            candidates_summary:
+                                                "invalid decision envelope after two attempts"
+                                                    .to_string(),
+                                            outcome: DecisionEnvelopeOutcome::NoOp {
+                                                reason: "invalid_decision_shape".to_string(),
+                                            },
+                                            explanation: format!(
+                                                "decision envelope invalid after two attempts: {}",
+                                                sanitize_preview(&retry_error, 180)
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            let retry_reply = retry_output.explanation.trim().to_string();
+                            match parse_autonomy_decision_envelope(&retry_reply, &decision_trigger)
+                            {
+                                Ok(envelope) => {
+                                    decision_envelope = Some(envelope);
+                                }
+                                Err(retry_error) => {
+                                    append_inner_dialogue(
+                                        &mut inner_dialogue,
+                                        &render_decision_envelope_error_context(&retry_error),
+                                    );
+                                    decision_envelope = Some(AutonomyDecisionEnvelope {
+                                        trigger: decision_trigger.clone(),
+                                        candidates_summary:
+                                            "invalid decision envelope after two attempts"
+                                                .to_string(),
+                                        outcome: DecisionEnvelopeOutcome::NoOp {
+                                            reason: "invalid_decision_shape".to_string(),
+                                        },
+                                        explanation: format!(
+                                            "decision envelope invalid after two attempts: {}",
+                                            sanitize_preview(&retry_error, 180)
+                                        ),
+                                    });
+                                }
                             }
                         }
                     }
@@ -3186,14 +3690,17 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             }
 
             if last_error.is_none() {
-                let envelope = decision_envelope.unwrap_or_else(|| AutonomyDecisionEnvelope {
-                    trigger: decision_trigger.clone(),
-                    candidates_summary: "scheduled review completed".to_string(),
-                    outcome: DecisionEnvelopeOutcome::NoOp {
-                        reason: "invalid_decision_shape".to_string(),
-                    },
-                    explanation: "missing autonomy decision envelope".to_string(),
-                });
+                let envelope = normalize_decision_envelope_for_runtime_constraint(
+                    decision_envelope.unwrap_or_else(|| AutonomyDecisionEnvelope {
+                        trigger: decision_trigger.clone(),
+                        candidates_summary: "scheduled review completed".to_string(),
+                        outcome: DecisionEnvelopeOutcome::NoOp {
+                            reason: "invalid_decision_shape".to_string(),
+                        },
+                        explanation: "missing autonomy decision envelope".to_string(),
+                    }),
+                    autonomy_runtime_constraint.as_ref(),
+                );
                 let decision_record = decision_record_from_envelope(
                     &turn_id,
                     current_time_ns(),
@@ -3329,11 +3836,12 @@ fn advance_state(state: &mut AgentState, event: &AgentEvent, turn_id: &str) -> R
 mod tests {
     use super::*;
     use crate::domain::types::{
-        AutonomyPolicy, ContinuationStopReason, DecisionOutcome, DecisionRecord, DecisionTrigger,
-        EvmPollCursor, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState,
-        InferenceProxyResultPayload, MemoryFact, MemoryRollup, PendingInferenceProxyJob,
-        PromptLayer, RoomContentType, RoomMessage, RuntimeSnapshot, SubmitInferenceResultArgs,
-        SurvivalTier, ToolCall, ToolCallRecord, ToolFailureKind,
+        AutonomyInferenceSuppressionClassification, AutonomyPolicy, ContinuationStopReason,
+        DecisionOutcome, DecisionRecord, DecisionTrigger, EvmPollCursor, InboxMessageSource,
+        InboxMessageStatus, InboxProxyWaitState, InferenceProxyResultPayload, MemoryFact,
+        MemoryRollup, PendingInferenceProxyJob, PromptLayer, RoomContentType, RoomMessage,
+        RuntimeSnapshot, SpawnBootstrapView, SubmitInferenceResultArgs, SurvivalTier, ToolCall,
+        ToolCallRecord, ToolFailureKind,
     };
     use crate::util::block_on_with_spin;
 
@@ -3356,6 +3864,13 @@ mod tests {
             ..RuntimeSnapshot::default()
         };
         stable::save_runtime_snapshot(&snapshot);
+    }
+
+    fn set_host_cycle_balances(total_cycles: u128, liquid_cycles: u128) {
+        sqlite::set_runtime_scalar("host.total_cycles", &total_cycles.to_string())
+            .expect("host total cycles override should store");
+        sqlite::set_runtime_scalar("host.liquid_cycles", &liquid_cycles.to_string())
+            .expect("host liquid cycles override should store");
     }
 
     fn staged_message(id: &str, seq: u64, sender: &str, body: &str) -> InboxMessage {
@@ -4429,6 +4944,46 @@ mod tests {
     }
 
     #[test]
+    fn autonomy_low_cycles_inference_defer_records_noop_without_parse_noise() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_inference_provider(InferenceProvider::OpenRouter);
+        stable::set_openrouter_api_key(Some("sk-or-test".to_string()));
+        set_host_cycle_balances(0, 0);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "low-cycle autonomous inference defers should degrade to a deterministic no-op"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].error.is_none(),
+            "typed low-cycle defer should not fault the turn"
+        );
+        let inner_dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(
+            inner_dialogue.contains("autonomy inference deferred: low cycles"),
+            "turn dialogue should record the low-cycle defer marker"
+        );
+        assert!(
+            !inner_dialogue.contains("decision envelope invalid"),
+            "typed defer should bypass invalid-envelope parsing noise"
+        );
+
+        let decisions = stable::list_recent_decisions(1);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].trigger, DecisionTrigger::ScheduledReview);
+        assert_eq!(
+            decisions[0].outcome,
+            DecisionOutcome::NoOp {
+                reason: "inference_deferred_low_cycles".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn no_input_inference_error_records_noop_without_invalid_envelope_noise() {
         reset_runtime(AgentState::Sleeping, true, false, 0);
         stable::set_inference_provider(InferenceProvider::OpenRouter);
@@ -4471,6 +5026,342 @@ mod tests {
                 .contains("openrouter api key is not configured"),
             "decision audit record should preserve the inference failure context"
         );
+    }
+
+    #[test]
+    fn repeated_provider_auth_failures_trigger_autonomy_inference_cooldown() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        stable::set_inference_provider(InferenceProvider::OpenRouter);
+        stable::set_openrouter_api_key(Some("sk-or-test".to_string()));
+
+        for _ in 0..3 {
+            stable::record_autonomy_inference_suppression_failure(
+                current_time_ns(),
+                AutonomyInferenceSuppressionClassification::ProviderRejected,
+            );
+        }
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "active provider-rejection cooldown should short-circuit the turn deterministically"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].inference_round_count, 0,
+            "cooldown should skip provider inference before the first round"
+        );
+        let inner_dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(
+            inner_dialogue.contains("autonomy inference suppressed: provider rejected"),
+            "turn dialogue should record the suppression marker"
+        );
+        assert!(
+            !inner_dialogue.contains("decision envelope invalid"),
+            "provider rejection cooldown should not add invalid-envelope noise"
+        );
+
+        let decisions = stable::list_recent_decisions(1);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].outcome,
+            DecisionOutcome::NoOp {
+                reason: "inference_provider_rejected".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn scheduled_review_with_fresh_reserve_shortfall_enters_coordination_only_mode() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        let now_ns = current_time_ns();
+        stable::set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0x1".to_string()),
+            usdc_balance_raw_hex: Some("0x1".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            last_synced_at_ns: Some(now_ns),
+            last_synced_block: None,
+            last_error: None,
+        });
+        stable::set_wallet_balance_sync_config(crate::domain::types::WalletBalanceSyncConfig {
+            freshness_window_secs: 600,
+            ..crate::domain::types::WalletBalanceSyncConfig::default()
+        })
+        .expect("wallet balance sync config should persist");
+
+        let mut policy = AutonomyPolicy::conservative_default(now_ns);
+        policy.reserve_policy.min_inference_usdc_6dp = Some(250_000);
+        policy.reserve_policy.min_gas_wei = Some(42);
+        stable::set_autonomy_policy(policy).expect("policy should store");
+        stable::set_spawn_bootstrap_metadata(SpawnBootstrapView {
+            factory_principal: Some(
+                candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                    .expect("factory principal should parse"),
+            ),
+            ..SpawnBootstrapView::default()
+        });
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "fresh reserve shortfall should still complete the turn in coordination-only mode"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].inference_round_count, 1,
+            "coordination-only mode should still allow one restricted inference round"
+        );
+        let inner_dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(
+            inner_dialogue.contains("autonomy reserve restriction:"),
+            "turn dialogue should record entry into reserve-restricted mode"
+        );
+        assert!(
+            inner_dialogue.contains("coordination-only mode active"),
+            "turn dialogue should explain that capital actions were blocked"
+        );
+        assert!(
+            !inner_dialogue.contains("decision envelope invalid"),
+            "reserve-restricted turns should not add invalid-envelope noise"
+        );
+
+        let decisions = stable::list_recent_decisions(1);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].outcome,
+            DecisionOutcome::NoOp {
+                reason: "reserve_insufficient".to_string(),
+            }
+        );
+        assert!(
+            decisions[0]
+                .explanation
+                .contains("capital-touching actions blocked by reserve shortfall"),
+            "decision explanation should come from the runtime-generated reserve restriction"
+        );
+        assert_eq!(
+            decisions[0].candidates_summary,
+            "checked reserves against policy minimums"
+        );
+    }
+
+    #[test]
+    fn scheduled_review_with_fresh_reserve_shortfall_bypasses_inference_without_room_access() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        let now_ns = current_time_ns();
+        stable::set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0x1".to_string()),
+            usdc_balance_raw_hex: Some("0x1".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            last_synced_at_ns: Some(now_ns),
+            last_synced_block: None,
+            last_error: None,
+        });
+        stable::set_wallet_balance_sync_config(crate::domain::types::WalletBalanceSyncConfig {
+            freshness_window_secs: 600,
+            ..crate::domain::types::WalletBalanceSyncConfig::default()
+        })
+        .expect("wallet balance sync config should persist");
+
+        let mut policy = AutonomyPolicy::conservative_default(now_ns);
+        policy.reserve_policy.min_inference_usdc_6dp = Some(250_000);
+        policy.reserve_policy.min_gas_wei = Some(42);
+        stable::set_autonomy_policy(policy).expect("policy should store");
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(
+            result.is_ok(),
+            "fresh reserve shortfall should deterministically no-op when coordination is unavailable"
+        );
+
+        let turns = stable::list_turns(1);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].inference_round_count, 0,
+            "turn should skip provider inference when no peer coordination lane exists"
+        );
+        let inner_dialogue = turns[0].inner_dialogue.as_deref().unwrap_or_default();
+        assert!(inner_dialogue.contains("autonomy reserve no-op:"));
+        assert!(!inner_dialogue.contains("decision envelope invalid"));
+
+        let decisions = stable::list_recent_decisions(1);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].outcome,
+            DecisionOutcome::NoOp {
+                reason: "reserve_insufficient".to_string(),
+            }
+        );
+        assert!(
+            decisions[0]
+                .explanation
+                .contains("no safe peer coordination lane is available"),
+            "runtime explanation should explain why restricted inference was skipped"
+        );
+    }
+
+    #[test]
+    fn coordination_only_available_tools_section_omits_capital_tools() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+
+        let section = build_available_tools_section_with_scope(
+            "turn-0",
+            InferenceToolScope::CoordinationOnly,
+        );
+        assert!(section.contains("- post_room_message: calls_this_turn=0"));
+        assert!(section.contains("- remember: calls_this_turn=0"));
+        assert!(!section.contains("- send_eth:"));
+        assert!(!section.contains("- execute_strategy_action:"));
+        assert!(!section.contains("- market_fetch:"));
+    }
+
+    #[test]
+    fn dynamic_context_renders_reserve_restricted_runtime_constraints() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        let now_ns = current_time_ns();
+        stable::set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0x1".to_string()),
+            usdc_balance_raw_hex: Some("0x1".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            last_synced_at_ns: Some(now_ns),
+            last_synced_block: None,
+            last_error: None,
+        });
+
+        let mut policy = AutonomyPolicy::conservative_default(now_ns);
+        policy.reserve_policy.min_inference_usdc_6dp = Some(10_000_000);
+        policy.reserve_policy.min_gas_wei = Some(3_000_000_000_000_000);
+        stable::set_spawn_bootstrap_metadata(SpawnBootstrapView {
+            factory_principal: Some(
+                candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                    .expect("factory principal should parse"),
+            ),
+            ..SpawnBootstrapView::default()
+        });
+
+        let snapshot = stable::runtime_snapshot();
+        let constraint = autonomy_runtime_constraint_for_turn(
+            &snapshot,
+            &policy,
+            ScheduledTurnTrigger::Periodic,
+            false,
+            now_ns,
+        )
+        .expect("fresh shortfall should enter coordination-only mode");
+        let context = build_dynamic_context_with_scope(
+            &snapshot,
+            &[],
+            0,
+            &[],
+            &[],
+            DynamicContextOptions {
+                turn_id: "turn-0",
+                conversation_history_limit: 5,
+                tool_scope: constraint.tool_scope,
+                runtime_constraint: Some(&constraint),
+            },
+        );
+
+        assert!(context.contains("### Autonomy Runtime Constraints"));
+        assert!(context.contains("- autonomy_tool_scope: coordination_only"));
+        assert!(context.contains("- coordination_actions_allowed: true"));
+        assert!(context.contains(
+            "- shortfall: ETH gas reserve: 0.000000000000000001 ETH < 0.003 ETH minimum"
+        ));
+        assert!(context
+            .contains("- shortfall: Inference USDC reserve: 0.000001 USDC < 10 USDC minimum"));
+        assert!(!context.contains("- send_eth: calls_this_turn=0"));
+        assert!(context.contains("- post_room_message: calls_this_turn=0"));
+    }
+
+    #[test]
+    fn coordination_only_mode_allows_room_post_execution_under_reserve_shortfall() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        let now_ns = current_time_ns();
+        stable::set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0x1".to_string()),
+            usdc_balance_raw_hex: Some("0x1".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            last_synced_at_ns: Some(now_ns),
+            last_synced_block: None,
+            last_error: None,
+        });
+        stable::set_wallet_balance_sync_config(crate::domain::types::WalletBalanceSyncConfig {
+            freshness_window_secs: 600,
+            ..crate::domain::types::WalletBalanceSyncConfig::default()
+        })
+        .expect("wallet balance sync config should persist");
+
+        let mut policy = AutonomyPolicy::conservative_default(now_ns);
+        policy.reserve_policy.min_inference_usdc_6dp = Some(250_000);
+        policy.reserve_policy.min_gas_wei = Some(42);
+        stable::set_autonomy_policy(policy).expect("policy should store");
+        stable::set_spawn_bootstrap_metadata(SpawnBootstrapView {
+            factory_principal: Some(
+                candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                    .expect("factory principal should parse"),
+            ),
+            ..SpawnBootstrapView::default()
+        });
+        seed_prompt_layer_6(
+            "## Layer 6: Economic Decision Loop\n- request_coordination_room_post:true",
+        );
+
+        crate::features::factory_room::clear_mock_factory_room_call();
+        crate::features::factory_room::set_mock_factory_room_call(
+            move |canister_id, method, encoded_args| {
+                assert_eq!(
+                    canister_id,
+                    candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                        .expect("factory principal should parse")
+                );
+                assert_eq!(method, "post_room_message");
+                let request: crate::domain::types::PostRoomMessageRequest =
+                    candid::decode_one(encoded_args).expect("room post args should decode");
+                assert!(request.body.contains("reserve shortfall"));
+                candid::encode_one(crate::features::factory_room::FactoryRoomCallResult::Ok(
+                    crate::domain::types::RoomMessage {
+                        seq: 7,
+                        message_id: "room-message-7".to_string(),
+                        author_canister_id: "rrkah-fqaaa-aaaaa-aaaaq-cai".to_string(),
+                        body: request.body,
+                        mentions: request.mentions.unwrap_or_default(),
+                        content_type: request.content_type.unwrap_or(RoomContentType::TextPlain),
+                        created_at: 77,
+                    },
+                ))
+                .map_err(|error| format!("failed to encode room response: {error}"))
+            },
+        );
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        crate::features::factory_room::clear_mock_factory_room_call();
+        assert!(
+            result.is_ok(),
+            "coordination-only mode should still allow room posts"
+        );
+
+        let decisions = stable::list_recent_decisions(1);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].outcome,
+            DecisionOutcome::Executed {
+                action_summary: "post_room_message".to_string(),
+            }
+        );
+
+        let tools = stable::get_tools_for_turn("turn-1");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool, "post_room_message");
+        assert!(tools[0].success, "room post should succeed");
     }
 
     #[test]

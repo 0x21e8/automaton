@@ -18,13 +18,15 @@ use crate::domain::cycle_admission::{
     OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
-    DecisionTrigger, InferenceInput, InferenceProvider, OpenRouterReasoningLevel, OperationFailure,
-    OperationFailureKind, OutcallFailure, OutcallFailureKind, RecoveryFailure, RuntimeSnapshot,
-    SurvivalOperationClass, ToolCall,
+    AutonomyInferenceSuppressionClassification, DecisionTrigger, InferenceInput, InferenceProvider,
+    InferenceToolScope, OpenRouterReasoningLevel, OperationFailure, OperationFailureKind,
+    OutcallFailure, OutcallFailureKind, RecoveryFailure, RuntimeSnapshot, SurvivalOperationClass,
+    ToolCall,
 };
 use crate::prompt;
 use crate::storage::stable;
 use crate::timing::current_time_ns;
+use crate::tools::tool_allowed_in_scope;
 use async_trait::async_trait;
 use candid::{CandidType, Nat, Principal};
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
@@ -80,15 +82,44 @@ impl GetLogFilter for InferenceLogPriority {
 /// `tool_calls` contains zero or more structured tool invocations parsed from
 /// the model response.  `explanation` holds the model's free-text content
 /// (may be empty when only tool calls are returned).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferenceDeferredReason {
+    ProxyCallbackPending,
+    SurvivalPolicy,
+    LowCycles,
+}
+
 #[derive(Debug)]
 pub struct InferenceOutput {
     pub tool_calls: Vec<ToolCall>,
-    #[allow(dead_code)]
     pub explanation: String,
+    pub deferred_reason: Option<InferenceDeferredReason>,
+}
+
+impl InferenceOutput {
+    fn text(tool_calls: Vec<ToolCall>, explanation: String) -> Self {
+        Self {
+            tool_calls,
+            explanation,
+            deferred_reason: None,
+        }
+    }
+
+    fn deferred(reason: InferenceDeferredReason, explanation: String) -> Self {
+        Self {
+            tool_calls: Vec::new(),
+            explanation,
+            deferred_reason: Some(reason),
+        }
+    }
+
+    pub fn is_deferred(&self) -> bool {
+        self.deferred_reason.is_some()
+    }
 }
 
 pub fn is_inference_proxy_deferred_output(output: &InferenceOutput) -> bool {
-    output.tool_calls.is_empty() && output.explanation == INFERENCE_PROXY_DEFERRED_EXPLANATION
+    output.deferred_reason == Some(InferenceDeferredReason::ProxyCallbackPending)
 }
 
 /// A single entry in the multi-round conversation transcript.
@@ -162,10 +193,10 @@ pub async fn infer_with_provider_transcript(
 ) -> Result<InferenceOutput, String> {
     let now_ns = current_time_ns();
     if !stable::can_run_survival_operation(&SurvivalOperationClass::Inference, now_ns) {
-        return Ok(InferenceOutput {
-            tool_calls: Vec::new(),
-            explanation: "inference skipped due to survival policy".to_string(),
-        });
+        return Ok(InferenceOutput::deferred(
+            InferenceDeferredReason::SurvivalPolicy,
+            "inference skipped due to survival policy".to_string(),
+        ));
     }
 
     let output = match snapshot.inference_provider {
@@ -186,10 +217,27 @@ pub async fn infer_with_provider_transcript(
         }
     };
 
-    if output.is_ok() {
+    if output.as_ref().is_ok_and(|output| !output.is_deferred()) {
         stable::record_survival_operation_success(&SurvivalOperationClass::Inference);
+        stable::clear_autonomy_inference_suppression_state();
     }
     output
+}
+
+fn current_cycle_balances() -> (u128, u128) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return (
+            ic_cdk::api::canister_cycle_balance(),
+            ic_cdk::api::canister_liquid_cycle_balance(),
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let telemetry = stable::cycle_telemetry();
+        (telemetry.total_cycles, telemetry.liquid_cycles)
+    }
 }
 
 fn run_deterministic_inference(
@@ -291,6 +339,12 @@ fn run_deterministic_inference(
             .context_snippet
             .contains("request_autonomy_decision_envelope:true")
         || assembled_prompt.contains("request_autonomy_decision_envelope:true");
+    let coordination_room_post_request =
+        input.input.contains("request_coordination_room_post:true")
+            || input
+                .context_snippet
+                .contains("request_coordination_room_post:true")
+            || assembled_prompt.contains("request_coordination_room_post:true");
 
     let has_tool_transcript = transcript
         .iter()
@@ -299,9 +353,9 @@ fn run_deterministic_inference(
     if autonomy_decision_invalid_persistent_request
         || (autonomy_decision_invalid_request && !autonomy_decision_retry_request)
     {
-        return Ok(InferenceOutput {
-            tool_calls: Vec::new(),
-            explanation: serde_json::json!({
+        return Ok(InferenceOutput::text(
+            Vec::new(),
+            serde_json::json!({
                 "trigger": DecisionTrigger::ScheduledReview.as_wire_name(),
                 "candidates_summary": "policy-bounded autonomy turn",
                 "outcome": {
@@ -311,24 +365,56 @@ fn run_deterministic_inference(
                 }
             })
             .to_string(),
-        });
+        ));
     }
 
     if autonomy_decision_envelope_request || autonomy_decision_retry_request {
-        return Ok(InferenceOutput {
-            tool_calls: Vec::new(),
-            explanation: serde_json::json!({
+        return Ok(InferenceOutput::text(
+            Vec::new(),
+            serde_json::json!({
                 "trigger": DecisionTrigger::ScheduledReview.as_wire_name(),
                 "candidates_summary": "policy-bounded autonomy turn",
                 "outcome": {
                     "Executed": {
-                        "action_summary": "record_signal(tick)"
+                        "action_summary": deterministic_action_summary_from_transcript(transcript)
                     }
                 },
                 "explanation": "deterministic autonomy decision envelope"
             })
             .to_string(),
-        });
+        ));
+    }
+
+    if coordination_room_post_request && !has_tool_transcript {
+        return Ok(InferenceOutput::text(
+            vec![ToolCall {
+                tool_call_id: None,
+                tool: "post_room_message".to_string(),
+                args_json: serde_json::json!({
+                    "body": "reserve shortfall: seeking peer coordination for funding or opportunities",
+                    "content_type": "text_plain",
+                })
+                .to_string(),
+            }],
+            format!("deterministic inference for {}", input.turn_id),
+        ));
+    }
+
+    if input.tool_scope == InferenceToolScope::CoordinationOnly && !has_tool_transcript {
+        return Ok(InferenceOutput::text(
+            Vec::new(),
+            serde_json::json!({
+                "trigger": DecisionTrigger::ScheduledReview.as_wire_name(),
+                "candidates_summary": "checked reserves against policy minimums",
+                "outcome": {
+                    "NoOp": {
+                        "reason": "reserve_insufficient"
+                    }
+                },
+                "explanation": "coordination-only mode found no higher-value peer or local action"
+            })
+            .to_string(),
+        ));
     }
 
     if continuation_error_request && has_tool_transcript {
@@ -336,10 +422,10 @@ fn run_deterministic_inference(
     }
 
     if has_tool_transcript && !continuation_loop_request {
-        return Ok(InferenceOutput {
-            tool_calls: Vec::new(),
-            explanation: format!("deterministic continuation for {}", input.turn_id),
-        });
+        return Ok(InferenceOutput::text(
+            Vec::new(),
+            format!("deterministic continuation for {}", input.turn_id),
+        ));
     }
 
     let tool_calls = if remember_failure_loop_probe_request {
@@ -443,10 +529,7 @@ fn run_deterministic_inference(
         format!("deterministic inference for {}", input.turn_id)
     };
 
-    Ok(InferenceOutput {
-        tool_calls,
-        explanation,
-    })
+    Ok(InferenceOutput::text(tool_calls, explanation))
 }
 
 #[allow(dead_code)]
@@ -644,7 +727,10 @@ fn build_ic_llm_request_with_transcript(
     IcLlmRequest {
         model: model.to_string(),
         messages,
-        tools: Some(ic_llm_tools_with_capabilities(evm_tools_enabled)),
+        tools: Some(ic_llm_tools_with_capabilities_and_scope(
+            evm_tools_enabled,
+            input.tool_scope,
+        )),
     }
 }
 
@@ -1613,6 +1699,13 @@ fn web_search_ic_tool() -> IcLlmTool {
 }
 
 fn ic_llm_tools_with_capabilities(evm_tools_enabled: bool) -> Vec<IcLlmTool> {
+    ic_llm_tools_with_capabilities_and_scope(evm_tools_enabled, InferenceToolScope::Full)
+}
+
+fn ic_llm_tools_with_capabilities_and_scope(
+    evm_tools_enabled: bool,
+    tool_scope: InferenceToolScope,
+) -> Vec<IcLlmTool> {
     let mut tools = ic_llm_tools();
     if !evm_tools_enabled {
         tools.retain(|tool| {
@@ -1622,12 +1715,18 @@ fn ic_llm_tools_with_capabilities(evm_tools_enabled: bool) -> Vec<IcLlmTool> {
             )
         });
     }
+    tools.retain(|tool| tool_allowed_in_scope(ic_llm_tool_name(tool), tool_scope));
     tools
 }
 
 fn openrouter_tools() -> Vec<Value> {
+    openrouter_tools_with_scope(InferenceToolScope::Full)
+}
+
+fn openrouter_tools_with_scope(tool_scope: InferenceToolScope) -> Vec<Value> {
     ic_llm_tools()
         .into_iter()
+        .filter(|tool| tool_allowed_in_scope(ic_llm_tool_name(tool), tool_scope))
         .map(|tool| {
             if ic_llm_tool_name(&tool) == "evm_read" {
                 shared_tool_to_openrouter(evm_read_shared_tool())
@@ -1908,10 +2007,10 @@ fn parse_ic_llm_response(response: IcLlmResponse) -> Result<InferenceOutput, Str
         });
     }
 
-    Ok(InferenceOutput {
+    Ok(InferenceOutput::text(
         tool_calls,
-        explanation: response.message.content.unwrap_or_default(),
-    })
+        response.message.content.unwrap_or_default(),
+    ))
 }
 
 fn parse_ic_llm_model(model: &str) -> Result<IcLlmModel, String> {
@@ -2110,8 +2209,7 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
         let request_size_bytes = Self::estimate_request_size_bytes(&payload);
         let requirements =
             Self::affordability_requirements(request_size_bytes, self.max_response_bytes)?;
-        let total_cycles = ic_cdk::api::canister_cycle_balance();
-        let liquid_cycles = ic_cdk::api::canister_liquid_cycle_balance();
+        let (total_cycles, liquid_cycles) = current_cycle_balances();
 
         log!(
             InferenceLogPriority::Info,
@@ -2142,10 +2240,10 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
                 DEFAULT_RESERVE_FLOOR_CYCLES,
                 requirements.required_cycles
             );
-            return Ok(InferenceOutput {
-                tool_calls: Vec::new(),
-                explanation: "inference skipped due to low cycles".to_string(),
-            });
+            return Ok(InferenceOutput::deferred(
+                InferenceDeferredReason::LowCycles,
+                "inference skipped due to low cycles".to_string(),
+            ));
         }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -2229,10 +2327,10 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
                         liquid_cycles,
                         total_cycles
                     );
-                    return Ok(InferenceOutput {
-                        tool_calls: Vec::new(),
-                        explanation: "inference skipped due to low cycles".to_string(),
-                    });
+                    return Ok(InferenceOutput::deferred(
+                        InferenceDeferredReason::LowCycles,
+                        "inference skipped due to low cycles".to_string(),
+                    ));
                 }
                 if is_transport_class_error(&message) {
                     stable::record_survival_operation_failure(
@@ -2346,10 +2444,10 @@ impl OpenRouterProxyWorkerInferenceAdapter {
     }
 
     fn deferred_output() -> InferenceOutput {
-        InferenceOutput {
-            tool_calls: Vec::new(),
-            explanation: INFERENCE_PROXY_DEFERRED_EXPLANATION.to_string(),
-        }
+        InferenceOutput::deferred(
+            InferenceDeferredReason::ProxyCallbackPending,
+            INFERENCE_PROXY_DEFERRED_EXPLANATION.to_string(),
+        )
     }
 
     fn submit_ack_max_response_bytes(&self) -> u64 {
@@ -2444,10 +2542,10 @@ fn inference_output_from_proxy_callback(
         callback.job_id,
         callback.turn_id,
     );
-    Ok(InferenceOutput {
-        tool_calls: result.tool_calls,
-        explanation: result.explanation.unwrap_or_default(),
-    })
+    Ok(InferenceOutput::text(
+        result.tool_calls,
+        result.explanation.unwrap_or_default(),
+    ))
 }
 
 #[async_trait(?Send)]
@@ -2520,8 +2618,7 @@ impl InferenceAdapter for OpenRouterProxyWorkerInferenceAdapter {
             request_size_bytes,
             max_response_bytes,
         )?;
-        let total_cycles = ic_cdk::api::canister_cycle_balance();
-        let liquid_cycles = ic_cdk::api::canister_liquid_cycle_balance();
+        let (total_cycles, liquid_cycles) = current_cycle_balances();
 
         if !can_afford(liquid_cycles, &requirements) {
             stable::record_survival_operation_failure(
@@ -2770,6 +2867,30 @@ pub fn classify_inference_failure(error: &str) -> RecoveryFailure {
     })
 }
 
+pub fn classify_autonomy_inference_suppression_failure(
+    error: &str,
+) -> Option<AutonomyInferenceSuppressionClassification> {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("status 401")
+        || normalized.contains("status 403")
+        || normalized.contains("http 401")
+        || normalized.contains("http 403")
+    {
+        return Some(AutonomyInferenceSuppressionClassification::ProviderRejected);
+    }
+
+    match classify_inference_failure(error) {
+        RecoveryFailure::Outcall(OutcallFailure {
+            kind: OutcallFailureKind::RejectedByPolicy,
+            ..
+        })
+        | RecoveryFailure::Operation(OperationFailure {
+            kind: OperationFailureKind::Unauthorized,
+        }) => Some(AutonomyInferenceSuppressionClassification::ProviderRejected),
+        _ => None,
+    }
+}
+
 #[allow(dead_code)]
 fn classify_inference_outcall_failure_kind(normalized_error: &str) -> OutcallFailureKind {
     if normalized_error.contains("http body exceeds size limit")
@@ -2863,21 +2984,19 @@ fn build_openrouter_request_body_with_transcript_capabilities(
 ) -> Value {
     let mut body = build_openrouter_request_body_with_transcript(input, model, transcript);
     apply_openrouter_reasoning_level(&mut body, reasoning_level);
-    if evm_tools_enabled {
-        return body;
-    }
-
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-        tools.retain(|tool| {
-            let function_name = tool
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str);
-            !matches!(
-                function_name,
-                Some("evm_read" | "send_eth" | "execute_strategy_action")
-            )
-        });
+        if !evm_tools_enabled {
+            tools.retain(|tool| {
+                let function_name = tool
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str);
+                !matches!(
+                    function_name,
+                    Some("evm_read" | "send_eth" | "execute_strategy_action")
+                )
+            });
+        }
     }
 
     body
@@ -2921,7 +3040,7 @@ fn build_openrouter_request_body_with_transcript(
         "model": model,
         "messages": messages,
         "tool_choice": "auto",
-        "tools": openrouter_tools()
+        "tools": openrouter_tools_with_scope(input.tool_scope)
     })
 }
 
@@ -2965,6 +3084,31 @@ fn build_openrouter_transcript_messages(transcript: &[InferenceTranscriptMessage
         }
     }
     messages
+}
+
+fn deterministic_action_summary_from_transcript(
+    transcript: &[InferenceTranscriptMessage],
+) -> String {
+    let Some(call) = transcript.iter().rev().find_map(|entry| match entry {
+        InferenceTranscriptMessage::Assistant { tool_calls, .. } => tool_calls.last(),
+        InferenceTranscriptMessage::Tool { .. } => None,
+    }) else {
+        return "record_signal(tick)".to_string();
+    };
+
+    match call.tool.as_str() {
+        "record_signal" => serde_json::from_str::<Value>(&call.args_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("signal")
+                    .and_then(Value::as_str)
+                    .map(|signal| format!("record_signal({signal})"))
+            })
+            .unwrap_or_else(|| "record_signal".to_string()),
+        "post_room_message" => "post_room_message".to_string(),
+        _ => call.tool.clone(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -3105,6 +3249,7 @@ fn parse_openrouter_completion(raw: &str) -> Result<InferenceOutput, String> {
     Ok(InferenceOutput {
         tool_calls,
         explanation: first_choice.message.content.clone().unwrap_or_default(),
+        deferred_reason: None,
     })
 }
 
@@ -3419,6 +3564,22 @@ mod tests {
     }
 
     #[test]
+    fn classify_autonomy_inference_suppression_failure_maps_provider_rejection() {
+        assert_eq!(
+            classify_autonomy_inference_suppression_failure(
+                "openrouter returned status 401: unauthorized"
+            ),
+            Some(AutonomyInferenceSuppressionClassification::ProviderRejected)
+        );
+        assert_eq!(
+            classify_autonomy_inference_suppression_failure(
+                "openrouter returned status 429: slow down"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn classify_inference_failure_maps_timeout_envelope_errors() {
         let failure = classify_inference_failure(
             "openrouter http outcall timeout envelope exceeded: elapsed=47000 ms timeout=45000 ms",
@@ -3485,6 +3646,7 @@ mod tests {
             input: "hello".to_string(),
             context_snippet: "## Layer 10: Dynamic Context\n### Conversation with 0xabc\n  [0xabc]: hi\n  [you]: hello".to_string(),
             turn_id: "turn-compact".to_string(),
+            tool_scope: Default::default(),
             proxy_resume_job_id: None,
             allow_global_proxy_callback_resume: false,
         };
@@ -3514,6 +3676,7 @@ mod tests {
             input: "hello".to_string(),
             context_snippet: "## Layer 10: Dynamic Context\n### Conversation with 0xdef\n  [0xdef]: ping\n  [you]: pong".to_string(),
             turn_id: "turn-openrouter".to_string(),
+            tool_scope: Default::default(),
             proxy_resume_job_id: None,
             allow_global_proxy_callback_resume: false,
         };
@@ -3545,6 +3708,7 @@ mod tests {
             input: "inbox:ping".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-continue-ic-llm".to_string(),
+            tool_scope: Default::default(),
             proxy_resume_job_id: None,
             allow_global_proxy_callback_resume: false,
         };
@@ -3608,6 +3772,7 @@ mod tests {
             input: "inbox:ping".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-continue-openrouter".to_string(),
+            tool_scope: Default::default(),
             proxy_resume_job_id: None,
             allow_global_proxy_callback_resume: false,
         };
@@ -4038,6 +4203,7 @@ mod tests {
                 input: "hello".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-1".to_string(),
+                tool_scope: Default::default(),
                 proxy_resume_job_id: None,
                 allow_global_proxy_callback_resume: false,
             },
@@ -4073,6 +4239,43 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_request_body_filters_to_coordination_only_tool_scope() {
+        reset_test_storage();
+        stable::set_search_api_key(Some("brave-test-key".to_string()));
+
+        let body = build_openrouter_request_body(
+            &InferenceInput {
+                input: "hello".to_string(),
+                context_snippet: "ctx".to_string(),
+                turn_id: "turn-1".to_string(),
+                tool_scope: InferenceToolScope::CoordinationOnly,
+                proxy_resume_job_id: None,
+                allow_global_proxy_callback_resume: false,
+            },
+            "openai/gpt-4o-mini",
+        );
+
+        let tools = body
+            .get("tools")
+            .and_then(|value| value.as_array())
+            .expect("tools array must exist");
+        let names = tools
+            .iter()
+            .filter_map(|entry| entry.get("function"))
+            .filter_map(|function| function.get("name"))
+            .filter_map(|name| name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"post_room_message"));
+        assert!(names.contains(&"remember"));
+        assert!(names.contains(&"record_signal"));
+        assert!(!names.contains(&"send_eth"));
+        assert!(!names.contains(&"execute_strategy_action"));
+        assert!(!names.contains(&"market_fetch"));
+        assert!(!names.contains(&"http_fetch"));
+    }
+
+    #[test]
     fn openrouter_request_body_omits_web_search_without_search_api_key() {
         reset_test_storage();
         stable::set_search_api_key(None);
@@ -4082,6 +4285,7 @@ mod tests {
                 input: "hello".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-1".to_string(),
+                tool_scope: Default::default(),
                 proxy_resume_job_id: None,
                 allow_global_proxy_callback_resume: false,
             },
@@ -4279,6 +4483,7 @@ mod tests {
                 input: "hello".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-1".to_string(),
+                tool_scope: Default::default(),
                 proxy_resume_job_id: None,
                 allow_global_proxy_callback_resume: false,
             },
@@ -4320,6 +4525,7 @@ mod tests {
                 input: "hello".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-reasoning".to_string(),
+                tool_scope: Default::default(),
                 proxy_resume_job_id: None,
                 allow_global_proxy_callback_resume: false,
             },
@@ -4355,6 +4561,7 @@ mod tests {
             input: "request_layer_6_probe:true".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-probe-1".to_string(),
+            tool_scope: Default::default(),
             proxy_resume_job_id: None,
             allow_global_proxy_callback_resume: false,
         };
@@ -4376,12 +4583,34 @@ mod tests {
             input: "request_layer_6_probe:true".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-probe-2".to_string(),
+            tool_scope: Default::default(),
             proxy_resume_job_id: None,
             allow_global_proxy_callback_resume: false,
         };
         let second = block_on_with_spin(adapter.infer(&with_marker))
             .expect("deterministic inference should succeed");
         assert_eq!(second.explanation, "layer6_probe:present");
+    }
+
+    #[test]
+    fn deterministic_coordination_only_mode_defaults_to_reserve_insufficient_noop() {
+        reset_test_storage();
+
+        let output = run_deterministic_inference(
+            &InferenceInput {
+                input: "scheduled_review".to_string(),
+                context_snippet: "ctx".to_string(),
+                turn_id: "turn-coordination-only".to_string(),
+                tool_scope: InferenceToolScope::CoordinationOnly,
+                proxy_resume_job_id: None,
+                allow_global_proxy_callback_resume: false,
+            },
+            &[],
+        )
+        .expect("deterministic inference should succeed");
+
+        assert!(output.tool_calls.is_empty());
+        assert!(output.explanation.contains("reserve_insufficient"));
     }
 
     #[test]
@@ -4396,6 +4625,7 @@ mod tests {
             input: "hello".to_string(),
             context_snippet: "ctx".to_string(),
             turn_id: "turn-invalid-llm-id".to_string(),
+            tool_scope: Default::default(),
             proxy_resume_job_id: None,
             allow_global_proxy_callback_resume: false,
         };
@@ -4480,6 +4710,7 @@ mod tests {
                 input: "recovery_follow_up".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-resume".to_string(),
+                tool_scope: Default::default(),
                 proxy_resume_job_id: Some("job-1".to_string()),
                 allow_global_proxy_callback_resume: false,
             },
@@ -4522,6 +4753,7 @@ mod tests {
                 input: "recovery_follow_up".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-wait".to_string(),
+                tool_scope: Default::default(),
                 proxy_resume_job_id: Some("job-pending".to_string()),
                 allow_global_proxy_callback_resume: false,
             },
@@ -4583,6 +4815,7 @@ mod tests {
                 input: "inbox:target".to_string(),
                 context_snippet: "ctx".to_string(),
                 turn_id: "turn-resume-target".to_string(),
+                tool_scope: Default::default(),
                 proxy_resume_job_id: Some("job-target".to_string()),
                 allow_global_proxy_callback_resume: false,
             },

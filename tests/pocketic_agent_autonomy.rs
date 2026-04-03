@@ -98,6 +98,42 @@ struct RuntimeView {
     inference_model: String,
 }
 
+#[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq, Default)]
+enum WalletBalanceStatus {
+    #[default]
+    Unknown,
+    Fresh,
+    Stale,
+    Error,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
+struct WalletBalanceTelemetryView {
+    eth_balance_wei_hex: Option<String>,
+    usdc_balance_raw_hex: Option<String>,
+    usdc_decimals: u8,
+    usdc_contract_address: Option<String>,
+    last_synced_at_ns: Option<u64>,
+    last_synced_block: Option<u64>,
+    last_error: Option<String>,
+    age_secs: Option<u64>,
+    freshness_window_secs: u64,
+    is_stale: bool,
+    status: WalletBalanceStatus,
+    bootstrap_pending: bool,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+struct SpawnBootstrapView {
+    session_id: Option<String>,
+    parent_id: Option<String>,
+    factory_principal: Option<Principal>,
+    risk: Option<u8>,
+    strategies: Vec<String>,
+    skills: Vec<String>,
+    version_commit: Option<String>,
+}
+
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
 struct InitArgs {
     ecdsa_key_name: String,
@@ -368,12 +404,19 @@ fn assert_wasm_artifact_present() -> Vec<u8> {
 }
 
 fn with_backend_canister_with_init_args(init: InitArgs) -> (PocketIc, Principal) {
+    with_backend_canister_with_init_args_and_cycles(init, 2_000_000_000_000)
+}
+
+fn with_backend_canister_with_init_args_and_cycles(
+    init: InitArgs,
+    cycles: u128,
+) -> (PocketIc, Principal) {
     let pic = PocketIc::new();
     let canister_id = pic.create_canister();
     let wasm = assert_wasm_artifact_present();
     let init_args = encode_args((init,)).expect("failed to encode init args");
 
-    pic.add_cycles(canister_id, 2_000_000_000_000);
+    pic.add_cycles(canister_id, cycles);
     pic.install_canister(canister_id, wasm, init_args, None);
     set_inference_provider(&pic, canister_id, InferenceProvider::IcLlm);
     set_inference_model(&pic, canister_id, "deterministic-local");
@@ -689,10 +732,12 @@ fn rpc_log(
     })
 }
 
-fn rpc_response_body_for_request(
+fn rpc_response_body_for_request_with_wallet(
     request: &CanisterHttpRequest,
     latest_block: u64,
     logs: &[Value],
+    eth_balance_hex: &str,
+    usdc_balance_hex: &str,
 ) -> Vec<u8> {
     let request_json: Value = serde_json::from_slice(&request.body)
         .unwrap_or_else(|error| panic!("failed to decode canister http request body: {error}"));
@@ -715,12 +760,12 @@ fn rpc_response_body_for_request(
         "eth_getBalance" => json!({
             "jsonrpc":"2.0",
             "id":1,
-            "result":"0x0"
+            "result": eth_balance_hex
         }),
         "eth_call" => json!({
             "jsonrpc":"2.0",
             "id":1,
-            "result":"0x0000000000000000000000000000000000000000000000000000000000000000"
+            "result": usdc_balance_hex
         }),
         unsupported => panic!("unsupported canister http method in test: {unsupported}"),
     };
@@ -732,6 +777,24 @@ fn drive_poll_inbox_with_http_mocks(
     canister_id: Principal,
     latest_block: u64,
     logs: &[Value],
+) {
+    drive_poll_inbox_with_http_mocks_and_wallet(
+        pic,
+        canister_id,
+        latest_block,
+        logs,
+        "0x0",
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+    );
+}
+
+fn drive_poll_inbox_with_http_mocks_and_wallet(
+    pic: &PocketIc,
+    canister_id: Principal,
+    latest_block: u64,
+    logs: &[Value],
+    eth_balance_hex: &str,
+    usdc_balance_hex: &str,
 ) {
     let before_latest_poll_job_id = list_scheduler_jobs(pic, canister_id)
         .into_iter()
@@ -745,7 +808,13 @@ fn drive_poll_inbox_with_http_mocks(
         let pending_http = pic.get_canister_http();
         if !pending_http.is_empty() {
             for request in pending_http {
-                let body = rpc_response_body_for_request(&request, latest_block, logs);
+                let body = rpc_response_body_for_request_with_wallet(
+                    &request,
+                    latest_block,
+                    logs,
+                    eth_balance_hex,
+                    usdc_balance_hex,
+                );
                 pic.mock_canister_http_response(MockCanisterHttpResponse {
                     subnet_id: request.subnet_id,
                     request_id: request.request_id,
@@ -849,6 +918,27 @@ fn get_runtime_view(pic: &PocketIc, canister_id: Principal) -> RuntimeView {
         canister_id,
         "get_runtime_view",
         encode_args(()).expect("failed to encode empty args"),
+    )
+}
+
+fn get_wallet_balance_telemetry(
+    pic: &PocketIc,
+    canister_id: Principal,
+) -> WalletBalanceTelemetryView {
+    call_query(
+        pic,
+        canister_id,
+        "get_wallet_balance_telemetry",
+        encode_args(()).expect("failed to encode get_wallet_balance_telemetry args"),
+    )
+}
+
+fn get_spawn_bootstrap_view(pic: &PocketIc, canister_id: Principal) -> SpawnBootstrapView {
+    call_query(
+        pic,
+        canister_id,
+        "get_spawn_bootstrap_view",
+        encode_args(()).expect("failed to encode get_spawn_bootstrap_view args"),
     )
 }
 
@@ -1043,6 +1133,61 @@ fn evm_read_missing_calldata_tool_call() -> ToolCall {
         })
         .to_string(),
     }
+}
+
+fn drive_agent_turn_with_openrouter_status(
+    pic: &PocketIc,
+    canister_id: Principal,
+    status: u16,
+    body: Value,
+) {
+    let before_latest_job_id = list_scheduler_jobs(pic, canister_id)
+        .into_iter()
+        .filter(|job| job.kind == TaskKind::AgentTurn)
+        .max_by_key(|job| job.created_at_ns)
+        .map(|job| job.id);
+
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+
+    for _ in 0..24 {
+        let pending_http = pic.get_canister_http();
+        if !pending_http.is_empty() {
+            for request in pending_http {
+                pic.mock_canister_http_response(MockCanisterHttpResponse {
+                    subnet_id: request.subnet_id,
+                    request_id: request.request_id,
+                    response: CanisterHttpResponse::CanisterHttpReply(CanisterHttpReply {
+                        status,
+                        headers: vec![],
+                        body: serde_json::to_vec(&body)
+                            .expect("failed to encode openrouter mock response"),
+                    }),
+                    additional_responses: vec![],
+                });
+            }
+        }
+
+        pic.tick();
+        let jobs = list_scheduler_jobs(pic, canister_id);
+        let latest_job = jobs
+            .iter()
+            .filter(|job| job.kind == TaskKind::AgentTurn)
+            .max_by_key(|job| job.created_at_ns);
+        let terminal = latest_job
+            .map(|job| matches!(job.status, JobStatus::Succeeded | JobStatus::Failed))
+            .unwrap_or(false);
+        let saw_new_job = latest_job
+            .map(|job| before_latest_job_id.as_deref() != Some(job.id.as_str()))
+            .unwrap_or(false);
+        if saw_new_job && terminal && pic.get_canister_http().is_empty() {
+            return;
+        }
+
+        pic.advance_time(Duration::from_secs(2));
+    }
+
+    panic!("agent turn did not finish with mocked openrouter response in expected ticks");
 }
 
 #[test]
@@ -1487,6 +1632,175 @@ fn autonomy_turn_round_trips_policy_and_persists_executed_decision() {
             .iter()
             .any(|turn| turn.contains("inference_round_count: 3")),
         "scheduled autonomy turn should retry through the tool and decision-envelope phases before persisting"
+    );
+}
+
+#[test]
+fn scheduled_review_with_fresh_reserve_shortfall_records_canonical_noop_in_pocketic() {
+    let (pic, canister_id) = with_backend_canister();
+
+    for kind in [
+        TaskKind::AgentTurn,
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::Reconcile,
+    ] {
+        set_task_enabled(&pic, canister_id, kind, false);
+        set_task_interval_secs(&pic, canister_id, kind, 60);
+    }
+
+    let _ = configure_route_for_polling(&pic, canister_id);
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, true);
+    pic.advance_time(Duration::from_secs(61));
+    drive_poll_inbox_with_http_mocks_and_wallet(
+        &pic,
+        canister_id,
+        2,
+        &[],
+        "0x1",
+        "0x0000000000000000000000000000000000000000000000000000000000000001",
+    );
+
+    let telemetry = get_wallet_balance_telemetry(&pic, canister_id);
+    assert_eq!(telemetry.status, WalletBalanceStatus::Fresh);
+    assert_eq!(telemetry.eth_balance_wei_hex.as_deref(), Some("0x1"));
+    assert_eq!(telemetry.usdc_balance_raw_hex.as_deref(), Some("0x1"));
+    assert_eq!(
+        get_spawn_bootstrap_view(&pic, canister_id).factory_principal,
+        None,
+        "test should not expose a factory coordination lane"
+    );
+
+    let policy = AutonomyPolicy {
+        version: 9,
+        reserve_policy: ReservePolicy {
+            min_cycles_runway_hours: 72,
+            min_inference_usdc_6dp: Some(250_000),
+            min_gas_wei: Some(42),
+        },
+        risk_limits: RiskLimits {
+            max_total_exposure_bps: 3_000,
+            max_single_action_bps: 1_000,
+            max_protocol_concentration_bps: 1_500,
+        },
+        execution_authority: ExecutionAuthority {
+            autonomous_execution_enabled: true,
+            require_simulation_first: true,
+            per_action_value_limit_wei: Some(50_000_000_000_000_000),
+        },
+        escalation_rules: EscalationRules {
+            escalate_on_missing_policy: true,
+            escalate_on_authority_exceeded: true,
+            escalate_on_repeated_failure: true,
+            failure_quarantine_threshold: 3,
+        },
+        updated_at_ns: 123_456_789,
+    };
+    let stored = update_autonomy_policy(&pic, canister_id, policy.clone())
+        .expect("policy update should succeed");
+    assert_eq!(stored, policy);
+
+    set_task_enabled(&pic, canister_id, TaskKind::PollInbox, false);
+    set_task_enabled(&pic, canister_id, TaskKind::AgentTurn, true);
+    drive_agent_turn_with_openrouter_status(
+        &pic,
+        canister_id,
+        200,
+        json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"trigger\":\"ScheduledReview\",\"candidates_summary\":\"unexpected\",\"outcome\":{\"NoOp\":{\"reason\":\"unexpected\"}},\"explanation\":\"unexpected\"}"
+                }
+            }]
+        }),
+    );
+    assert!(
+        pic.get_canister_http().is_empty(),
+        "fresh reserve shortfall should bypass provider inference when no room coordination lane exists"
+    );
+
+    let decisions = get_recent_decisions(&pic, canister_id);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(
+        decisions[0].outcome,
+        DecisionOutcome::NoOp {
+            reason: "reserve_insufficient".to_string(),
+        }
+    );
+    assert_eq!(decisions[0].policy_version, 9);
+    assert_eq!(
+        decisions[0].candidates_summary,
+        "checked reserves against policy minimums"
+    );
+    assert!(
+        decisions[0]
+            .explanation
+            .contains("capital-touching actions blocked by reserve shortfall"),
+        "runtime should supply the canonical reserve explanation"
+    );
+
+    let turns = list_turns(&pic, canister_id, 5);
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.contains("autonomy reserve restriction:")),
+        "turn log should record reserve restriction context"
+    );
+    assert!(
+        turns
+            .iter()
+            .all(|turn| !turn.contains("decision envelope invalid")),
+        "reserve-restricted turns should not be relabeled as invalid decision envelopes"
+    );
+}
+
+#[test]
+fn repeated_openrouter_auth_failures_suppress_future_autonomy_turns_in_pocketic() {
+    let (pic, canister_id) = with_backend_canister();
+    configure_only_agent_turn(&pic, canister_id, 60);
+    set_task_enabled(&pic, canister_id, TaskKind::TopUpCycles, false);
+    set_inference_provider(&pic, canister_id, InferenceProvider::OpenRouter);
+    set_openrouter_api_key(&pic, canister_id, Some("sk-or-test".to_string()));
+
+    let unauthorized = json!({
+        "error": {
+            "message": "unauthorized"
+        }
+    });
+    for _ in 0..3 {
+        drive_agent_turn_with_openrouter_status(&pic, canister_id, 401, unauthorized.clone());
+    }
+
+    pic.advance_time(Duration::from_secs(61));
+    pic.tick();
+    assert!(
+        pic.get_canister_http().is_empty(),
+        "suppressed autonomy turn should skip provider inference"
+    );
+
+    let decisions = get_recent_decisions(&pic, canister_id);
+    let latest = decisions
+        .first()
+        .expect("suppressed autonomy turn should persist a decision");
+    assert_eq!(
+        latest.outcome,
+        DecisionOutcome::NoOp {
+            reason: "inference_provider_rejected".to_string(),
+        }
+    );
+
+    let turns = list_turns(&pic, canister_id, 10);
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn.contains("autonomy inference suppressed: provider rejected")),
+        "turn log should show provider-rejection suppression"
+    );
+    assert!(
+        turns
+            .iter()
+            .all(|turn| !turn.contains("decision envelope invalid")),
+        "suppressed autonomy turns should not be relabeled as invalid envelopes"
     );
 }
 

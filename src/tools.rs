@@ -21,8 +21,8 @@
 /// | `MAX_MEMORY_RECALL_RESULTS`     | 50     |
 /// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
-    AbiTypeSpec, ActiveExposure, AgentState, AutonomyPolicy, ExecutionPlan, MemoryFact,
-    PostRoomMessageRequest, PromptLayer, RoomContentType, StrategyExecutionIntent,
+    AbiTypeSpec, ActiveExposure, AgentState, AutonomyPolicy, ExecutionPlan, InferenceToolScope,
+    MemoryFact, PostRoomMessageRequest, PromptLayer, RoomContentType, StrategyExecutionIntent,
     StrategyQuarantine, StrategyTemplateKey, SurvivalOperationClass, ToolCall, ToolCallOutcome,
     ToolCallRecord, ToolFailureKind,
 };
@@ -578,6 +578,22 @@ impl Default for ToolPolicy {
 /// Tool implementations are matched by name inside `execute_actions_with_broadcaster`.
 pub struct ToolManager {
     policies: HashMap<String, ToolPolicy>,
+}
+
+pub fn tool_allowed_in_scope(tool: &str, scope: InferenceToolScope) -> bool {
+    let normalized = canonicalize_tool_name(tool);
+    match scope {
+        InferenceToolScope::Full => true,
+        InferenceToolScope::CoordinationOnly => matches!(
+            normalized.as_str(),
+            "record_signal"
+                | "remember"
+                | "recall"
+                | "memory_stats"
+                | "forget"
+                | "post_room_message"
+        ),
+    }
 }
 
 impl ToolManager {
@@ -6036,6 +6052,41 @@ mod tests {
         );
 
         crate::features::factory_room::clear_mock_factory_room_call();
+    }
+
+    #[test]
+    fn coordination_only_tool_scope_retains_room_and_memory_tools() {
+        for tool in [
+            "record_signal",
+            "remember",
+            "recall",
+            "memory_stats",
+            "forget",
+            "post_room_message",
+        ] {
+            assert!(
+                tool_allowed_in_scope(tool, InferenceToolScope::CoordinationOnly),
+                "{tool} should remain available in coordination-only scope"
+            );
+        }
+    }
+
+    #[test]
+    fn coordination_only_tool_scope_blocks_capital_and_strategy_mutation_tools() {
+        for tool in [
+            "send_eth",
+            "execute_strategy_action",
+            "register_strategy",
+            "update_prompt_layer",
+            "market_fetch",
+            "http_fetch",
+            "canister_call",
+        ] {
+            assert!(
+                !tool_allowed_in_scope(tool, InferenceToolScope::CoordinationOnly),
+                "{tool} should be blocked in coordination-only scope"
+            );
+        }
     }
 
     #[test]

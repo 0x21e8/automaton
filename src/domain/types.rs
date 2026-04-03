@@ -641,6 +641,24 @@ impl Default for AutonomySuppressionConfig {
     }
 }
 
+/// Classification for autonomous inference-provider suppression tracking.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub enum AutonomyInferenceSuppressionClassification {
+    #[default]
+    ProviderRejected,
+}
+
+/// Small persistent runtime state for autonomous inference-provider suppression.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct AutonomyInferenceSuppressionState {
+    #[serde(default)]
+    pub consecutive_failure_count: u32,
+    #[serde(default)]
+    pub last_failure_classification: Option<AutonomyInferenceSuppressionClassification>,
+    #[serde(default)]
+    pub suppression_until_ns: Option<u64>,
+}
+
 /// Durable governance policy that bounds autonomous economic behavior.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct AutonomyPolicy {
@@ -892,6 +910,8 @@ pub struct RuntimeSnapshot {
     #[serde(default)]
     pub autonomy_suppression: AutonomySuppressionConfig,
     #[serde(default)]
+    pub autonomy_inference_suppression: AutonomyInferenceSuppressionState,
+    #[serde(default)]
     pub spawn_session_id: Option<String>,
     #[serde(default)]
     pub spawn_parent_id: Option<String>,
@@ -950,6 +970,7 @@ impl Default for RuntimeSnapshot {
             wallet_balance: WalletBalanceSnapshot::default(),
             wallet_balance_sync: WalletBalanceSyncConfig::default(),
             autonomy_suppression: AutonomySuppressionConfig::default(),
+            autonomy_inference_suppression: AutonomyInferenceSuppressionState::default(),
             spawn_session_id: None,
             spawn_parent_id: None,
             factory_principal: None,
@@ -2229,11 +2250,30 @@ pub struct InferenceProxyStatusView {
 }
 
 /// The assembled prompt and context passed to the LLM at the start of a turn.
+#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum InferenceToolScope {
+    #[default]
+    Full,
+    CoordinationOnly,
+}
+
+impl InferenceToolScope {
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::CoordinationOnly => "coordination_only",
+        }
+    }
+}
+
+/// The assembled prompt and context passed to the LLM at the start of a turn.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug)]
 pub struct InferenceInput {
     pub input: String,
     pub context_snippet: String,
     pub turn_id: String,
+    #[serde(default)]
+    pub tool_scope: InferenceToolScope,
     #[serde(default)]
     pub proxy_resume_job_id: Option<String>,
     #[serde(default)]

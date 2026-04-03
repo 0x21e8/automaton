@@ -9,7 +9,8 @@ use super::sqlite::SurvivalOperationRuntimeRecord;
 /// Public function signatures are intentionally identical to the original so
 /// that callers require no changes.
 use crate::domain::types::{
-    AbiArtifact, AbiArtifactKey, ActiveExposure, AgentEvent, AgentState, AutonomyPolicy,
+    AbiArtifact, AbiArtifactKey, ActiveExposure, AgentEvent, AgentState,
+    AutonomyInferenceSuppressionClassification, AutonomyInferenceSuppressionState, AutonomyPolicy,
     AutonomySuppressionConfig, ConversationEntry, ConversationLog, ConversationSummary,
     CycleTelemetry, DecisionRecord, EvmPollCursor, EvmRouteStateView, ExposureReconciliationStatus,
     InboxMessage, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState, InboxStats,
@@ -218,6 +219,8 @@ const MIN_AUTONOMY_FAILURE_REPEAT_THRESHOLD: u32 = 1;
 const MAX_AUTONOMY_FAILURE_REPEAT_THRESHOLD: u32 = 100;
 const MIN_AUTONOMY_FAILURE_COOLDOWN_SECS: u64 = 1;
 const MAX_AUTONOMY_FAILURE_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60;
+const AUTONOMY_INFERENCE_PROVIDER_REJECTION_THRESHOLD: u32 = 3;
+const AUTONOMY_INFERENCE_PROVIDER_REJECTION_COOLDOWN_SECS: u64 = 60 * 60;
 
 #[derive(Clone, Copy, Debug, LogPriorityLevels)]
 enum SchedulerStorageLogPriority {
@@ -1378,6 +1381,75 @@ pub fn set_autonomy_suppression_config(
     Ok(config)
 }
 
+pub fn autonomy_inference_suppression_state() -> AutonomyInferenceSuppressionState {
+    runtime_snapshot().autonomy_inference_suppression
+}
+
+pub fn autonomy_inference_suppression_active(
+    now_ns: u64,
+) -> Option<AutonomyInferenceSuppressionState> {
+    let mut snapshot = runtime_snapshot();
+    let until_ns = snapshot
+        .autonomy_inference_suppression
+        .suppression_until_ns?;
+    if until_ns > now_ns {
+        return Some(snapshot.autonomy_inference_suppression);
+    }
+    snapshot.autonomy_inference_suppression = AutonomyInferenceSuppressionState::default();
+    snapshot.last_transition_at_ns = now_ns;
+    save_runtime_snapshot(&snapshot);
+    None
+}
+
+pub fn clear_autonomy_inference_suppression_state() {
+    let mut snapshot = runtime_snapshot();
+    if snapshot.autonomy_inference_suppression == AutonomyInferenceSuppressionState::default() {
+        return;
+    }
+    snapshot.autonomy_inference_suppression = AutonomyInferenceSuppressionState::default();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    log!(
+        SchedulerStorageLogPriority::Info,
+        "autonomy_inference_suppression_reset"
+    );
+}
+
+pub fn record_autonomy_inference_suppression_failure(
+    failed_at_ns: u64,
+    classification: AutonomyInferenceSuppressionClassification,
+) -> AutonomyInferenceSuppressionState {
+    let mut snapshot = runtime_snapshot();
+    let state = &mut snapshot.autonomy_inference_suppression;
+    if state
+        .last_failure_classification
+        .as_ref()
+        .is_some_and(|existing| *existing == classification)
+    {
+        state.consecutive_failure_count = state.consecutive_failure_count.saturating_add(1);
+    } else {
+        state.consecutive_failure_count = 1;
+    }
+    state.last_failure_classification = Some(classification.clone());
+    if state.consecutive_failure_count >= AUTONOMY_INFERENCE_PROVIDER_REJECTION_THRESHOLD {
+        let cooldown_ns =
+            AUTONOMY_INFERENCE_PROVIDER_REJECTION_COOLDOWN_SECS.saturating_mul(1_000_000_000);
+        state.suppression_until_ns = Some(failed_at_ns.saturating_add(cooldown_ns));
+        log!(
+            SchedulerStorageLogPriority::Warn,
+            "autonomy_inference_suppression_armed classification={classification:?} consecutive_failures={} suppression_until_ns={}",
+            state.consecutive_failure_count,
+            state.suppression_until_ns.unwrap_or_default(),
+        );
+    } else {
+        state.suppression_until_ns = None;
+    }
+    snapshot.last_transition_at_ns = failed_at_ns;
+    let updated = state.clone();
+    save_runtime_snapshot(&snapshot);
+    updated
+}
+
 pub fn autonomy_policy() -> Option<AutonomyPolicy> {
     sqlite::read_autonomy_policy().ok().flatten()
 }
@@ -1895,6 +1967,7 @@ pub fn set_evm_rpc_max_response_bytes(max_response_bytes: u64) -> Result<u64, St
 pub fn set_inference_provider(provider: InferenceProvider) {
     let mut snapshot = runtime_snapshot();
     snapshot.inference_provider = provider;
+    snapshot.autonomy_inference_suppression = AutonomyInferenceSuppressionState::default();
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
 }
@@ -1907,6 +1980,7 @@ pub fn set_inference_model(model: String) -> Result<String, String> {
     }
     let mut snapshot = runtime_snapshot();
     snapshot.inference_model = model.trim().to_string();
+    snapshot.autonomy_inference_suppression = AutonomyInferenceSuppressionState::default();
     snapshot.last_transition_at_ns = now_ns();
     let out = snapshot.inference_model.clone();
     save_runtime_snapshot(&snapshot);
@@ -1943,6 +2017,7 @@ pub fn set_openrouter_base_url(base_url: String) -> Result<String, String> {
     }
     let mut snapshot = runtime_snapshot();
     snapshot.openrouter_base_url = base_url.trim().trim_end_matches('/').to_string();
+    snapshot.autonomy_inference_suppression = AutonomyInferenceSuppressionState::default();
     snapshot.last_transition_at_ns = now_ns();
     let out = snapshot.openrouter_base_url.clone();
     save_runtime_snapshot(&snapshot);
@@ -1961,6 +2036,7 @@ pub fn set_openrouter_api_key(api_key: Option<String>) {
             Some(trimmed)
         }
     });
+    snapshot.autonomy_inference_suppression = AutonomyInferenceSuppressionState::default();
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
 }
@@ -5543,6 +5619,38 @@ mod tests {
         assert_eq!(
             snapshot.openrouter_reasoning_level,
             OpenRouterReasoningLevel::Medium
+        );
+    }
+
+    #[test]
+    fn inference_config_mutations_reset_autonomy_inference_suppression_state() {
+        init_storage();
+        let armed = record_autonomy_inference_suppression_failure(
+            123,
+            AutonomyInferenceSuppressionClassification::ProviderRejected,
+        );
+        assert_eq!(armed.consecutive_failure_count, 1);
+
+        let armed = record_autonomy_inference_suppression_failure(
+            124,
+            AutonomyInferenceSuppressionClassification::ProviderRejected,
+        );
+        assert_eq!(armed.consecutive_failure_count, 2);
+
+        let armed = record_autonomy_inference_suppression_failure(
+            125,
+            AutonomyInferenceSuppressionClassification::ProviderRejected,
+        );
+        assert!(
+            armed.suppression_until_ns.is_some(),
+            "third provider rejection should arm cooldown state"
+        );
+
+        set_inference_model("openai/gpt-4.1-mini".to_string())
+            .expect("config mutation should succeed");
+        assert_eq!(
+            autonomy_inference_suppression_state(),
+            AutonomyInferenceSuppressionState::default()
         );
     }
 
