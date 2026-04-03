@@ -11,12 +11,14 @@ use candid::Nat;
 #[cfg(target_arch = "wasm32")]
 use ic_cdk::management_canister::{http_request, HttpHeader, HttpMethod, HttpRequestArgs};
 
-const WEB_SEARCH_DEFAULT_RESULTS: usize = 5;
-const WEB_SEARCH_MAX_RESULTS: usize = 10;
-const WEB_SEARCH_MAX_OUTPUT_CHARS: usize = 4_000;
-const WEB_SEARCH_MAX_SNIPPET_CHARS: usize = 200;
+const WEB_SEARCH_DEFAULT_RESULTS: usize = 3;
+const WEB_SEARCH_MAX_RESULTS: usize = 6;
+const WEB_SEARCH_RETRY_RESULTS: usize = 3;
+const WEB_SEARCH_MAX_QUERY_CHARS: usize = 320;
+const WEB_SEARCH_MAX_OUTPUT_CHARS: usize = 8_000;
+const WEB_SEARCH_MAX_SNIPPET_CHARS: usize = 320;
 const WEB_SEARCH_MAX_DOMAIN_FILTERS: usize = 5;
-const WEB_SEARCH_MAX_RESPONSE_BYTES: u64 = 16 * 1024;
+const WEB_SEARCH_MAX_RESPONSE_BYTES: u64 = 32 * 1024;
 
 #[derive(Deserialize)]
 struct WebSearchArgs {
@@ -71,13 +73,7 @@ pub async fn web_search_tool(args_json: &str) -> Result<String, String> {
     let api_key = stable::get_search_api_key()
         .ok_or_else(|| "search api key is not configured".to_string())?;
 
-    let url = build_brave_search_url(&args);
-    let request_size_bytes =
-        u64::try_from(url.len().saturating_add(api_key.len()).saturating_add(256))
-            .unwrap_or(u64::MAX);
-    ensure_web_search_affordable(request_size_bytes, WEB_SEARCH_MAX_RESPONSE_BYTES)?;
-
-    let body = http_get_search(&url, &api_key, WEB_SEARCH_MAX_RESPONSE_BYTES).await?;
+    let body = http_get_search_with_retry(&args, &api_key).await?;
     let response: BraveSearchResponse = serde_json::from_slice(&body)
         .map_err(|error| format!("web_search failed to parse provider response: {error}"))?;
     let formatted = format_search_results(&args.query, &response)?;
@@ -90,6 +86,11 @@ fn parse_web_search_args(args_json: &str) -> Result<NormalizedWebSearchArgs, Str
     let query = args.query.trim();
     if query.is_empty() {
         return Err("missing required field: query".to_string());
+    }
+    if query.chars().count() > WEB_SEARCH_MAX_QUERY_CHARS {
+        return Err(format!(
+            "query may contain at most {WEB_SEARCH_MAX_QUERY_CHARS} characters"
+        ));
     }
 
     let count = args
@@ -124,6 +125,64 @@ fn parse_web_search_args(args_json: &str) -> Result<NormalizedWebSearchArgs, Str
         include_domains,
         exclude_domains,
     })
+}
+
+async fn http_get_search_with_retry(
+    args: &NormalizedWebSearchArgs,
+    api_key: &str,
+) -> Result<Vec<u8>, String> {
+    let url = build_brave_search_url(args);
+    let request_size_bytes =
+        u64::try_from(url.len().saturating_add(api_key.len()).saturating_add(256))
+            .unwrap_or(u64::MAX);
+    ensure_web_search_affordable(request_size_bytes, WEB_SEARCH_MAX_RESPONSE_BYTES)?;
+    match http_get_search(&url, api_key, WEB_SEARCH_MAX_RESPONSE_BYTES).await {
+        Ok(body) => Ok(body),
+        Err(error) => {
+            let Some(retry_args) = body_limit_retry_args(args, &error) else {
+                return Err(error);
+            };
+            let retry_url = build_brave_search_url(&retry_args);
+            let retry_request_size_bytes = u64::try_from(
+                retry_url
+                    .len()
+                    .saturating_add(api_key.len())
+                    .saturating_add(256),
+            )
+            .unwrap_or(u64::MAX);
+            ensure_web_search_affordable(retry_request_size_bytes, WEB_SEARCH_MAX_RESPONSE_BYTES)?;
+            http_get_search(&retry_url, api_key, WEB_SEARCH_MAX_RESPONSE_BYTES).await
+        }
+    }
+}
+
+fn body_limit_retry_args(
+    args: &NormalizedWebSearchArgs,
+    error: &str,
+) -> Option<NormalizedWebSearchArgs> {
+    if !is_response_too_large_error(error) {
+        return None;
+    }
+
+    let stripped_filters = !args.include_domains.is_empty() || !args.exclude_domains.is_empty();
+    let reduced_count = args.count > WEB_SEARCH_RETRY_RESULTS;
+    if !stripped_filters && !reduced_count {
+        return None;
+    }
+
+    Some(NormalizedWebSearchArgs {
+        query: args.query.clone(),
+        count: args.count.min(WEB_SEARCH_RETRY_RESULTS),
+        freshness: args.freshness.clone(),
+        include_domains: Vec::new(),
+        exclude_domains: Vec::new(),
+    })
+}
+
+fn is_response_too_large_error(error: &str) -> bool {
+    let normalized = error.trim().to_ascii_lowercase();
+    normalized.contains("http body exceeds size limit")
+        || normalized.contains("response exceeded max_response_bytes")
 }
 
 fn normalize_freshness(freshness: Option<String>) -> Result<Option<String>, String> {
@@ -418,6 +477,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_web_search_args_rejects_overlong_query() {
+        let long_query = "x".repeat(WEB_SEARCH_MAX_QUERY_CHARS + 1);
+        let error = parse_web_search_args(&format!(r#"{{"query":"{long_query}"}}"#))
+            .expect_err("overlong query should fail");
+        assert!(error.contains("at most"));
+    }
+
+    #[test]
     fn parse_web_search_args_normalizes_domain_filters() {
         let args = parse_web_search_args(
             r#"{"query":"uniswap v4","include_domains":["https://docs.uniswap.org/contracts"],"exclude_domains":["WWW.Example.com"]}"#,
@@ -435,5 +502,52 @@ mod tests {
         let error =
             format_search_results("query", &response).expect_err("empty results should fail");
         assert!(error.contains("no results"));
+    }
+
+    #[test]
+    fn body_limit_retry_args_strips_filters_and_reduces_result_count() {
+        let args = parse_web_search_args(
+            r#"{"query":"latest audits","count":6,"include_domains":["docs.uniswap.org"],"exclude_domains":["example.com"]}"#,
+        )
+        .expect("args should parse");
+        let retried = body_limit_retry_args(
+            &args,
+            "web_search failed: Http body exceeds size limit of 32768 bytes.",
+        )
+        .expect("body limit should trigger a retry");
+        assert_eq!(retried.count, WEB_SEARCH_RETRY_RESULTS);
+        assert!(retried.include_domains.is_empty());
+        assert!(retried.exclude_domains.is_empty());
+    }
+
+    #[test]
+    fn body_limit_retry_args_ignores_non_size_errors() {
+        let args = parse_web_search_args(r#"{"query":"latest audits","count":6}"#)
+            .expect("args should parse");
+        assert!(body_limit_retry_args(&args, "web_search provider returned HTTP 500").is_none());
+    }
+
+    #[test]
+    fn format_search_results_uses_expanded_output_budget() {
+        let response = BraveSearchResponse {
+            web: Some(BraveSearchWeb {
+                results: (0..6)
+                    .map(|index| BraveSearchResult {
+                        title: Some(format!("Verbose title {index} {}", "x".repeat(140))),
+                        url: Some(format!(
+                            "https://example.com/{index}/{}",
+                            "segment/".repeat(24)
+                        )),
+                        description: Some("detail ".repeat(160)),
+                        age: None,
+                        page_age: Some("2026-04-03".to_string()),
+                    })
+                    .collect(),
+            }),
+        };
+        let formatted =
+            format_search_results("verbose query", &response).expect("results should format");
+        assert!(formatted.len() > 4_000);
+        assert!(formatted.len() <= WEB_SEARCH_MAX_OUTPUT_CHARS + 3);
     }
 }
