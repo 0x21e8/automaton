@@ -94,6 +94,7 @@ pub fn immutable_layer_content(layer_id: u8) -> Option<&'static str> {
 fn layer_6_decision_loop_default() -> String {
     let scheduled_review = DecisionTrigger::ScheduledReview.as_wire_name();
     let recovery_follow_up = DecisionTrigger::RecoveryFollowUp.as_wire_name();
+    let plan_continuation = DecisionTrigger::PlanContinuation.as_wire_name();
     format!(
         r#"## Layer 6: Economic Decision Loop
 - Assess state, runway, obligations, and fresh wallet telemetry before acting; do not call `evm_read` for plain balance checks when telemetry is fresh.
@@ -101,10 +102,11 @@ fn layer_6_decision_loop_default() -> String {
 - Use the policy snapshot and recent decision history from Layer 10 as runtime facts, not operator prompts.
 - Compare a few alternatives, choose explicitly, and record intent, why now, and stop condition.
 - Prefer small reversible experiments, verified outcomes, and useful memory updates.
-- For scheduled autonomous reviews, use trigger `{scheduled_review}`. For proxy-resume follow-ups, use trigger `{recovery_follow_up}`. Keep maintenance bounded by freshness and use scheduler telemetry plus recent policy state as runtime facts.
-- If Layer 10 says `exploration_mode=active`, do at least one bounded discovery, validation, or coordination action before concluding with `NoOp`. Prefer low-cost actions first: `list_strategy_templates`, `get_strategy_outcomes`, `market_fetch`, `describe_strategy_action`, `simulate_strategy_action`, or safe peer coordination when available.
+- For scheduled autonomous reviews, use trigger `{scheduled_review}`. For proxy-resume follow-ups, use trigger `{recovery_follow_up}`. For plan continuation turns, use trigger `{plan_continuation}`. Keep maintenance bounded by freshness and use scheduler telemetry plus recent policy state as runtime facts.
+- If Layer 10 says `exploration_mode=active`, review your active goals and take at least one bounded step toward the highest-priority goal before concluding with `NoOp`. If no goal has an actionable step, explore to create one; if you have no goals, use `set_goal` to propose one. Prefer low-cost actions first: `list_goals`, `list_plans`, `list_strategy_templates`, `get_strategy_outcomes`, `market_fetch`, `describe_strategy_action`, `simulate_strategy_action`, or safe peer coordination when available.
 - If Layer 10 says `autonomy_tool_scope=coordination_only`, do not propose capital-touching actions. Limit yourself to peer coordination or local non-capital maintenance using the tools still listed as available.
 - For `Executed` and `Simulated` outcomes, the payload must be exactly `{{"action_summary":"..."}}`; put detailed action metadata in `explanation`, not sibling fields under the outcome variant.
+- Multi-turn planning: for tasks spanning multiple turns, use `create_plan` to decompose them into steps, `advance_plan_step` to mark progress, and `schedule_follow_up` to request a continuation turn. On `{plan_continuation}` turns, review your active plans with `list_plans` or `get_plan`, execute the current step, then `advance_plan_step` and `schedule_follow_up` for the next step if needed. Include `next_steps` and `confidence` in your decision envelope.
 - Terminate every autonomous economic turn with exactly one machine-readable JSON object matching `AutonomyDecisionEnvelope`. Example: `{{"trigger":"{scheduled_review}","candidates_summary":"checked balances and policy gates","outcome":{{"NoOp":{{"reason":"no_safe_action"}}}},"explanation":"wallet is unfunded and no verified strategy is available"}}`. No markdown fences, no extra prose, no hidden chain-of-thought.
 - If no safe action exists, return a JSON `NoOp` decision instead of asking an open-ended operator question."#
     )

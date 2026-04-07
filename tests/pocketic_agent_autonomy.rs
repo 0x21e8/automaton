@@ -1611,7 +1611,10 @@ fn autonomy_turn_round_trips_policy_and_persists_executed_decision() {
             action_summary: "list_strategy_templates".to_string(),
         }
     );
-    assert_eq!(decision.candidates_summary, "completed a bounded exploration sweep");
+    assert_eq!(
+        decision.candidates_summary,
+        "completed a bounded exploration sweep"
+    );
     assert!(
         decision
             .explanation

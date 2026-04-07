@@ -1695,6 +1695,280 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
                 ]),
             }),
         }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "set_goal".to_string(),
+            description: Some(
+                "Create or update a persistent goal. Goals give your autonomous turns direction. Use short, descriptive ids (e.g. `explore-defi-yield`). Priority must be high, medium, or low."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "id".to_string(),
+                        description: Some("Short unique goal identifier.".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "description".to_string(),
+                        description: Some("What you are trying to achieve.".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "success_criteria".to_string(),
+                        description: Some("Specific, verifiable conditions for completion.".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "priority".to_string(),
+                        description: Some("Goal priority.".to_string()),
+                        enum_values: Some(vec![
+                            "high".to_string(),
+                            "medium".to_string(),
+                            "low".to_string(),
+                        ]),
+                    },
+                ]),
+                required: Some(vec![
+                    "id".to_string(),
+                    "description".to_string(),
+                    "success_criteria".to_string(),
+                    "priority".to_string(),
+                ]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "list_goals".to_string(),
+            description: Some(
+                "List goals. Defaults to active goals only. Set `status` to `all`, `completed`, or `abandoned` to see others."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![IcLlmProperty {
+                    type_: "string".to_string(),
+                    name: "status".to_string(),
+                    description: Some("Filter by status.".to_string()),
+                    enum_values: Some(vec![
+                        "active".to_string(),
+                        "completed".to_string(),
+                        "abandoned".to_string(),
+                        "all".to_string(),
+                    ]),
+                }]),
+                required: None,
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "update_goal".to_string(),
+            description: Some(
+                "Mark a goal as completed or abandoned. Provide the goal id, new status, and an outcome summary describing what happened."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "id".to_string(),
+                        description: Some("Goal identifier.".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "status".to_string(),
+                        description: Some("New goal status.".to_string()),
+                        enum_values: Some(vec![
+                            "completed".to_string(),
+                            "abandoned".to_string(),
+                        ]),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "outcome".to_string(),
+                        description: Some("Summary of what happened or why the goal was abandoned.".to_string()),
+                        enum_values: None,
+                    },
+                ]),
+                required: Some(vec![
+                    "id".to_string(),
+                    "status".to_string(),
+                    "outcome".to_string(),
+                ]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "create_plan".to_string(),
+            description: Some(
+                "Create a multi-turn plan to decompose a goal into ordered steps. Plans persist across turns and let you track progress on multi-step strategies. Use `schedule_follow_up` after creating a plan to resume on the next turn."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "id".to_string(),
+                        description: Some("Short unique plan identifier (e.g. `monitor-eth-price`).".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "description".to_string(),
+                        description: Some("What this plan accomplishes overall.".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "goal_id".to_string(),
+                        description: Some("Optional id of the goal this plan works toward.".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "array".to_string(),
+                        name: "steps".to_string(),
+                        description: Some(
+                            "Ordered list of steps. Each step is an object with `description` (required) and optional `success_criteria`. Max 20 steps."
+                                .to_string(),
+                        ),
+                        enum_values: None,
+                    },
+                ]),
+                required: Some(vec![
+                    "id".to_string(),
+                    "description".to_string(),
+                    "steps".to_string(),
+                ]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "get_plan".to_string(),
+            description: Some(
+                "Retrieve a plan by id, showing all steps with their status and the current step marker."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![IcLlmProperty {
+                    type_: "string".to_string(),
+                    name: "id".to_string(),
+                    description: Some("Plan identifier.".to_string()),
+                    enum_values: None,
+                }]),
+                required: Some(vec!["id".to_string()]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "advance_plan_step".to_string(),
+            description: Some(
+                "Mark the current step of a plan as completed/skipped and advance to the next step. If the last step is completed, the plan is automatically marked as completed. Optionally set plan_status to abandon or pause the entire plan."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "id".to_string(),
+                        description: Some("Plan identifier.".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "step_status".to_string(),
+                        description: Some("New status for the current step.".to_string()),
+                        enum_values: Some(vec![
+                            "completed".to_string(),
+                            "skipped".to_string(),
+                            "in_progress".to_string(),
+                        ]),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "result".to_string(),
+                        description: Some("Summary of what happened in this step.".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "plan_status".to_string(),
+                        description: Some("Optionally change overall plan status.".to_string()),
+                        enum_values: Some(vec![
+                            "abandoned".to_string(),
+                            "paused".to_string(),
+                        ]),
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "outcome".to_string(),
+                        description: Some("Summary when abandoning or pausing the plan.".to_string()),
+                        enum_values: None,
+                    },
+                ]),
+                required: Some(vec![
+                    "id".to_string(),
+                    "step_status".to_string(),
+                ]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "list_plans".to_string(),
+            description: Some(
+                "List plans. Defaults to active plans. Set `status` to `all`, `completed`, `abandoned`, or `paused` to see others."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![IcLlmProperty {
+                    type_: "string".to_string(),
+                    name: "status".to_string(),
+                    description: Some("Filter by status.".to_string()),
+                    enum_values: Some(vec![
+                        "active".to_string(),
+                        "completed".to_string(),
+                        "abandoned".to_string(),
+                        "paused".to_string(),
+                        "all".to_string(),
+                    ]),
+                }]),
+                required: None,
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
+            name: "schedule_follow_up".to_string(),
+            description: Some(
+                "Schedule a follow-up agent turn with trigger `PlanContinuation`. Use this after advancing a plan step to ensure the next step executes on a future turn. Optional `delay_secs` defers the follow-up (default: immediate). The follow-up turn receives the plan context automatically."
+                    .to_string(),
+            ),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "reason".to_string(),
+                        description: Some("Why this follow-up is needed (shown in turn context).".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "string".to_string(),
+                        name: "plan_id".to_string(),
+                        description: Some("Optional plan id this follow-up continues.".to_string()),
+                        enum_values: None,
+                    },
+                    IcLlmProperty {
+                        type_: "integer".to_string(),
+                        name: "delay_secs".to_string(),
+                        description: Some("Delay in seconds before the follow-up turn (default: 0 = immediate).".to_string()),
+                        enum_values: None,
+                    },
+                ]),
+                required: Some(vec!["reason".to_string()]),
+            }),
+        }),
     ];
     if !stable::web_search_runtime_enabled() {
         tools.retain(|tool| ic_llm_tool_name(tool) != "web_search");

@@ -310,6 +310,11 @@ async fn dispatch_job(job: &ScheduledJob) -> Result<JobDispatchOutcome, String> 
                 .starts_with("AgentTurn:inference-proxy-resume:")
             {
                 ScheduledTurnTrigger::InferenceProxyResume
+            } else if job
+                .dedupe_key
+                .starts_with("AgentTurn:plan-continuation:")
+            {
+                ScheduledTurnTrigger::PlanContinuation
             } else {
                 ScheduledTurnTrigger::Periodic
             };

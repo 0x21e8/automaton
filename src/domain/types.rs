@@ -1063,6 +1063,7 @@ pub enum DecisionTrigger {
     LowRunway,
     PositionMaintenance,
     RecoveryFollowUp,
+    PlanContinuation,
 }
 
 impl DecisionTrigger {
@@ -1073,6 +1074,7 @@ impl DecisionTrigger {
             Self::LowRunway => "LowRunway",
             Self::PositionMaintenance => "PositionMaintenance",
             Self::RecoveryFollowUp => "RecoveryFollowUp",
+            Self::PlanContinuation => "PlanContinuation",
         }
     }
 
@@ -1083,6 +1085,7 @@ impl DecisionTrigger {
             Self::LowRunway => "low_runway",
             Self::PositionMaintenance => "position_maintenance",
             Self::RecoveryFollowUp => "recovery_follow_up",
+            Self::PlanContinuation => "plan_continuation",
         }
     }
 }
@@ -1163,6 +1166,12 @@ pub struct AutonomyDecisionEnvelope {
     pub candidates_summary: String,
     pub outcome: DecisionEnvelopeOutcome,
     pub explanation: String,
+    /// What the agent intends to do on the next turn (aids multi-turn continuity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_steps: Option<String>,
+    /// Agent's confidence in this decision (e.g. "high", "medium", "low").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
 }
 
 /// Small operator-facing view of the last exposure reconciliation run.
@@ -1216,6 +1225,150 @@ pub struct SkillRecord {
     /// executing any call.  An empty vec means the skill grants no IC call permissions.
     #[serde(default)]
     pub allowed_canister_calls: Vec<CanisterCallPermission>,
+}
+
+// ── Goal types ───────────────────────────────────────────────────────────────
+
+/// Status of an agent goal.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum GoalStatus {
+    Active,
+    Completed,
+    Abandoned,
+}
+
+impl std::fmt::Display for GoalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GoalStatus::Active => write!(f, "active"),
+            GoalStatus::Completed => write!(f, "completed"),
+            GoalStatus::Abandoned => write!(f, "abandoned"),
+        }
+    }
+}
+
+impl GoalStatus {
+    pub fn from_str_lenient(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "active" => Ok(GoalStatus::Active),
+            "completed" => Ok(GoalStatus::Completed),
+            "abandoned" => Ok(GoalStatus::Abandoned),
+            other => Err(format!("unknown goal status: {other}")),
+        }
+    }
+}
+
+/// A persistent goal that the agent is working toward.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GoalRecord {
+    pub id: String,
+    pub description: String,
+    pub success_criteria: String,
+    pub priority: String,
+    pub status: GoalStatus,
+    pub created_at_ns: u64,
+    pub updated_at_ns: u64,
+    pub source_turn_id: String,
+    #[serde(default)]
+    pub outcome: Option<String>,
+}
+
+// ── Plan types ──────────────────────────────────────────────────────────────
+
+/// Status of a multi-turn plan.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum PlanStatus {
+    Active,
+    Completed,
+    Abandoned,
+    Paused,
+}
+
+impl std::fmt::Display for PlanStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanStatus::Active => write!(f, "active"),
+            PlanStatus::Completed => write!(f, "completed"),
+            PlanStatus::Abandoned => write!(f, "abandoned"),
+            PlanStatus::Paused => write!(f, "paused"),
+        }
+    }
+}
+
+impl PlanStatus {
+    pub fn from_str_lenient(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "active" => Ok(PlanStatus::Active),
+            "completed" => Ok(PlanStatus::Completed),
+            "abandoned" => Ok(PlanStatus::Abandoned),
+            "paused" => Ok(PlanStatus::Paused),
+            other => Err(format!("unknown plan status: {other}")),
+        }
+    }
+}
+
+/// Status of a single step within a plan.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Skipped,
+}
+
+impl std::fmt::Display for PlanStepStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanStepStatus::Pending => write!(f, "pending"),
+            PlanStepStatus::InProgress => write!(f, "in_progress"),
+            PlanStepStatus::Completed => write!(f, "completed"),
+            PlanStepStatus::Skipped => write!(f, "skipped"),
+        }
+    }
+}
+
+impl PlanStepStatus {
+    pub fn from_str_lenient(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "pending" => Ok(PlanStepStatus::Pending),
+            "in_progress" => Ok(PlanStepStatus::InProgress),
+            "completed" => Ok(PlanStepStatus::Completed),
+            "skipped" => Ok(PlanStepStatus::Skipped),
+            other => Err(format!("unknown plan step status: {other}")),
+        }
+    }
+}
+
+/// A single step within a multi-turn plan.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PlanStep {
+    pub description: String,
+    pub success_criteria: String,
+    pub status: PlanStepStatus,
+    #[serde(default)]
+    pub result: Option<String>,
+}
+
+/// A persistent multi-turn plan that the agent executes across turns.
+///
+/// Plans are linked to goals and decompose them into ordered steps.
+/// The agent advances through steps across successive turns, using
+/// `schedule_follow_up` to request continuation turns.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PlanRecord {
+    pub id: String,
+    /// Optional goal this plan is working toward.
+    #[serde(default)]
+    pub goal_id: Option<String>,
+    pub description: String,
+    pub steps: Vec<PlanStep>,
+    pub current_step_idx: usize,
+    pub status: PlanStatus,
+    pub created_at_ns: u64,
+    pub updated_at_ns: u64,
+    pub source_turn_id: String,
+    #[serde(default)]
+    pub outcome: Option<String>,
 }
 
 // ── Prompt layer types ───────────────────────────────────────────────────────

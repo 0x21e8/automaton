@@ -21,8 +21,9 @@
 /// | `MAX_MEMORY_RECALL_RESULTS`     | 50     |
 /// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
-    AbiTypeSpec, ActiveExposure, AgentState, AutonomyPolicy, ExecutionPlan, InferenceToolScope,
-    MemoryFact, PostRoomMessageRequest, PromptLayer, RoomContentType, StrategyExecutionIntent,
+    AbiTypeSpec, ActiveExposure, AgentState, AutonomyPolicy, ExecutionPlan, GoalRecord, GoalStatus,
+    InferenceToolScope, MemoryFact, PlanRecord, PlanStatus, PlanStep, PlanStepStatus,
+    PostRoomMessageRequest, PromptLayer, RoomContentType, StrategyExecutionIntent,
     StrategyQuarantine, StrategyTemplateKey, SurvivalOperationClass, ToolCall, ToolCallOutcome,
     ToolCallRecord, ToolFailureKind,
 };
@@ -449,6 +450,9 @@ fn is_parallel_read_only_tool(tool: &str) -> bool {
             | "recall"
             | "memory_stats"
             | "sql_query"
+            | "list_goals"
+            | "list_plans"
+            | "get_plan"
             | "list_strategy_templates"
             | "describe_strategy_action"
             | "get_strategy_outcomes"
@@ -601,6 +605,14 @@ pub fn tool_allowed_in_scope(tool: &str, scope: InferenceToolScope) -> bool {
                 | "memory_stats"
                 | "forget"
                 | "post_room_message"
+                | "set_goal"
+                | "list_goals"
+                | "update_goal"
+                | "create_plan"
+                | "get_plan"
+                | "advance_plan_step"
+                | "list_plans"
+                | "schedule_follow_up"
         ),
     }
 }
@@ -793,6 +805,62 @@ impl ToolManager {
         );
         policies.insert(
             "post_room_message".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "set_goal".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "list_goals".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+            },
+        );
+        policies.insert(
+            "update_goal".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "create_plan".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "get_plan".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+            },
+        );
+        policies.insert(
+            "advance_plan_step".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "list_plans".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
+            },
+        );
+        policies.insert(
+            "schedule_follow_up".to_string(),
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
@@ -1120,6 +1188,9 @@ impl ToolManager {
                     .unwrap_or_default();
                 Ok(thought)
             }
+            "set_goal" => set_goal_tool(&call.args_json, turn_id),
+            "list_goals" => list_goals_tool(&call.args_json),
+            "update_goal" => update_goal_tool(&call.args_json, turn_id),
             "record_signal" => Ok("recorded".to_string()),
             "remember" => remember_fact_tool(&call.args_json, turn_id),
             "recall" => recall_facts_tool(&call.args_json),
@@ -1341,6 +1412,11 @@ impl ToolManager {
                     result
                 }
             }
+            "create_plan" => create_plan_tool(&call.args_json, turn_id),
+            "get_plan" => get_plan_tool(&call.args_json),
+            "advance_plan_step" => advance_plan_step_tool(&call.args_json, turn_id),
+            "list_plans" => list_plans_tool(&call.args_json),
+            "schedule_follow_up" => schedule_follow_up_tool(&call.args_json, turn_id),
             _ => Err("unknown tool".to_string()),
         }
     }
@@ -3702,6 +3778,417 @@ fn parse_u256_decimal(raw: &str) -> Result<U256, String> {
     }
     U256::from_str(trimmed).map_err(|error| format!("failed to parse decimal quantity: {error}"))
 }
+
+// ── Goal tools ────────────────────────────────────────────────────────────────
+
+fn set_goal_tool(args_json: &str, turn_id: &str) -> Result<String, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).map_err(|err| format!("invalid goal args: {err}"))?;
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing or empty goal id")?;
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing or empty goal description")?;
+    let success_criteria = args
+        .get("success_criteria")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing or empty goal success_criteria")?;
+    let priority = args
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "medium".to_string());
+    if !matches!(priority.as_str(), "high" | "medium" | "low") {
+        return Err(format!("invalid goal priority: {priority}"));
+    }
+
+    let now_ns = current_time_ns();
+    let existing = stable::get_goal(id);
+    let created_at_ns = existing.as_ref().map(|g| g.created_at_ns).unwrap_or(now_ns);
+    let goal = GoalRecord {
+        id: id.to_string(),
+        description: description.to_string(),
+        success_criteria: success_criteria.to_string(),
+        priority,
+        status: GoalStatus::Active,
+        created_at_ns,
+        updated_at_ns: now_ns,
+        source_turn_id: turn_id.to_string(),
+        outcome: None,
+    };
+    stable::set_goal(&goal)?;
+    let verb = if existing.is_some() { "updated" } else { "created" };
+    Ok(format!("goal `{id}` {verb}"))
+}
+
+fn list_goals_tool(args_json: &str) -> Result<String, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).unwrap_or(serde_json::Value::Object(Default::default()));
+    let status_filter = args
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("active");
+
+    let goals = match status_filter {
+        "all" => stable::list_all_goals(),
+        "active" | "completed" | "abandoned" => {
+            crate::storage::sqlite::list_goals_by_status(status_filter, stable::MAX_GOALS)
+                .unwrap_or_default()
+        }
+        other => return Err(format!("unknown status filter: {other}")),
+    };
+
+    if goals.is_empty() {
+        return Ok(format!("no {status_filter} goals"));
+    }
+
+    let mut lines = Vec::with_capacity(goals.len());
+    for goal in &goals {
+        lines.push(format!(
+            "- [{}] {} (priority={}, status={}): {} | success_criteria: {}{}",
+            goal.id,
+            goal.description,
+            goal.priority,
+            goal.status,
+            if let Some(outcome) = &goal.outcome {
+                format!("outcome: {outcome}")
+            } else {
+                String::new()
+            },
+            goal.success_criteria,
+            String::new(),
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn update_goal_tool(args_json: &str, turn_id: &str) -> Result<String, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).map_err(|err| format!("invalid args: {err}"))?;
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing or empty goal id")?;
+    let new_status_str = args
+        .get("status")
+        .and_then(|v| v.as_str())
+        .ok_or("missing goal status")?;
+    let new_status = GoalStatus::from_str_lenient(new_status_str)?;
+    if new_status == GoalStatus::Active {
+        return Err("use set_goal to create or reactivate goals".to_string());
+    }
+    let outcome = args
+        .get("outcome")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing outcome summary")?;
+
+    let mut goal = stable::get_goal(id).ok_or_else(|| format!("goal `{id}` not found"))?;
+    goal.status = new_status;
+    goal.outcome = Some(outcome);
+    goal.updated_at_ns = current_time_ns();
+    goal.source_turn_id = turn_id.to_string();
+    stable::set_goal(&goal)?;
+    Ok(format!("goal `{id}` marked as {}", goal.status))
+}
+
+// ── Plan tools ───────────────────────────────────────────────────────────────
+
+fn create_plan_tool(args_json: &str, turn_id: &str) -> Result<String, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).map_err(|err| format!("invalid plan args: {err}"))?;
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing or empty plan id")?;
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing or empty plan description")?;
+    let goal_id = args
+        .get("goal_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let steps_arr = args
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .ok_or("missing or empty steps array")?;
+    if steps_arr.is_empty() {
+        return Err("plan must have at least one step".to_string());
+    }
+    if steps_arr.len() > 20 {
+        return Err("plan cannot have more than 20 steps".to_string());
+    }
+    let mut steps = Vec::with_capacity(steps_arr.len());
+    for (i, step_val) in steps_arr.iter().enumerate() {
+        let desc = step_val
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("step {i}: missing description"))?;
+        let criteria = step_val
+            .get("success_criteria")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        steps.push(PlanStep {
+            description: desc.to_string(),
+            success_criteria: criteria,
+            status: PlanStepStatus::Pending,
+            result: None,
+        });
+    }
+
+    let now_ns = current_time_ns();
+    let existing = stable::get_plan(id);
+    let created_at_ns = existing.as_ref().map(|p| p.created_at_ns).unwrap_or(now_ns);
+    let plan = PlanRecord {
+        id: id.to_string(),
+        goal_id,
+        description: description.to_string(),
+        steps,
+        current_step_idx: 0,
+        status: PlanStatus::Active,
+        created_at_ns,
+        updated_at_ns: now_ns,
+        source_turn_id: turn_id.to_string(),
+        outcome: None,
+    };
+    stable::set_plan(&plan)?;
+    let verb = if existing.is_some() { "updated" } else { "created" };
+    Ok(format!(
+        "plan `{id}` {verb} with {} steps",
+        plan.steps.len()
+    ))
+}
+
+fn get_plan_tool(args_json: &str) -> Result<String, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).map_err(|err| format!("invalid args: {err}"))?;
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing or empty plan id")?;
+    let plan = stable::get_plan(id).ok_or_else(|| format!("plan `{id}` not found"))?;
+    let mut lines = vec![format!(
+        "plan `{}` (status={}, goal={}, step {}/{})",
+        plan.id,
+        plan.status,
+        plan.goal_id.as_deref().unwrap_or("none"),
+        plan.current_step_idx + 1,
+        plan.steps.len()
+    )];
+    if let Some(desc) = Some(&plan.description).filter(|d| !d.is_empty()) {
+        lines.push(format!("description: {desc}"));
+    }
+    for (i, step) in plan.steps.iter().enumerate() {
+        let marker = if i == plan.current_step_idx && plan.status == PlanStatus::Active {
+            ">>>"
+        } else {
+            "   "
+        };
+        lines.push(format!(
+            "{marker} step {}: [{}] {}{}",
+            i + 1,
+            step.status,
+            step.description,
+            step.result
+                .as_ref()
+                .map(|r| format!(" | result: {r}"))
+                .unwrap_or_default()
+        ));
+    }
+    if let Some(outcome) = &plan.outcome {
+        lines.push(format!("outcome: {outcome}"));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn advance_plan_step_tool(args_json: &str, turn_id: &str) -> Result<String, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).map_err(|err| format!("invalid args: {err}"))?;
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing or empty plan id")?;
+    let new_status_str = args
+        .get("step_status")
+        .and_then(|v| v.as_str())
+        .ok_or("missing step_status")?;
+    let step_status = PlanStepStatus::from_str_lenient(new_status_str)?;
+    let result_text = args
+        .get("result")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut plan = stable::get_plan(id).ok_or_else(|| format!("plan `{id}` not found"))?;
+    if plan.status != PlanStatus::Active {
+        return Err(format!("plan `{id}` is not active (status={})", plan.status));
+    }
+    let idx = plan.current_step_idx;
+    if idx >= plan.steps.len() {
+        return Err(format!("plan `{id}` has no more steps to advance"));
+    }
+
+    plan.steps[idx].status = step_status.clone();
+    plan.steps[idx].result = result_text;
+
+    let response = if step_status == PlanStepStatus::Completed
+        || step_status == PlanStepStatus::Skipped
+    {
+        let next_idx = idx + 1;
+        if next_idx >= plan.steps.len() {
+            plan.status = PlanStatus::Completed;
+            plan.outcome = Some("all steps completed".to_string());
+            format!("plan `{id}` completed (all steps done)")
+        } else {
+            plan.current_step_idx = next_idx;
+            plan.steps[next_idx].status = PlanStepStatus::InProgress;
+            format!(
+                "plan `{id}` advanced to step {}/{}: {}",
+                next_idx + 1,
+                plan.steps.len(),
+                plan.steps[next_idx].description
+            )
+        }
+    } else {
+        format!(
+            "plan `{id}` step {}/{} marked as {}",
+            idx + 1,
+            plan.steps.len(),
+            step_status
+        )
+    };
+
+    // Optionally update overall plan status if explicitly provided.
+    if let Some(plan_status_str) = args.get("plan_status").and_then(|v| v.as_str()) {
+        let ps = PlanStatus::from_str_lenient(plan_status_str)?;
+        if ps != PlanStatus::Active {
+            plan.status = ps;
+            if let Some(outcome) = args
+                .get("outcome")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                plan.outcome = Some(outcome);
+            }
+        }
+    }
+
+    plan.updated_at_ns = current_time_ns();
+    plan.source_turn_id = turn_id.to_string();
+    stable::set_plan(&plan)?;
+    Ok(response)
+}
+
+fn list_plans_tool(args_json: &str) -> Result<String, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).unwrap_or(serde_json::Value::Object(Default::default()));
+    let status_filter = args
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("active");
+
+    let plans = match status_filter {
+        "all" => stable::list_all_plans(),
+        "active" | "completed" | "abandoned" | "paused" => {
+            sqlite::list_plans_by_status(status_filter, stable::MAX_PLANS).unwrap_or_default()
+        }
+        other => return Err(format!("unknown status filter: {other}")),
+    };
+
+    if plans.is_empty() {
+        return Ok(format!("no {status_filter} plans"));
+    }
+
+    let mut lines = Vec::with_capacity(plans.len());
+    for plan in &plans {
+        lines.push(format!(
+            "- [{}] {} (status={}, step {}/{}, goal={})",
+            plan.id,
+            plan.description,
+            plan.status,
+            plan.current_step_idx + 1,
+            plan.steps.len(),
+            plan.goal_id.as_deref().unwrap_or("none"),
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn schedule_follow_up_tool(args_json: &str, turn_id: &str) -> Result<String, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).map_err(|err| format!("invalid args: {err}"))?;
+    let reason = args
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing or empty reason")?;
+    let plan_id = args
+        .get("plan_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let delay_secs = args
+        .get("delay_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // Build dedupe key
+    let dedupe_key = if let Some(ref pid) = plan_id {
+        format!("AgentTurn:plan-continuation:{pid}:{turn_id}")
+    } else {
+        format!("AgentTurn:plan-continuation:general:{turn_id}")
+    };
+
+    let now_ns = current_time_ns();
+    let scheduled_for_ns = now_ns.saturating_add(delay_secs.saturating_mul(1_000_000_000));
+    let job_id = stable::enqueue_job_if_absent(
+        crate::domain::types::TaskKind::AgentTurn,
+        crate::domain::types::TaskLane::Mutating,
+        dedupe_key,
+        scheduled_for_ns,
+        stable::agent_turn_priority(),
+    );
+
+    match job_id {
+        Some(id) => Ok(format!(
+            "follow-up scheduled: reason={reason}, plan={}, delay={delay_secs}s, job_id={id}",
+            plan_id.as_deref().unwrap_or("none")
+        )),
+        None => Ok(format!(
+            "follow-up already pending for plan={}",
+            plan_id.as_deref().unwrap_or("none")
+        )),
+    }
+}
+
+// ── Memory tools ──────────────────────────────────────────────────────────────
 
 /// Store a key/value fact in stable memory, preserving the original `created_at_ns`
 /// timestamp on updates so the fact's age remains accurate.

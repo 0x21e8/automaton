@@ -13,7 +13,8 @@ use crate::domain::types::{
     AutonomyInferenceSuppressionClassification, AutonomyInferenceSuppressionState, AutonomyPolicy,
     AutonomySuppressionConfig, ConversationEntry, ConversationLog, ConversationSummary,
     CycleTelemetry, DecisionRecord, EvmPollCursor, EvmRouteStateView, ExposureReconciliationStatus,
-    InboxMessage, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState, InboxStats,
+    GoalRecord, InboxMessage, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState, PlanRecord,
+    InboxStats,
     InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
     InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup,
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
@@ -4283,6 +4284,74 @@ pub fn list_skills() -> Vec<SkillRecord> {
 
 pub fn remove_skill(name: &str) -> bool {
     sqlite::delete_skill(name).is_ok()
+}
+
+// ── Goals ─────────────────────────────────────────────────────────────────────
+
+/// Maximum number of goals stored.  Oldest completed/abandoned goals are
+/// evicted when the cap is reached and a new goal is inserted.
+pub const MAX_GOALS: usize = 20;
+
+pub fn set_goal(goal: &GoalRecord) -> Result<(), String> {
+    if goal.id.trim().is_empty() {
+        return Err("goal id must be non-empty".to_string());
+    }
+    if goal.description.trim().is_empty() {
+        return Err("goal description must be non-empty".to_string());
+    }
+    let count = sqlite::count_goals().unwrap_or(0);
+    if count >= MAX_GOALS && sqlite::get_goal(&goal.id).ok().flatten().is_none() {
+        let _ = sqlite::delete_oldest_completed_or_abandoned_goal();
+    }
+    sqlite::upsert_goal(goal)
+}
+
+pub fn get_goal(id: &str) -> Option<GoalRecord> {
+    sqlite::get_goal(id).ok().flatten()
+}
+
+pub fn remove_goal(id: &str) -> bool {
+    sqlite::delete_goal(id).is_ok()
+}
+
+pub fn list_active_goals() -> Vec<GoalRecord> {
+    sqlite::list_goals_by_status("active", MAX_GOALS).unwrap_or_default()
+}
+
+pub fn list_all_goals() -> Vec<GoalRecord> {
+    sqlite::list_all_goals(MAX_GOALS).unwrap_or_default()
+}
+
+// ── Plans ─────────────────────────────────────────────────────────────────────
+
+/// Maximum number of plans stored.  Oldest completed/abandoned plans are
+/// evicted when the cap is reached and a new plan is inserted.
+pub const MAX_PLANS: usize = 10;
+
+pub fn set_plan(plan: &PlanRecord) -> Result<(), String> {
+    if plan.id.trim().is_empty() {
+        return Err("plan id must be non-empty".to_string());
+    }
+    if plan.description.trim().is_empty() {
+        return Err("plan description must be non-empty".to_string());
+    }
+    let count = sqlite::count_plans().unwrap_or(0);
+    if count >= MAX_PLANS && sqlite::get_plan(&plan.id).ok().flatten().is_none() {
+        let _ = sqlite::delete_oldest_terminal_plan();
+    }
+    sqlite::upsert_plan(plan)
+}
+
+pub fn get_plan(id: &str) -> Option<PlanRecord> {
+    sqlite::get_plan(id).ok().flatten()
+}
+
+pub fn list_active_plans() -> Vec<PlanRecord> {
+    sqlite::list_plans_by_status("active", MAX_PLANS).unwrap_or_default()
+}
+
+pub fn list_all_plans() -> Vec<PlanRecord> {
+    sqlite::list_all_plans(MAX_PLANS).unwrap_or_default()
 }
 
 // ── Job queue ─────────────────────────────────────────────────────────────────

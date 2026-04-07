@@ -5,11 +5,11 @@
 
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, ActiveExposure, AutonomyPolicy, ConversationEntry,
-    ConversationLog, DecisionRecord, ExposureReconciliationStatus, InboxMessage, MemoryFact,
-    OutboxMessage, ReflectionMemoryRecord, RuntimeSnapshot, ScheduledJob, SchedulerRuntime,
-    SkillRecord, StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass,
-    TaskKind, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord,
-    TurnRecord,
+    ConversationLog, DecisionRecord, ExposureReconciliationStatus, GoalRecord, InboxMessage,
+    MemoryFact, OutboxMessage, PlanRecord, ReflectionMemoryRecord, RuntimeSnapshot, ScheduledJob,
+    SchedulerRuntime, SkillRecord, StrategyQuarantine, StrategyTemplate, StrategyTemplateKey,
+    SurvivalOperationClass, TaskKind, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
+    TransitionLogRecord, TurnRecord,
 };
 use crate::features::cycle_topup::TopUpStage;
 #[cfg(target_arch = "wasm32")]
@@ -291,11 +291,36 @@ CREATE TABLE IF NOT EXISTS exposure_reconciliation_status (
 );
 "#;
 
+const MIGRATION_006_GOALS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS goals (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'active',
+    priority TEXT NOT NULL DEFAULT 'medium',
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
+CREATE INDEX IF NOT EXISTS idx_goals_updated_at ON goals(updated_at_ns);
+"#;
+
+const MIGRATION_007_PLANS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS plans (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'active',
+    goal_id TEXT,
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status);
+CREATE INDEX IF NOT EXISTS idx_plans_updated_at ON plans(updated_at_ns);
+"#;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
     use super::{
         MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
         MIGRATION_004_REFLECTION_MEMORY_SCHEMA, MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA,
+        MIGRATION_006_GOALS_SCHEMA, MIGRATION_007_PLANS_SCHEMA,
     };
     use rusqlite::{params, Connection};
     use std::cell::RefCell;
@@ -350,6 +375,10 @@ mod backend {
             .map_err(|err| err.to_string())?;
         conn.execute_batch(MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA)
             .map_err(|err| err.to_string())?;
+        conn.execute_batch(MIGRATION_006_GOALS_SCHEMA)
+            .map_err(|err| err.to_string())?;
+        conn.execute_batch(MIGRATION_007_PLANS_SCHEMA)
+            .map_err(|err| err.to_string())?;
         let version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -358,7 +387,7 @@ mod backend {
             )
             .map_err(|err| err.to_string())?;
         let now = crate::timing::current_time_ns() as i64;
-        for v in (version + 1)..=5 {
+        for v in (version + 1)..=6 {
             conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
                 params![v, now],
@@ -374,6 +403,7 @@ mod backend {
     use super::{
         MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
         MIGRATION_004_REFLECTION_MEMORY_SCHEMA, MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA,
+        MIGRATION_006_GOALS_SCHEMA, MIGRATION_007_PLANS_SCHEMA,
     };
 
     pub type SqlResult<T> = Result<T, String>;
@@ -390,6 +420,10 @@ mod backend {
                 .map_err(|err| err.to_string())?;
             conn.execute_batch(MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA)
                 .map_err(|err| err.to_string())?;
+            conn.execute_batch(MIGRATION_006_GOALS_SCHEMA)
+                .map_err(|err| err.to_string())?;
+            conn.execute_batch(MIGRATION_007_PLANS_SCHEMA)
+                .map_err(|err| err.to_string())?;
             let version: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -398,7 +432,7 @@ mod backend {
                 )
                 .map_err(|err| err.to_string())?;
             let now = crate::timing::current_time_ns() as i64;
-            for v in (version + 1)..=5 {
+            for v in (version + 1)..=6 {
                 conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
                     [v, now],
@@ -1072,6 +1106,261 @@ pub fn delete_skill(name: &str) -> Result<(), String> {
         Ok(())
     })
 }
+
+// ── Goals ─────────────────────────────────────────────────────────────────────
+
+pub fn upsert_goal(goal: &GoalRecord) -> Result<(), String> {
+    let payload_json = row_payload(goal)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO goals(id, status, priority, updated_at_ns, payload_json) VALUES(?1, ?2, ?3, ?4, ?5)",
+            (
+                goal.id.trim(),
+                goal.status.to_string(),
+                goal.priority.as_str(),
+                goal.updated_at_ns as i64,
+                payload_json,
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn get_goal(id: &str) -> Result<Option<GoalRecord>, String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM goals WHERE id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([trimmed], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn delete_goal(id: &str) -> Result<(), String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM goals WHERE id = ?1", [trimmed])
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn list_goals_by_status(status: &str, limit: usize) -> Result<Vec<GoalRecord>, String> {
+    let keep = bounded_limit(limit, 50, 100);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM goals WHERE status = ?1 ORDER BY updated_at_ns DESC LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([status, &(keep as i64).to_string()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn list_all_goals(limit: usize) -> Result<Vec<GoalRecord>, String> {
+    let keep = bounded_limit(limit, 50, 100);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM goals ORDER BY
+                 CASE status WHEN 'active' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END,
+                 updated_at_ns DESC
+                 LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn count_goals() -> Result<usize, String> {
+    backend::with_connection(|conn| {
+        let count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM goals", [], |row| row.get(0))
+            .map_err(|err| err.to_string())?;
+        Ok(count as usize)
+    })
+}
+
+pub fn count_goals_by_status(status: &str) -> Result<usize, String> {
+    backend::with_connection(|conn| {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM goals WHERE status = ?1",
+                [status],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(count as usize)
+    })
+}
+
+pub fn delete_oldest_completed_or_abandoned_goal() -> Result<bool, String> {
+    backend::with_connection(|conn| {
+        let deleted = conn
+            .execute(
+                "DELETE FROM goals WHERE id = (
+                    SELECT id FROM goals
+                    WHERE status IN ('completed', 'abandoned')
+                    ORDER BY updated_at_ns ASC
+                    LIMIT 1
+                )",
+                [],
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(deleted > 0)
+    })
+}
+
+// ── Plans ─────────────────────────────────────────────────────────────────────
+
+pub fn upsert_plan(plan: &PlanRecord) -> Result<(), String> {
+    let payload_json = row_payload(plan)?;
+    backend::with_connection(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO plans(id, status, goal_id, updated_at_ns, payload_json) VALUES(?1, ?2, ?3, ?4, ?5)",
+            (
+                plan.id.trim(),
+                plan.status.to_string(),
+                plan.goal_id.as_deref().unwrap_or(""),
+                plan.updated_at_ns as i64,
+                payload_json,
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn get_plan(id: &str) -> Result<Option<PlanRecord>, String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM plans WHERE id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = stmt
+            .query_map([trimmed], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        match rows.next() {
+            Some(row) => from_payload_json(row.map_err(|err| err.to_string())?).map(Some),
+            None => Ok(None),
+        }
+    })
+}
+
+pub fn delete_plan(id: &str) -> Result<(), String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    backend::with_connection(|conn| {
+        conn.execute("DELETE FROM plans WHERE id = ?1", [trimmed])
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    })
+}
+
+pub fn list_plans_by_status(status: &str, limit: usize) -> Result<Vec<PlanRecord>, String> {
+    let keep = bounded_limit(limit, 50, 100);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM plans WHERE status = ?1 ORDER BY updated_at_ns DESC LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([status, &(keep as i64).to_string()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn list_all_plans(limit: usize) -> Result<Vec<PlanRecord>, String> {
+    let keep = bounded_limit(limit, 50, 100);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM plans ORDER BY
+                 CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 WHEN 'completed' THEN 2 ELSE 3 END,
+                 updated_at_ns DESC
+                 LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(records)
+    })
+}
+
+pub fn count_plans() -> Result<usize, String> {
+    backend::with_connection(|conn| {
+        let count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM plans", [], |row| row.get(0))
+            .map_err(|err| err.to_string())?;
+        Ok(count as usize)
+    })
+}
+
+pub fn delete_oldest_terminal_plan() -> Result<bool, String> {
+    backend::with_connection(|conn| {
+        let deleted = conn
+            .execute(
+                "DELETE FROM plans WHERE id = (
+                    SELECT id FROM plans
+                    WHERE status IN ('completed', 'abandoned')
+                    ORDER BY updated_at_ns ASC
+                    LIMIT 1
+                )",
+                [],
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(deleted > 0)
+    })
+}
+
+// ── Strategy templates ────────────────────────────────────────────────────────
 
 pub fn upsert_strategy_template(template: &StrategyTemplate) -> Result<(), String> {
     let payload_json = row_payload(template)?;
@@ -3071,7 +3360,7 @@ mod tests {
     fn migrations_reach_version_one() {
         close_storage().expect("close before migration test");
         init_storage().expect("init sqlite");
-        assert_eq!(schema_version().expect("schema version"), 5);
+        assert_eq!(schema_version().expect("schema version"), 6);
     }
 
     #[test]

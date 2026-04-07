@@ -82,6 +82,7 @@ const HEALTHY_AUTONOMY_NOOP_STREAK_CONTEXT_LIMIT: usize = 10;
 pub enum ScheduledTurnTrigger {
     Periodic,
     InferenceProxyResume,
+    PlanContinuation,
 }
 
 // ── Log types ────────────────────────────────────────────────────────────────
@@ -254,6 +255,8 @@ impl AutonomyRuntimeConstraint {
                 reason: self.machine_reason.to_string(),
             },
             explanation: self.explanation(),
+            next_steps: None,
+            confidence: None,
         }
     }
 }
@@ -314,13 +317,16 @@ fn autonomy_exploration_state_for_turn(
     has_external_input: bool,
     runtime_constraint: Option<&AutonomyRuntimeConstraint>,
 ) -> AutonomyExplorationState {
-    if trigger != ScheduledTurnTrigger::Periodic || has_external_input || runtime_constraint.is_some()
+    if trigger != ScheduledTurnTrigger::Periodic
+        || has_external_input
+        || runtime_constraint.is_some()
     {
         return AutonomyExplorationState::default();
     }
 
-    let quiet_noop_streak =
-        quiet_scheduled_noop_streak(&stable::list_recent_decisions(HEALTHY_AUTONOMY_NOOP_STREAK_CONTEXT_LIMIT));
+    let quiet_noop_streak = quiet_scheduled_noop_streak(&stable::list_recent_decisions(
+        HEALTHY_AUTONOMY_NOOP_STREAK_CONTEXT_LIMIT,
+    ));
     AutonomyExplorationState {
         active: true,
         quiet_noop_streak,
@@ -467,6 +473,21 @@ fn summarize_tool_call(call: &ToolCallRecord) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(call.output.as_str());
     format!("`{}` failed: {}", call.tool, sanitize_preview(reason, 220))
+}
+
+fn tool_record_counts_as_bounded_exploration_action(record: &ToolCallRecord) -> bool {
+    record.success && record.outcome == ToolCallOutcome::Executed && record.tool != "record_signal"
+}
+
+fn exploration_action_summary_from_tool_records(records: &[ToolCallRecord]) -> Option<String> {
+    records
+        .iter()
+        .rev()
+        .find(|record| tool_record_counts_as_bounded_exploration_action(record))
+        .map(|record| match record.tool.as_str() {
+            "post_room_message" => "post_room_message".to_string(),
+            _ => record.tool.clone(),
+        })
 }
 
 /// Formats non-recoverable tool failures into a compact, machine-readable
@@ -2088,6 +2109,7 @@ fn decision_trigger_for_turn(
     match trigger {
         ScheduledTurnTrigger::Periodic => DecisionTrigger::ScheduledReview,
         ScheduledTurnTrigger::InferenceProxyResume => DecisionTrigger::RecoveryFollowUp,
+        ScheduledTurnTrigger::PlanContinuation => DecisionTrigger::PlanContinuation,
     }
 }
 
@@ -2133,6 +2155,8 @@ fn autonomy_noop_envelope_for_inference_defer(
             reason: noop_reason.to_string(),
         },
         explanation: explanation.to_string(),
+        next_steps: None,
+        confidence: None,
     })
 }
 
@@ -2168,6 +2192,8 @@ fn autonomy_noop_envelope_for_inference_error(
             "autonomy inference failed before decision generation: {}",
             sanitize_preview(error, 180)
         ),
+        next_steps: None,
+        confidence: None,
     }
 }
 
@@ -2187,6 +2213,8 @@ fn autonomy_noop_envelope_for_provider_rejection_suppression(
             "autonomy inference suppressed after repeated provider rejection failures: repeat_count={} cooldown_remaining_secs={}",
             repeat_count, remaining_secs
         ),
+        next_steps: None,
+        confidence: None,
     }
 }
 
@@ -2204,6 +2232,34 @@ fn normalize_decision_envelope_for_runtime_constraint(
         envelope.explanation = runtime_constraint.explanation();
     }
 
+    envelope
+}
+
+fn normalize_decision_envelope_for_exploration_action(
+    mut envelope: AutonomyDecisionEnvelope,
+    exploration_state: AutonomyExplorationState,
+    tool_records: &[ToolCallRecord],
+) -> AutonomyDecisionEnvelope {
+    if !exploration_state.active {
+        return envelope;
+    }
+
+    let DecisionEnvelopeOutcome::NoOp { .. } = envelope.outcome else {
+        return envelope;
+    };
+
+    let Some(action_summary) = exploration_action_summary_from_tool_records(tool_records) else {
+        return envelope;
+    };
+
+    let prior_explanation = envelope.explanation.clone();
+    envelope.outcome = DecisionEnvelopeOutcome::Executed {
+        action_summary: action_summary.clone(),
+    };
+    envelope.explanation = format!(
+        "{} Healthy-runway exploration completed `{}` successfully, so the terminal outcome was normalized from NoOp to Executed.",
+        prior_explanation, action_summary
+    );
     envelope
 }
 
@@ -2263,7 +2319,8 @@ fn parse_autonomy_decision_envelope(
     raw: &str,
     expected_trigger: &DecisionTrigger,
 ) -> Result<AutonomyDecisionEnvelope, String> {
-    let trimmed = raw.trim();
+    let normalized = unwrap_markdown_code_fence(raw);
+    let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return Err("decision envelope output was empty".to_string());
     }
@@ -2278,6 +2335,23 @@ fn parse_autonomy_decision_envelope(
     };
     validate_decision_envelope(&envelope, expected_trigger)?;
     Ok(envelope)
+}
+
+fn unwrap_markdown_code_fence(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Some(without_opening) = trimmed.strip_prefix("```") else {
+        return trimmed.to_string();
+    };
+    let Some(without_closing) = without_opening.trim_end().strip_suffix("```") else {
+        return trimmed.to_string();
+    };
+    let fenced_body = without_closing.trim();
+    if let Some((first_line, rest)) = fenced_body.split_once('\n') {
+        if !first_line.contains('{') && !first_line.contains('[') {
+            return rest.trim().to_string();
+        }
+    }
+    fenced_body.to_string()
 }
 
 fn parse_legacy_autonomy_decision_envelope(
@@ -2308,11 +2382,21 @@ fn parse_legacy_autonomy_decision_envelope(
         .and_then(JsonValue::as_str)
         .ok_or_else(|| "missing field `explanation`".to_string())?
         .to_string();
+    let next_steps = object
+        .get("next_steps")
+        .and_then(JsonValue::as_str)
+        .map(|s| s.to_string());
+    let confidence = object
+        .get("confidence")
+        .and_then(JsonValue::as_str)
+        .map(|s| s.to_string());
     Ok(AutonomyDecisionEnvelope {
         trigger,
         candidates_summary,
         outcome,
         explanation,
+        next_steps,
+        confidence,
     })
 }
 
@@ -2598,6 +2682,8 @@ fn build_dynamic_context_with_scope(
         build_conversation_context(staged_messages, conversation_history_limit),
         memory_section,
     ];
+    sections.push(build_active_goals_section());
+    sections.push(build_active_plans_section());
     sections.push(render_autonomy_exploration_section(exploration_state));
     if let Some(runtime_constraint) = runtime_constraint {
         sections.push(render_autonomy_runtime_constraints_section(
@@ -2613,6 +2699,48 @@ fn build_dynamic_context_with_scope(
     sections.join("\n\n")
 }
 
+fn build_active_goals_section() -> String {
+    let goals = stable::list_active_goals();
+    if goals.is_empty() {
+        return "### Active Goals\n- none — use `set_goal` to define what you are working toward"
+            .to_string();
+    }
+    let mut lines = vec!["### Active Goals".to_string()];
+    for goal in &goals {
+        lines.push(format!(
+            "- [{}] (priority={}) {}: success_criteria={}",
+            goal.id, goal.priority, goal.description, goal.success_criteria
+        ));
+    }
+    lines.join("\n")
+}
+
+fn build_active_plans_section() -> String {
+    let plans = stable::list_active_plans();
+    if plans.is_empty() {
+        return "### Active Plans\n- none — use `create_plan` to decompose a goal into steps"
+            .to_string();
+    }
+    let mut lines = vec!["### Active Plans".to_string()];
+    for plan in &plans {
+        let current_step_desc = plan
+            .steps
+            .get(plan.current_step_idx)
+            .map(|s| s.description.as_str())
+            .unwrap_or("?");
+        lines.push(format!(
+            "- [{}] {} (step {}/{}: {}, goal={})",
+            plan.id,
+            plan.description,
+            plan.current_step_idx + 1,
+            plan.steps.len(),
+            current_step_desc,
+            plan.goal_id.as_deref().unwrap_or("none"),
+        ));
+    }
+    lines.join("\n")
+}
+
 fn render_autonomy_exploration_section(exploration_state: AutonomyExplorationState) -> String {
     let mut lines = vec![
         "### Autonomy Exploration".to_string(),
@@ -2624,10 +2752,13 @@ fn render_autonomy_exploration_section(exploration_state: AutonomyExplorationSta
     ];
     if exploration_state.should_request_bounded_action() {
         lines.push(
-            "- directive: before final NoOp, perform at least one bounded discovery, validation, or coordination action using the available tools.".to_string(),
+            "- directive: review your active goals and take at least one bounded step toward the highest-priority goal. If no goal has an actionable step, explore to create one. If you have no goals, use `set_goal` to propose one based on your capabilities and current state.".to_string(),
         );
     }
-    lines.push(format!("- explanation: {}", exploration_state.explanation()));
+    lines.push(format!(
+        "- explanation: {}",
+        exploration_state.explanation()
+    ));
     lines.join("\n")
 }
 
@@ -3892,6 +4023,8 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                                                 "decision envelope invalid after two attempts: {}",
                                                 sanitize_preview(&retry_error, 180)
                                             ),
+                                            next_steps: None,
+                                            confidence: None,
                                         });
                                     }
                                 }
@@ -3920,6 +4053,8 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                                             "decision envelope invalid after two attempts: {}",
                                             sanitize_preview(&retry_error, 180)
                                         ),
+                                        next_steps: None,
+                                        confidence: None,
                                     });
                                 }
                             }
@@ -3932,17 +4067,36 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             }
 
             if last_error.is_none() {
+                let raw_envelope = decision_envelope.unwrap_or_else(|| AutonomyDecisionEnvelope {
+                    trigger: decision_trigger.clone(),
+                    candidates_summary: "scheduled review completed".to_string(),
+                    outcome: DecisionEnvelopeOutcome::NoOp {
+                        reason: "invalid_decision_shape".to_string(),
+                    },
+                    explanation: "missing autonomy decision envelope".to_string(),
+                    next_steps: None,
+                    confidence: None,
+                });
                 let envelope = normalize_decision_envelope_for_runtime_constraint(
-                    decision_envelope.unwrap_or_else(|| AutonomyDecisionEnvelope {
-                        trigger: decision_trigger.clone(),
-                        candidates_summary: "scheduled review completed".to_string(),
-                        outcome: DecisionEnvelopeOutcome::NoOp {
-                            reason: "invalid_decision_shape".to_string(),
-                        },
-                        explanation: "missing autonomy decision envelope".to_string(),
-                    }),
+                    normalize_decision_envelope_for_exploration_action(
+                        raw_envelope.clone(),
+                        exploration_state,
+                        &all_tool_calls,
+                    ),
                     autonomy_runtime_constraint.as_ref(),
                 );
+                if matches!(raw_envelope.outcome, DecisionEnvelopeOutcome::NoOp { .. }) {
+                    if let DecisionEnvelopeOutcome::Executed { action_summary } = &envelope.outcome
+                    {
+                        append_inner_dialogue(
+                            &mut inner_dialogue,
+                            &format!(
+                                "autonomy decision normalized: healthy exploration recorded `{}` as Executed instead of final NoOp",
+                                action_summary
+                            ),
+                        );
+                    }
+                }
                 let decision_record = decision_record_from_envelope(
                     &turn_id,
                     current_time_ns(),
@@ -5187,6 +5341,61 @@ mod tests {
     }
 
     #[test]
+    fn exploration_noop_with_successful_tool_is_normalized_to_executed() {
+        let envelope = AutonomyDecisionEnvelope {
+            trigger: DecisionTrigger::ScheduledReview,
+            candidates_summary: "explored template".to_string(),
+            outcome: DecisionEnvelopeOutcome::NoOp {
+                reason: "watchful".to_string(),
+            },
+            explanation: "posted coordination update after exploration".to_string(),
+            next_steps: None,
+            confidence: None,
+        };
+        let tool_records = vec![
+            ToolCallRecord {
+                turn_id: "turn-1".to_string(),
+                tool: "record_signal".to_string(),
+                args_json: r#"{"signal":"exploration"}"#.to_string(),
+                output: "ok".to_string(),
+                success: true,
+                outcome: ToolCallOutcome::Executed,
+                error: None,
+                failure_kind: None,
+            },
+            ToolCallRecord {
+                turn_id: "turn-1".to_string(),
+                tool: "post_room_message".to_string(),
+                args_json: r#"{"body":"opportunity note"}"#.to_string(),
+                output: "ok".to_string(),
+                success: true,
+                outcome: ToolCallOutcome::Executed,
+                error: None,
+                failure_kind: None,
+            },
+        ];
+
+        let normalized = normalize_decision_envelope_for_exploration_action(
+            envelope,
+            AutonomyExplorationState {
+                active: true,
+                quiet_noop_streak: 2,
+            },
+            &tool_records,
+        );
+
+        assert_eq!(
+            normalized.outcome,
+            DecisionEnvelopeOutcome::Executed {
+                action_summary: "post_room_message".to_string(),
+            }
+        );
+        assert!(normalized
+            .explanation
+            .contains("normalized from NoOp to Executed"));
+    }
+
+    #[test]
     fn invalid_autonomy_decision_shape_retries_then_noops() {
         reset_runtime(AgentState::Sleeping, true, false, 0);
         stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
@@ -5251,6 +5460,29 @@ mod tests {
             envelope.outcome,
             DecisionEnvelopeOutcome::Executed {
                 action_summary: "enter_supply on moonwell-v2/base-moonwell-usdc-reserve-01 amount_usdc=1000000 tx=0x5aa1952db4bd1edb2a13e76c87cf9f46a6c70801d2fccdbf96c70575774c9eb7".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_autonomy_decision_envelope_accepts_fenced_json_payload() {
+        let raw = r#"```json
+{
+  "trigger":"ScheduledReview",
+  "candidates_summary":"completed bounded discovery",
+  "outcome":{"Executed":{"action_summary":"market_fetch"}},
+  "explanation":"verified market data"
+}
+```"#;
+
+        let envelope = parse_autonomy_decision_envelope(raw, &DecisionTrigger::ScheduledReview)
+            .expect("fenced decision envelope should parse");
+
+        assert_eq!(envelope.trigger, DecisionTrigger::ScheduledReview);
+        assert_eq!(
+            envelope.outcome,
+            DecisionEnvelopeOutcome::Executed {
+                action_summary: "market_fetch".to_string(),
             }
         );
     }
