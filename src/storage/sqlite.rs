@@ -21,6 +21,8 @@ use serde_json::{Map as JsonMap, Number as JsonNumber};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+const CURRENT_SCHEMA_VERSION: i64 = 8;
+
 const MIGRATION_001_BASE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -354,10 +356,10 @@ CREATE INDEX IF NOT EXISTS idx_strategy_discovery_completed_callback_jobs_accept
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
     use super::{
-        MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
-        MIGRATION_004_REFLECTION_MEMORY_SCHEMA, MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA,
-        MIGRATION_006_GOALS_SCHEMA, MIGRATION_007_PLANS_SCHEMA,
-        MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA,
+        CURRENT_SCHEMA_VERSION, MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA,
+        MIGRATION_003_REMAINING_SCHEMA, MIGRATION_004_REFLECTION_MEMORY_SCHEMA,
+        MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA, MIGRATION_006_GOALS_SCHEMA,
+        MIGRATION_007_PLANS_SCHEMA, MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA,
     };
     use rusqlite::{params, Connection};
     use std::cell::RefCell;
@@ -426,7 +428,7 @@ mod backend {
             )
             .map_err(|err| err.to_string())?;
         let now = crate::timing::current_time_ns() as i64;
-        for v in (version + 1)..=8 {
+        for v in (version + 1)..=CURRENT_SCHEMA_VERSION {
             conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
                 params![v, now],
@@ -440,10 +442,10 @@ mod backend {
 #[cfg(target_arch = "wasm32")]
 mod backend {
     use super::{
-        MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA, MIGRATION_003_REMAINING_SCHEMA,
-        MIGRATION_004_REFLECTION_MEMORY_SCHEMA, MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA,
-        MIGRATION_006_GOALS_SCHEMA, MIGRATION_007_PLANS_SCHEMA,
-        MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA,
+        CURRENT_SCHEMA_VERSION, MIGRATION_001_BASE_SCHEMA, MIGRATION_002_HOT_STATE_SCHEMA,
+        MIGRATION_003_REMAINING_SCHEMA, MIGRATION_004_REFLECTION_MEMORY_SCHEMA,
+        MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA, MIGRATION_006_GOALS_SCHEMA,
+        MIGRATION_007_PLANS_SCHEMA, MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA,
     };
 
     pub type SqlResult<T> = Result<T, String>;
@@ -474,7 +476,7 @@ mod backend {
                 )
                 .map_err(|err| err.to_string())?;
             let now = crate::timing::current_time_ns() as i64;
-            for v in (version + 1)..=8 {
+            for v in (version + 1)..=CURRENT_SCHEMA_VERSION {
                 conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?1, ?2)",
                     [v, now],
@@ -3660,7 +3662,10 @@ mod tests {
     fn migrations_reach_version_one() {
         close_storage().expect("close before migration test");
         init_storage().expect("init sqlite");
-        assert_eq!(schema_version().expect("schema version"), 6);
+        assert_eq!(
+            schema_version().expect("schema version"),
+            CURRENT_SCHEMA_VERSION as u64
+        );
     }
 
     #[test]

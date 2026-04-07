@@ -130,6 +130,45 @@ struct RetentionConfig {
     maintenance_interval_secs: u64,
 }
 
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ReservePolicy {
+    min_cycles_runway_hours: u64,
+    min_inference_usdc_6dp: Option<u64>,
+    min_gas_wei: Option<u128>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct RiskLimits {
+    max_total_exposure_bps: u16,
+    max_single_action_bps: u16,
+    max_protocol_concentration_bps: u16,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ExecutionAuthority {
+    autonomous_execution_enabled: bool,
+    require_simulation_first: bool,
+    per_action_value_limit_wei: Option<u128>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct EscalationRules {
+    escalate_on_missing_policy: bool,
+    escalate_on_authority_exceeded: bool,
+    escalate_on_repeated_failure: bool,
+    failure_quarantine_threshold: u32,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct AutonomyPolicy {
+    version: u32,
+    reserve_policy: ReservePolicy,
+    risk_limits: RiskLimits,
+    execution_authority: ExecutionAuthority,
+    escalation_rules: EscalationRules,
+    updated_at_ns: u64,
+}
+
 fn assert_wasm_artifact_present() -> Vec<u8> {
     for path in WASM_PATHS {
         if Path::new(path).exists() {
@@ -301,6 +340,28 @@ fn get_scheduler_view(pic: &PocketIc, canister_id: Principal) -> SchedulerRuntim
         canister_id,
         "get_scheduler_view",
         encode_args(()).expect("failed to encode empty args"),
+    )
+}
+
+fn get_autonomy_policy(pic: &PocketIc, canister_id: Principal) -> AutonomyPolicy {
+    call_query(
+        pic,
+        canister_id,
+        "get_autonomy_policy",
+        encode_args(()).expect("failed to encode get_autonomy_policy args"),
+    )
+}
+
+fn update_autonomy_policy(
+    pic: &PocketIc,
+    canister_id: Principal,
+    policy: AutonomyPolicy,
+) -> Result<AutonomyPolicy, String> {
+    call_update(
+        pic,
+        canister_id,
+        "update_autonomy_policy",
+        encode_args((policy,)).expect("failed to encode update_autonomy_policy args"),
     )
 }
 
@@ -659,6 +720,11 @@ fn placeholder_agent_turn_lease_ttl_covers_longer_continuation_runtime() {
     configure_only_agent_turn(&pic, canister_id, 60);
     set_inference_provider(&pic, canister_id, InferenceProvider::OpenRouter);
     set_openrouter_api_key(&pic, canister_id, Some("test-api-key".to_string()));
+    let mut policy = get_autonomy_policy(&pic, canister_id);
+    policy.reserve_policy.min_cycles_runway_hours = 0;
+    policy.reserve_policy.min_inference_usdc_6dp = None;
+    policy.reserve_policy.min_gas_wei = None;
+    update_autonomy_policy(&pic, canister_id, policy).expect("policy update should succeed");
     pic.advance_time(Duration::from_secs(61));
 
     pic.tick();

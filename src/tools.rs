@@ -21,9 +21,9 @@
 /// | `MAX_MEMORY_RECALL_RESULTS`     | 50     |
 /// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
-    AbiTypeSpec, ActiveExposure, AgentState, AutonomyPolicy, ExecutionPlan, GoalRecord, GoalStatus,
-    InferenceToolScope, MemoryFact, PlanRecord, PlanStatus, PlanStep, PlanStepStatus,
-    PostRoomMessageRequest, PromptLayer, RoomContentType, StrategyExecutionIntent,
+    AbiTypeSpec, ActiveExposure, AgentState, AutonomyPolicy, CycleTelemetry, ExecutionPlan,
+    GoalRecord, GoalStatus, InferenceToolScope, MemoryFact, PlanRecord, PlanStatus, PlanStep,
+    PlanStepStatus, PostRoomMessageRequest, PromptLayer, RoomContentType, StrategyExecutionIntent,
     StrategyQuarantine, StrategyTemplateKey, SurvivalOperationClass, ToolCall, ToolCallOutcome,
     ToolCallRecord, ToolFailureKind,
 };
@@ -3246,9 +3246,10 @@ fn enforce_reserve_floors(policy: &AutonomyPolicy) -> Result<(), String> {
     if cycles.total_cycles > 0 && cycles.liquid_cycles > 0 {
         if let Some(estimated_seconds) = cycles.estimated_seconds_until_freezing_threshold {
             if u128::from(estimated_seconds) < min_cycles_runway_secs {
-                return Err(format!(
-                    "execute_strategy_action blocked: reserve_cycles_runway_below_floor:{}",
-                    min_cycles_runway_secs
+                return Err(format_cycles_runway_below_floor(
+                    &cycles,
+                    min_cycles_runway_secs,
+                    u128::from(estimated_seconds),
                 ));
             }
         } else if let Some(burn_rate_cycles_per_hour) = cycles.burn_rate_cycles_per_hour {
@@ -3258,9 +3259,10 @@ fn enforce_reserve_floors(policy: &AutonomyPolicy) -> Result<(), String> {
                     .saturating_mul(3_600)
                     .saturating_div(burn_rate_cycles_per_hour);
                 if estimated_seconds < min_cycles_runway_secs {
-                    return Err(format!(
-                        "execute_strategy_action blocked: reserve_cycles_runway_below_floor:{}",
-                        min_cycles_runway_secs
+                    return Err(format_cycles_runway_below_floor(
+                        &cycles,
+                        min_cycles_runway_secs,
+                        estimated_seconds,
                     ));
                 }
             }
@@ -3295,6 +3297,21 @@ fn enforce_reserve_floors(policy: &AutonomyPolicy) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn format_cycles_runway_below_floor(
+    cycles: &CycleTelemetry,
+    min_cycles_runway_secs: u128,
+    estimated_seconds: u128,
+) -> String {
+    format!(
+        "execute_strategy_action blocked: reserve_cycles_runway_below_floor:min_required_seconds={min_cycles_runway_secs},estimated_seconds={estimated_seconds},liquid_cycles={},burn_rate_cycles_per_hour={},window_duration_seconds={},window_sample_count={},moving_window_seconds={}",
+        cycles.liquid_cycles,
+        cycles.burn_rate_cycles_per_hour.unwrap_or_default(),
+        cycles.window_duration_seconds,
+        cycles.window_sample_count,
+        cycles.moving_window_seconds
+    )
 }
 
 fn enforce_concentration_gate(
@@ -4362,9 +4379,56 @@ mod tests {
         TimeOverrideGuard
     }
 
+    fn set_host_cycle_balances(total_cycles: u128, liquid_cycles: u128) {
+        crate::storage::sqlite::set_runtime_scalar("host.total_cycles", &total_cycles.to_string())
+            .expect("host total cycles should persist");
+        crate::storage::sqlite::set_runtime_scalar(
+            "host.liquid_cycles",
+            &liquid_cycles.to_string(),
+        )
+        .expect("host liquid cycles should persist");
+    }
+
     fn test_factory_principal() -> candid::Principal {
         candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
             .expect("test principal should parse")
+    }
+
+    #[test]
+    fn reserve_cycles_gate_reports_triggering_telemetry() {
+        stable::init_storage();
+
+        {
+            let _time_guard = with_fixed_time_ns(1_000_000_000);
+            set_host_cycle_balances(5_000, 600);
+            let _ = stable::observability_snapshot(1);
+        }
+        {
+            let _time_guard = with_fixed_time_ns(7_000_000_000);
+            set_host_cycle_balances(5_000, 300);
+            let _ = stable::observability_snapshot(1);
+        }
+        {
+            let _time_guard = with_fixed_time_ns(13_000_000_000);
+            set_host_cycle_balances(5_000, 200);
+            let _ = stable::observability_snapshot(1);
+        }
+
+        let mut policy = AutonomyPolicy::conservative_default(13_000_000_000);
+        policy.reserve_policy.min_cycles_runway_hours = 1;
+
+        let error = {
+            let _time_guard = with_fixed_time_ns(13_000_000_000);
+            enforce_reserve_floors(&policy).expect_err("runway below floor should block")
+        };
+
+        assert!(error.contains("reserve_cycles_runway_below_floor:min_required_seconds=3600"));
+        assert!(error.contains("estimated_seconds=6"));
+        assert!(error.contains("liquid_cycles=200"));
+        assert!(error.contains("burn_rate_cycles_per_hour=120000"));
+        assert!(error.contains("window_duration_seconds=12"));
+        assert!(error.contains("window_sample_count=3"));
+        assert!(error.contains("moving_window_seconds=18"));
     }
 
     fn configure_factory_room_access() {

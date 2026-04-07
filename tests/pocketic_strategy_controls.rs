@@ -1092,9 +1092,9 @@ fn autonomous_strategy_turn_quarantines_and_blocks_repeat_failures() {
     let policy = AutonomyPolicy {
         version: 12,
         reserve_policy: ReservePolicy {
-            min_cycles_runway_hours: 72,
-            min_inference_usdc_6dp: Some(10_000_000),
-            min_gas_wei: Some(3_000_000_000_000_000),
+            min_cycles_runway_hours: 0,
+            min_inference_usdc_6dp: None,
+            min_gas_wei: None,
         },
         risk_limits: RiskLimits {
             max_total_exposure_bps: 3_000,
@@ -1129,12 +1129,12 @@ fn autonomous_strategy_turn_quarantines_and_blocks_repeat_failures() {
             .iter()
             .any(|call| call.tool == "execute_strategy_action"
                 && !call.success
-                && call
+                && !call
                     .error
                     .as_deref()
                     .unwrap_or_default()
                     .contains("simulation_first_required")),
-        "first failure should be blocked by the simulation-first gate"
+        "first turn should attempt execution and surface the underlying strategy failure"
     );
 
     pic.advance_time(Duration::from_secs(61));

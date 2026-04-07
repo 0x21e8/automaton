@@ -2595,18 +2595,33 @@ mod tests {
             "stale steward parity mappings without controller-gated update methods: {stale_mappings:?}"
         );
 
-        let command_labels_from_match: BTreeSet<&str> = lines
-            .iter()
-            .filter_map(|line| {
-                let line = line.trim();
-                if !line.starts_with("StewardCommand::") || !line.contains("=> \"") {
-                    return None;
+        let mut command_labels_from_match = BTreeSet::new();
+        for (idx, line) in lines.iter().enumerate() {
+            let line = line.trim();
+            if !line.starts_with("StewardCommand::") {
+                continue;
+            }
+
+            for look_ahead in 0..=3 {
+                let Some(candidate) = lines.get(idx + look_ahead) else {
+                    break;
+                };
+                let candidate = candidate.trim();
+                if let Some((_, rhs)) = candidate.split_once("=> \"") {
+                    if let Some((label, _)) = rhs.split_once('"') {
+                        command_labels_from_match.insert(label);
+                        break;
+                    }
                 }
-                let (_, rhs) = line.split_once("=> \"")?;
-                let (label, _) = rhs.split_once('"')?;
-                Some(label)
-            })
-            .collect();
+
+                if let Some(stripped) = candidate.strip_prefix('"') {
+                    if let Some((label, _)) = stripped.split_once('"') {
+                        command_labels_from_match.insert(label);
+                        break;
+                    }
+                }
+            }
+        }
         let unknown_labels: Vec<String> = method_to_command_label
             .iter()
             .filter_map(|(method, label)| {

@@ -5435,14 +5435,11 @@ fn calculate_liquid_burn_cycles_per_sec(samples: &[CycleBalanceSample]) -> Optio
         return None;
     }
 
-    let burned_cycles = samples.windows(2).fold(0u128, |acc, pair| {
-        let prev = &pair[0];
-        let next = &pair[1];
-        if next.captured_at_ns <= prev.captured_at_ns {
-            return acc;
-        }
-        acc.saturating_add(prev.liquid_cycles.saturating_sub(next.liquid_cycles))
-    });
+    // Use the net window delta rather than summing every transient dip.
+    // Liquid cycles can bounce within the window, and counting each downward
+    // step while ignoring recoveries inflates burn estimates enough to trip
+    // reserve gates spuriously.
+    let burned_cycles = first.liquid_cycles.saturating_sub(last.liquid_cycles);
 
     if burned_cycles == 0 {
         return None;
@@ -5822,9 +5819,79 @@ pub fn insert_dedupe_for_tests(_dedupe_key: String, _job_id: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timing;
+
+    struct TimeOverrideGuard;
+
+    impl Drop for TimeOverrideGuard {
+        fn drop(&mut self) {
+            timing::clear_test_time_ns();
+        }
+    }
+
+    fn with_fixed_time_ns(now_ns: u64) -> TimeOverrideGuard {
+        timing::set_test_time_ns(now_ns);
+        TimeOverrideGuard
+    }
 
     fn trusted_test_principal() -> Principal {
         Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai").expect("test principal should parse")
+    }
+
+    #[test]
+    fn liquid_burn_rate_ignores_transient_liquid_cycle_dips() {
+        let samples = vec![
+            CycleBalanceSample {
+                captured_at_ns: 1_000_000_000,
+                total_cycles: 5_000,
+                liquid_cycles: 1_200,
+            },
+            CycleBalanceSample {
+                captured_at_ns: 7_000_000_000,
+                total_cycles: 5_000,
+                liquid_cycles: 600,
+            },
+            CycleBalanceSample {
+                captured_at_ns: 13_000_000_000,
+                total_cycles: 5_000,
+                liquid_cycles: 1_200,
+            },
+        ];
+
+        assert_eq!(calculate_liquid_burn_cycles_per_sec(&samples), None);
+    }
+
+    #[test]
+    fn observability_cycle_telemetry_uses_net_window_burn() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        sqlite::set_runtime_scalar(HOST_TOTAL_CYCLES_OVERRIDE_KEY, "5000")
+            .expect("host total cycles should persist");
+
+        {
+            let _time_guard = with_fixed_time_ns(1_000_000_000);
+            sqlite::set_runtime_scalar(HOST_LIQUID_CYCLES_OVERRIDE_KEY, "1200")
+                .expect("host liquid cycles should persist");
+            let _ = observability_snapshot(1);
+        }
+        {
+            let _time_guard = with_fixed_time_ns(7_000_000_000);
+            sqlite::set_runtime_scalar(HOST_LIQUID_CYCLES_OVERRIDE_KEY, "600")
+                .expect("host liquid cycles should persist");
+            let _ = observability_snapshot(1);
+        }
+        let cycles = {
+            let _time_guard = with_fixed_time_ns(13_000_000_000);
+            sqlite::set_runtime_scalar(HOST_LIQUID_CYCLES_OVERRIDE_KEY, "1200")
+                .expect("host liquid cycles should persist");
+            observability_snapshot(1).cycles
+        };
+
+        assert_eq!(cycles.window_duration_seconds, 12);
+        assert_eq!(cycles.window_sample_count, 3);
+        assert_eq!(cycles.burn_rate_cycles_per_hour, None);
+        assert_eq!(cycles.estimated_seconds_until_freezing_threshold, None);
     }
 
     #[test]
