@@ -448,6 +448,7 @@ mod tests {
     use crate::scheduler::{
         lease_due_jobs_for_test, run_scheduler_tick, spawn_job_id, PAYMENT_POLL_JOB_ID,
     };
+    use crate::types::{InferenceTransport, OpenRouterReasoningLevel};
     use candid::Principal;
     use sha2::{Digest, Sha256};
 
@@ -473,6 +474,8 @@ mod tests {
             ]),
             llm_canister_id: Some(Principal::from_text("aaaaa-aa").expect("valid principal")),
             search_api_key: Some("brave-key".to_string()),
+            inference_proxy_worker_base_url: Some("https://proxy.example.com".to_string()),
+            inference_proxy_trusted_callback_principal: Some("aaaaa-aa".to_string()),
             cycle_topup_enabled: Some(true),
             auto_topup_cycle_threshold: Some(123_456),
         }
@@ -525,6 +528,8 @@ mod tests {
                     open_router_api_key: Some("or-key".to_string()),
                     model: Some("openrouter/auto".to_string()),
                     brave_search_api_key: Some("brave-key".to_string()),
+                    inference_transport: InferenceTransport::OpenrouterDirect,
+                    open_router_reasoning_level: OpenRouterReasoningLevel::Default,
                 },
             },
             parent_id: None,

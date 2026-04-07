@@ -1574,8 +1574,8 @@ pub async fn execute_spawn(
 mod tests {
     use super::build_bootstrap_verification;
     use crate::types::{
-        AutomatonBootstrapEvidence, PaymentStatus, ProviderConfig, SpawnAsset, SpawnChain,
-        SpawnConfig, SpawnSession, SpawnSessionState,
+        AutomatonBootstrapEvidence, InferenceTransport, OpenRouterReasoningLevel, PaymentStatus,
+        ProviderConfig, SpawnAsset, SpawnChain, SpawnConfig, SpawnSession, SpawnSessionState,
     };
 
     fn sample_session() -> SpawnSession {
@@ -1613,6 +1613,8 @@ mod tests {
                     open_router_api_key: Some("or-key".to_string()),
                     model: Some("openrouter/auto".to_string()),
                     brave_search_api_key: Some("brave-key".to_string()),
+                    inference_transport: InferenceTransport::OpenrouterDirect,
+                    open_router_reasoning_level: OpenRouterReasoningLevel::Default,
                 },
             },
             created_at: 1,

@@ -8,6 +8,8 @@ type AutomatonChildRuntimeConfig = record {
   http_allowed_domains : opt vec text;
   llm_canister_id : opt principal;
   search_api_key : opt text;
+  inference_proxy_worker_base_url : opt text;
+  inference_proxy_trusted_callback_principal : opt text;
   cycle_topup_enabled : opt bool;
   auto_topup_cycle_threshold : opt nat64;
 };
@@ -222,11 +224,18 @@ type FactoryInitArgs = record {
   admin_principals : vec principal;
 };
 type FeeConfig = record { usdc_fee : text; updated_at : nat64 };
+type InferenceTransport = variant {
+  OpenrouterDirect;
+  OpenrouterProxyWorker;
+};
+type OpenRouterReasoningLevel = variant { Default; Low; Medium; High };
 type PaymentStatus = variant { Refunded; Paid; Unpaid; Partial };
 type ProviderConfig = record {
   model : opt text;
   open_router_api_key : opt text;
   brave_search_api_key : opt text;
+  inference_transport : InferenceTransport;
+  open_router_reasoning_level : OpenRouterReasoningLevel;
 };
 type ReleaseBroadcastConfig = record {
   chain_id : nat64;

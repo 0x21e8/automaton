@@ -17,6 +17,8 @@ pub struct ValidatedAutomatonChildRuntimeConfig {
     pub http_allowed_domains: Option<Vec<String>>,
     pub llm_canister_id: Option<candid::Principal>,
     pub search_api_key: Option<String>,
+    pub inference_proxy_worker_base_url: Option<String>,
+    pub inference_proxy_trusted_callback_principal: Option<candid::Principal>,
     pub cycle_topup_enabled: Option<bool>,
     pub auto_topup_cycle_threshold: Option<u64>,
 }
@@ -42,6 +44,21 @@ fn require_u64_field(value: Option<u64>, field: &str) -> Result<u64, FactoryErro
     value.ok_or_else(|| FactoryError::MissingChildRuntimeConfig {
         field: field.to_string(),
     })
+}
+
+fn parse_optional_principal_field(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<candid::Principal>, FactoryError> {
+    match normalize_optional_text(value) {
+        Some(principal_text) => candid::Principal::from_text(&principal_text)
+            .map(Some)
+            .map_err(|error| FactoryError::InvalidChildRuntimeConfig {
+                field: field.to_string(),
+                message: error.to_string(),
+            }),
+        None => Ok(None),
+    }
 }
 
 fn normalize_string_list(value: Option<&[String]>) -> Option<Vec<String>> {
@@ -84,6 +101,13 @@ pub fn validate_automaton_child_runtime_config(
         http_allowed_domains: normalize_string_list(config.http_allowed_domains.as_deref()),
         llm_canister_id: config.llm_canister_id,
         search_api_key: normalize_optional_text(config.search_api_key.as_deref()),
+        inference_proxy_worker_base_url: normalize_optional_text(
+            config.inference_proxy_worker_base_url.as_deref(),
+        ),
+        inference_proxy_trusted_callback_principal: parse_optional_principal_field(
+            config.inference_proxy_trusted_callback_principal.as_deref(),
+            "child_runtime.inference_proxy_trusted_callback_principal",
+        )?,
         cycle_topup_enabled: config.cycle_topup_enabled,
         auto_topup_cycle_threshold: config.auto_topup_cycle_threshold,
     })
@@ -227,6 +251,10 @@ pub fn build_automaton_install_args(
         http_allowed_domains: child_runtime.http_allowed_domains.clone(),
         llm_canister_id: child_runtime.llm_canister_id,
         search_api_key: child_runtime.search_api_key.clone(),
+        inference_proxy_worker_base_url: child_runtime.inference_proxy_worker_base_url.clone(),
+        inference_proxy_trusted_callback_principal: child_runtime
+            .inference_proxy_trusted_callback_principal
+            .clone(),
         cycle_topup_enabled: child_runtime.cycle_topup_enabled,
         auto_topup_cycle_threshold: child_runtime.auto_topup_cycle_threshold,
         spawn_bootstrap: Some(AutomatonSpawnBootstrapArgs {
@@ -286,8 +314,9 @@ mod tests {
     };
     use crate::types::{
         AutomatonChildInitArgs, AutomatonChildRuntimeConfig, CreateSpawnSessionRequest,
-        ProviderConfig, RepositoryStrategySessionSnapshot, RepositoryStrategySource,
-        RepositoryStrategyStatus, SpawnAsset, SpawnChain, SpawnConfig,
+        InferenceTransport, OpenRouterReasoningLevel, ProviderConfig,
+        RepositoryStrategySessionSnapshot, RepositoryStrategySource, RepositoryStrategyStatus,
+        SpawnAsset, SpawnChain, SpawnConfig,
     };
 
     fn sample_request() -> CreateSpawnSessionRequest {
@@ -304,6 +333,8 @@ mod tests {
                     open_router_api_key: Some(" sk-or-test ".to_string()),
                     model: Some(" openai/gpt-4o-mini ".to_string()),
                     brave_search_api_key: Some(" brave-test-key ".to_string()),
+                    inference_transport: InferenceTransport::OpenrouterProxyWorker,
+                    open_router_reasoning_level: OpenRouterReasoningLevel::Medium,
                 },
             },
             parent_id: Some("parent-automaton".to_string()),
@@ -355,6 +386,24 @@ mod tests {
     }
 
     #[test]
+    fn validates_proxy_callback_principal_when_present() {
+        let error = validate_automaton_child_runtime_config(&AutomatonChildRuntimeConfig {
+            ecdsa_key_name: Some("key_1".to_string()),
+            evm_chain_id: Some(8_453),
+            evm_rpc_url: Some("http://127.0.0.1:18545".to_string()),
+            inference_proxy_trusted_callback_principal: Some("not-a-principal".to_string()),
+            ..Default::default()
+        })
+        .expect_err("invalid proxy callback principal should fail validation");
+
+        assert!(matches!(
+            error,
+            crate::FactoryError::InvalidChildRuntimeConfig { ref field, .. }
+                if field == "child_runtime.inference_proxy_trusted_callback_principal"
+        ));
+    }
+
+    #[test]
     fn encodes_the_real_child_init_args_envelope() {
         crate::restore_state(Default::default());
         let request = sample_request();
@@ -372,6 +421,8 @@ mod tests {
             ]),
             llm_canister_id: Some(Principal::from_text("aaaaa-aa").expect("valid principal")),
             search_api_key: Some(" brave-key ".to_string()),
+            inference_proxy_worker_base_url: Some(" https://proxy.example.com ".to_string()),
+            inference_proxy_trusted_callback_principal: Some(" aaaaa-aa ".to_string()),
             cycle_topup_enabled: Some(true),
             auto_topup_cycle_threshold: Some(123_456),
         })
@@ -408,6 +459,18 @@ mod tests {
             ])
         );
         assert_eq!(
+            decoded.inference_proxy_worker_base_url.as_deref(),
+            Some("https://proxy.example.com")
+        );
+        assert_eq!(
+            decoded
+                .inference_proxy_trusted_callback_principal
+                .as_ref()
+                .map(candid::Principal::to_text)
+                .as_deref(),
+            Some("aaaaa-aa")
+        );
+        assert_eq!(
             decoded
                 .spawn_bootstrap
                 .as_ref()
@@ -430,6 +493,20 @@ mod tests {
                 .as_ref()
                 .and_then(|bootstrap| bootstrap.provider.open_router_api_key.as_deref()),
             Some(" sk-or-test ")
+        );
+        assert_eq!(
+            decoded
+                .spawn_bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.provider.inference_transport.clone()),
+            Some(InferenceTransport::OpenrouterProxyWorker)
+        );
+        assert_eq!(
+            decoded
+                .spawn_bootstrap
+                .as_ref()
+                .map(|bootstrap| bootstrap.provider.open_router_reasoning_level.clone()),
+            Some(OpenRouterReasoningLevel::Medium)
         );
         assert_eq!(
             decoded

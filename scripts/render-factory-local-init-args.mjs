@@ -160,6 +160,12 @@ const childHttpAllowedDomains = normalizeOptionalList(
 );
 const childLlmCanisterId = normalizeOptionalString(process.env.FACTORY_CHILD_LLM_CANISTER_ID);
 const childSearchApiKey = normalizeOptionalString(process.env.FACTORY_CHILD_SEARCH_API_KEY);
+const childInferenceProxyWorkerBaseUrl = normalizeOptionalString(
+  process.env.FACTORY_CHILD_INFERENCE_PROXY_WORKER_BASE_URL
+);
+const childInferenceProxyTrustedCallbackPrincipal = normalizeOptionalString(
+  process.env.FACTORY_CHILD_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL
+);
 const childCycleTopupEnabled = normalizeOptionalBoolean(
   process.env.FACTORY_CHILD_CYCLE_TOPUP_ENABLED
 );
@@ -231,6 +237,8 @@ const childRuntimeRecord = `record {
   http_allowed_domains = ${renderOptVecText(childHttpAllowedDomains)};
   llm_canister_id = ${renderOptPrincipal(childLlmCanisterId)};
   search_api_key = ${renderOptText(childSearchApiKey)};
+  inference_proxy_worker_base_url = ${renderOptText(childInferenceProxyWorkerBaseUrl)};
+  inference_proxy_trusted_callback_principal = ${renderOptPrincipal(childInferenceProxyTrustedCallbackPrincipal)};
   cycle_topup_enabled = ${renderOptBool(childCycleTopupEnabled)};
   auto_topup_cycle_threshold = ${renderOptNat(childAutoTopupCycleThreshold)};
 }`;

@@ -93,10 +93,40 @@ pub enum SessionAuditActor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub enum InferenceTransport {
+    OpenrouterDirect,
+    OpenrouterProxyWorker,
+}
+
+impl Default for InferenceTransport {
+    fn default() -> Self {
+        Self::OpenrouterDirect
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub enum OpenRouterReasoningLevel {
+    Default,
+    Low,
+    Medium,
+    High,
+}
+
+impl Default for OpenRouterReasoningLevel {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub open_router_api_key: Option<String>,
     pub model: Option<String>,
     pub brave_search_api_key: Option<String>,
+    #[serde(default)]
+    pub inference_transport: InferenceTransport,
+    #[serde(default)]
+    pub open_router_reasoning_level: OpenRouterReasoningLevel,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
@@ -110,6 +140,8 @@ pub struct AutomatonChildRuntimeConfig {
     pub http_allowed_domains: Option<Vec<String>>,
     pub llm_canister_id: Option<Principal>,
     pub search_api_key: Option<String>,
+    pub inference_proxy_worker_base_url: Option<String>,
+    pub inference_proxy_trusted_callback_principal: Option<String>,
     pub cycle_topup_enabled: Option<bool>,
     pub auto_topup_cycle_threshold: Option<u64>,
 }
@@ -138,6 +170,8 @@ pub struct AutomatonChildInitArgs {
     pub http_allowed_domains: Option<Vec<String>>,
     pub llm_canister_id: Option<Principal>,
     pub search_api_key: Option<String>,
+    pub inference_proxy_worker_base_url: Option<String>,
+    pub inference_proxy_trusted_callback_principal: Option<Principal>,
     pub cycle_topup_enabled: Option<bool>,
     pub auto_topup_cycle_threshold: Option<u64>,
     pub spawn_bootstrap: Option<AutomatonSpawnBootstrapArgs>,
@@ -950,6 +984,10 @@ pub enum FactoryError {
     MissingChildRuntimeConfig {
         field: String,
     },
+    InvalidChildRuntimeConfig {
+        field: String,
+        message: String,
+    },
     ManagementCallFailed {
         method: String,
         message: String,
@@ -1153,6 +1191,9 @@ impl Display for FactoryError {
             }
             Self::MissingChildRuntimeConfig { field } => {
                 write!(f, "missing child runtime config: {field}")
+            }
+            Self::InvalidChildRuntimeConfig { field, message } => {
+                write!(f, "invalid child runtime config: {field}: {message}")
             }
             Self::ManagementCallFailed { method, message } => {
                 write!(

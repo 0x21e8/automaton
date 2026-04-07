@@ -235,8 +235,8 @@ mod tests {
 
     use crate::state::FactoryState;
     use crate::types::{
-        FactoryError, PaymentStatus, ProviderConfig, SessionAuditActor, SpawnAsset, SpawnChain,
-        SpawnConfig, SpawnSession, SpawnSessionState,
+        FactoryError, InferenceTransport, OpenRouterReasoningLevel, PaymentStatus, ProviderConfig,
+        SessionAuditActor, SpawnAsset, SpawnChain, SpawnConfig, SpawnSession, SpawnSessionState,
     };
 
     use super::{
@@ -278,6 +278,8 @@ mod tests {
                     open_router_api_key: None,
                     model: Some("openrouter/auto".to_string()),
                     brave_search_api_key: None,
+                    inference_transport: InferenceTransport::OpenrouterDirect,
+                    open_router_reasoning_level: OpenRouterReasoningLevel::Default,
                 },
             },
             created_at: 1,
