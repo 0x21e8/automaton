@@ -9,6 +9,8 @@ A self-service launchpad for spawning autonomous [ic-automaton](https://github.c
 | **Factory canister** | `backend/factory/` | Rust · IC CDK · stable-structures | On-chain spawn orchestrator: session lifecycle, escrow polling, child canister creation, threshold ECDSA release transactions |
 | **Web app** | `apps/web/` | React · Vite · TypeScript | Spawn wizard UI, automaton canvas, drawer detail view, CLI command panel |
 | **Indexer** | `apps/indexer/` | Fastify · SQLite · WebSocket | Polls factory canister, normalizes data, serves REST + realtime updates to the frontend |
+| **Evaluator backend** | `apps/evaluator/` | Fastify · TypeScript | Boots a fresh playground, runs experiment fleets, samples evidence, writes evaluation artifacts |
+| **Evaluator dashboard** | `apps/evaluator-web/` | React · Vite · TypeScript | Operator console for one active evaluation run, fleet metrics, stop control, recent event feed |
 | **Shared contracts** | `packages/shared/` | TypeScript | Shared types and validation between web and indexer |
 | **EVM contracts** | `evm/` | Solidity · Foundry | MockUSDC and LocalEscrow for local development of the Base payment path |
 
@@ -133,6 +135,67 @@ This starts:
 
 Open `http://127.0.0.1:5173`. The app works with an empty database — you get the full UI shell with an empty automaton list.
 
+## Local Evaluation Harness
+
+The evaluation harness uses the full local playground plus a separate operator stack:
+
+- `apps/evaluator` boots a fresh playground, validates the experiment, spawns the fleet, samples evidence every `15s`, and writes artifacts to `tmp/evaluations/<runId>/`
+- `apps/evaluator-web` shows the live run dashboard and exposes the stop control
+
+Before starting the harness, create a repo-root `.env` from `.env.example`:
+
+```bash
+cp .env.example .env
+$EDITOR .env
+```
+
+The evaluator expects the following keys:
+
+```dotenv
+EVAL_STEWARD_ADDRESS=0x...
+EVAL_OPENROUTER_API_KEY=...
+LOCAL_EVM_FORK_URL=https://...
+IC_AUTOMATON_REPO=/absolute/path/to/ic-automaton
+
+# Optional
+EVAL_BRAVE_SEARCH_API_KEY=
+```
+
+Use `eval` during implementation. It runs the evaluator backend in watch mode, bootstraps the playground stack (including the indexer), serves the operator dashboard from Vite, and serves the main launchpad web app:
+
+```bash
+npm run eval -- --experiment evaluations/experiments/smoke.yaml
+```
+
+`eval:dev` remains available as an explicit alias for the same workflow.
+
+Default local endpoints:
+
+- evaluator API: `http://127.0.0.1:3003`
+- evaluator dashboard: `http://127.0.0.1:4173`
+- launchpad web: `http://127.0.0.1:5173`
+- playground indexer: `http://127.0.0.1:3001`
+- artifacts: `tmp/evaluations/<runId>/`
+
+Use `eval:run` for a cleaner one-command local run without watch mode. It builds the required workspaces first, then starts the evaluator backend plus preview-served dashboard and launchpad web:
+
+```bash
+npm run eval:run -- --experiment evaluations/experiments/smoke.yaml
+```
+
+Manual stop is handled from the dashboard. Press `Stop Run` in the operator console to finalize the current run, write `manifest.json`, `events.ndjson`, `samples/*.jsonl`, `summary.json`, and `report.md`, and tear the playground down cleanly.
+
+Both scripts accept the following optional overrides:
+
+- `EVALUATOR_HOST` / `EVALUATOR_PORT` for the backend bind address
+- `EVALUATOR_WEB_HOST` / `EVALUATOR_WEB_PORT` for the dashboard server
+- `LAUNCHPAD_WEB_HOST` / `LAUNCHPAD_WEB_PORT` for the main launchpad web server
+- `LAUNCHPAD_INDEXER_BASE_URL` to point the launchpad web at a non-default indexer origin
+- `EVALUATOR_ARTIFACTS_ROOT` to move run outputs away from `tmp/evaluations`
+- `VITE_EVALUATOR_BASE_URL` if you want the dashboard to target a different evaluator origin
+
+Both web servers use strict ports. If `4173` or `5173` is already occupied, the eval wrapper exits instead of silently switching to a different port.
+
 For the full local spawn setup, including Base-fork Anvil, canonical Base USDC mock injection,
 launchpad escrow, sibling `ic-automaton` inbox deployment, real child Wasm upload, wallet seeding,
 local ICP, factory/indexer/rpc-gateway startup, and hot-reload web:
@@ -149,6 +212,16 @@ and uses the canister-ready `backend_nowasi.wasm` automatically. You only need t
 
 `playground:dev` bootstraps the backend stack and then starts only the Vite web app in hot-reload mode.
 Use it instead of `npm run dev` when you need the full local playground.
+
+For lifecycle control without the web dev server:
+
+```bash
+sh ./scripts/playground-stop.sh
+sh ./scripts/playground-reset.sh
+```
+
+`playground-stop.sh` tears down the local playground stack without rebooting it.
+`playground-reset.sh` now reuses the same stop path and then performs a fresh bootstrap.
 
 ### Run each service separately
 

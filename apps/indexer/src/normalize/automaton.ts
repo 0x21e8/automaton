@@ -274,6 +274,12 @@ export function normalizeAutomatonDetail(options: {
     base.runtime.heartbeatIntervalSeconds;
   const runtimeState = toVariantName(runtime?.snapshot.runtime?.state, base.runtime.agentState);
   const commitHash = toOptionalString(identity?.buildInfo.commit) ?? base.version.commitHash;
+  const runtimeLastError =
+    runtime !== undefined
+      ? toOptionalString(runtime.snapshot.runtime?.last_error) ??
+        toOptionalString(runtime.snapshot.scheduler?.last_tick_error) ??
+        null
+      : base.runtime.lastError;
 
   return {
     ...base,
@@ -343,9 +349,7 @@ export function normalizeAutomatonDetail(options: {
       agentState: runtimeState,
       loopEnabled: runtime?.snapshot.runtime?.loop_enabled ?? base.runtime.loopEnabled,
       lastTransitionAt: transitionAt,
-      lastError:
-        toOptionalString(runtime?.snapshot.runtime?.last_error) ??
-        base.runtime.lastError,
+      lastError: runtimeLastError,
       heartbeatIntervalSeconds
     },
     version: {

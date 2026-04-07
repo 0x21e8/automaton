@@ -1,0 +1,24 @@
+name: smoke-fleet
+description: Compare three model and strategy combinations in one fresh playground run.
+maxRuntimeMinutes: 240
+samplingIntervalSeconds: 15
+stallAfterMinutes: 10
+spawn:
+  grossAmount: "75000000"
+  minSuccessRatio: 0.8
+automatons:
+  - id: alpha
+    label: Google Gemma
+    model: google/gemma-4-31b-it
+    strategies:
+      - base-aave-usdc-reserve-01
+  - id: beta
+    label: Xiao
+    model: xiaomi/mimo-v2-pro
+    strategies:
+      - base-moonwell-usdc-reserve-01
+  - id: gamma
+    label: Qwen searcher
+    model: qwen/qwen3.6-plus:free
+    strategies:
+      - base-usdc-carry-cbbtc-01

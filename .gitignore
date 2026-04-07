@@ -11,6 +11,7 @@ evm/out/
 tmp/
 .claude
 .icp
+.env
 playground.local.env
 ops/playground/playground.env
 apps/web/.env.local

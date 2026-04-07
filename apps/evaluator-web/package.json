@@ -1,0 +1,17 @@
+{
+  "name": "@ic-automaton/evaluator-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "sh ../../scripts/with-repo-node.sh vite --host 127.0.0.1 --port 4173",
+    "lint": "sh ../../scripts/with-repo-node.sh tsc -p tsconfig.json --noEmit",
+    "build": "sh ../../scripts/with-repo-node.sh tsc -p tsconfig.json --noEmit && sh ../../scripts/with-repo-node.sh vite build",
+    "test": "sh ../../scripts/with-repo-node.sh vitest run"
+  },
+  "dependencies": {
+    "@ic-automaton/shared": "0.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

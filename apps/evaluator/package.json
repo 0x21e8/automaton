@@ -1,0 +1,17 @@
+{
+  "name": "@ic-automaton/evaluator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "sh ../../scripts/with-repo-node.sh tsx watch src/server.ts",
+    "lint": "sh ../../scripts/with-repo-node.sh tsc -p tsconfig.json --noEmit",
+    "build": "sh ../../scripts/with-repo-node.sh tsc -p tsconfig.build.json",
+    "test": "sh ../../scripts/with-repo-node.sh vitest run"
+  },
+  "dependencies": {
+    "@fastify/websocket": "^11.2.0",
+    "@ic-automaton/shared": "0.1.0",
+    "fastify": "^5.8.2"
+  }
+}

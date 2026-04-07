@@ -378,6 +378,113 @@ describe("automaton indexer poller", () => {
     await store.close();
   });
 
+  it("surfaces scheduler tick failures as runtime lastError", async () => {
+    const canisterId = "txyno-ch777-77776-aaaaq-cai";
+    const schedulerError =
+      "autonomy inference error: openrouter returned status 429: provider rate-limited";
+    const store = createSqliteStore({
+      databasePath: await createDatabasePath()
+    });
+    const client: AutomatonClient = {
+      readIdentityConfig: vi.fn(async () => createIdentityConfigRead(canisterId)),
+      readRuntimeFinancial: vi.fn(async () => {
+        const runtime = createRuntimeFinancialRead(canisterId);
+        runtime.snapshot.scheduler = {
+          ...runtime.snapshot.scheduler,
+          last_tick_error: schedulerError
+        };
+        runtime.snapshot.runtime = {
+          ...runtime.snapshot.runtime,
+          last_error: null
+        };
+        return runtime;
+      }),
+      readRecentTurns: vi.fn(async () => createRecentTurnsRead(canisterId))
+    };
+    const indexer = new AutomatonIndexer({
+      client,
+      store,
+      config: createIndexerConfig([canisterId]),
+      priceSource: new FixedEthUsdPriceSource(2_500)
+    });
+
+    await store.initialize();
+    await store.syncConfiguredCanisterIds([canisterId]);
+
+    await indexer.refreshPriceNow();
+    await indexer.pollIdentityNow();
+    await indexer.pollRuntimeNow();
+
+    await expect(store.getAutomatonDetail(canisterId)).resolves.toMatchObject({
+      canisterId,
+      runtime: {
+        lastError: schedulerError
+      }
+    });
+
+    await store.close();
+  });
+
+  it("clears a stale runtime lastError after a clean runtime poll", async () => {
+    const canisterId = "txyno-ch777-77776-aaaaq-cai";
+    const schedulerError =
+      "autonomy inference error: openrouter returned status 429: provider rate-limited";
+    const store = createSqliteStore({
+      databasePath: await createDatabasePath()
+    });
+    const readRuntimeFinancial = vi
+      .fn<AutomatonClient["readRuntimeFinancial"]>()
+      .mockImplementationOnce(async () => {
+        const runtime = createRuntimeFinancialRead(canisterId);
+        runtime.snapshot.scheduler = {
+          ...runtime.snapshot.scheduler,
+          last_tick_error: schedulerError
+        };
+        runtime.snapshot.runtime = {
+          ...runtime.snapshot.runtime,
+          last_error: null
+        };
+        return runtime;
+      })
+      .mockImplementationOnce(async () => createRuntimeFinancialRead(canisterId));
+    const client: AutomatonClient = {
+      readIdentityConfig: vi.fn(async () => createIdentityConfigRead(canisterId)),
+      readRuntimeFinancial,
+      readRecentTurns: vi.fn(async () => createRecentTurnsRead(canisterId))
+    };
+    const indexer = new AutomatonIndexer({
+      client,
+      store,
+      config: createIndexerConfig([canisterId]),
+      priceSource: new FixedEthUsdPriceSource(2_500)
+    });
+
+    await store.initialize();
+    await store.syncConfiguredCanisterIds([canisterId]);
+
+    await indexer.refreshPriceNow();
+    await indexer.pollIdentityNow();
+    await indexer.pollRuntimeNow();
+
+    await expect(store.getAutomatonDetail(canisterId)).resolves.toMatchObject({
+      canisterId,
+      runtime: {
+        lastError: schedulerError
+      }
+    });
+
+    await indexer.pollRuntimeNow();
+
+    await expect(store.getAutomatonDetail(canisterId)).resolves.toMatchObject({
+      canisterId,
+      runtime: {
+        lastError: null
+      }
+    });
+
+    await store.close();
+  });
+
   it("indexes a factory-discovered canister without a seed config entry", async () => {
     const canisterId = "txyno-ch777-77776-aaaaq-cai";
     const registryRecord = createSpawnedAutomatonRecordFixture({ canisterId });

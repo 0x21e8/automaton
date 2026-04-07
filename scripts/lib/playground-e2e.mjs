@@ -365,6 +365,30 @@ export async function waitForSpawnSession(
   const deadline = Date.now() + pollTimeoutMs;
   let lastDetail = null;
 
+  function describeTerminalReason(detail) {
+    const latestAuditReason = detail?.audit
+      ?.map((entry) => normalizeOptionalString(entry?.reason))
+      .filter((value) => value !== null)
+      .at(-1);
+
+    if (latestAuditReason) {
+      return latestAuditReason;
+    }
+
+    const state = normalizeOptionalString(detail?.session?.state);
+    const paymentStatus = normalizeOptionalString(detail?.session?.paymentStatus);
+
+    if (state !== null && paymentStatus !== null) {
+      return `state=${state}, paymentStatus=${paymentStatus}`;
+    }
+
+    if (state !== null) {
+      return `state=${state}`;
+    }
+
+    return null;
+  }
+
   while (Date.now() < deadline) {
     const detail = await getSpawnSessionDetail(indexerBaseUrl, sessionId);
     lastDetail = detail;
@@ -376,7 +400,12 @@ export async function waitForSpawnSession(
     }
 
     if (detail?.session?.state === "failed" || detail?.session?.state === "expired") {
-      const error = new Error(`spawn session ${sessionId} ended in ${detail.session.state}`);
+      const terminalReason = describeTerminalReason(detail);
+      const error = new Error(
+        terminalReason === null
+          ? `spawn session ${sessionId} ended in ${detail.session.state}`
+          : `spawn session ${sessionId} ended in ${detail.session.state}: ${terminalReason}`
+      );
       error.details = detail;
       throw error;
     }

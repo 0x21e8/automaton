@@ -459,11 +459,11 @@ async fn install_snapped_strategies_into_child(
         arg: &A,
     ) -> Result<R, FactoryError>
     where
-        A: candid::CandidType,
+        A: candid::utils::ArgumentEncoder,
         R: for<'de> candid::utils::ArgumentDecoder<'de>,
     {
         let response = Call::unbounded_wait(*principal, method)
-            .with_arg(arg)
+            .with_args(arg)
             .await
             .map_err(|error| FactoryError::ManagementCallFailed {
                 method: method.to_string(),
@@ -487,11 +487,12 @@ async fn install_snapped_strategies_into_child(
 
     for snapshot in strategies {
         let adapted_recipe_json = build_strategy_install_recipe(snapshot)?;
+        let registration_args = (adapted_recipe_json.clone(),);
         let (registration_result,): (ChildRegisterStrategyAdminResult,) =
             call_child_canister_tuple_with_arg(
                 &principal,
                 "register_strategy_admin",
-                &adapted_recipe_json,
+                &registration_args,
             )
             .await?;
         let registered_template = match registration_result {
