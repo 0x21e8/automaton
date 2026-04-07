@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   EVALUATION_AUTOMATON_STATUSES,
+  EVALUATION_INFERENCE_TRANSPORTS,
+  EVALUATION_OPENROUTER_REASONING_LEVELS,
   EVALUATION_PROVIDER_INFERENCE_UNAVAILABLE,
   EVALUATION_RUN_STATES,
   MAX_EVALUATION_AUTOMATON_COUNT,
@@ -32,6 +34,16 @@ describe("evaluation contracts", () => {
       "stalled",
       "spawn_failed",
       "completed"
+    ]);
+    expect(EVALUATION_INFERENCE_TRANSPORTS).toEqual([
+      "openrouter_direct",
+      "openrouter_proxy_worker"
+    ]);
+    expect(EVALUATION_OPENROUTER_REASONING_LEVELS).toEqual([
+      "default",
+      "low",
+      "medium",
+      "high"
     ]);
     expect(EVALUATION_PROVIDER_INFERENCE_UNAVAILABLE).toBe("unavailable");
     expect(MIN_EVALUATION_AUTOMATON_COUNT).toBe(1);
@@ -64,9 +76,44 @@ automatons:
     expect(experiment.spawn.grossAmount).toBe("75000000");
     expect(experiment.spawn.minSuccessRatio).toBe(0.8);
     expect(experiment.automatons).toHaveLength(2);
+    expect(experiment.automatons[0]?.transport).toBe("openrouter_direct");
+    expect(experiment.automatons[0]?.reasoningLevel).toBe("default");
     expect(experiment.automatons[0]?.strategies).toEqual([
       "uniswap-base-momentum"
     ]);
+  });
+
+  it("parses explicit transport and reasoning settings", () => {
+    const experiment = parseEvaluationExperimentYaml(`
+name: smoke-fleet
+description: Compare transport settings.
+maxRuntimeMinutes: 240
+samplingIntervalSeconds: 15
+stallAfterMinutes: 10
+spawn:
+  grossAmount: "75000000"
+  minSuccessRatio: 0.8
+automatons:
+  - id: alpha
+    label: GPT-5 direct
+    model: openrouter/openai/gpt-5
+    transport: openrouter_direct
+    reasoningLevel: medium
+    strategies:
+      - uniswap-base-momentum
+  - id: beta
+    label: GPT-5 proxy
+    model: openrouter/openai/gpt-5
+    transport: openrouter_proxy_worker
+    reasoningLevel: high
+    strategies:
+      - aerodrome-base-stables
+`);
+
+    expect(experiment.automatons[0]?.transport).toBe("openrouter_direct");
+    expect(experiment.automatons[0]?.reasoningLevel).toBe("medium");
+    expect(experiment.automatons[1]?.transport).toBe("openrouter_proxy_worker");
+    expect(experiment.automatons[1]?.reasoningLevel).toBe("high");
   });
 
   it("rejects duplicate IDs and unknown secret-bearing keys", () => {
@@ -143,12 +190,16 @@ automatons:
           id: "alpha",
           label: "Alpha",
           model: "openrouter/openai/gpt-5",
+          transport: "openrouter_direct",
+          reasoningLevel: "default",
           strategies: ["strategy-one"],
           sessionId: "session-1",
           canisterId: "ryjl3-tyaaa-aaaaa-aaaba-cai",
           evmAddress: "0xabc",
           spawnSucceeded: true,
           stalled: false,
+          everStalled: false,
+          stallEpisodeCount: 0,
           stallDetectedAt: null,
           baselineAt: 1_711_447_200_000,
           finalObservedAt: 1_711_447_260_000,
@@ -196,6 +247,7 @@ automatons:
         generatedAt: 1_711_447_260_000,
         completionReason: "completed",
         comparisonValid: true,
+        comparisonInvalidReason: null,
         strongestAutomatonId: "alpha",
         weakestAutomatonId: "alpha"
       },
@@ -203,7 +255,10 @@ automatons:
         requestedSpawns: 2,
         successfulSpawns: 1,
         stalledAutomatons: 0,
+        everStalledAutomatons: 0,
         activeAutomatons: 1,
+        baselineCapturedAutomatons: 1,
+        comparableAutomatons: 1,
         totalTurns: 3,
         totalToolCalls: 5,
         totalErrors: 0,
@@ -215,6 +270,8 @@ automatons:
           id: "alpha",
           label: "Alpha",
           model: "openrouter/openai/gpt-5",
+          transport: "openrouter_direct",
+          reasoningLevel: "default",
           strategies: ["strategy-one"],
           sessionId: "session-1",
           canisterId: "ryjl3-tyaaa-aaaaa-aaaba-cai",
@@ -259,6 +316,8 @@ automatons:
           id: "alpha",
           label: "Alpha",
           model: "openrouter/openai/gpt-5",
+          transport: "openrouter_direct",
+          reasoningLevel: "default",
           strategies: ["strategy-one"]
         }
       ]

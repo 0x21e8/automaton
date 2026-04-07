@@ -17,9 +17,19 @@ import type {
   RuntimeAutomatonState
 } from "../types.js";
 import { loadExperimentFile } from "../lib/experiment.js";
-import { buildDashboardAutomatons, buildFleetTotals, buildReportMetadata, buildSummary, renderMarkdownReport } from "../lib/report.js";
+import {
+  assessComparisonValidity,
+  buildDashboardAutomatons,
+  buildFleetTotals,
+  buildReportMetadata,
+  buildSummary,
+  renderMarkdownReport
+} from "../lib/report.js";
 import { createEmptyObservedErrorMap, recordErrorOccurrence } from "./error-histogram.js";
 import { captureAutomatonSample } from "./sampler.js";
+
+const BASELINE_CAPTURE_MAX_ATTEMPTS = 8;
+const BASELINE_CAPTURE_RETRY_MS = 5_000;
 
 interface PlaygroundE2eModule {
   claimPlaygroundFaucet(indexerBaseUrl: string, walletAddress: string): Promise<unknown>;
@@ -73,6 +83,23 @@ function buildFailedSpawnSummary(automaton: RuntimeAutomatonState) {
   return `${automaton.config.id}: ${automaton.lastError ?? "spawn failed"}`;
 }
 
+function baselineSampleIsReady(sample: {
+  metrics: {
+    cycles: string | null;
+    netWorthUsd: string | null;
+    ethBalanceWei: string | null;
+    usdcBalanceRaw: string | null;
+  };
+}) {
+  return (
+    sample.metrics.cycles !== null &&
+    sample.metrics.netWorthUsd !== null &&
+    sample.metrics.netWorthUsd !== "0" &&
+    sample.metrics.ethBalanceWei !== null &&
+    sample.metrics.usdcBalanceRaw !== null
+  );
+}
+
 function createAutomatonState(config: RuntimeAutomatonState["config"]): RuntimeAutomatonState {
   return {
     config,
@@ -83,6 +110,8 @@ function createAutomatonState(config: RuntimeAutomatonState["config"]): RuntimeA
     runtimeStatus: "pending_spawn",
     spawnSucceeded: false,
     stalled: false,
+    everStalled: false,
+    stallEpisodeCount: 0,
     stallDetectedAt: null,
     baseline: null,
     finalObservedAt: null,
@@ -292,6 +321,8 @@ export class RunController {
     run.metadata.runState = "validating";
     await this.persistManifest();
 
+    this.validateInferenceRuntimeConfig();
+
     const response = await this.deps.indexerClient.fetchRepositoryStrategies();
     const available = new Set(response.items.map((item) => item.strategyId));
 
@@ -316,6 +347,30 @@ export class RunController {
     });
 
     return response;
+  }
+
+  private validateInferenceRuntimeConfig() {
+    const requestedProxyTransport = [...this.requireRun().automatons.values()].some(
+      (automaton) => automaton.config.transport === "openrouter_proxy_worker"
+    );
+
+    if (!requestedProxyTransport) {
+      return;
+    }
+
+    const missingFields: string[] = [];
+    if (this.deps.env.inferenceProxyWorkerBaseUrl === null) {
+      missingFields.push("EVAL_INFERENCE_PROXY_WORKER_BASE_URL");
+    }
+    if (this.deps.env.inferenceProxyTrustedCallbackPrincipal === null) {
+      missingFields.push("EVAL_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL");
+    }
+
+    if (missingFields.length > 0) {
+      throw new Error(
+        `Proxy-backed evaluation requires ${missingFields.join(" and ")} when any automaton uses transport=openrouter_proxy_worker.`
+      );
+    }
   }
 
   private async spawnAutomaton(
@@ -356,7 +411,9 @@ export class RunController {
           provider: {
             openRouterApiKey: this.deps.env.openRouterApiKey,
             model: automaton.config.model,
-            braveSearchApiKey: this.deps.env.braveSearchApiKey
+            braveSearchApiKey: this.deps.env.braveSearchApiKey,
+            inferenceTransport: automaton.config.transport,
+            openRouterReasoningLevel: automaton.config.reasoningLevel
           }
         }
       };
@@ -415,44 +472,66 @@ export class RunController {
       paymentRpcUrl: string;
     }
   ) {
-    const sampleResult = await captureAutomatonSample({
-      now: this.now(),
-      automaton,
-      stallAfterMs: this.requireRun().experiment.parsed.stallAfterMinutes * 60_000,
-      indexerClient: this.deps.indexerClient,
-      automatonClient: this.deps.automatonClient,
-      evmClient: this.deps.evmClient,
-      config: this.deps.config
-    });
+    let lastFailure: string | null = null;
 
-    automaton.baseline = {
-      observedAt: sampleResult.sample.observedAt,
-      cycles: sampleResult.sample.metrics.cycles,
-      netWorthUsd: sampleResult.sample.metrics.netWorthUsd,
-      ethBalanceWei: sampleResult.sample.metrics.ethBalanceWei,
-      usdcBalanceRaw: sampleResult.sample.metrics.usdcBalanceRaw,
-      txCount: sampleResult.sample.metrics.txCount
-    };
-    recordCyclesConsumedPoint(automaton, {
-      observedAt: sampleResult.sample.observedAt,
-      cyclesConsumed: "0"
-    });
-    automaton.lastProgressAt = automaton.baseline.observedAt;
-    automaton.childCommit ??= sampleResult.evidence.buildInfo.commit ?? null;
-    this.requireRun().metadata.childCommit ??= automaton.childCommit;
+    for (let attempt = 1; attempt <= BASELINE_CAPTURE_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const sampleResult = await captureAutomatonSample({
+          now: this.now(),
+          automaton,
+          stallAfterMs: this.requireRun().experiment.parsed.stallAfterMinutes * 60_000,
+          indexerClient: this.deps.indexerClient,
+          automatonClient: this.deps.automatonClient,
+          evmClient: this.deps.evmClient,
+          config: this.deps.config
+        });
 
-    await this.deps.artifacts.appendSample(this.requireRun().artifacts, automaton.config.id, sampleResult.sample);
-    await this.emitEvent({
-      type: "sample.recorded",
-      runId: this.requireRun().metadata.runId,
-      timestamp: sampleResult.sample.observedAt,
-      payload: {
-        automatonId: automaton.config.id,
-        baseline: true
+        if (!baselineSampleIsReady(sampleResult.sample)) {
+          lastFailure =
+            `baseline telemetry not ready on attempt ${attempt}/${BASELINE_CAPTURE_MAX_ATTEMPTS}`;
+        } else {
+          automaton.baseline = {
+            observedAt: sampleResult.sample.observedAt,
+            cycles: sampleResult.sample.metrics.cycles,
+            netWorthUsd: sampleResult.sample.metrics.netWorthUsd,
+            ethBalanceWei: sampleResult.sample.metrics.ethBalanceWei,
+            usdcBalanceRaw: sampleResult.sample.metrics.usdcBalanceRaw,
+            txCount: sampleResult.sample.metrics.txCount
+          };
+          recordCyclesConsumedPoint(automaton, {
+            observedAt: sampleResult.sample.observedAt,
+            cyclesConsumed: "0"
+          });
+          automaton.lastProgressAt = automaton.baseline.observedAt;
+          automaton.childCommit ??= sampleResult.evidence.buildInfo.commit ?? null;
+          this.requireRun().metadata.childCommit ??= automaton.childCommit;
+
+          await this.deps.artifacts.appendSample(this.requireRun().artifacts, automaton.config.id, sampleResult.sample);
+          await this.emitEvent({
+            type: "sample.recorded",
+            runId: this.requireRun().metadata.runId,
+            timestamp: sampleResult.sample.observedAt,
+            payload: {
+              automatonId: automaton.config.id,
+              baseline: true
+            }
+          });
+
+          void runtime;
+          return;
+        }
+      } catch (error) {
+        lastFailure = error instanceof Error ? error.message : String(error);
       }
-    });
 
-    void runtime;
+      if (attempt < BASELINE_CAPTURE_MAX_ATTEMPTS) {
+        await this.pause(BASELINE_CAPTURE_RETRY_MS);
+      }
+    }
+
+    throw new Error(
+      `Baseline capture failed after ${BASELINE_CAPTURE_MAX_ATTEMPTS} attempts: ${lastFailure ?? "unknown error"}`
+    );
   }
 
   private async sampleFleet(runtime: { paymentRpcUrl: string }) {
@@ -540,19 +619,21 @@ export class RunController {
     }
 
     run.completionReason = reason;
-    run.comparisonValid = reason === "timed_out" || reason === "stopped_manually" || reason === "completed";
     run.metadata.runState =
       reason === "aborted" ? "aborted" : reason === "failed" ? "failed" : "completed";
     run.metadata.endedAt = this.now();
 
     for (const automaton of run.automatons.values()) {
       if (automaton.spawnSucceeded && automaton.runtimeStatus !== "spawn_failed") {
-        automaton.runtimeStatus = automaton.stalled ? "stalled" : "completed";
+        automaton.runtimeStatus = automaton.runtimeStatus === "stalled" ? "stalled" : "completed";
       }
     }
 
-    const summary = buildSummary(run);
-    const report = buildReportMetadata(run, summary);
+    const comparisonAssessment = assessComparisonValidity(run, reason);
+    run.comparisonValid = comparisonAssessment.valid;
+
+    const summary = buildSummary(run, comparisonAssessment.valid);
+    const report = buildReportMetadata(run, summary, comparisonAssessment.reason);
     run.report = report;
     const markdown = renderMarkdownReport(run.metadata, report, summary);
 

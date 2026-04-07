@@ -9,8 +9,11 @@ interface FleetSummaryProps {
 const summaryItems = [
   ["Requested spawns", "requestedSpawns"],
   ["Successful spawns", "successfulSpawns"],
-  ["Stalled", "stalledAutomatons"],
+  ["Stalled now", "stalledAutomatons"],
+  ["Ever stalled", "everStalledAutomatons"],
   ["Active", "activeAutomatons"],
+  ["Baselines", "baselineCapturedAutomatons"],
+  ["Comparable", "comparableAutomatons"],
   ["Total turns", "totalTurns"],
   ["Tool calls", "totalToolCalls"],
   ["Errors", "totalErrors"],

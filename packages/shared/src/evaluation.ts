@@ -38,6 +38,16 @@ export const EVALUATION_ERROR_HISTOGRAM_SOURCES = [
   "wallet",
   "indexer"
 ] as const;
+export const EVALUATION_INFERENCE_TRANSPORTS = [
+  "openrouter_direct",
+  "openrouter_proxy_worker"
+] as const;
+export const EVALUATION_OPENROUTER_REASONING_LEVELS = [
+  "default",
+  "low",
+  "medium",
+  "high"
+] as const;
 
 export const MIN_EVALUATION_AUTOMATON_COUNT = 1;
 export const MAX_EVALUATION_AUTOMATON_COUNT = 10;
@@ -49,6 +59,10 @@ export type EvaluationCompletionReason =
   (typeof EVALUATION_COMPLETION_REASONS)[number];
 export type EvaluationErrorHistogramSource =
   (typeof EVALUATION_ERROR_HISTOGRAM_SOURCES)[number];
+export type EvaluationInferenceTransport =
+  (typeof EVALUATION_INFERENCE_TRANSPORTS)[number];
+export type EvaluationOpenRouterReasoningLevel =
+  (typeof EVALUATION_OPENROUTER_REASONING_LEVELS)[number];
 export type EvaluationObservedCount =
   | number
   | typeof EVALUATION_PROVIDER_INFERENCE_UNAVAILABLE;
@@ -69,6 +83,8 @@ export interface EvaluationAutomatonConfig {
   id: string;
   label: string;
   model: string;
+  transport: EvaluationInferenceTransport;
+  reasoningLevel: EvaluationOpenRouterReasoningLevel;
   strategies: StrategyRepositoryId[];
 }
 
@@ -133,6 +149,10 @@ export interface EvaluationAutomatonEvidenceSample {
       recentEvents: unknown[];
       roomActivity: unknown | null;
     };
+    inference: {
+      config: unknown | null;
+      proxyStatus: unknown | null;
+    };
     evm: {
       ethBalanceWei: string | null;
       usdcBalanceRaw: string | null;
@@ -146,12 +166,16 @@ export interface EvaluationAutomatonSummary {
   id: string;
   label: string;
   model: string;
+  transport: EvaluationInferenceTransport;
+  reasoningLevel: EvaluationOpenRouterReasoningLevel;
   strategies: StrategyRepositoryId[];
   sessionId: string | null;
   canisterId: string | null;
   evmAddress: string | null;
   spawnSucceeded: boolean;
   stalled: boolean;
+  everStalled: boolean;
+  stallEpisodeCount: number;
   stallDetectedAt: number | null;
   baselineAt: number | null;
   finalObservedAt: number | null;
@@ -185,6 +209,7 @@ export interface EvaluationReportMetadata {
   generatedAt: number;
   completionReason: EvaluationCompletionReason;
   comparisonValid: boolean;
+  comparisonInvalidReason: string | null;
   strongestAutomatonId: string | null;
   weakestAutomatonId: string | null;
 }
@@ -193,7 +218,10 @@ export interface EvaluationFleetTotals {
   requestedSpawns: number;
   successfulSpawns: number;
   stalledAutomatons: number;
+  everStalledAutomatons: number;
   activeAutomatons: number;
+  baselineCapturedAutomatons: number;
+  comparableAutomatons: number;
   totalTurns: number;
   totalToolCalls: number;
   totalErrors: number;
@@ -210,6 +238,8 @@ export interface EvaluationDashboardAutomaton {
   id: string;
   label: string;
   model: string;
+  transport: EvaluationInferenceTransport;
+  reasoningLevel: EvaluationOpenRouterReasoningLevel;
   strategies: StrategyRepositoryId[];
   sessionId: string | null;
   canisterId: string | null;
@@ -818,11 +848,30 @@ function toEvaluationAutomatonConfig(
   automatonIds: Set<string>
 ): EvaluationAutomatonConfig | null {
   const record = expectPlainObject(value, issues, path);
-  rejectUnknownKeys(record, ["id", "label", "model", "strategies"], issues, path);
+  rejectUnknownKeys(
+    record,
+    ["id", "label", "model", "transport", "reasoningLevel", "strategies"],
+    issues,
+    path
+  );
 
   const id = expectNonEmptyString(record.id, issues, `${path}.id`);
   const label = expectNonEmptyString(record.label, issues, `${path}.label`);
   const model = expectNonEmptyString(record.model, issues, `${path}.model`);
+  const transport = expectOptionalEnumValue(
+    record.transport,
+    EVALUATION_INFERENCE_TRANSPORTS,
+    "openrouter_direct",
+    issues,
+    `${path}.transport`
+  );
+  const reasoningLevel = expectOptionalEnumValue(
+    record.reasoningLevel,
+    EVALUATION_OPENROUTER_REASONING_LEVELS,
+    "default",
+    issues,
+    `${path}.reasoningLevel`
+  );
   const strategies = expectArray(record.strategies, issues, `${path}.strategies`)
     .map((entry, index) =>
       expectNonEmptyString(entry, issues, `${path}.strategies[${index}]`)
@@ -843,6 +892,8 @@ function toEvaluationAutomatonConfig(
     id,
     label,
     model,
+    transport,
+    reasoningLevel,
     strategies
   };
 }
@@ -876,6 +927,35 @@ function expectNonEmptyString(value: unknown, issues: string[], path: string): s
   }
 
   return value.trim();
+}
+
+function expectOptionalEnumValue<const TValues extends readonly string[]>(
+  value: unknown,
+  allowedValues: TValues,
+  defaultValue: TValues[number],
+  issues: string[],
+  path: string
+): TValues[number] {
+  if (value === undefined) {
+    return defaultValue;
+  }
+
+  if (typeof value !== "string" || value.trim() === "") {
+    issues.push(
+      `${path} must be one of: ${allowedValues.map((entry) => `"${entry}"`).join(", ")}.`
+    );
+    return defaultValue;
+  }
+
+  const normalized = value.trim();
+  if (!allowedValues.includes(normalized as TValues[number])) {
+    issues.push(
+      `${path} must be one of: ${allowedValues.map((entry) => `"${entry}"`).join(", ")}.`
+    );
+    return defaultValue;
+  }
+
+  return normalized as TValues[number];
 }
 
 function expectPositiveInteger(value: unknown, issues: string[], path: string): number {

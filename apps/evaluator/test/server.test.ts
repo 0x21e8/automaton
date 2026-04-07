@@ -38,6 +38,8 @@ function createRuntimeEnv(): EvaluatorRuntimeEnv {
     stewardAddress: "0x0000000000000000000000000000000000000001",
     openRouterApiKey: "test-openrouter",
     braveSearchApiKey: null,
+    inferenceProxyWorkerBaseUrl: "https://proxy.example.com",
+    inferenceProxyTrustedCallbackPrincipal: "aaaaa-aa",
     localEvmForkUrl: "https://example.invalid/base-fork",
     automatonRepoPath: "/tmp/ic-automaton"
   };
@@ -439,7 +441,10 @@ describe("evaluator server", () => {
                 requestedSpawns: 1,
                 successfulSpawns: 0,
                 stalledAutomatons: 0,
+                everStalledAutomatons: 0,
                 activeAutomatons: 0,
+                baselineCapturedAutomatons: 0,
+                comparableAutomatons: 0,
                 totalTurns: 0,
                 totalToolCalls: 0,
                 totalErrors: 0,

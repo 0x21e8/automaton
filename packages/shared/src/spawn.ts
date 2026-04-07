@@ -6,6 +6,16 @@ import type {
 
 export const SUPPORTED_SPAWN_CHAINS = ["base"] as const;
 export const SUPPORTED_SPAWN_ASSETS = ["usdc"] as const;
+export const SPAWN_INFERENCE_TRANSPORTS = [
+  "openrouter_direct",
+  "openrouter_proxy_worker"
+] as const;
+export const SPAWN_OPENROUTER_REASONING_LEVELS = [
+  "default",
+  "low",
+  "medium",
+  "high"
+] as const;
 
 export const SPAWN_SESSION_STATES = [
   "awaiting_payment",
@@ -39,11 +49,16 @@ export type SpawnSessionState = (typeof SPAWN_SESSION_STATES)[number];
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 export type SessionAuditActor = (typeof SESSION_AUDIT_ACTORS)[number];
 export type StrategyRepositoryId = RepositoryStrategyRecord["strategyId"];
+export type SpawnInferenceTransport = (typeof SPAWN_INFERENCE_TRANSPORTS)[number];
+export type SpawnOpenRouterReasoningLevel =
+  (typeof SPAWN_OPENROUTER_REASONING_LEVELS)[number];
 
 export interface ProviderConfig {
   openRouterApiKey: string | null;
   model: string | null;
   braveSearchApiKey: string | null;
+  inferenceTransport: SpawnInferenceTransport;
+  openRouterReasoningLevel: SpawnOpenRouterReasoningLevel;
 }
 
 export interface SpawnSessionStrategySnapshot {

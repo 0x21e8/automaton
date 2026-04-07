@@ -55,8 +55,31 @@ describe("evaluator env loading", () => {
       stewardAddress: "0x00000000000000000000000000000000000000aa",
       openRouterApiKey: "env-openrouter",
       braveSearchApiKey: null,
+      inferenceProxyWorkerBaseUrl: null,
+      inferenceProxyTrustedCallbackPrincipal: null,
       localEvmForkUrl: "https://dotenv.invalid/base",
       automatonRepoPath: "/tmp/from-dotenv"
     });
+  });
+
+  it("loads optional proxy runtime settings when present", async () => {
+    const repoRoot = await createTempDirectory("evaluator-env-proxy-");
+    await writeFile(
+      join(repoRoot, ".env"),
+      [
+        "EVAL_STEWARD_ADDRESS=0x00000000000000000000000000000000000000aa",
+        "EVAL_OPENROUTER_API_KEY=dotenv-openrouter",
+        "EVAL_INFERENCE_PROXY_WORKER_BASE_URL=https://proxy.example.com",
+        "EVAL_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL=aaaaa-aa",
+        "LOCAL_EVM_FORK_URL=https://dotenv.invalid/base",
+        "IC_AUTOMATON_REPO=/tmp/from-dotenv"
+      ].join("\n"),
+      "utf8"
+    );
+
+    const runtimeEnv = loadEvaluatorEnv(repoRoot);
+
+    expect(runtimeEnv.inferenceProxyWorkerBaseUrl).toBe("https://proxy.example.com");
+    expect(runtimeEnv.inferenceProxyTrustedCallbackPrincipal).toBe("aaaaa-aa");
   });
 });

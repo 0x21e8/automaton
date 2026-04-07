@@ -159,6 +159,35 @@ IC_AUTOMATON_REPO=/absolute/path/to/ic-automaton
 
 # Optional
 EVAL_BRAVE_SEARCH_API_KEY=
+EVAL_INFERENCE_PROXY_WORKER_BASE_URL=
+EVAL_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL=
+```
+
+Use `transport` and `reasoningLevel` per automaton in the experiment YAML. Keep proxy worker infrastructure in env/runtime config, not in the experiment:
+
+```yaml
+automatons:
+  - id: alpha-direct
+    label: Alpha Direct
+    model: openrouter/openai/gpt-5
+    transport: openrouter_direct
+    reasoningLevel: default
+    strategies:
+      - base-aave-usdc-reserve-01
+  - id: alpha-proxy
+    label: Alpha Proxy
+    model: openrouter/openai/gpt-5
+    transport: openrouter_proxy_worker
+    reasoningLevel: medium
+    strategies:
+      - base-aave-usdc-reserve-01
+```
+
+When any automaton uses `transport: openrouter_proxy_worker`, the evaluator requires both proxy env keys above, and the local factory child runtime should be configured with:
+
+```dotenv
+FACTORY_CHILD_INFERENCE_PROXY_WORKER_BASE_URL=
+FACTORY_CHILD_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL=
 ```
 
 Use `eval` during implementation. It runs the evaluator backend in watch mode, bootstraps the playground stack (including the indexer), serves the operator dashboard from Vite, and serves the main launchpad web app:

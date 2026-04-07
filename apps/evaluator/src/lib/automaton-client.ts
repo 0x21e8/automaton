@@ -22,6 +22,19 @@ export interface HttpWalletBalanceResponse {
   usdc_decimals?: number;
 }
 
+export interface HttpInferenceConfigResponse {
+  model?: string | null;
+  provider?: string | null;
+  reasoning_level?: string | null;
+}
+
+export interface HttpInferenceProxyStatusResponse {
+  configured?: boolean;
+  provider?: string | null;
+  trusted_callback_principal?: string | null;
+  worker_base_url?: string | null;
+}
+
 export interface HttpTurnRecordResponse {
   created_at_ns?: number;
   duration_ms?: number | null;
@@ -90,6 +103,8 @@ function buildCanisterApiUrl(
 export interface AutomatonRuntimeEvidence {
   buildInfo: HttpBuildInfoResponse;
   evmConfig: HttpEvmConfigResponse;
+  inferenceConfig: HttpInferenceConfigResponse | null;
+  inferenceProxyStatus: HttpInferenceProxyStatusResponse | null;
   snapshot: HttpSnapshotResponse;
   walletBalance: HttpWalletBalanceResponse;
   recentTurns: HttpTurnRecordResponse[];
@@ -102,7 +117,11 @@ export class AutomatonClient {
     private readonly fetchImpl: typeof fetch = fetch
   ) {}
 
-  private async requestJson<T>(canisterId: string, path: string): Promise<T> {
+  private async requestJsonOptional<T>(
+    canisterId: string,
+    path: string,
+    allowedStatuses: readonly number[]
+  ): Promise<T | null> {
     const response = await this.fetchImpl(buildCanisterApiUrl(this.host, this.port, canisterId, path), {
       headers: {
         accept: "application/json"
@@ -110,6 +129,10 @@ export class AutomatonClient {
     });
 
     if (!response.ok) {
+      if (allowedStatuses.includes(response.status)) {
+        return null;
+      }
+
       throw new Error(
         `Canister HTTP request failed for ${canisterId} ${path}: ${response.status} ${response.statusText}`
       );
@@ -118,10 +141,30 @@ export class AutomatonClient {
     return (await response.json()) as T;
   }
 
+  private async requestJson<T>(canisterId: string, path: string): Promise<T> {
+    const result = await this.requestJsonOptional<T>(canisterId, path, []);
+    if (result === null) {
+      throw new Error(`Canister HTTP request failed for ${canisterId} ${path}: empty response`);
+    }
+
+    return result;
+  }
+
   async readEvidence(canisterId: string): Promise<AutomatonRuntimeEvidence> {
-    const [buildInfo, evmConfig, snapshot, walletBalance] = await Promise.all([
+    const [buildInfo, evmConfig, inferenceConfig, inferenceProxyStatus, snapshot, walletBalance] =
+      await Promise.all([
       this.requestJson<HttpBuildInfoResponse>(canisterId, "/api/build-info"),
       this.requestJson<HttpEvmConfigResponse>(canisterId, "/api/evm/config"),
+      this.requestJsonOptional<HttpInferenceConfigResponse>(
+        canisterId,
+        "/api/inference/config",
+        [404]
+      ),
+      this.requestJsonOptional<HttpInferenceProxyStatusResponse>(
+        canisterId,
+        "/api/inference/proxy/status",
+        [400, 404]
+      ),
       this.requestJson<HttpSnapshotResponse>(canisterId, "/api/snapshot"),
       this.requestJson<HttpWalletBalanceResponse>(canisterId, "/api/wallet/balance")
     ]);
@@ -129,6 +172,8 @@ export class AutomatonClient {
     return {
       buildInfo,
       evmConfig,
+      inferenceConfig,
+      inferenceProxyStatus,
       snapshot,
       walletBalance,
       recentTurns: snapshot.recent_turns ?? []

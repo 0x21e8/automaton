@@ -248,7 +248,9 @@ describe("shared contracts", () => {
           provider: {
             openRouterApiKey: null,
             model: null,
-            braveSearchApiKey: null
+            braveSearchApiKey: null,
+            inferenceTransport: "openrouter_direct",
+            openRouterReasoningLevel: "default"
           }
         },
         createdAt: 1_710_000_000_000,

@@ -47,7 +47,9 @@ function createSession(overrides: Partial<SpawnSession> = {}): SpawnSession {
       provider: {
         openRouterApiKey: null,
         model: null,
-        braveSearchApiKey: null
+        braveSearchApiKey: null,
+        inferenceTransport: "openrouter_direct",
+        openRouterReasoningLevel: "default"
       }
     },
     createdAt: 1_709_912_345_000,

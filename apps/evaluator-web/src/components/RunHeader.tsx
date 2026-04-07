@@ -126,12 +126,12 @@ export function RunHeader({
 
       {comparisonInvalid ? (
         <div className="run-banner run-banner--critical">
-          Spawn success fell below the comparison threshold. The final report is visible, but
-          this run should not be compared against other commits.
+          {report?.comparisonInvalidReason ??
+            "This run should not be compared against other commits."}
         </div>
       ) : null}
 
-      {report !== null ? (
+      {report !== null && report.comparisonValid ? (
         <div className="run-banner run-banner--muted">
           Strongest: {report.strongestAutomatonId ?? "n/a"} | Weakest:{" "}
           {report.weakestAutomatonId ?? "n/a"}

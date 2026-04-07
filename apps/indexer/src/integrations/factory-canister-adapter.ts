@@ -35,6 +35,12 @@ type CandidVariant<TName extends string, TValue = null> = {
 
 type CandidSpawnChain = CandidVariant<"Base">;
 type CandidSpawnAsset = CandidVariant<"Usdc">;
+type CandidInferenceTransport = CandidVariant<
+  "OpenrouterDirect" | "OpenrouterProxyWorker"
+>;
+type CandidOpenRouterReasoningLevel = CandidVariant<
+  "Default" | "Low" | "Medium" | "High"
+>;
 type CandidSpawnSessionState = CandidVariant<
   | "AwaitingPayment"
   | "PaymentDetected"
@@ -50,7 +56,9 @@ type CandidRepositoryStrategyStatus = CandidVariant<"Active" | "Deprecated" | "R
 
 interface CandidProviderConfig {
   brave_search_api_key: Optional<string>;
+  inference_transport: CandidInferenceTransport;
   model: Optional<string>;
+  open_router_reasoning_level: CandidOpenRouterReasoningLevel;
   open_router_api_key: Optional<string>;
 }
 
@@ -318,7 +326,17 @@ function createFactoryIdl() {
       Base: candid.Null
     });
     const ProviderConfig = candid.Record({
+      inference_transport: candid.Variant({
+        OpenrouterDirect: candid.Null,
+        OpenrouterProxyWorker: candid.Null
+      }),
       model: candid.Opt(candid.Text),
+      open_router_reasoning_level: candid.Variant({
+        Default: candid.Null,
+        Low: candid.Null,
+        Medium: candid.Null,
+        High: candid.Null
+      }),
       open_router_api_key: candid.Opt(candid.Text),
       brave_search_api_key: candid.Opt(candid.Text)
     });
@@ -817,6 +835,62 @@ function toNumber(value: bigint) {
   return Number(value);
 }
 
+function mapInferenceTransport(
+  transport: CandidInferenceTransport
+): CreateSpawnSessionRequest["config"]["provider"]["inferenceTransport"] {
+  if ("OpenrouterDirect" in transport) {
+    return "openrouter_direct";
+  }
+  if ("OpenrouterProxyWorker" in transport) {
+    return "openrouter_proxy_worker";
+  }
+
+  throw new Error(`Unsupported inference transport variant: ${JSON.stringify(transport)}`);
+}
+
+function mapOpenRouterReasoningLevel(
+  level: CandidOpenRouterReasoningLevel
+): CreateSpawnSessionRequest["config"]["provider"]["openRouterReasoningLevel"] {
+  if ("Default" in level) {
+    return "default";
+  }
+  if ("Low" in level) {
+    return "low";
+  }
+  if ("Medium" in level) {
+    return "medium";
+  }
+  if ("High" in level) {
+    return "high";
+  }
+
+  throw new Error(`Unsupported OpenRouter reasoning level variant: ${JSON.stringify(level)}`);
+}
+
+function toCandidInferenceTransport(
+  transport: CreateSpawnSessionRequest["config"]["provider"]["inferenceTransport"]
+): CandidInferenceTransport {
+  return transport === "openrouter_proxy_worker"
+    ? { OpenrouterProxyWorker: null }
+    : { OpenrouterDirect: null };
+}
+
+function toCandidOpenRouterReasoningLevel(
+  level: CreateSpawnSessionRequest["config"]["provider"]["openRouterReasoningLevel"]
+): CandidOpenRouterReasoningLevel {
+  switch (level) {
+    case "low":
+      return { Low: null };
+    case "medium":
+      return { Medium: null };
+    case "high":
+      return { High: null };
+    case "default":
+    default:
+      return { Default: null };
+  }
+}
+
 function mapSpawnConfig(config: CandidSpawnConfig): CreateSpawnSessionRequest["config"] {
   return {
     chain: mapChain(config.chain),
@@ -824,7 +898,11 @@ function mapSpawnConfig(config: CandidSpawnConfig): CreateSpawnSessionRequest["c
     skills: [...config.skills],
     strategies: [...config.strategies],
     provider: {
+      inferenceTransport: mapInferenceTransport(config.provider.inference_transport),
       model: unwrapOptional(config.provider.model),
+      openRouterReasoningLevel: mapOpenRouterReasoningLevel(
+        config.provider.open_router_reasoning_level
+      ),
       openRouterApiKey: unwrapOptional(config.provider.open_router_api_key),
       braveSearchApiKey: unwrapOptional(config.provider.brave_search_api_key)
     }
@@ -997,7 +1075,13 @@ function mapCreateRequest(
           request.config.provider.braveSearchApiKey === null
             ? []
             : [request.config.provider.braveSearchApiKey],
+        inference_transport: toCandidInferenceTransport(
+          request.config.provider.inferenceTransport
+        ),
         model: request.config.provider.model === null ? [] : [request.config.provider.model],
+        open_router_reasoning_level: toCandidOpenRouterReasoningLevel(
+          request.config.provider.openRouterReasoningLevel
+        ),
         open_router_api_key:
           request.config.provider.openRouterApiKey === null
             ? []

@@ -289,7 +289,9 @@ export function createSpawnSessionDetailFixture(
       provider: {
         openRouterApiKey: null,
         model: "openrouter/auto",
-        braveSearchApiKey: null
+        braveSearchApiKey: null,
+        inferenceTransport: "openrouter_direct",
+        openRouterReasoningLevel: "default"
       }
     },
     createdAt: 1_709_912_345_000,

@@ -35,6 +35,10 @@ export function AutomatonCard({ automaton }: AutomatonCardProps) {
           <dd>{automaton.model}</dd>
         </div>
         <div>
+          <dt>Inference</dt>
+          <dd>{`${automaton.transport} / ${automaton.reasoningLevel}`}</dd>
+        </div>
+        <div>
           <dt>Strategies</dt>
           <dd>{formatStrategies(automaton.strategies)}</dd>
         </div>

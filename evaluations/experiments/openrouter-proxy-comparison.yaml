@@ -1,0 +1,23 @@
+name: openrouter-proxy-comparison
+description: Compare direct OpenRouter against proxy-worker-backed OpenRouter with the same model.
+maxRuntimeMinutes: 240
+samplingIntervalSeconds: 15
+stallAfterMinutes: 10
+spawn:
+  grossAmount: "75000000"
+  minSuccessRatio: 0.8
+automatons:
+  - id: alpha-direct
+    label: Alpha Direct
+    model: openrouter/openai/gpt-5
+    transport: openrouter_direct
+    reasoningLevel: default
+    strategies:
+      - base-aave-usdc-reserve-01
+  - id: alpha-proxy
+    label: Alpha Proxy
+    model: openrouter/openai/gpt-5
+    transport: openrouter_proxy_worker
+    reasoningLevel: medium
+    strategies:
+      - base-aave-usdc-reserve-01

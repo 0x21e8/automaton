@@ -1098,7 +1098,9 @@ export function SpawnWizard({
           braveSearchApiKey:
             state.braveSearchApiKey.trim() === ""
               ? null
-              : state.braveSearchApiKey.trim()
+              : state.braveSearchApiKey.trim(),
+          inferenceTransport: "openrouter_direct",
+          openRouterReasoningLevel: "default"
         }
       }
     };

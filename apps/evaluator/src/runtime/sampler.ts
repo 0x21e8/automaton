@@ -115,10 +115,15 @@ export async function captureAutomatonSample(context: SampleContext): Promise<Sa
   }
 
   if (context.now - context.automaton.lastProgressAt >= context.stallAfterMs) {
+    if (!context.automaton.stalled) {
+      context.automaton.stallEpisodeCount += 1;
+    }
     context.automaton.stalled = true;
+    context.automaton.everStalled = true;
     context.automaton.stallDetectedAt ??= context.now;
     context.automaton.runtimeStatus = "stalled";
   } else {
+    context.automaton.stalled = false;
     context.automaton.runtimeStatus = "active";
   }
 
@@ -149,6 +154,10 @@ export async function captureAutomatonSample(context: SampleContext): Promise<Sa
         automaton: detail,
         recentEvents: [],
         roomActivity: roomMessages
+      },
+      inference: {
+        config: evidence.inferenceConfig,
+        proxyStatus: evidence.inferenceProxyStatus
       },
       evm: evmObservation
     },

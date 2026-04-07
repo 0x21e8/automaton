@@ -42,6 +42,8 @@ function createRuntimeEnv(): EvaluatorRuntimeEnv {
     stewardAddress: "0x0000000000000000000000000000000000000001",
     openRouterApiKey: "test-openrouter",
     braveSearchApiKey: null,
+    inferenceProxyWorkerBaseUrl: "https://proxy.example.com",
+    inferenceProxyTrustedCallbackPrincipal: "aaaaa-aa",
     localEvmForkUrl: "https://example.invalid/base-fork",
     automatonRepoPath: "/tmp/ic-automaton"
   };
@@ -51,6 +53,8 @@ function createController(options: {
   repoRoot: string;
   artifactsRoot: string;
   experimentPath: string | null;
+  env?: Partial<EvaluatorRuntimeEnv>;
+  onCreateSpawnSession?: (body: unknown) => void;
   loadPlaygroundHelpers: () => Promise<{
     claimPlaygroundFaucet(indexerBaseUrl: string, walletAddress: string): Promise<unknown>;
     createEphemeralWallet(rootDir: string): {
@@ -89,7 +93,10 @@ function createController(options: {
         localReplicaHost: "127.0.0.1",
         localReplicaPort: 8000
       },
-      env: createRuntimeEnv(),
+      env: {
+        ...createRuntimeEnv(),
+        ...options.env
+      },
       artifacts,
       processes: {
         async bootstrapPlayground() {},
@@ -135,6 +142,7 @@ function createController(options: {
           } as const;
         },
         async createSpawnSession(body) {
+          options.onCreateSpawnSession?.(body);
           const sessionId = `session-${body.config.provider.model}`;
           return {
             session: {
@@ -297,6 +305,12 @@ function createController(options: {
                   ? "0x0000000000000000000000000000000000000aaa"
                   : "0x0000000000000000000000000000000000000bbb"
             },
+            inferenceConfig: {
+              provider: "OpenRouter",
+              model: "test-model",
+              reasoning_level: "default"
+            },
+            inferenceProxyStatus: null,
             snapshot: {
               cycles: {
                 total_cycles: canisterId === "canister-alpha" ? 900 : 850
@@ -534,12 +548,6 @@ describe("run controller", () => {
       ].join("\n")
     );
 
-    let resumeSleep = () => {};
-    let notifySleep: (() => void) | null = null;
-    const sleepStarted = new Promise<void>((resolve) => {
-      notifySleep = resolve;
-    });
-
     const { controller, loggerApp } = createController({
       repoRoot,
       artifactsRoot,
@@ -568,18 +576,23 @@ describe("run controller", () => {
           throw new Error("baseline capture failed");
         }
       },
-      sleep: async () =>
-        await new Promise<void>((resolve) => {
-          notifySleep?.();
-          resumeSleep = resolve;
-        })
+      sleep: async () => {}
     });
 
     try {
       await controller.startRun(experimentPath);
-      await sleepStarted;
+
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        if (controller.getDashboard()?.run.successfulSpawnCount === 1) {
+          break;
+        }
+
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        });
+      }
+
       await controller.requestStop();
-      resumeSleep();
       await controller.waitForCompletion();
 
       const dashboard = controller.getDashboard();
@@ -587,9 +600,11 @@ describe("run controller", () => {
       expect(dashboard?.automatons[0]?.spawnStatus).toBe("active");
       expect(dashboard?.automatons[0]?.lastError).toContain("baseline capture failed");
       expect(dashboard?.automatons[0]?.errorHistogram[0]).toMatchObject({
-        source: "sampling",
-        message: "baseline capture failed"
+        source: "sampling"
       });
+      expect(dashboard?.automatons[0]?.errorHistogram[0]?.message).toContain(
+        "baseline capture failed"
+      );
       expect(dashboard?.automatons[0]?.errorHistogram[0]?.count).toBeGreaterThanOrEqual(1);
     } finally {
       await loggerApp.close();
@@ -660,6 +675,12 @@ describe("run controller", () => {
             evmConfig: {
               automaton_address: "0x0000000000000000000000000000000000000aaa"
             },
+            inferenceConfig: {
+              provider: "OpenRouter",
+              model: "model-alpha",
+              reasoning_level: "default"
+            },
+            inferenceProxyStatus: null,
             snapshot: {
               cycles: {
                 total_cycles: 900
@@ -708,6 +729,146 @@ describe("run controller", () => {
           count: 1
         })
       ]);
+    } finally {
+      await loggerApp.close();
+    }
+  });
+
+  it("maps proxy transport and reasoning into the spawn provider config", async () => {
+    const repoRoot = await createTempDirectory("evaluator-controller-repo-proxy-config-");
+    const artifactsRoot = await createTempDirectory("evaluator-controller-artifacts-proxy-config-");
+    const experimentPath = await writeExperiment(
+      repoRoot,
+      [
+        "name: smoke",
+        "description: proxy config mapping",
+        "maxRuntimeMinutes: 1",
+        "samplingIntervalSeconds: 15",
+        "stallAfterMinutes: 10",
+        "spawn:",
+        "  grossAmount: \"75000000\"",
+        "  minSuccessRatio: 1",
+        "automatons:",
+        "  - id: alpha",
+        "    label: Alpha",
+        "    model: model-alpha",
+        "    transport: openrouter_proxy_worker",
+        "    reasoningLevel: medium",
+        "    strategies:",
+        "      - momentum"
+      ].join("\n")
+    );
+
+    const createdRequests: Array<Record<string, any>> = [];
+
+    const { controller, loggerApp } = createController({
+      repoRoot,
+      artifactsRoot,
+      experimentPath,
+      onCreateSpawnSession(body) {
+        createdRequests.push(body as Record<string, any>);
+      },
+      loadPlaygroundHelpers: async () => ({
+        async claimPlaygroundFaucet() {},
+        createEphemeralWallet() {
+          return {
+            address: "0x0000000000000000000000000000000000000aaa",
+            privateKey: "0x01"
+          };
+        },
+        async submitSpawnPayment() {},
+        async waitForSessionCompletion() {
+          return {
+            registryRecord: {
+              canisterId: "canister-alpha",
+              evmAddress: "0x0000000000000000000000000000000000000aaa",
+              versionCommit: "89abcdef0123456789abcdef0123456789abcdef"
+            }
+          };
+        }
+      }),
+      sleep: async () => {}
+    });
+
+    try {
+      await controller.startRun(experimentPath);
+      await controller.waitForCompletion();
+
+      expect(createdRequests).toHaveLength(1);
+      expect(createdRequests[0]?.config.provider).toMatchObject({
+        openRouterApiKey: "test-openrouter",
+        model: "model-alpha",
+        braveSearchApiKey: null,
+        inferenceTransport: "openrouter_proxy_worker",
+        openRouterReasoningLevel: "medium"
+      });
+    } finally {
+      await loggerApp.close();
+    }
+  });
+
+  it("fails before spawning when proxy transport is requested without proxy runtime config", async () => {
+    const repoRoot = await createTempDirectory("evaluator-controller-repo-proxy-missing-env-");
+    const artifactsRoot = await createTempDirectory("evaluator-controller-artifacts-proxy-missing-env-");
+    const experimentPath = await writeExperiment(
+      repoRoot,
+      [
+        "name: smoke",
+        "description: proxy missing env",
+        "maxRuntimeMinutes: 1",
+        "samplingIntervalSeconds: 15",
+        "stallAfterMinutes: 10",
+        "spawn:",
+        "  grossAmount: \"75000000\"",
+        "  minSuccessRatio: 1",
+        "automatons:",
+        "  - id: alpha",
+        "    label: Alpha",
+        "    model: model-alpha",
+        "    transport: openrouter_proxy_worker",
+        "    strategies:",
+        "      - momentum"
+      ].join("\n")
+    );
+
+    const { controller, loggerApp } = createController({
+      repoRoot,
+      artifactsRoot,
+      experimentPath,
+      env: {
+        inferenceProxyWorkerBaseUrl: null,
+        inferenceProxyTrustedCallbackPrincipal: null
+      },
+      loadPlaygroundHelpers: async () => ({
+        async claimPlaygroundFaucet() {},
+        createEphemeralWallet() {
+          return {
+            address: "0x0000000000000000000000000000000000000aaa",
+            privateKey: "0x01"
+          };
+        },
+        async submitSpawnPayment() {},
+        async waitForSessionCompletion() {
+          return {
+            registryRecord: null
+          };
+        }
+      })
+    });
+
+    try {
+      await controller.startRun(experimentPath);
+      await controller.waitForCompletion();
+
+      const dashboard = controller.getDashboard();
+      expect(dashboard?.run.runState).toBe("failed");
+      expect(dashboard?.run.successfulSpawnCount).toBe(0);
+      expect(dashboard?.run.abortReason).toContain(
+        "EVAL_INFERENCE_PROXY_WORKER_BASE_URL"
+      );
+      expect(dashboard?.run.abortReason).toContain(
+        "EVAL_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL"
+      );
     } finally {
       await loggerApp.close();
     }
@@ -782,7 +943,7 @@ describe("run controller", () => {
       const dashboard = controller.getDashboard();
       expect(dashboard?.run.runState).toBe("completed");
       expect(dashboard?.report?.completionReason).toBe("stopped_manually");
-      expect(dashboard?.report?.comparisonValid).toBe(true);
+      expect(dashboard?.report?.comparisonValid).toBe(false);
     } finally {
       await loggerApp.close();
     }

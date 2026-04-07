@@ -82,6 +82,10 @@ export function loadEvaluatorEnv(
       issues
     ),
     braveSearchApiKey: merged.EVAL_BRAVE_SEARCH_API_KEY?.trim() || null,
+    inferenceProxyWorkerBaseUrl:
+      merged.EVAL_INFERENCE_PROXY_WORKER_BASE_URL?.trim() || null,
+    inferenceProxyTrustedCallbackPrincipal:
+      merged.EVAL_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL?.trim() || null,
     localEvmForkUrl: requireValue(merged.LOCAL_EVM_FORK_URL, "LOCAL_EVM_FORK_URL", issues),
     automatonRepoPath: requireValue(merged.IC_AUTOMATON_REPO, "IC_AUTOMATON_REPO", issues)
   };

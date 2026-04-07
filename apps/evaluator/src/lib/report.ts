@@ -3,6 +3,7 @@ import type {
   EvaluationDashboardCyclesPoint,
   EvaluationFleetTotals,
   EvaluationReportMetadata,
+  EvaluationCompletionReason,
   EvaluationRunMetadata,
   EvaluationRunSummary
 } from "@ic-automaton/shared";
@@ -40,7 +41,71 @@ function subtractNumericStrings(current: string | null, baseline: string | null)
 function compareNullableNumberStringsDescending(left: string | null, right: string | null) {
   const leftValue = left === null ? Number.NEGATIVE_INFINITY : Number(left);
   const rightValue = right === null ? Number.NEGATIVE_INFINITY : Number(right);
-  return rightValue - leftValue;
+  const comparison = rightValue - leftValue;
+  return Number.isNaN(comparison) ? 0 : comparison;
+}
+
+function hasBaseline(automaton: RuntimeAutomatonState) {
+  return automaton.baseline !== null;
+}
+
+function hasComparableBaseline(automaton: RuntimeAutomatonState) {
+  if (!hasBaseline(automaton)) {
+    return false;
+  }
+
+  return (
+    automaton.baseline?.cycles !== null &&
+    automaton.baseline?.netWorthUsd !== null &&
+    automaton.baseline?.ethBalanceWei !== null &&
+    automaton.baseline?.usdcBalanceRaw !== null &&
+    automaton.baseline?.txCount !== null
+  );
+}
+
+export function assessComparisonValidity(
+  run: ActiveEvaluationRun,
+  completionReason: EvaluationCompletionReason
+) {
+  if (!["timed_out", "stopped_manually", "completed"].includes(completionReason)) {
+    return {
+      valid: false,
+      reason: run.metadata.abortReason ?? `Run ended with completion reason "${completionReason}".`
+    };
+  }
+
+  const successful = [...run.automatons.values()].filter((automaton) => automaton.spawnSucceeded);
+  if (successful.length < 2) {
+    return {
+      valid: false,
+      reason: `Only ${successful.length} successful spawn${successful.length === 1 ? "" : "s"}; need at least 2 for comparison.`
+    };
+  }
+
+  const missingBaseline = successful
+    .filter((automaton) => !hasBaseline(automaton))
+    .map((automaton) => automaton.config.id);
+  if (missingBaseline.length > 0) {
+    return {
+      valid: false,
+      reason: `Missing baseline capture for successful spawns: ${missingBaseline.join(", ")}.`
+    };
+  }
+
+  const nonComparable = successful
+    .filter((automaton) => !hasComparableBaseline(automaton))
+    .map((automaton) => automaton.config.id);
+  if (nonComparable.length > 0) {
+    return {
+      valid: false,
+      reason: `Baseline telemetry incomplete for successful spawns: ${nonComparable.join(", ")}.`
+    };
+  }
+
+  return {
+    valid: true,
+    reason: null
+  };
 }
 
 function downsampleCyclesSeries(points: EvaluationDashboardCyclesPoint[]) {
@@ -95,7 +160,10 @@ export function buildFleetTotals(automatons: RuntimeAutomatonState[]): Evaluatio
   let totalErrors = 0;
   let successfulSpawns = 0;
   let stalledAutomatons = 0;
+  let everStalledAutomatons = 0;
   let activeAutomatons = 0;
+  let baselineCapturedAutomatons = 0;
+  let comparableAutomatons = 0;
   let totalNetWorthUsdDelta = 0;
   let hasNetWorthUsdDelta = false;
   let totalCyclesConsumed = 0n;
@@ -114,7 +182,19 @@ export function buildFleetTotals(automatons: RuntimeAutomatonState[]): Evaluatio
       stalledAutomatons += 1;
     }
 
-    if (automaton.spawnSucceeded && !automaton.stalled) {
+    if (automaton.everStalled) {
+      everStalledAutomatons += 1;
+    }
+
+    if (hasBaseline(automaton)) {
+      baselineCapturedAutomatons += 1;
+    }
+
+    if (hasComparableBaseline(automaton)) {
+      comparableAutomatons += 1;
+    }
+
+    if (automaton.spawnSucceeded && automaton.runtimeStatus === "active") {
       activeAutomatons += 1;
     }
 
@@ -141,7 +221,10 @@ export function buildFleetTotals(automatons: RuntimeAutomatonState[]): Evaluatio
     requestedSpawns: automatons.length,
     successfulSpawns,
     stalledAutomatons,
+    everStalledAutomatons,
     activeAutomatons,
+    baselineCapturedAutomatons,
+    comparableAutomatons,
     totalTurns,
     totalToolCalls,
     totalErrors,
@@ -158,6 +241,8 @@ export function buildDashboardAutomatons(automatons: RuntimeAutomatonState[]): E
       id: automaton.config.id,
       label: automaton.config.label,
       model: automaton.config.model,
+      transport: automaton.config.transport,
+      reasoningLevel: automaton.config.reasoningLevel,
       strategies: [...automaton.config.strategies],
       sessionId: automaton.sessionId,
       canisterId: automaton.canisterId,
@@ -186,7 +271,7 @@ export function buildDashboardAutomatons(automatons: RuntimeAutomatonState[]): E
   });
 }
 
-export function buildSummary(run: ActiveEvaluationRun): EvaluationRunSummary {
+export function buildSummary(run: ActiveEvaluationRun, comparisonValid: boolean): EvaluationRunSummary {
   const ranked = [...run.automatons.values()].sort((left, right) => {
     if (left.spawnSucceeded !== right.spawnSucceeded) {
       return left.spawnSucceeded ? -1 : 1;
@@ -219,12 +304,16 @@ export function buildSummary(run: ActiveEvaluationRun): EvaluationRunSummary {
     id: automaton.config.id,
     label: automaton.config.label,
     model: automaton.config.model,
+    transport: automaton.config.transport,
+    reasoningLevel: automaton.config.reasoningLevel,
     strategies: [...automaton.config.strategies],
     sessionId: automaton.sessionId,
     canisterId: automaton.canisterId,
     evmAddress: automaton.evmAddress,
     spawnSucceeded: automaton.spawnSucceeded,
     stalled: automaton.stalled,
+    everStalled: automaton.everStalled,
+    stallEpisodeCount: automaton.stallEpisodeCount,
     stallDetectedAt: automaton.stallDetectedAt,
     baselineAt: automaton.baseline?.observedAt ?? null,
     finalObservedAt: automaton.finalObservedAt,
@@ -253,7 +342,7 @@ export function buildSummary(run: ActiveEvaluationRun): EvaluationRunSummary {
       automaton.baseline?.txCount !== null && automaton.baseline !== null && automaton.txCountLatest !== null
         ? automaton.txCountLatest - automaton.baseline.txCount
         : null,
-    rank: automaton.spawnSucceeded ? index + 1 : null
+    rank: comparisonValid && automaton.spawnSucceeded ? index + 1 : null
   }));
 
   return {
@@ -262,15 +351,20 @@ export function buildSummary(run: ActiveEvaluationRun): EvaluationRunSummary {
   };
 }
 
-export function buildReportMetadata(run: ActiveEvaluationRun, summary: EvaluationRunSummary): EvaluationReportMetadata {
+export function buildReportMetadata(
+  run: ActiveEvaluationRun,
+  summary: EvaluationRunSummary,
+  comparisonInvalidReason: string | null
+): EvaluationReportMetadata {
   const rankedSuccessful = summary.automatonResults.filter((entry) => entry.rank !== null);
 
   return {
     generatedAt: run.metadata.endedAt ?? run.metadata.startedAt,
     completionReason: run.completionReason ?? "failed",
     comparisonValid: run.comparisonValid,
-    strongestAutomatonId: rankedSuccessful[0]?.id ?? null,
-    weakestAutomatonId: rankedSuccessful.at(-1)?.id ?? null
+    comparisonInvalidReason,
+    strongestAutomatonId: run.comparisonValid ? rankedSuccessful[0]?.id ?? null : null,
+    weakestAutomatonId: run.comparisonValid ? rankedSuccessful.at(-1)?.id ?? null : null
   };
 }
 
@@ -297,7 +391,9 @@ export function renderMarkdownReport(
     `- Ended at: ${formatTimestamp(metadata.endedAt)}`,
     `- Outcome: ${report.completionReason}`,
     `- Comparison valid: ${report.comparisonValid ? "yes" : "no"}`,
-    report.comparisonValid ? "" : `- Abort reason: ${metadata.abortReason ?? "n/a"}`,
+    report.comparisonValid
+      ? ""
+      : `- Comparison invalid reason: ${report.comparisonInvalidReason ?? metadata.abortReason ?? "n/a"}`,
     "",
     "## Rankings",
     ""
@@ -305,13 +401,17 @@ export function renderMarkdownReport(
 
   for (const entry of summary.automatonResults) {
     lines.push(
-      `- ${entry.rank ?? "n/a"}. ${entry.label} (${entry.id}) | spawn=${entry.spawnSucceeded ? "ok" : "failed"} | stalled=${entry.stalled ? "yes" : "no"} | netWorthDelta=${entry.netWorthUsdDelta ?? "n/a"} | txDelta=${entry.txCountDelta ?? "n/a"} | turns=${entry.turnCount} | errors=${entry.errorCount}`
+      `- ${entry.rank ?? "n/a"}. ${entry.label} (${entry.id}) | spawn=${entry.spawnSucceeded ? "ok" : "failed"} | transport=${entry.transport} | reasoning=${entry.reasoningLevel} | stalled_now=${entry.stalled ? "yes" : "no"} | ever_stalled=${entry.everStalled ? "yes" : "no"} | stallEpisodes=${entry.stallEpisodeCount} | netWorthDelta=${entry.netWorthUsdDelta ?? "n/a"} | txDelta=${entry.txCountDelta ?? "n/a"} | turns=${entry.turnCount} | errors=${entry.errorCount}`
     );
   }
 
   lines.push("", "## Highlights", "");
-  lines.push(`- Strongest performer: ${report.strongestAutomatonId ?? "n/a"}`);
-  lines.push(`- Weakest performer: ${report.weakestAutomatonId ?? "n/a"}`);
+  lines.push(
+    `- Strongest performer: ${report.comparisonValid ? report.strongestAutomatonId ?? "n/a" : "n/a"}`
+  );
+  lines.push(
+    `- Weakest performer: ${report.comparisonValid ? report.weakestAutomatonId ?? "n/a" : "n/a"}`
+  );
   lines.push(`- Spawn outcomes: ${metadata.successfulSpawnCount}/${metadata.requestedAutomatonCount}`);
   lines.push(
     `- Evidence-backed failure reason: ${metadata.abortReason ?? "none recorded"}`

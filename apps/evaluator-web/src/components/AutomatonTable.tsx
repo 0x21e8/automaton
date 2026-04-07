@@ -50,6 +50,9 @@ export function AutomatonTable({ automatons }: AutomatonTableProps) {
                 <td>
                   <strong>{automaton.label}</strong>
                   <div className="cell-subtle">{automaton.id}</div>
+                  <div className="cell-subtle">
+                    {`${automaton.transport} / ${automaton.reasoningLevel}`}
+                  </div>
                   <div className="cell-subtle">{automaton.canisterId ?? "canister pending"}</div>
                 </td>
                 <td>{automaton.model}</td>

@@ -19,7 +19,9 @@ function createSession(sessionId = "550e8400-e29b-41d4-a716-446655440000") {
       chain: BASE,
       provider: {
         brave_search_api_key: ["brave-key"],
+        inference_transport: { OpenrouterDirect: null },
         model: ["openrouter/auto"],
+        open_router_reasoning_level: { Default: null },
         open_router_api_key: ["openrouter-key"]
       },
       risk: 7,
@@ -309,7 +311,9 @@ describe("CanisterFactoryAdapter", () => {
         provider: {
           openRouterApiKey: "openrouter-key",
           braveSearchApiKey: "brave-key",
-          model: "openrouter/auto"
+          model: "openrouter/auto",
+          inferenceTransport: "openrouter_direct",
+          openRouterReasoningLevel: "default"
         }
       }
     });
@@ -342,7 +346,9 @@ describe("CanisterFactoryAdapter", () => {
         chain: BASE,
         provider: {
           brave_search_api_key: ["brave-key"],
+          inference_transport: { OpenrouterDirect: null },
           model: ["openrouter/auto"],
+          open_router_reasoning_level: { Default: null },
           open_router_api_key: ["openrouter-key"]
         },
         risk: 7,
@@ -369,7 +375,9 @@ describe("CanisterFactoryAdapter", () => {
           provider: {
             openRouterApiKey: "openrouter-key",
             braveSearchApiKey: "brave-key",
-            model: "openrouter/auto"
+            model: "openrouter/auto",
+            inferenceTransport: "openrouter_direct",
+            openRouterReasoningLevel: "default"
           }
         }
       },

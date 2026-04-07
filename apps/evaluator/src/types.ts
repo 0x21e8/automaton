@@ -28,6 +28,8 @@ export interface EvaluatorRuntimeEnv {
   stewardAddress: string;
   openRouterApiKey: string;
   braveSearchApiKey: string | null;
+  inferenceProxyWorkerBaseUrl: string | null;
+  inferenceProxyTrustedCallbackPrincipal: string | null;
   localEvmForkUrl: string;
   automatonRepoPath: string;
 }
@@ -84,6 +86,8 @@ export interface RuntimeAutomatonState {
   runtimeStatus: EvaluationAutomatonStatus;
   spawnSucceeded: boolean;
   stalled: boolean;
+  everStalled: boolean;
+  stallEpisodeCount: number;
   stallDetectedAt: number | null;
   baseline: RuntimeBaseline | null;
   finalObservedAt: number | null;
