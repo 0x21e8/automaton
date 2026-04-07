@@ -13,22 +13,23 @@ use crate::domain::types::{
     AutonomyInferenceSuppressionClassification, AutonomyInferenceSuppressionState, AutonomyPolicy,
     AutonomySuppressionConfig, ConversationEntry, ConversationLog, ConversationSummary,
     CycleTelemetry, DecisionRecord, EvmPollCursor, EvmRouteStateView, ExposureReconciliationStatus,
-    GoalRecord, InboxMessage, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState, PlanRecord,
-    InboxStats,
-    InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
+    GoalRecord, InboxMessage, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState,
+    InboxStats, InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
     InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup,
     ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
-    OutboxStats, PendingInferenceProxyJob, PromptLayer, PromptLayerView, ReflectionMemoryRecord,
-    ReflectionOrigin, RetentionConfig, RetentionMaintenanceRuntime, RoomMessage, RoomPollingState,
-    RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary,
-    SkillRecord, SpawnBootstrapView, StewardNonceState, StewardState, StewardStatusView,
-    StorageGrowthMetrics, StoragePressureLevel, StrategyKillSwitchState, StrategyOutcomeEvent,
-    StrategyOutcomeKind, StrategyOutcomeStats, StrategyQuarantine, StrategyTemplate,
-    StrategyTemplateKey, SubmitInferenceResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind,
-    TaskLane, TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState,
-    TemplateRevocationState, ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary,
-    WalletBalanceSnapshot, WalletBalanceSyncConfig, WalletBalanceSyncConfigView,
-    WalletBalanceTelemetryView,
+    OutboxStats, PendingInferenceProxyJob, PendingStrategyDiscoveryJob, PlanRecord, PromptLayer,
+    PromptLayerView, ProtocolWatchlistEntry, ReflectionMemoryRecord, ReflectionOrigin,
+    RetentionConfig, RetentionMaintenanceRuntime, RoomMessage, RoomPollingState, RuntimeSnapshot,
+    RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord,
+    SpawnBootstrapView, StewardNonceState, StewardState, StewardStatusView, StorageGrowthMetrics,
+    StoragePressureLevel, StrategyDiscoveryCallbackRecord, StrategyDiscoveryResultPayload,
+    StrategyDiscoveryResultStatus, StrategyDiscoveryStatusView, StrategyDiscoveryWorkerConfig,
+    StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats,
+    StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
+    SubmitStrategyDiscoveryResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+    TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState,
+    ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
+    WalletBalanceSyncConfig, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 pub use crate::domain::types::{
     AutonomyToolFailureCooldown, MemoryFactSort, MemoryFactStats, RetentionPruneStats,
@@ -73,6 +74,7 @@ const INBOX_PROXY_WAIT_STATES_KEY: &str = "inference.proxy.inbox_wait_states";
 const INFERENCE_PROXY_CALLBACK_RESULTS_KEY: &str = "inference.proxy.callback_results";
 const INFERENCE_PROXY_COMPLETED_CALLBACK_JOBS_KEY: &str = "inference.proxy.completed_callback_jobs";
 const INFERENCE_PROXY_METRICS_KEY: &str = "inference.proxy.metrics";
+const STRATEGY_DISCOVERY_METRICS_KEY: &str = "strategy.discovery.metrics";
 const SEARCH_API_KEY_KEY: &str = "search.api_key";
 const SEARCH_MAX_PER_TURN_KEY: &str = "search.max_per_turn";
 const SEARCH_TURN_USAGE_KEY: &str = "search.usage.turn_counts";
@@ -80,6 +82,8 @@ const SEARCH_TURN_USAGE_KEY: &str = "search.usage.turn_counts";
 pub const MAX_WELCOME_MESSAGE_CHARS: usize = 2_000;
 pub const INFERENCE_PROXY_PENDING_JOB_TTL_SECS: u64 = 15 * 60;
 const MAX_COMPLETED_INFERENCE_PROXY_CALLBACK_JOBS: usize = 2_048;
+pub const MAX_STRATEGY_DISCOVERY_RESULTS: usize = 256;
+pub const MAX_STRATEGY_DISCOVERY_CALLBACK_PAYLOAD_BYTES: usize = 96 * 1024;
 pub const DEFAULT_SEARCH_MAX_PER_TURN: u8 = 3;
 const MAX_SEARCH_TURN_USAGE_ENTRIES: usize = 128;
 
@@ -261,6 +265,17 @@ struct InferenceProxyRuntimeMetrics {
     callback_duplicates: u64,
     callback_auth_failures: u64,
     resumed_callbacks: u64,
+    expired_jobs: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StrategyDiscoveryRuntimeMetrics {
+    submit_accepted: u64,
+    submit_failed: u64,
+    callback_accepted: u64,
+    callback_rejected: u64,
+    callback_duplicates: u64,
+    callback_auth_failures: u64,
     expired_jobs: u64,
 }
 
@@ -2218,6 +2233,127 @@ pub fn assert_inference_proxy_callback_authorized(caller_principal: &str) -> Res
     Ok(())
 }
 
+fn normalize_strategy_discovery_watchlist_entry(
+    entry: ProtocolWatchlistEntry,
+) -> Result<ProtocolWatchlistEntry, String> {
+    let id = entry.id.trim();
+    if id.is_empty() {
+        return Err("strategy discovery watchlist id cannot be empty".to_string());
+    }
+    if entry.chain_id == 0 {
+        return Err(format!(
+            "strategy discovery watchlist id={} chain_id must be greater than zero",
+            id
+        ));
+    }
+    let market_data_api_url = entry.market_data_api_url.trim();
+    if market_data_api_url.is_empty() {
+        return Err(format!(
+            "strategy discovery watchlist id={} market_data_api_url cannot be empty",
+            id
+        ));
+    }
+    let abi_api_url = entry.abi_api_url.trim();
+    if abi_api_url.is_empty() {
+        return Err(format!(
+            "strategy discovery watchlist id={} abi_api_url cannot be empty",
+            id
+        ));
+    }
+    let normalized_pool_address = normalize_evm_address(&entry.pool_address)?;
+    Ok(ProtocolWatchlistEntry {
+        id: id.to_string(),
+        chain_id: entry.chain_id,
+        pool_address: normalized_pool_address,
+        market_data_api_url: market_data_api_url.to_string(),
+        abi_api_url: abi_api_url.to_string(),
+    })
+}
+
+pub fn set_strategy_discovery_worker_config(
+    config: StrategyDiscoveryWorkerConfig,
+) -> Result<StrategyDiscoveryWorkerConfig, String> {
+    let worker_base_url = config
+        .worker_base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let objective = config.objective.trim().to_string();
+    let protocol_watchlist = config
+        .protocol_watchlist
+        .into_iter()
+        .map(normalize_strategy_discovery_watchlist_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    let worker_api_key = config
+        .worker_api_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    if config.enabled {
+        if worker_base_url.is_empty() {
+            return Err(
+                "strategy discovery worker_base_url cannot be empty when enabled".to_string(),
+            );
+        }
+        if worker_api_key.is_none() {
+            return Err("strategy discovery worker_api_key is required when enabled".to_string());
+        }
+        if config.trusted_callback_principal.is_none() {
+            return Err(
+                "strategy discovery trusted_callback_principal is required when enabled"
+                    .to_string(),
+            );
+        }
+        if objective.is_empty() {
+            return Err("strategy discovery objective cannot be empty when enabled".to_string());
+        }
+        if protocol_watchlist.is_empty() {
+            return Err(
+                "strategy discovery protocol_watchlist cannot be empty when enabled".to_string(),
+            );
+        }
+    }
+    if config.result_ttl_secs == 0 {
+        return Err("strategy discovery result_ttl_secs must be greater than zero".to_string());
+    }
+
+    let stored = StrategyDiscoveryWorkerConfig {
+        enabled: config.enabled,
+        worker_base_url,
+        worker_api_key,
+        trusted_callback_principal: config.trusted_callback_principal,
+        result_ttl_secs: config.result_ttl_secs,
+        objective,
+        protocol_watchlist,
+    };
+    let mut snapshot = runtime_snapshot();
+    snapshot.strategy_discovery_worker = stored.clone();
+    snapshot.last_transition_at_ns = now_ns();
+    save_runtime_snapshot(&snapshot);
+    Ok(stored)
+}
+
+pub fn strategy_discovery_worker_config() -> StrategyDiscoveryWorkerConfig {
+    runtime_snapshot().strategy_discovery_worker
+}
+
+pub fn assert_strategy_discovery_callback_authorized(caller_principal: &str) -> Result<(), String> {
+    let expected = runtime_snapshot()
+        .strategy_discovery_worker
+        .trusted_callback_principal
+        .ok_or_else(|| {
+            "strategy discovery trusted callback principal is not configured".to_string()
+        })?
+        .to_text();
+    if caller_principal != expected {
+        return Err(format!(
+            "unauthorized strategy discovery callback caller={} expected={}",
+            caller_principal, expected
+        ));
+    }
+    Ok(())
+}
+
 // ── Private scalar helpers ────────────────────────────────────────────────────
 
 fn runtime_u64(key: &str) -> Option<u64> {
@@ -2339,6 +2475,61 @@ where
     let mut metrics = load_inference_proxy_metrics();
     mutate(&mut metrics);
     save_inference_proxy_metrics(&metrics);
+}
+
+fn load_strategy_discovery_metrics() -> StrategyDiscoveryRuntimeMetrics {
+    sqlite::get_runtime_scalar(STRATEGY_DISCOVERY_METRICS_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<StrategyDiscoveryRuntimeMetrics>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_strategy_discovery_metrics(metrics: &StrategyDiscoveryRuntimeMetrics) {
+    if let Ok(raw) = serde_json::to_string(metrics) {
+        let _ = sqlite::set_runtime_scalar(STRATEGY_DISCOVERY_METRICS_KEY, &raw);
+    }
+}
+
+fn update_strategy_discovery_metrics<F>(mutate: F)
+where
+    F: FnOnce(&mut StrategyDiscoveryRuntimeMetrics),
+{
+    let mut metrics = load_strategy_discovery_metrics();
+    mutate(&mut metrics);
+    save_strategy_discovery_metrics(&metrics);
+}
+
+fn strategy_discovery_watchlist_hash(
+    watchlist: &[ProtocolWatchlistEntry],
+) -> Result<String, String> {
+    let payload = serde_json::to_vec(watchlist)
+        .map_err(|error| format!("watchlist hash encode failed: {error}"))?;
+    let digest = Keccak256::digest(payload);
+    Ok(format!("0x{}", hex::encode(digest)))
+}
+
+fn strategy_discovery_result_hash(
+    payload: &StrategyDiscoveryResultPayload,
+) -> Result<String, String> {
+    let bytes = serde_json::to_vec(payload)
+        .map_err(|error| format!("strategy discovery result encode failed: {error}"))?;
+    let digest = Keccak256::digest(bytes);
+    Ok(format!("0x{}", hex::encode(digest)))
+}
+
+fn strategy_discovery_status_key(status: &StrategyDiscoveryResultStatus) -> &'static str {
+    match status {
+        StrategyDiscoveryResultStatus::Validated => "validated",
+        StrategyDiscoveryResultStatus::Rejected { .. } => "rejected",
+    }
+}
+
+fn strategy_discovery_status_reason(status: &StrategyDiscoveryResultStatus) -> Option<&str> {
+    match status {
+        StrategyDiscoveryResultStatus::Validated => None,
+        StrategyDiscoveryResultStatus::Rejected { reason } => Some(reason.as_str()),
+    }
 }
 
 fn evm_ingest_dedupe_key(tx_hash: &str, log_index: u64) -> String {
@@ -3874,6 +4065,509 @@ pub fn wallet_balance_sync_capable(snapshot: &RuntimeSnapshot) -> bool {
 
 pub fn inference_config_view() -> InferenceConfigView {
     InferenceConfigView::from(&runtime_snapshot())
+}
+
+fn source_host_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (_, remainder) = trimmed.split_once("://")?;
+    let host_port = remainder
+        .split(['/', '?', '#'])
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let host = host_port.rsplit('@').next().unwrap_or(host_port);
+    Some(host.to_ascii_lowercase())
+}
+
+fn strategy_discovery_allowed_source_hosts(
+    watchlist: &[ProtocolWatchlistEntry],
+) -> Result<BTreeMap<String, bool>, String> {
+    let mut hosts = BTreeMap::new();
+    for entry in watchlist {
+        let market_host = source_host_from_url(&entry.market_data_api_url).ok_or_else(|| {
+            format!(
+                "strategy discovery watchlist id={} market_data_api_url must include a host",
+                entry.id
+            )
+        })?;
+        hosts.insert(market_host, true);
+        let abi_host = source_host_from_url(&entry.abi_api_url).ok_or_else(|| {
+            format!(
+                "strategy discovery watchlist id={} abi_api_url must include a host",
+                entry.id
+            )
+        })?;
+        hosts.insert(abi_host, true);
+    }
+    Ok(hosts)
+}
+
+fn validate_strategy_discovery_payload(
+    pending_job: &PendingStrategyDiscoveryJob,
+    args: &SubmitStrategyDiscoveryResultArgs,
+    accepted_at_ns: u64,
+    result_ttl_secs: u64,
+) -> Result<StrategyDiscoveryResultStatus, String> {
+    if args.job_id.trim().is_empty() {
+        return Err("strategy discovery callback job_id cannot be empty".to_string());
+    }
+    if args.objective.trim().is_empty() {
+        return Ok(StrategyDiscoveryResultStatus::Rejected {
+            reason: "strategy discovery callback objective cannot be empty".to_string(),
+        });
+    }
+    let payload_size_bytes = serde_json::to_vec(&args.payload)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if payload_size_bytes > MAX_STRATEGY_DISCOVERY_CALLBACK_PAYLOAD_BYTES {
+        return Ok(StrategyDiscoveryResultStatus::Rejected {
+            reason: format!(
+                "strategy discovery callback payload too large: {} > {} bytes",
+                payload_size_bytes, MAX_STRATEGY_DISCOVERY_CALLBACK_PAYLOAD_BYTES
+            ),
+        });
+    }
+    if args.objective.trim() != pending_job.objective.trim() {
+        return Ok(StrategyDiscoveryResultStatus::Rejected {
+            reason: format!(
+                "strategy discovery callback objective mismatch expected={} received={}",
+                pending_job.objective, args.objective
+            ),
+        });
+    }
+    let expected_watchlist_hash = strategy_discovery_watchlist_hash(&pending_job.watchlist)?;
+    let actual_watchlist_hash = strategy_discovery_watchlist_hash(&args.watchlist)?;
+    if expected_watchlist_hash != actual_watchlist_hash {
+        return Ok(StrategyDiscoveryResultStatus::Rejected {
+            reason: format!(
+                "strategy discovery callback watchlist mismatch expected={} received={}",
+                expected_watchlist_hash, actual_watchlist_hash
+            ),
+        });
+    }
+    let ttl_ns = result_ttl_secs.saturating_mul(1_000_000_000);
+    if ttl_ns == 0 {
+        return Ok(StrategyDiscoveryResultStatus::Rejected {
+            reason: "strategy discovery result ttl is zero".to_string(),
+        });
+    }
+    let min_completed_at_ns = accepted_at_ns.saturating_sub(ttl_ns);
+    if args.completed_at_ns < min_completed_at_ns {
+        return Ok(StrategyDiscoveryResultStatus::Rejected {
+            reason: format!(
+                "strategy discovery callback expired completed_at_ns={} accepted_at_ns={} ttl_secs={}",
+                args.completed_at_ns, accepted_at_ns, result_ttl_secs
+            ),
+        });
+    }
+    if args.payload.protocol_artifacts.is_empty()
+        && args.payload.candidates.is_empty()
+        && args.payload.source_records.is_empty()
+    {
+        return Ok(StrategyDiscoveryResultStatus::Rejected {
+            reason:
+                "strategy discovery callback payload must include artifacts, candidates, or sources"
+                    .to_string(),
+        });
+    }
+
+    let allowed_hosts = strategy_discovery_allowed_source_hosts(&pending_job.watchlist)?;
+    for source in &args.payload.source_records {
+        if source.source_id.trim().is_empty() {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: "strategy discovery source_id cannot be empty".to_string(),
+            });
+        }
+        let Some(host) = source_host_from_url(&source.url) else {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery source url missing host source_id={}",
+                    source.source_id
+                ),
+            });
+        };
+        if !allowed_hosts.contains_key(&host) {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery source host not allowlisted source_id={} host={}",
+                    source.source_id, host
+                ),
+            });
+        }
+        if source.fetched_at_ns < min_completed_at_ns {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery source stale source_id={} fetched_at_ns={} ttl_secs={}",
+                    source.source_id, source.fetched_at_ns, result_ttl_secs
+                ),
+            });
+        }
+    }
+
+    for bundle in &args.payload.protocol_artifacts {
+        if bundle.bundle_id.trim().is_empty() {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: "strategy discovery protocol artifact bundle_id cannot be empty"
+                    .to_string(),
+            });
+        }
+        if bundle.protocol_id.trim().is_empty() || bundle.role.trim().is_empty() {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery protocol artifact bundle={} must include protocol_id and role",
+                    bundle.bundle_id
+                ),
+            });
+        }
+        if bundle.chain_id == 0 {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery protocol artifact bundle={} chain_id must be greater than zero",
+                    bundle.bundle_id
+                ),
+            });
+        }
+        if normalize_evm_address(&bundle.contract_address).is_err() {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery protocol artifact bundle={} contract_address invalid",
+                    bundle.bundle_id
+                ),
+            });
+        }
+        if bundle.abi_json.trim().is_empty() {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery protocol artifact bundle={} abi_json cannot be empty",
+                    bundle.bundle_id
+                ),
+            });
+        }
+        let Some(host) = source_host_from_url(&bundle.source_ref) else {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery protocol artifact bundle={} source_ref missing host",
+                    bundle.bundle_id
+                ),
+            });
+        };
+        if !allowed_hosts.contains_key(&host) {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery protocol artifact source host not allowlisted bundle={} host={}",
+                    bundle.bundle_id, host
+                ),
+            });
+        }
+    }
+
+    for candidate in &args.payload.candidates {
+        if candidate.candidate_id.trim().is_empty() {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: "strategy discovery candidate_id cannot be empty".to_string(),
+            });
+        }
+        if candidate.objective.trim().is_empty() {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery candidate={} objective cannot be empty",
+                    candidate.candidate_id
+                ),
+            });
+        }
+        if candidate.chain_id == 0 {
+            return Ok(StrategyDiscoveryResultStatus::Rejected {
+                reason: format!(
+                    "strategy discovery candidate={} chain_id must be greater than zero",
+                    candidate.candidate_id
+                ),
+            });
+        }
+    }
+
+    Ok(StrategyDiscoveryResultStatus::Validated)
+}
+
+pub fn upsert_pending_strategy_discovery_job(
+    job: PendingStrategyDiscoveryJob,
+) -> Result<(), String> {
+    if job.job_id.trim().is_empty() {
+        return Err("pending strategy discovery job_id cannot be empty".to_string());
+    }
+    if job.objective.trim().is_empty() {
+        return Err("pending strategy discovery objective cannot be empty".to_string());
+    }
+    if job.watchlist.is_empty() {
+        return Err("pending strategy discovery watchlist cannot be empty".to_string());
+    }
+    let watchlist_hash = strategy_discovery_watchlist_hash(&job.watchlist)?;
+    sqlite::upsert_strategy_discovery_pending_job(&job, &watchlist_hash)
+}
+
+pub fn get_pending_strategy_discovery_job(job_id: &str) -> Option<PendingStrategyDiscoveryJob> {
+    sqlite::strategy_discovery_pending_job(job_id)
+        .ok()
+        .flatten()
+}
+
+pub fn list_strategy_discovery_jobs(limit: usize) -> Vec<PendingStrategyDiscoveryJob> {
+    sqlite::list_strategy_discovery_pending_jobs(limit).unwrap_or_default()
+}
+
+pub fn pending_strategy_discovery_jobs_count() -> u64 {
+    sqlite::strategy_discovery_pending_jobs_count().unwrap_or(0)
+}
+
+pub fn expire_strategy_discovery_pending_jobs(
+    now_ns_param: u64,
+    pending_job_ttl_secs: u64,
+) -> Vec<PendingStrategyDiscoveryJob> {
+    if pending_job_ttl_secs == 0 {
+        return Vec::new();
+    }
+    let ttl_ns = pending_job_ttl_secs.saturating_mul(1_000_000_000);
+    let cutoff_ns = now_ns_param.saturating_sub(ttl_ns);
+    let pending_jobs = sqlite::list_strategy_discovery_pending_jobs(500).unwrap_or_default();
+    let mut expired = pending_jobs
+        .into_iter()
+        .filter(|job| job.submitted_at_ns <= cutoff_ns)
+        .collect::<Vec<_>>();
+    expired.sort_by_key(|job| job.submitted_at_ns);
+    for job in &expired {
+        let _ = sqlite::delete_strategy_discovery_pending_job(&job.job_id);
+    }
+    if !expired.is_empty() {
+        update_strategy_discovery_metrics(|metrics| {
+            metrics.expired_jobs = metrics
+                .expired_jobs
+                .saturating_add(u64::try_from(expired.len()).unwrap_or(u64::MAX));
+        });
+    }
+    expired
+}
+
+pub fn record_strategy_discovery_submit_accepted() {
+    update_strategy_discovery_metrics(|metrics| {
+        metrics.submit_accepted = metrics.submit_accepted.saturating_add(1);
+    });
+}
+
+pub fn record_strategy_discovery_submit_failed() {
+    update_strategy_discovery_metrics(|metrics| {
+        metrics.submit_failed = metrics.submit_failed.saturating_add(1);
+    });
+}
+
+pub fn record_strategy_discovery_callback_rejected(auth_failure: bool) {
+    update_strategy_discovery_metrics(|metrics| {
+        metrics.callback_rejected = metrics.callback_rejected.saturating_add(1);
+        if auth_failure {
+            metrics.callback_auth_failures = metrics.callback_auth_failures.saturating_add(1);
+        }
+    });
+}
+
+pub enum StrategyDiscoveryCallbackApply {
+    Accepted(StrategyDiscoveryResultStatus),
+    Duplicate,
+}
+
+pub fn apply_strategy_discovery_callback(
+    args: SubmitStrategyDiscoveryResultArgs,
+    caller_principal: String,
+    accepted_at_ns: u64,
+) -> Result<StrategyDiscoveryCallbackApply, String> {
+    if args.job_id.trim().is_empty() {
+        return Err("strategy discovery callback job_id cannot be empty".to_string());
+    }
+    if sqlite::strategy_discovery_completed_callback_job(&args.job_id)
+        .ok()
+        .flatten()
+        .is_some()
+        || sqlite::strategy_discovery_result(&args.job_id)
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        update_strategy_discovery_metrics(|metrics| {
+            metrics.callback_duplicates = metrics.callback_duplicates.saturating_add(1);
+        });
+        return Ok(StrategyDiscoveryCallbackApply::Duplicate);
+    }
+
+    let config = strategy_discovery_worker_config();
+    let pending_job = sqlite::strategy_discovery_pending_job(&args.job_id)
+        .ok()
+        .flatten();
+    if let Some(pending_job) = pending_job.as_ref() {
+        let _ = sqlite::delete_strategy_discovery_pending_job(&args.job_id);
+        let status = validate_strategy_discovery_payload(
+            pending_job,
+            &args,
+            accepted_at_ns,
+            config.result_ttl_secs,
+        )?;
+        let result_hash = strategy_discovery_result_hash(&args.payload)?;
+        let record = StrategyDiscoveryCallbackRecord {
+            job_id: args.job_id.clone(),
+            completed_at_ns: args.completed_at_ns,
+            accepted_at_ns,
+            validated_at_ns: matches!(status, StrategyDiscoveryResultStatus::Validated)
+                .then_some(accepted_at_ns),
+            caller_principal,
+            objective: args.objective,
+            watchlist: args.watchlist,
+            result_hash: result_hash.clone(),
+            status: status.clone(),
+            payload: args.payload,
+        };
+        let watchlist_hash = strategy_discovery_watchlist_hash(&record.watchlist)?;
+        sqlite::upsert_strategy_discovery_result(
+            &record,
+            strategy_discovery_status_key(&status),
+            &watchlist_hash,
+        )?;
+        sqlite::remember_strategy_discovery_completed_callback_job(
+            &record.job_id,
+            accepted_at_ns,
+            &result_hash,
+        )?;
+        update_strategy_discovery_metrics(|metrics| {
+            metrics.callback_accepted = metrics.callback_accepted.saturating_add(1);
+            if matches!(status, StrategyDiscoveryResultStatus::Rejected { .. }) {
+                metrics.callback_rejected = metrics.callback_rejected.saturating_add(1);
+            }
+        });
+        return Ok(StrategyDiscoveryCallbackApply::Accepted(status));
+    }
+
+    let status = StrategyDiscoveryResultStatus::Rejected {
+        reason: format!("unknown pending strategy discovery job_id={}", args.job_id),
+    };
+    let result_hash = strategy_discovery_result_hash(&args.payload)?;
+    let record = StrategyDiscoveryCallbackRecord {
+        job_id: args.job_id.clone(),
+        completed_at_ns: args.completed_at_ns,
+        accepted_at_ns,
+        validated_at_ns: None,
+        caller_principal,
+        objective: args.objective,
+        watchlist: args.watchlist,
+        result_hash: result_hash.clone(),
+        status: status.clone(),
+        payload: args.payload,
+    };
+    let watchlist_hash = strategy_discovery_watchlist_hash(&record.watchlist)?;
+    sqlite::upsert_strategy_discovery_result(
+        &record,
+        strategy_discovery_status_key(&status),
+        &watchlist_hash,
+    )?;
+    sqlite::remember_strategy_discovery_completed_callback_job(
+        &record.job_id,
+        accepted_at_ns,
+        &result_hash,
+    )?;
+    update_strategy_discovery_metrics(|metrics| {
+        metrics.callback_accepted = metrics.callback_accepted.saturating_add(1);
+        metrics.callback_rejected = metrics.callback_rejected.saturating_add(1);
+    });
+    Ok(StrategyDiscoveryCallbackApply::Accepted(status))
+}
+
+pub fn list_strategy_discovery_results(limit: usize) -> Vec<StrategyDiscoveryCallbackRecord> {
+    let mut records = sqlite::list_strategy_discovery_results(limit).unwrap_or_default();
+    if records.len() > MAX_STRATEGY_DISCOVERY_RESULTS {
+        records.truncate(MAX_STRATEGY_DISCOVERY_RESULTS);
+    }
+    records
+}
+
+pub fn get_strategy_discovery_result(job_id: &str) -> Option<StrategyDiscoveryCallbackRecord> {
+    sqlite::strategy_discovery_result(job_id).ok().flatten()
+}
+
+pub fn freshest_validated_strategy_discovery_result() -> Option<StrategyDiscoveryCallbackRecord> {
+    sqlite::freshest_validated_strategy_discovery_result()
+        .ok()
+        .flatten()
+}
+
+pub fn freshest_validated_strategy_discovery_result_for_config(
+    config: &StrategyDiscoveryWorkerConfig,
+    now_ns_param: u64,
+) -> Option<StrategyDiscoveryCallbackRecord> {
+    let expected_watchlist_hash =
+        strategy_discovery_watchlist_hash(&config.protocol_watchlist).ok()?;
+    freshest_validated_strategy_discovery_result().and_then(|record| {
+        if record.objective.trim() != config.objective.trim() {
+            return None;
+        }
+        let record_hash = strategy_discovery_watchlist_hash(&record.watchlist).ok()?;
+        if record_hash != expected_watchlist_hash {
+            return None;
+        }
+        let validated_at_ns = record.validated_at_ns?;
+        let ttl_ns = config.result_ttl_secs.saturating_mul(1_000_000_000);
+        if now_ns_param > validated_at_ns.saturating_add(ttl_ns) {
+            return None;
+        }
+        Some(record)
+    })
+}
+
+pub fn strategy_discovery_status_view(now_ns_param: u64) -> StrategyDiscoveryStatusView {
+    let config = strategy_discovery_worker_config();
+    let worker_base_url = config.worker_base_url.trim().to_string();
+    let pending_jobs = sqlite::strategy_discovery_pending_jobs_count().unwrap_or(0);
+    let result_records = sqlite::strategy_discovery_results_count().unwrap_or(0);
+    let freshest = freshest_validated_strategy_discovery_result();
+    let freshest_validated_at_ns = freshest.as_ref().and_then(|record| record.validated_at_ns);
+    let freshest_validated_age_secs =
+        freshest_validated_at_ns.map(|value| now_ns_param.saturating_sub(value) / 1_000_000_000);
+    let freshest_validated_expired = freshest_validated_at_ns
+        .map(|value| {
+            now_ns_param
+                > value.saturating_add(config.result_ttl_secs.saturating_mul(1_000_000_000))
+        })
+        .unwrap_or(false);
+    let metrics = load_strategy_discovery_metrics();
+    StrategyDiscoveryStatusView {
+        enabled: config.enabled,
+        worker_base_url: if worker_base_url.is_empty() {
+            None
+        } else {
+            Some(worker_base_url)
+        },
+        has_worker_api_key: config
+            .worker_api_key
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        trusted_callback_principal: config
+            .trusted_callback_principal
+            .as_ref()
+            .map(Principal::to_text),
+        result_ttl_secs: config.result_ttl_secs,
+        objective: (!config.objective.trim().is_empty()).then_some(config.objective),
+        protocol_watchlist_len: u64::try_from(config.protocol_watchlist.len()).unwrap_or(u64::MAX),
+        pending_jobs,
+        result_records,
+        freshest_validated_job_id: freshest.as_ref().map(|record| record.job_id.clone()),
+        freshest_validated_at_ns,
+        freshest_validated_age_secs,
+        freshest_validated_expired,
+        submit_accepted: metrics.submit_accepted,
+        submit_failed: metrics.submit_failed,
+        callback_accepted: metrics.callback_accepted,
+        callback_rejected: metrics.callback_rejected,
+        callback_duplicates: metrics.callback_duplicates,
+        callback_auth_failures: metrics.callback_auth_failures,
+        expired_jobs: metrics.expired_jobs,
+    }
 }
 
 pub fn upsert_pending_inference_proxy_job(job: PendingInferenceProxyJob) -> Result<(), String> {
@@ -5962,6 +6656,138 @@ mod tests {
 
         let status = inference_proxy_status_view();
         assert_eq!(status.expired_jobs, 1);
+    }
+
+    #[test]
+    fn strategy_discovery_storage_roundtrip_and_dedupe() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+        set_strategy_discovery_worker_config(StrategyDiscoveryWorkerConfig {
+            enabled: true,
+            worker_base_url: "https://discovery.example.workers.dev".to_string(),
+            worker_api_key: Some("secret".to_string()),
+            trusted_callback_principal: Some(trusted_test_principal()),
+            result_ttl_secs: 3_600,
+            objective: "find Base reserve opportunities".to_string(),
+            protocol_watchlist: vec![ProtocolWatchlistEntry {
+                id: "moonwell-usdc".to_string(),
+                chain_id: 8453,
+                pool_address: "0x1111111111111111111111111111111111111111".to_string(),
+                market_data_api_url: "https://api.example.com/market/moonwell".to_string(),
+                abi_api_url: "https://api.example.com/abi/moonwell".to_string(),
+            }],
+        })
+        .expect("discovery config should persist");
+
+        let pending = PendingStrategyDiscoveryJob {
+            job_id: "sd-job-1".to_string(),
+            submitted_at_ns: 100,
+            objective: "find Base reserve opportunities".to_string(),
+            watchlist: vec![ProtocolWatchlistEntry {
+                id: "moonwell-usdc".to_string(),
+                chain_id: 8453,
+                pool_address: "0x1111111111111111111111111111111111111111".to_string(),
+                market_data_api_url: "https://api.example.com/market/moonwell".to_string(),
+                abi_api_url: "https://api.example.com/abi/moonwell".to_string(),
+            }],
+            exposure_summary: "active_exposures=0".to_string(),
+            autonomy_summary: "preserve runway".to_string(),
+        };
+        upsert_pending_strategy_discovery_job(pending.clone())
+            .expect("pending strategy discovery job should persist");
+
+        let first = apply_strategy_discovery_callback(
+            SubmitStrategyDiscoveryResultArgs {
+                job_id: pending.job_id.clone(),
+                completed_at_ns: 200,
+                objective: pending.objective.clone(),
+                watchlist: pending.watchlist.clone(),
+                payload: StrategyDiscoveryResultPayload {
+                    protocol_artifacts: vec![crate::domain::types::ProtocolArtifactBundle {
+                        bundle_id: "moonwell-main".to_string(),
+                        protocol_id: "moonwell".to_string(),
+                        chain_id: 8453,
+                        role: "pool".to_string(),
+                        contract_address: "0x1111111111111111111111111111111111111111".to_string(),
+                        abi_json: "[{\"type\":\"function\",\"name\":\"supply\",\"inputs\":[]}]"
+                            .to_string(),
+                        source_ref: "https://api.example.com/abi/moonwell".to_string(),
+                        codehash: None,
+                        selector_assertions: Vec::new(),
+                        spec_summary: "primary pool".to_string(),
+                        risk_notes: vec!["guardian pause".to_string()],
+                    }],
+                    market: StrategyDiscoveryResultPayload::default().market,
+                    candidates: vec![crate::domain::types::StrategyCandidateBundle {
+                        candidate_id: "cand-1".to_string(),
+                        objective: pending.objective.clone(),
+                        protocol_id: "moonwell".to_string(),
+                        primitive: "reserve_supply".to_string(),
+                        chain_id: 8453,
+                        rationale: "bounded reserve parking".to_string(),
+                        required_artifacts: vec!["moonwell-main".to_string()],
+                        assumptions: vec!["pool remains liquid".to_string()],
+                        missing_inputs: Vec::new(),
+                        confidence_label: "medium".to_string(),
+                        freshness_deadline_ns: None,
+                        suggested_template_shape: Some("base-moonwell-usdc-reserve".to_string()),
+                        estimated_yield_bps: Some(420),
+                        warnings: vec!["monitor utilization".to_string()],
+                    }],
+                    source_records: vec![crate::domain::types::SourceRecord {
+                        source_id: "market-1".to_string(),
+                        source_type:
+                            crate::domain::types::StrategyDiscoverySourceType::MarketDataApi,
+                        url: "https://api.example.com/market/moonwell".to_string(),
+                        fetched_at_ns: 190,
+                        content_hash: "0xabc".to_string(),
+                        trust_tier:
+                            crate::domain::types::StrategyDiscoverySourceTrustTier::Official,
+                    }],
+                },
+            },
+            trusted_test_principal().to_text(),
+            210,
+        )
+        .expect("first strategy discovery callback should persist");
+        assert!(matches!(
+            first,
+            StrategyDiscoveryCallbackApply::Accepted(StrategyDiscoveryResultStatus::Validated)
+        ));
+
+        let duplicate = apply_strategy_discovery_callback(
+            SubmitStrategyDiscoveryResultArgs {
+                job_id: pending.job_id.clone(),
+                completed_at_ns: 201,
+                objective: pending.objective.clone(),
+                watchlist: pending.watchlist.clone(),
+                payload: StrategyDiscoveryResultPayload::default(),
+            },
+            trusted_test_principal().to_text(),
+            220,
+        )
+        .expect("duplicate callback should be idempotent");
+        assert!(matches!(
+            duplicate,
+            StrategyDiscoveryCallbackApply::Duplicate
+        ));
+
+        let results = list_strategy_discovery_results(10);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            results[0].status,
+            StrategyDiscoveryResultStatus::Validated
+        ));
+        assert!(
+            freshest_validated_strategy_discovery_result().is_some(),
+            "validated result should be queryable for prompt context"
+        );
+
+        let status = strategy_discovery_status_view(220);
+        assert_eq!(status.pending_jobs, 0);
+        assert_eq!(status.result_records, 1);
+        assert_eq!(status.callback_accepted, 1);
+        assert_eq!(status.callback_duplicates, 1);
     }
 
     #[test]

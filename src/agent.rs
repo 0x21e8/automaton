@@ -2531,6 +2531,67 @@ fn build_dynamic_context(
     )
 }
 
+fn render_strategy_discovery_context_section(now_ns: u64) -> Option<String> {
+    let record = stable::freshest_validated_strategy_discovery_result()?;
+    let validated_at_ns = record.validated_at_ns?;
+    let ttl_secs = stable::strategy_discovery_worker_config().result_ttl_secs;
+    let age_secs = now_ns.saturating_sub(validated_at_ns) / 1_000_000_000;
+    let expired = age_secs > ttl_secs;
+    let candidate_limit = 3usize;
+    let candidate_lines = record
+        .payload
+        .candidates
+        .iter()
+        .take(candidate_limit)
+        .map(|candidate| {
+            format!(
+                "- candidate={} protocol={} primitive={} confidence={} est_yield_bps={} warnings={} assumptions={}",
+                candidate.candidate_id,
+                candidate.protocol_id,
+                candidate.primitive,
+                candidate.confidence_label,
+                candidate
+                    .estimated_yield_bps
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                sanitize_preview(&candidate.warnings.join("; "), 140),
+                sanitize_preview(&candidate.assumptions.join("; "), 140),
+            )
+        })
+        .collect::<Vec<_>>();
+    let protocols = record
+        .payload
+        .protocol_artifacts
+        .iter()
+        .map(|bundle| bundle.protocol_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut lines = vec![
+        "### Strategy Discovery".to_string(),
+        format!("- freshest_job_id: {}", record.job_id),
+        format!("- freshest_validated_at_ns: {validated_at_ns}"),
+        format!("- freshest_age_secs: {age_secs}"),
+        format!("- freshness_ttl_secs: {ttl_secs}"),
+        format!("- discovery_expired: {expired}"),
+        format!("- objective: {}", sanitize_preview(&record.objective, 180)),
+        format!(
+            "- protocol_ids: {}",
+            if protocols.is_empty() {
+                "none".to_string()
+            } else {
+                protocols.join(",")
+            }
+        ),
+    ];
+    if candidate_lines.is_empty() {
+        lines.push("- top_candidates: none".to_string());
+    } else {
+        lines.extend(candidate_lines);
+    }
+    Some(lines.join("\n"))
+}
+
 fn build_dynamic_context_with_scope(
     snapshot: &crate::domain::types::RuntimeSnapshot,
     staged_messages: &[InboxMessage],
@@ -2588,6 +2649,7 @@ fn build_dynamic_context_with_scope(
     let autonomy_policy_section = render_autonomy_policy_section(&autonomy_policy);
     let recent_decisions_section = render_recent_decisions_section(&recent_decisions);
     let reflection_lines = stable::reflection_brief_for_context(now_ns);
+    let strategy_discovery_section = render_strategy_discovery_context_section(now_ns);
 
     let memory_section = if memory_facts.is_empty() && memory_rollups.is_empty() {
         "### Recent Memory\n- none".to_string()
@@ -2689,6 +2751,9 @@ fn build_dynamic_context_with_scope(
         sections.push(render_autonomy_runtime_constraints_section(
             runtime_constraint,
         ));
+    }
+    if let Some(strategy_discovery_section) = strategy_discovery_section {
+        sections.push(strategy_discovery_section);
     }
     if let Some(reflection_section) = reflection_section {
         sections.push(reflection_section);
@@ -4235,9 +4300,10 @@ mod tests {
         AutonomyInferenceSuppressionClassification, AutonomyPolicy, ContinuationStopReason,
         DecisionOutcome, DecisionRecord, DecisionTrigger, EvmPollCursor, InboxMessageSource,
         InboxMessageStatus, InboxProxyWaitState, InferenceProxyResultPayload, MemoryFact,
-        MemoryRollup, PendingInferenceProxyJob, PromptLayer, RoomContentType, RoomMessage,
-        RuntimeSnapshot, SpawnBootstrapView, SubmitInferenceResultArgs, SurvivalTier, ToolCall,
-        ToolCallRecord, ToolFailureKind,
+        MemoryRollup, PendingInferenceProxyJob, PendingStrategyDiscoveryJob, PromptLayer,
+        ProtocolWatchlistEntry, RoomContentType, RoomMessage, RuntimeSnapshot, SpawnBootstrapView,
+        StrategyDiscoveryResultPayload, StrategyDiscoveryWorkerConfig, SubmitInferenceResultArgs,
+        SubmitStrategyDiscoveryResultArgs, SurvivalTier, ToolCall, ToolCallRecord, ToolFailureKind,
     };
     use crate::util::block_on_with_spin;
 
@@ -5393,6 +5459,108 @@ mod tests {
         assert!(normalized
             .explanation
             .contains("normalized from NoOp to Executed"));
+    }
+
+    #[test]
+    fn autonomy_context_includes_staged_discovery_summary() {
+        reset_runtime(AgentState::Sleeping, true, false, 7);
+        let watchlist = vec![ProtocolWatchlistEntry {
+            id: "moonwell-usdc".to_string(),
+            chain_id: 8453,
+            pool_address: "0x1111111111111111111111111111111111111111".to_string(),
+            market_data_api_url: "https://api.example.com/market/moonwell".to_string(),
+            abi_api_url: "https://api.example.com/abi/moonwell".to_string(),
+        }];
+        stable::set_strategy_discovery_worker_config(StrategyDiscoveryWorkerConfig {
+            enabled: true,
+            worker_base_url: "https://discovery.example.workers.dev".to_string(),
+            worker_api_key: Some("secret".to_string()),
+            trusted_callback_principal: Some(
+                candid::Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
+                    .expect("principal should parse"),
+            ),
+            result_ttl_secs: 3_600,
+            objective: "find reserve opportunities".to_string(),
+            protocol_watchlist: watchlist.clone(),
+        })
+        .expect("discovery config should store");
+        stable::upsert_pending_strategy_discovery_job(PendingStrategyDiscoveryJob {
+            job_id: "sd-job-1".to_string(),
+            submitted_at_ns: 100,
+            objective: "find reserve opportunities".to_string(),
+            watchlist: watchlist.clone(),
+            exposure_summary: "active_exposures=0".to_string(),
+            autonomy_summary: "preserve runway".to_string(),
+        })
+        .expect("pending discovery job should store");
+        let applied = stable::apply_strategy_discovery_callback(
+            SubmitStrategyDiscoveryResultArgs {
+                job_id: "sd-job-1".to_string(),
+                completed_at_ns: current_time_ns(),
+                objective: "find reserve opportunities".to_string(),
+                watchlist,
+                payload: StrategyDiscoveryResultPayload {
+                    protocol_artifacts: vec![crate::domain::types::ProtocolArtifactBundle {
+                        bundle_id: "moonwell-main".to_string(),
+                        protocol_id: "moonwell".to_string(),
+                        chain_id: 8453,
+                        role: "pool".to_string(),
+                        contract_address: "0x1111111111111111111111111111111111111111".to_string(),
+                        abi_json: "[{\"type\":\"function\",\"name\":\"supply\",\"inputs\":[]}]"
+                            .to_string(),
+                        source_ref: "https://api.example.com/abi/moonwell".to_string(),
+                        codehash: None,
+                        selector_assertions: Vec::new(),
+                        spec_summary: "pool contract".to_string(),
+                        risk_notes: vec!["guardian pause".to_string()],
+                    }],
+                    market: crate::domain::types::MarketSynthesisBundle::default(),
+                    candidates: vec![crate::domain::types::StrategyCandidateBundle {
+                        candidate_id: "cand-1".to_string(),
+                        objective: "find reserve opportunities".to_string(),
+                        protocol_id: "moonwell".to_string(),
+                        primitive: "reserve_supply".to_string(),
+                        chain_id: 8453,
+                        rationale: "reserve parking".to_string(),
+                        required_artifacts: vec!["moonwell-main".to_string()],
+                        assumptions: vec!["pool remains liquid".to_string()],
+                        missing_inputs: Vec::new(),
+                        confidence_label: "medium".to_string(),
+                        freshness_deadline_ns: None,
+                        suggested_template_shape: Some("base-moonwell-usdc-reserve".to_string()),
+                        estimated_yield_bps: Some(420),
+                        warnings: vec!["watch utilization".to_string()],
+                    }],
+                    source_records: vec![crate::domain::types::SourceRecord {
+                        source_id: "market-1".to_string(),
+                        source_type:
+                            crate::domain::types::StrategyDiscoverySourceType::MarketDataApi,
+                        url: "https://api.example.com/market/moonwell".to_string(),
+                        fetched_at_ns: current_time_ns(),
+                        content_hash: "0xabc".to_string(),
+                        trust_tier:
+                            crate::domain::types::StrategyDiscoverySourceTrustTier::Official,
+                    }],
+                },
+            },
+            "w36hm-eqaaa-aaaal-qr76a-cai".to_string(),
+            current_time_ns(),
+        )
+        .expect("discovery callback should store");
+        assert!(matches!(
+            applied,
+            stable::StrategyDiscoveryCallbackApply::Accepted(
+                crate::domain::types::StrategyDiscoveryResultStatus::Validated
+            )
+        ));
+
+        let snapshot = stable::runtime_snapshot();
+        let context = build_dynamic_context(&snapshot, &[], 0, &[], &[], "turn-7", 5);
+        assert!(context.contains("### Strategy Discovery"));
+        assert!(context.contains("freshest_job_id: sd-job-1"));
+        assert!(context.contains("protocol_ids: moonwell"));
+        assert!(context.contains("candidate=cand-1"));
+        assert!(context.contains("assumptions=pool remains liquid"));
     }
 
     #[test]

@@ -4,12 +4,18 @@ use std::path::Path;
 use std::time::Duration;
 
 use candid::{decode_one, encode_args, CandidType, Principal};
+use pocket_ic::common::rest::{
+    CanisterHttpHeader, CanisterHttpReply, CanisterHttpRequest, CanisterHttpResponse,
+    MockCanisterHttpResponse,
+};
 use pocket_ic::PocketIc;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 
 const STEWARD_CHAIN_ID: u64 = 8453;
 const PROOF_EXPIRY_NS: u64 = 4_102_444_800_000_000_000;
+const FRESH_DISCOVERY_TIMESTAMP_NS: u64 = 9_000_000_000_000_000_000;
 const WASM_PATHS: &[&str] = &[
     "target/wasm32-wasip1/release/backend_nowasi.wasm",
     "target/wasm32-wasip1/release/backend.wasm",
@@ -59,6 +65,159 @@ struct EvmStewardProof {
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ProtocolWatchlistEntry {
+    id: String,
+    chain_id: u64,
+    pool_address: String,
+    market_data_api_url: String,
+    abi_api_url: String,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct StrategyDiscoveryWorkerConfig {
+    enabled: bool,
+    worker_base_url: String,
+    worker_api_key: Option<String>,
+    trusted_callback_principal: Option<Principal>,
+    result_ttl_secs: u64,
+    objective: String,
+    protocol_watchlist: Vec<ProtocolWatchlistEntry>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct PromoteDiscoveryProtocolArtifactsArgs {
+    job_id: String,
+    bundle_id: String,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct AbiSelectorAssertion {
+    signature: String,
+    selector_hex: String,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ProtocolArtifactBundle {
+    bundle_id: String,
+    protocol_id: String,
+    chain_id: u64,
+    role: String,
+    contract_address: String,
+    abi_json: String,
+    source_ref: String,
+    codehash: Option<String>,
+    selector_assertions: Vec<AbiSelectorAssertion>,
+    spec_summary: String,
+    risk_notes: Vec<String>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ProtocolMarketSnapshot {
+    protocol_id: String,
+    chain_id: u64,
+    pool_address: String,
+    tvl_usd: Option<String>,
+    supply_apy_bps: Option<u64>,
+    borrow_apy_bps: Option<u64>,
+    utilization_bps: Option<u64>,
+    summary: String,
+    warnings: Vec<String>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct MarketSynthesisBundle {
+    chain_id: u64,
+    generated_at_ns: u64,
+    protocols: Vec<ProtocolMarketSnapshot>,
+    warnings: Vec<String>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct StrategyCandidateBundle {
+    candidate_id: String,
+    objective: String,
+    protocol_id: String,
+    primitive: String,
+    chain_id: u64,
+    rationale: String,
+    required_artifacts: Vec<String>,
+    assumptions: Vec<String>,
+    missing_inputs: Vec<String>,
+    confidence_label: String,
+    freshness_deadline_ns: Option<u64>,
+    suggested_template_shape: Option<String>,
+    estimated_yield_bps: Option<u64>,
+    warnings: Vec<String>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum StrategyDiscoverySourceType {
+    OfficialDocs,
+    BlockExplorer,
+    ProtocolApi,
+    MarketDataApi,
+    Other,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum StrategyDiscoverySourceTrustTier {
+    Official,
+    Secondary,
+    BestEffort,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct SourceRecord {
+    source_id: String,
+    source_type: StrategyDiscoverySourceType,
+    url: String,
+    fetched_at_ns: u64,
+    content_hash: String,
+    trust_tier: StrategyDiscoverySourceTrustTier,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct StrategyDiscoveryResultPayload {
+    protocol_artifacts: Vec<ProtocolArtifactBundle>,
+    market: MarketSynthesisBundle,
+    candidates: Vec<StrategyCandidateBundle>,
+    source_records: Vec<SourceRecord>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct SubmitStrategyDiscoveryResultArgs {
+    job_id: String,
+    completed_at_ns: u64,
+    objective: String,
+    watchlist: Vec<ProtocolWatchlistEntry>,
+    payload: StrategyDiscoveryResultPayload,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct StrategyDiscoveryStatusView {
+    enabled: bool,
+    worker_base_url: Option<String>,
+    has_worker_api_key: bool,
+    trusted_callback_principal: Option<String>,
+    result_ttl_secs: u64,
+    objective: Option<String>,
+    protocol_watchlist_len: u64,
+    pending_jobs: u64,
+    result_records: u64,
+    freshest_validated_job_id: Option<String>,
+    freshest_validated_at_ns: Option<u64>,
+    freshest_validated_age_secs: Option<u64>,
+    freshest_validated_expired: bool,
+    submit_accepted: u64,
+    submit_failed: u64,
+    callback_accepted: u64,
+    callback_rejected: u64,
+    callback_duplicates: u64,
+    callback_auth_failures: u64,
+    expired_jobs: u64,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum StewardCommand {
     Noop,
     SetLoopEnabled {
@@ -73,6 +232,12 @@ enum StewardCommand {
     SendStewardMessage {
         sender: String,
         message: String,
+    },
+    SetStrategyDiscoveryWorkerConfig {
+        config: StrategyDiscoveryWorkerConfig,
+    },
+    PromoteDiscoveryProtocolArtifacts {
+        args: PromoteDiscoveryProtocolArtifactsArgs,
     },
     SetPrincipal {
         principal: Option<Principal>,
@@ -311,6 +476,104 @@ fn list_conversations(pic: &PocketIc, canister_id: Principal) -> Vec<Conversatio
         "list_conversations",
         encode_args(()).expect("failed to encode list_conversations"),
     )
+}
+
+fn get_strategy_discovery_status(
+    pic: &PocketIc,
+    canister_id: Principal,
+) -> StrategyDiscoveryStatusView {
+    call_query(
+        pic,
+        canister_id,
+        "get_strategy_discovery_worker_status",
+        encode_args(()).expect("failed to encode get_strategy_discovery_worker_status"),
+    )
+}
+
+fn discovery_watchlist() -> Vec<ProtocolWatchlistEntry> {
+    vec![ProtocolWatchlistEntry {
+        id: "moonwell-usdc".to_string(),
+        chain_id: 8453,
+        pool_address: "0x1111111111111111111111111111111111111111".to_string(),
+        market_data_api_url: "https://api.example.com/market/moonwell".to_string(),
+        abi_api_url: "https://api.example.com/abi/moonwell".to_string(),
+    }]
+}
+
+fn header_value(headers: &[CanisterHttpHeader], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| header.value.clone())
+}
+
+fn respond_with_discovery_submit_ack(pic: &PocketIc, request: CanisterHttpRequest) -> String {
+    assert!(
+        request.url.ends_with("/v1/strategy-discovery/jobs"),
+        "unexpected discovery url: {}",
+        request.url
+    );
+    let auth = header_value(&request.headers, "authorization")
+        .expect("discovery submit should include authorization header");
+    assert_eq!(auth, "Bearer secret");
+    let body: Value = serde_json::from_slice(&request.body)
+        .unwrap_or_else(|error| panic!("failed to decode discovery submit request body: {error}"));
+    let job_id = body
+        .get("job_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(!job_id.is_empty(), "job_id must be present");
+
+    let ack = json!({
+        "job_id": job_id,
+        "accepted_at_ns": 123456789u64,
+        "status": "accepted",
+    });
+    pic.mock_canister_http_response(MockCanisterHttpResponse {
+        subnet_id: request.subnet_id,
+        request_id: request.request_id,
+        response: CanisterHttpResponse::CanisterHttpReply(CanisterHttpReply {
+            status: 202,
+            headers: vec![],
+            body: serde_json::to_vec(&ack).expect("failed to encode discovery ack"),
+        }),
+        additional_responses: vec![],
+    });
+
+    job_id
+}
+
+fn drive_until_discovery_submit_accepted(pic: &PocketIc) -> String {
+    pic.advance_time(Duration::from_secs(90));
+    for _ in 0..24 {
+        pic.tick();
+        let pending_http = pic.get_canister_http();
+        if pending_http.is_empty() {
+            continue;
+        }
+        let mut job_id = None;
+        for request in pending_http {
+            job_id = Some(respond_with_discovery_submit_ack(pic, request));
+        }
+        pic.tick();
+        return job_id.expect("job id should be captured");
+    }
+    panic!("strategy discovery submit was not accepted within expected ticks");
+}
+
+fn wait_for_pending_discovery_job(
+    pic: &PocketIc,
+    canister_id: Principal,
+) -> StrategyDiscoveryStatusView {
+    for _ in 0..24 {
+        let status = get_strategy_discovery_status(pic, canister_id);
+        if status.submit_accepted >= 1 && status.pending_jobs >= 1 {
+            return status;
+        }
+        pic.tick();
+    }
+    panic!("pending discovery job was not observed within expected ticks");
 }
 
 fn get_conversation(
@@ -700,4 +963,131 @@ fn steward_direct_message_reaches_conversation_flow_in_pocketic() {
     }
 
     panic!("steward direct message did not appear in conversation flow within expected ticks");
+}
+
+#[test]
+fn steward_can_configure_and_promote_strategy_discovery_in_pocketic() {
+    let (pic, canister_id) = with_backend_canister();
+    let steward_key = steward_test_signing_key();
+    let steward_address = steward_address_from_key(&steward_key);
+    set_steward_admin(&pic, canister_id, STEWARD_CHAIN_ID, steward_address, true);
+
+    for kind in [
+        TaskKind::AgentTurn,
+        TaskKind::PollInbox,
+        TaskKind::CheckCycles,
+        TaskKind::TopUpCycles,
+        TaskKind::Reconcile,
+    ] {
+        set_task_enabled(&pic, canister_id, kind, false);
+        set_task_interval_secs(&pic, canister_id, kind, 1);
+    }
+    set_task_enabled(&pic, canister_id, TaskKind::Reconcile, true);
+
+    let worker = Principal::self_authenticating(b"strategy-discovery-worker");
+    let config_command = StewardCommand::SetStrategyDiscoveryWorkerConfig {
+        config: StrategyDiscoveryWorkerConfig {
+            enabled: true,
+            worker_base_url: "https://discovery.example.workers.dev".to_string(),
+            worker_api_key: Some("secret".to_string()),
+            trusted_callback_principal: Some(worker),
+            result_ttl_secs: 3_600,
+            objective: "find reserve opportunities".to_string(),
+            protocol_watchlist: discovery_watchlist(),
+        },
+    };
+    let config_proof = build_steward_proof(&pic, canister_id, &config_command, &steward_key, 0);
+    let config_result = steward_execute(&pic, canister_id, config_command, config_proof)
+        .expect("signed strategy discovery config should execute");
+    assert_eq!(
+        config_result,
+        "strategy_discovery_enabled=true watchlist_len=1"
+    );
+
+    let job_id = drive_until_discovery_submit_accepted(&pic);
+    let pending = wait_for_pending_discovery_job(&pic, canister_id);
+    assert!(pending.pending_jobs >= 1);
+    assert!(pending.submit_accepted >= 1);
+
+    let callback_payload = encode_args((SubmitStrategyDiscoveryResultArgs {
+        job_id: job_id.clone(),
+        completed_at_ns: FRESH_DISCOVERY_TIMESTAMP_NS,
+        objective: "find reserve opportunities".to_string(),
+        watchlist: discovery_watchlist(),
+        payload: StrategyDiscoveryResultPayload {
+            protocol_artifacts: vec![ProtocolArtifactBundle {
+                bundle_id: "moonwell-usdc:pool".to_string(),
+                protocol_id: "moonwell-usdc".to_string(),
+                chain_id: 8453,
+                role: "pool".to_string(),
+                contract_address: "0x1111111111111111111111111111111111111111".to_string(),
+                abi_json: r#"[{"type":"function","name":"supply","inputs":[],"outputs":[],"stateMutability":"nonpayable"}]"#.to_string(),
+                source_ref: "https://api.example.com/abi/moonwell".to_string(),
+                codehash: None,
+                selector_assertions: Vec::new(),
+                spec_summary: "pool contract".to_string(),
+                risk_notes: vec!["guardian pause".to_string()],
+            }],
+            market: MarketSynthesisBundle {
+                chain_id: 8453,
+                generated_at_ns: FRESH_DISCOVERY_TIMESTAMP_NS.saturating_sub(1),
+                protocols: Vec::new(),
+                warnings: Vec::new(),
+            },
+            candidates: vec![StrategyCandidateBundle {
+                candidate_id: "cand-1".to_string(),
+                objective: "find reserve opportunities".to_string(),
+                protocol_id: "moonwell-usdc".to_string(),
+                primitive: "reserve_supply".to_string(),
+                chain_id: 8453,
+                rationale: "bounded reserve parking".to_string(),
+                required_artifacts: vec!["moonwell-usdc:pool".to_string()],
+                assumptions: vec!["liquidity remains available".to_string()],
+                missing_inputs: Vec::new(),
+                confidence_label: "medium".to_string(),
+                freshness_deadline_ns: None,
+                suggested_template_shape: Some("base-moonwell-usdc-reserve".to_string()),
+                estimated_yield_bps: Some(420),
+                warnings: Vec::new(),
+            }],
+            source_records: vec![SourceRecord {
+                source_id: "market-1".to_string(),
+                source_type: StrategyDiscoverySourceType::MarketDataApi,
+                url: "https://api.example.com/market/moonwell".to_string(),
+                fetched_at_ns: FRESH_DISCOVERY_TIMESTAMP_NS.saturating_sub(2),
+                content_hash: "0xabc".to_string(),
+                trust_tier: StrategyDiscoverySourceTrustTier::Official,
+            }],
+        },
+    },))
+    .expect("failed to encode discovery callback payload");
+    let callback_result: Result<String, String> = call_update_as(
+        &pic,
+        canister_id,
+        worker,
+        "submit_strategy_discovery_result",
+        callback_payload,
+    );
+    assert_eq!(
+        callback_result.expect("trusted discovery callback should succeed"),
+        "strategy_discovery_callback_validated"
+    );
+
+    let promote_command = StewardCommand::PromoteDiscoveryProtocolArtifacts {
+        args: PromoteDiscoveryProtocolArtifactsArgs {
+            job_id,
+            bundle_id: "moonwell-usdc:pool".to_string(),
+        },
+    };
+    let promote_proof = build_steward_proof(&pic, canister_id, &promote_command, &steward_key, 1);
+    let promote_result = steward_execute(&pic, canister_id, promote_command, promote_proof)
+        .expect("signed discovery promotion should execute");
+    assert_eq!(
+        promote_result,
+        "strategy_discovery_protocol_artifact_promoted protocol=moonwell-usdc role=pool chain_id=8453"
+    );
+
+    let final_status = get_strategy_discovery_status(&pic, canister_id);
+    assert_eq!(final_status.pending_jobs, 0);
+    assert!(final_status.callback_accepted >= 1);
 }

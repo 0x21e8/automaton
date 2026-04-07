@@ -3826,7 +3826,11 @@ fn set_goal_tool(args_json: &str, turn_id: &str) -> Result<String, String> {
         outcome: None,
     };
     stable::set_goal(&goal)?;
-    let verb = if existing.is_some() { "updated" } else { "created" };
+    let verb = if existing.is_some() {
+        "updated"
+    } else {
+        "created"
+    };
     Ok(format!("goal `{id}` {verb}"))
 }
 
@@ -3973,7 +3977,11 @@ fn create_plan_tool(args_json: &str, turn_id: &str) -> Result<String, String> {
         outcome: None,
     };
     stable::set_plan(&plan)?;
-    let verb = if existing.is_some() { "updated" } else { "created" };
+    let verb = if existing.is_some() {
+        "updated"
+    } else {
+        "created"
+    };
     Ok(format!(
         "plan `{id}` {verb} with {} steps",
         plan.steps.len()
@@ -4046,7 +4054,10 @@ fn advance_plan_step_tool(args_json: &str, turn_id: &str) -> Result<String, Stri
 
     let mut plan = stable::get_plan(id).ok_or_else(|| format!("plan `{id}` not found"))?;
     if plan.status != PlanStatus::Active {
-        return Err(format!("plan `{id}` is not active (status={})", plan.status));
+        return Err(format!(
+            "plan `{id}` is not active (status={})",
+            plan.status
+        ));
     }
     let idx = plan.current_step_idx;
     if idx >= plan.steps.len() {
@@ -4056,32 +4067,31 @@ fn advance_plan_step_tool(args_json: &str, turn_id: &str) -> Result<String, Stri
     plan.steps[idx].status = step_status.clone();
     plan.steps[idx].result = result_text;
 
-    let response = if step_status == PlanStepStatus::Completed
-        || step_status == PlanStepStatus::Skipped
-    {
-        let next_idx = idx + 1;
-        if next_idx >= plan.steps.len() {
-            plan.status = PlanStatus::Completed;
-            plan.outcome = Some("all steps completed".to_string());
-            format!("plan `{id}` completed (all steps done)")
+    let response =
+        if step_status == PlanStepStatus::Completed || step_status == PlanStepStatus::Skipped {
+            let next_idx = idx + 1;
+            if next_idx >= plan.steps.len() {
+                plan.status = PlanStatus::Completed;
+                plan.outcome = Some("all steps completed".to_string());
+                format!("plan `{id}` completed (all steps done)")
+            } else {
+                plan.current_step_idx = next_idx;
+                plan.steps[next_idx].status = PlanStepStatus::InProgress;
+                format!(
+                    "plan `{id}` advanced to step {}/{}: {}",
+                    next_idx + 1,
+                    plan.steps.len(),
+                    plan.steps[next_idx].description
+                )
+            }
         } else {
-            plan.current_step_idx = next_idx;
-            plan.steps[next_idx].status = PlanStepStatus::InProgress;
             format!(
-                "plan `{id}` advanced to step {}/{}: {}",
-                next_idx + 1,
+                "plan `{id}` step {}/{} marked as {}",
+                idx + 1,
                 plan.steps.len(),
-                plan.steps[next_idx].description
+                step_status
             )
-        }
-    } else {
-        format!(
-            "plan `{id}` step {}/{} marked as {}",
-            idx + 1,
-            plan.steps.len(),
-            step_status
-        )
-    };
+        };
 
     // Optionally update overall plan status if explicitly provided.
     if let Some(plan_status_str) = args.get("plan_status").and_then(|v| v.as_str()) {
@@ -4154,10 +4164,7 @@ fn schedule_follow_up_tool(args_json: &str, turn_id: &str) -> Result<String, Str
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let delay_secs = args
-        .get("delay_secs")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let delay_secs = args.get("delay_secs").and_then(|v| v.as_u64()).unwrap_or(0);
 
     // Build dedupe key
     let dedupe_key = if let Some(ref pid) = plan_id {

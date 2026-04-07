@@ -34,16 +34,19 @@ mod util;
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AbiSelectorAssertion, ActiveExposure, AutonomyPolicy,
     AutonomySuppressionConfig, ConversationLog, ConversationSummary, DecisionRecord,
-    EvmRouteStateView, EvmStewardProof, ExposureReconciliationStatus, InboxMessage, InboxStats,
-    InferenceConfigView, InferenceProvider, InferenceProxyStatusView, MemoryFact, MemoryRollup,
-    ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
-    OutboxStats, PromptLayer, PromptLayerView, ReflectionMemoryRecord, RetentionConfig,
-    RetentionMaintenanceRuntime, RuntimeView, ScheduledJob, SchedulerRuntime, SessionSummary,
-    SkillRecord, SpawnBootstrapView, StewardCommand, StewardState, StewardStatusView,
-    StrategyKillSwitchState, StrategyOutcomeStats, StrategyQuarantine, StrategyTemplate,
-    StrategyTemplateKey, SubmitInferenceResultArgs, TaskKind, TaskScheduleConfig,
-    TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState, TemplateStatus,
-    ToolCallRecord, TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
+    EnqueueStrategyDiscoveryJobArgs, EvmRouteStateView, EvmStewardProof,
+    ExposureReconciliationStatus, InboxMessage, InboxStats, InferenceConfigView, InferenceProvider,
+    InferenceProxyStatusView, MemoryFact, MemoryRollup, ObservabilitySnapshot,
+    OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage, OutboxStats,
+    PendingStrategyDiscoveryJob, PromoteDiscoveryProtocolArtifactsArgs, PromptLayer,
+    PromptLayerView, ReflectionMemoryRecord, RetentionConfig, RetentionMaintenanceRuntime,
+    RuntimeView, ScheduledJob, SchedulerRuntime, SessionSummary, SkillRecord, SpawnBootstrapView,
+    StewardCommand, StewardState, StewardStatusView, StrategyDiscoveryStatusView,
+    StrategyDiscoveryWorkerConfig, StrategyKillSwitchState, StrategyOutcomeStats,
+    StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
+    SubmitStrategyDiscoveryResultArgs, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
+    TemplateActivationState, TemplateRevocationState, TemplateStatus, ToolCallRecord,
+    TurnWindowSummary, WalletBalanceSyncConfigView, WalletBalanceTelemetryView,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::scheduler::scheduler_tick;
@@ -75,6 +78,20 @@ enum InferenceProxyCallbackLogPriority {
 }
 
 impl GetLogFilter for InferenceProxyCallbackLogPriority {
+    fn get_log_filter() -> LogFilter {
+        LogFilter::ShowAll
+    }
+}
+
+#[derive(Clone, Copy, Debug, LogPriorityLevels)]
+enum StrategyDiscoveryCallbackLogPriority {
+    #[log_level(capacity = 1000, name = "STRATEGY_DISCOVERY_CALLBACK_INFO")]
+    DiscoveryInfo,
+    #[log_level(capacity = 500, name = "STRATEGY_DISCOVERY_CALLBACK_ERROR")]
+    DiscoveryError,
+}
+
+impl GetLogFilter for StrategyDiscoveryCallbackLogPriority {
     fn get_log_filter() -> LogFilter {
         LogFilter::ShowAll
     }
@@ -219,6 +236,9 @@ fn steward_command_label(command: &StewardCommand) -> &'static str {
         StewardCommand::ConfigureSearch { .. } => "configure_search",
         StewardCommand::SetOpenrouterReasoningLevel { .. } => "set_openrouter_reasoning_level",
         StewardCommand::SetInferenceProxyConfig { .. } => "set_inference_proxy_config",
+        StewardCommand::SetStrategyDiscoveryWorkerConfig { .. } => {
+            "set_strategy_discovery_worker_config"
+        }
         StewardCommand::SetWelcomeMessage { .. } => "set_welcome_message",
         StewardCommand::SetEvmRpcUrl { .. } => "set_evm_rpc_url",
         StewardCommand::SetEvmRpcFallbackUrl { .. } => "set_evm_rpc_fallback_url",
@@ -241,6 +261,10 @@ fn steward_command_label(command: &StewardCommand) -> &'static str {
         StewardCommand::SetRetentionConfig { .. } => "set_retention_config",
         StewardCommand::UpdateSoul { .. } => "update_soul",
         StewardCommand::UpsertSkill { .. } => "upsert_skill",
+        StewardCommand::EnqueueStrategyDiscoveryJob { .. } => "enqueue_strategy_discovery_job",
+        StewardCommand::PromoteDiscoveryProtocolArtifacts { .. } => {
+            "promote_discovery_protocol_artifacts"
+        }
         StewardCommand::RegisterStrategy { .. } => "register_strategy",
         StewardCommand::IngestStrategyTemplate { .. } => "ingest_strategy_template",
         StewardCommand::IngestStrategyAbiArtifact { .. } => "ingest_strategy_abi_artifact",
@@ -831,6 +855,123 @@ fn set_inference_proxy_config(
     Ok(stored)
 }
 
+fn strategy_discovery_exposure_summary() -> String {
+    let exposures = stable::list_active_exposures();
+    if exposures.is_empty() {
+        return "no active exposures tracked".to_string();
+    }
+    let protocols = exposures
+        .iter()
+        .map(|exposure| exposure.protocol.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    format!(
+        "active_exposures={} distinct_protocols={}",
+        exposures.len(),
+        protocols
+    )
+}
+
+fn strategy_discovery_autonomy_summary() -> String {
+    let telemetry = stable::cycle_telemetry();
+    format!(
+        "liquid_cycles={} total_cycles={} survival_tier={:?}",
+        telemetry.liquid_cycles,
+        telemetry.total_cycles,
+        stable::scheduler_survival_tier()
+    )
+}
+
+fn apply_strategy_discovery_worker_config(
+    config: StrategyDiscoveryWorkerConfig,
+) -> Result<StrategyDiscoveryStatusView, String> {
+    let _ = stable::set_strategy_discovery_worker_config(config)?;
+    crate::http::init_certification();
+    Ok(stable::strategy_discovery_status_view(current_time_ns()))
+}
+
+async fn enqueue_strategy_discovery_job_shared(
+    args: EnqueueStrategyDiscoveryJobArgs,
+) -> Result<PendingStrategyDiscoveryJob, String> {
+    let config = stable::strategy_discovery_worker_config();
+    let objective = args
+        .objective
+        .unwrap_or_else(|| config.objective.clone())
+        .trim()
+        .to_string();
+    let watchlist = args
+        .watchlist
+        .unwrap_or_else(|| config.protocol_watchlist.clone());
+    let pending = crate::features::strategy_discovery::submit_strategy_discovery_job(
+        &config,
+        objective,
+        watchlist,
+        strategy_discovery_exposure_summary(),
+        strategy_discovery_autonomy_summary(),
+    )
+    .await?;
+    crate::http::init_certification();
+    Ok(pending)
+}
+
+fn promote_discovery_protocol_artifacts_shared(
+    args: PromoteDiscoveryProtocolArtifactsArgs,
+) -> Result<AbiArtifact, String> {
+    let record = stable::get_strategy_discovery_result(&args.job_id)
+        .ok_or_else(|| format!("unknown strategy discovery result job_id={}", args.job_id))?;
+    if !matches!(
+        record.status,
+        crate::domain::types::StrategyDiscoveryResultStatus::Validated
+    ) {
+        return Err(format!(
+            "strategy discovery result job_id={} is not validated",
+            args.job_id
+        ));
+    }
+    let bundle = record
+        .payload
+        .protocol_artifacts
+        .iter()
+        .find(|bundle| bundle.bundle_id == args.bundle_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "strategy discovery result job_id={} missing protocol artifact bundle_id={}",
+                args.job_id, args.bundle_id
+            )
+        })?;
+    crate::strategy::abi::promote_discovery_protocol_artifact(&bundle, current_time_ns())
+}
+
+/// Stores strategy-discovery worker config used by async discovery callbacks (controller only).
+#[ic_cdk::update]
+fn set_strategy_discovery_worker_config(
+    config: StrategyDiscoveryWorkerConfig,
+) -> Result<StrategyDiscoveryStatusView, String> {
+    ensure_controller()?;
+    apply_strategy_discovery_worker_config(config)
+}
+
+/// Manually submits a strategy-discovery job for ops/testing (controller only).
+#[ic_cdk::update]
+async fn enqueue_strategy_discovery_job_admin(
+    args: EnqueueStrategyDiscoveryJobArgs,
+) -> Result<PendingStrategyDiscoveryJob, String> {
+    ensure_controller()?;
+    enqueue_strategy_discovery_job_shared(args).await
+}
+
+/// Promotes a validated staged discovery artifact into the ABI registry (controller only).
+#[ic_cdk::update]
+fn promote_discovery_protocol_artifacts_admin(
+    args: PromoteDiscoveryProtocolArtifactsArgs,
+) -> Result<AbiArtifact, String> {
+    ensure_controller()?;
+    let artifact = promote_discovery_protocol_artifacts_shared(args)?;
+    crate::http::init_certification();
+    Ok(artifact)
+}
+
 /// Sets a custom welcome message shown in the TUI on boot (controller only).
 /// An empty string clears the custom message and restores the default.
 #[ic_cdk::update]
@@ -972,6 +1113,13 @@ async fn dispatch_steward_command(
             Ok(format!(
                 "inference_proxy_worker_base_url={}",
                 stored.worker_base_url
+            ))
+        }
+        StewardCommand::SetStrategyDiscoveryWorkerConfig { config } => {
+            let stored = apply_strategy_discovery_worker_config(config)?;
+            Ok(format!(
+                "strategy_discovery_enabled={} watchlist_len={}",
+                stored.enabled, stored.protocol_watchlist_len
             ))
         }
         StewardCommand::SetWelcomeMessage { message } => {
@@ -1122,6 +1270,21 @@ async fn dispatch_steward_command(
         StewardCommand::UpsertSkill { skill } => {
             stable::upsert_skill(&skill);
             Ok(format!("skill_upserted name={}", skill.name))
+        }
+        StewardCommand::EnqueueStrategyDiscoveryJob { args } => {
+            let pending = enqueue_strategy_discovery_job_shared(args).await?;
+            Ok(format!(
+                "strategy_discovery_job_enqueued job_id={}",
+                pending.job_id
+            ))
+        }
+        StewardCommand::PromoteDiscoveryProtocolArtifacts { args } => {
+            let artifact = promote_discovery_protocol_artifacts_shared(args)?;
+            crate::http::init_certification();
+            Ok(format!(
+                "strategy_discovery_protocol_artifact_promoted protocol={} role={} chain_id={}",
+                artifact.key.protocol, artifact.key.role, artifact.key.chain_id
+            ))
         }
         StewardCommand::RegisterStrategy { recipe_json } => {
             let recipe: crate::strategy::registry::StrategyRecipe =
@@ -1681,6 +1844,74 @@ fn submit_inference_result(args: SubmitInferenceResultArgs) -> Result<String, St
     }
 }
 
+/// Callback endpoint used by the strategy-discovery worker to submit staged results.
+#[ic_cdk::update]
+fn submit_strategy_discovery_result(
+    args: SubmitStrategyDiscoveryResultArgs,
+) -> Result<String, String> {
+    let caller = inference_proxy_callback_caller_principal();
+    let callback_job_id = args.job_id.clone();
+    if let Err(error) = stable::assert_strategy_discovery_callback_authorized(&caller) {
+        stable::record_strategy_discovery_callback_rejected(true);
+        log!(
+            StrategyDiscoveryCallbackLogPriority::DiscoveryError,
+            "strategy_discovery_callback_rejected caller={} job_id={} reason={}",
+            caller,
+            callback_job_id,
+            error,
+        );
+        return Err(error);
+    }
+
+    let applied =
+        match stable::apply_strategy_discovery_callback(args, caller.clone(), current_time_ns()) {
+            Ok(applied) => applied,
+            Err(error) => {
+                stable::record_strategy_discovery_callback_rejected(false);
+                log!(
+                    StrategyDiscoveryCallbackLogPriority::DiscoveryError,
+                    "strategy_discovery_callback_rejected caller={} job_id={} reason={}",
+                    caller,
+                    callback_job_id,
+                    error,
+                );
+                return Err(error);
+            }
+        };
+    crate::http::init_certification();
+    match applied {
+        stable::StrategyDiscoveryCallbackApply::Accepted(status) => {
+            let enqueued = enqueue_immediate_agent_turn_if_absent(
+                format!("AgentTurn:strategy-discovery-resume:{callback_job_id}"),
+                "strategy_discovery_callback_resume",
+            );
+            let outcome = match status {
+                crate::domain::types::StrategyDiscoveryResultStatus::Validated => "validated",
+                crate::domain::types::StrategyDiscoveryResultStatus::Rejected { .. } => "rejected",
+            };
+            log!(
+                StrategyDiscoveryCallbackLogPriority::DiscoveryInfo,
+                "strategy_discovery_callback_accepted caller={} job_id={} outcome={} resume_job_enqueued={} resume_job_id={}",
+                caller,
+                callback_job_id,
+                outcome,
+                enqueued.is_some(),
+                enqueued.unwrap_or_default(),
+            );
+            Ok(format!("strategy_discovery_callback_{outcome}"))
+        }
+        stable::StrategyDiscoveryCallbackApply::Duplicate => {
+            log!(
+                StrategyDiscoveryCallbackLogPriority::DiscoveryInfo,
+                "strategy_discovery_callback_duplicate caller={} job_id={}",
+                caller,
+                callback_job_id,
+            );
+            Ok("strategy_discovery_callback_duplicate".to_string())
+        }
+    }
+}
+
 fn enqueue_immediate_agent_turn_if_absent(dedupe_key: String, wake_reason: &str) -> Option<String> {
     let enqueued = crate::scheduler::enqueue_immediate_agent_turn_job_if_absent(dedupe_key);
     if enqueued.is_some() {
@@ -1769,6 +2000,25 @@ fn get_exposure_reconciliation_status() -> ExposureReconciliationStatus {
 #[ic_cdk::query]
 fn get_inference_proxy_status() -> InferenceProxyStatusView {
     stable::inference_proxy_status_view()
+}
+
+#[ic_cdk::query]
+fn get_strategy_discovery_worker_status() -> StrategyDiscoveryStatusView {
+    stable::strategy_discovery_status_view(current_time_ns())
+}
+
+#[ic_cdk::query]
+fn list_strategy_discovery_jobs(limit: u32) -> Vec<PendingStrategyDiscoveryJob> {
+    let bounded_limit = usize::try_from(limit.max(1)).unwrap_or(25);
+    stable::list_strategy_discovery_jobs(bounded_limit)
+}
+
+#[ic_cdk::query]
+fn list_strategy_discovery_results(
+    limit: u32,
+) -> Vec<crate::domain::types::StrategyDiscoveryCallbackRecord> {
+    let bounded_limit = usize::try_from(limit.max(1)).unwrap_or(25);
+    stable::list_strategy_discovery_results(bounded_limit)
 }
 
 /// Returns the agent's "soul" — the core identity/persona prompt layer.
@@ -2255,6 +2505,10 @@ mod tests {
                 "set_openrouter_reasoning_level",
             ),
             ("set_inference_proxy_config", "set_inference_proxy_config"),
+            (
+                "set_strategy_discovery_worker_config",
+                "set_strategy_discovery_worker_config",
+            ),
             ("set_welcome_message", "set_welcome_message"),
             ("set_evm_rpc_url", "set_evm_rpc_url"),
             ("set_evm_rpc_fallback_url", "set_evm_rpc_fallback_url"),
@@ -2293,6 +2547,14 @@ mod tests {
             ("set_retention_config", "set_retention_config"),
             ("update_soul", "update_soul"),
             ("upsert_skill", "upsert_skill"),
+            (
+                "enqueue_strategy_discovery_job_admin",
+                "enqueue_strategy_discovery_job",
+            ),
+            (
+                "promote_discovery_protocol_artifacts_admin",
+                "promote_discovery_protocol_artifacts",
+            ),
             ("register_strategy_admin", "register_strategy"),
             ("ingest_strategy_template_admin", "ingest_strategy_template"),
             (

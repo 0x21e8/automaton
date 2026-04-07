@@ -13,8 +13,10 @@
 ///   compiler and dry-run compile validation.
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiSelectorAssertion, AbiTypeSpec,
+    ProtocolArtifactBundle,
 };
 use crate::storage::stable;
+use crate::util::normalize_evm_address;
 use crate::util::normalize_selector_hex;
 use alloy_primitives::keccak256;
 use serde::Deserialize;
@@ -161,6 +163,37 @@ pub fn normalize_and_store_abi_artifact(
         now_ns,
     )?;
     stable::upsert_abi_artifact(artifact)
+}
+
+/// Promote a staged discovery artifact bundle into the canonical ABI registry.
+pub fn promote_discovery_protocol_artifact(
+    bundle: &ProtocolArtifactBundle,
+    now_ns: u64,
+) -> Result<AbiArtifact, String> {
+    let protocol = bundle.protocol_id.trim();
+    if protocol.is_empty() {
+        return Err("discovery protocol artifact protocol_id must be non-empty".to_string());
+    }
+    if bundle.chain_id == 0 {
+        return Err("discovery protocol artifact chain_id must be greater than zero".to_string());
+    }
+    let role = bundle.role.trim();
+    if role.is_empty() {
+        return Err("discovery protocol artifact role must be non-empty".to_string());
+    }
+    let _ = normalize_evm_address(&bundle.contract_address)?;
+    normalize_and_store_abi_artifact(
+        AbiArtifactKey {
+            protocol: protocol.to_string(),
+            chain_id: bundle.chain_id,
+            role: role.to_string(),
+        },
+        &bundle.abi_json,
+        &bundle.source_ref,
+        bundle.codehash.clone(),
+        &bundle.selector_assertions,
+        now_ns,
+    )
 }
 
 /// Recompute the 4-byte selector from an [`AbiFunctionSpec`] and assert it matches
