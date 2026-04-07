@@ -36,7 +36,7 @@ use crate::domain::types::{
     AutonomySuppressionConfig, ConversationLog, ConversationSummary, DecisionRecord,
     EnqueueStrategyDiscoveryJobArgs, EvmRouteStateView, EvmStewardProof,
     ExposureReconciliationStatus, InboxMessage, InboxStats, InferenceConfigView, InferenceProvider,
-    InferenceProxyStatusView, MemoryFact, MemoryRollup, ObservabilitySnapshot,
+    InferenceProxyStatusView, InferenceTransport, MemoryFact, MemoryRollup, ObservabilitySnapshot,
     OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage, OutboxStats,
     PendingStrategyDiscoveryJob, PromoteDiscoveryProtocolArtifactsArgs, PromptLayer,
     PromptLayerView, ReflectionMemoryRecord, RetentionConfig, RetentionMaintenanceRuntime,
@@ -157,6 +157,10 @@ struct InitArgs {
     #[serde(default)]
     search_api_key: Option<String>,
     #[serde(default)]
+    inference_proxy_worker_base_url: Option<String>,
+    #[serde(default)]
+    inference_proxy_trusted_callback_principal: Option<Principal>,
+    #[serde(default)]
     cycle_topup_enabled: Option<bool>,
     #[serde(default)]
     auto_topup_cycle_threshold: Option<u64>,
@@ -172,6 +176,10 @@ struct SpawnProviderBootstrapArgs {
     model: Option<String>,
     #[serde(default)]
     brave_search_api_key: Option<String>,
+    #[serde(default)]
+    inference_transport: InferenceTransport,
+    #[serde(default)]
+    open_router_reasoning_level: OpenRouterReasoningLevel,
 }
 
 #[derive(CandidType, Deserialize)]
@@ -574,17 +582,22 @@ fn validate_version_commit(value: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-fn apply_spawn_bootstrap(args: SpawnBootstrapArgs) -> Result<(), String> {
-    let chain_id = stable::runtime_snapshot().evm_cursor.chain_id;
-    let steward = stable::set_active_steward(Some(StewardState {
-        chain_id,
-        address: args.steward_address,
-        enabled: true,
-        last_used_at_ns: None,
-        principal: None,
-    }))?
-    .expect("spawn bootstrap should persist steward");
+fn ensure_spawn_bootstrap_proxy_configured() -> Result<(), String> {
+    let config = stable::openrouter_proxy_config();
+    if config.worker_base_url.trim().is_empty() {
+        return Err(
+            "spawn bootstrap inference_transport=OpenrouterProxyWorker requires init arg inference_proxy_worker_base_url".to_string(),
+        );
+    }
+    if config.trusted_callback_principal.is_none() {
+        return Err(
+            "spawn bootstrap inference_transport=OpenrouterProxyWorker requires init arg inference_proxy_trusted_callback_principal".to_string(),
+        );
+    }
+    Ok(())
+}
 
+fn apply_spawn_bootstrap(args: SpawnBootstrapArgs) -> Result<(), String> {
     let session_id = args.session_id.trim().to_string();
     if session_id.is_empty() {
         return Err("spawn bootstrap session_id cannot be empty".to_string());
@@ -597,14 +610,34 @@ fn apply_spawn_bootstrap(args: SpawnBootstrapArgs) -> Result<(), String> {
     let model = normalize_optional_trimmed(args.provider.model);
     let open_router_api_key = normalize_optional_trimmed(args.provider.open_router_api_key);
     let brave_search_api_key = normalize_optional_trimmed(args.provider.brave_search_api_key);
+    let inference_transport = args.provider.inference_transport;
+    let open_router_reasoning_level = args.provider.open_router_reasoning_level;
+
+    if inference_transport == InferenceTransport::OpenrouterProxyWorker {
+        ensure_spawn_bootstrap_proxy_configured()?;
+    }
+
+    let chain_id = stable::runtime_snapshot().evm_cursor.chain_id;
+    let steward = stable::set_active_steward(Some(StewardState {
+        chain_id,
+        address: args.steward_address,
+        enabled: true,
+        last_used_at_ns: None,
+        principal: None,
+    }))?
+    .expect("spawn bootstrap should persist steward");
 
     if let Some(model) = model {
         let _ = stable::set_inference_model(model)?;
     }
     if let Some(api_key) = open_router_api_key {
         stable::set_openrouter_api_key(Some(api_key));
-        stable::set_inference_provider(InferenceProvider::OpenRouter);
     }
+    stable::set_openrouter_reasoning_level(open_router_reasoning_level);
+    stable::set_inference_provider(match inference_transport {
+        InferenceTransport::OpenrouterDirect => InferenceProvider::OpenRouter,
+        InferenceTransport::OpenrouterProxyWorker => InferenceProvider::OpenRouterProxyWorker,
+    });
     if let Some(api_key) = brave_search_api_key {
         let _ = apply_search_config(SearchConfigArgs {
             api_key,
@@ -667,6 +700,15 @@ fn apply_init_args(args: InitArgs) {
         let _ = apply_search_config(SearchConfigArgs {
             api_key: search_api_key,
             max_searches_per_turn: None,
+        })
+        .unwrap_or_else(|error| ic_cdk::trap(&error));
+    }
+    if args.inference_proxy_worker_base_url.is_some()
+        || args.inference_proxy_trusted_callback_principal.is_some()
+    {
+        let _ = stable::set_openrouter_proxy_config(OpenRouterProxyWorkerConfig {
+            worker_base_url: args.inference_proxy_worker_base_url.unwrap_or_default(),
+            trusted_callback_principal: args.inference_proxy_trusted_callback_principal,
         })
         .unwrap_or_else(|error| ic_cdk::trap(&error));
     }
@@ -2292,12 +2334,59 @@ mod tests {
     use super::*;
     use crate::domain::types::{
         AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding, InboxMessageSource,
-        InferenceProxyResultPayload, MemoryFact, OpenRouterProxyWorkerConfig,
-        PendingInferenceProxyJob, SkillRecord, StewardNonceState, StrategyTemplate,
-        StrategyTemplateKey, SubmitInferenceResultArgs, TemplateStatus,
+        InferenceProxyResultPayload, InferenceTransport, MemoryFact, OpenRouterProxyWorkerConfig,
+        OpenRouterReasoningLevel, PendingInferenceProxyJob, SkillRecord, StewardNonceState,
+        StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, TemplateStatus,
     };
     use sha3::{Digest, Keccak256};
     use std::collections::{BTreeMap, BTreeSet};
+
+    fn spawn_bootstrap_provider_args(
+        inference_transport: InferenceTransport,
+        open_router_reasoning_level: OpenRouterReasoningLevel,
+    ) -> SpawnProviderBootstrapArgs {
+        SpawnProviderBootstrapArgs {
+            open_router_api_key: Some(" sk-or-test ".to_string()),
+            model: Some(" openai/gpt-4o-mini ".to_string()),
+            brave_search_api_key: Some(" brave-test-key ".to_string()),
+            inference_transport,
+            open_router_reasoning_level,
+        }
+    }
+
+    fn sample_spawn_bootstrap_args(provider: SpawnProviderBootstrapArgs) -> SpawnBootstrapArgs {
+        SpawnBootstrapArgs {
+            steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),
+            session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            parent_id: Some("parent-automaton".to_string()),
+            factory_principal: Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+                .expect("test principal should parse"),
+            risk: 4,
+            strategies: vec![" carry ".to_string(), "".to_string()],
+            skills: vec![" messaging ".to_string()],
+            provider,
+            version_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        }
+    }
+
+    fn sample_init_args(spawn_bootstrap: Option<SpawnBootstrapArgs>) -> InitArgs {
+        InitArgs {
+            ecdsa_key_name: "dfx_test_key".to_string(),
+            inbox_contract_address: None,
+            evm_chain_id: Some(31337),
+            evm_rpc_url: None,
+            evm_confirmation_depth: None,
+            evm_bootstrap_lookback_blocks: None,
+            http_allowed_domains: None,
+            llm_canister_id: None,
+            search_api_key: None,
+            inference_proxy_worker_base_url: None,
+            inference_proxy_trusted_callback_principal: None,
+            cycle_topup_enabled: None,
+            auto_topup_cycle_threshold: None,
+            spawn_bootstrap,
+        }
+    }
 
     fn signing_key_from_hex(hex_key: &str) -> k256::ecdsa::SigningKey {
         let mut secret_key = [0u8; 32];
@@ -2659,6 +2748,8 @@ mod tests {
             http_allowed_domains: Some(vec!["api.coingecko.com".to_string()]),
             llm_canister_id: None,
             search_api_key: None,
+            inference_proxy_worker_base_url: None,
+            inference_proxy_trusted_callback_principal: None,
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
             spawn_bootstrap: None,
@@ -2686,6 +2777,8 @@ mod tests {
                     .expect("test principal should parse"),
             ),
             search_api_key: None,
+            inference_proxy_worker_base_url: None,
+            inference_proxy_trusted_callback_principal: None,
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
             spawn_bootstrap: None,
@@ -2706,6 +2799,8 @@ mod tests {
             http_allowed_domains: None,
             llm_canister_id: None,
             search_api_key: Some("brave-test-key".to_string()),
+            inference_proxy_worker_base_url: None,
+            inference_proxy_trusted_callback_principal: None,
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
             spawn_bootstrap: None,
@@ -2729,6 +2824,8 @@ mod tests {
             http_allowed_domains: None,
             llm_canister_id: None,
             search_api_key: None,
+            inference_proxy_worker_base_url: None,
+            inference_proxy_trusted_callback_principal: None,
             cycle_topup_enabled: Some(false),
             auto_topup_cycle_threshold: Some(150_000_000_000),
             spawn_bootstrap: None,
@@ -2754,6 +2851,8 @@ mod tests {
             http_allowed_domains: None,
             llm_canister_id: None,
             search_api_key: None,
+            inference_proxy_worker_base_url: None,
+            inference_proxy_trusted_callback_principal: None,
             cycle_topup_enabled: None,
             auto_topup_cycle_threshold: None,
             spawn_bootstrap: None,
@@ -2765,35 +2864,12 @@ mod tests {
 
     #[test]
     fn apply_init_args_can_apply_spawn_bootstrap() {
-        apply_init_args(InitArgs {
-            ecdsa_key_name: "dfx_test_key".to_string(),
-            inbox_contract_address: None,
-            evm_chain_id: Some(31337),
-            evm_rpc_url: None,
-            evm_confirmation_depth: None,
-            evm_bootstrap_lookback_blocks: None,
-            http_allowed_domains: None,
-            llm_canister_id: None,
-            search_api_key: None,
-            cycle_topup_enabled: None,
-            auto_topup_cycle_threshold: None,
-            spawn_bootstrap: Some(SpawnBootstrapArgs {
-                steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),
-                session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-                parent_id: Some("parent-automaton".to_string()),
-                factory_principal: Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
-                    .expect("test principal should parse"),
-                risk: 4,
-                strategies: vec![" carry ".to_string(), "".to_string()],
-                skills: vec![" messaging ".to_string()],
-                provider: SpawnProviderBootstrapArgs {
-                    open_router_api_key: Some(" sk-or-test ".to_string()),
-                    model: Some(" openai/gpt-4o-mini ".to_string()),
-                    brave_search_api_key: Some(" brave-test-key ".to_string()),
-                },
-                version_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            }),
-        });
+        apply_init_args(sample_init_args(Some(sample_spawn_bootstrap_args(
+            spawn_bootstrap_provider_args(
+                InferenceTransport::OpenrouterDirect,
+                OpenRouterReasoningLevel::High,
+            ),
+        ))));
 
         let steward = stable::active_steward().expect("spawn bootstrap should configure steward");
         assert_eq!(steward.chain_id, 31337);
@@ -2807,6 +2883,10 @@ mod tests {
         assert_eq!(snapshot.inference_provider, InferenceProvider::OpenRouter);
         assert_eq!(snapshot.inference_model, "openai/gpt-4o-mini");
         assert_eq!(snapshot.openrouter_api_key, Some("sk-or-test".to_string()));
+        assert_eq!(
+            snapshot.openrouter_reasoning_level,
+            OpenRouterReasoningLevel::High
+        );
         assert_eq!(
             snapshot.factory_principal,
             Some("rrkah-fqaaa-aaaaa-aaaaq-cai".to_string())
@@ -2831,6 +2911,58 @@ mod tests {
                 skills: vec!["messaging".to_string()],
                 version_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn apply_init_args_can_apply_spawn_bootstrap_for_proxy_transport() {
+        let trusted = Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
+            .expect("trusted principal should parse");
+        let mut args = sample_init_args(Some(sample_spawn_bootstrap_args(
+            spawn_bootstrap_provider_args(
+                InferenceTransport::OpenrouterProxyWorker,
+                OpenRouterReasoningLevel::Medium,
+            ),
+        )));
+        args.inference_proxy_worker_base_url = Some(" https://proxy.example.workers.dev/ ".into());
+        args.inference_proxy_trusted_callback_principal = Some(trusted);
+
+        apply_init_args(args);
+
+        let snapshot = stable::runtime_snapshot();
+        assert_eq!(
+            snapshot.inference_provider,
+            InferenceProvider::OpenRouterProxyWorker
+        );
+        assert_eq!(
+            snapshot.openrouter_reasoning_level,
+            OpenRouterReasoningLevel::Medium
+        );
+        assert_eq!(
+            snapshot.openrouter_proxy,
+            OpenRouterProxyWorkerConfig {
+                worker_base_url: "https://proxy.example.workers.dev".to_string(),
+                trusted_callback_principal: Some(trusted),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_init_args_spawn_bootstrap_proxy_transport_requires_proxy_config() {
+        stable::init_storage();
+        let _ =
+            stable::set_ecdsa_key_name("dfx_test_key".to_string()).expect("ecdsa key should store");
+        let _ = stable::set_evm_chain_id(31337).expect("evm chain id should store");
+
+        let message =
+            apply_spawn_bootstrap(sample_spawn_bootstrap_args(spawn_bootstrap_provider_args(
+                InferenceTransport::OpenrouterProxyWorker,
+                OpenRouterReasoningLevel::Default,
+            )))
+            .expect_err("missing proxy config must reject bootstrap");
+        assert!(
+            message.contains("inference_proxy_worker_base_url"),
+            "unexpected bootstrap error: {message}"
         );
     }
 

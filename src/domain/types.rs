@@ -2307,6 +2307,16 @@ pub enum InferenceProvider {
     OpenRouterProxyWorker,
 }
 
+/// Bootstrap-time transport selection for OpenRouter-backed inference.
+#[derive(
+    CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
+)]
+pub enum InferenceTransport {
+    #[default]
+    OpenrouterDirect,
+    OpenrouterProxyWorker,
+}
+
 /// Runtime reasoning-effort level used for OpenRouter requests.
 #[derive(
     CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default,

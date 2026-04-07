@@ -129,6 +129,7 @@ type DecisionRecord = record {
 type DecisionTrigger = variant {
   ScheduledReview;
   LowRunway;
+  PlanContinuation;
   InboxMessage;
   PositionMaintenance;
   RecoveryFollowUp;
@@ -257,6 +258,7 @@ type InferenceProxyStatusView = record {
   oldest_pending_age_secs : opt nat64;
   worker_base_url : opt text;
 };
+type InferenceTransport = variant { OpenrouterDirect; OpenrouterProxyWorker };
 type InitArgs = record {
   evm_chain_id : opt nat64;
   evm_confirmation_depth : opt nat64;
@@ -267,6 +269,8 @@ type InitArgs = record {
   auto_topup_cycle_threshold : opt nat64;
   cycle_topup_enabled : opt bool;
   inbox_contract_address : opt text;
+  inference_proxy_trusted_callback_principal : opt principal;
+  inference_proxy_worker_base_url : opt text;
   search_api_key : opt text;
   evm_bootstrap_lookback_blocks : opt nat64;
   http_allowed_domains : opt vec text;
@@ -609,9 +613,11 @@ type SpawnBootstrapView = record {
   strategies : vec text;
 };
 type SpawnProviderBootstrapArgs = record {
+  open_router_reasoning_level : OpenRouterReasoningLevel;
   model : opt text;
   open_router_api_key : opt text;
   brave_search_api_key : opt text;
+  inference_transport : InferenceTransport;
 };
 type StewardCommand = variant {
   IngestStrategyAbiArtifact : StrategyAbiIngestArgs;

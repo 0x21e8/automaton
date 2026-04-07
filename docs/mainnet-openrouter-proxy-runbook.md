@@ -83,3 +83,9 @@ curl -fsS https://oc3hk-viaaa-aaaak-qxcuq-cai.icp0.io/api/snapshot \
   | jq '{runtime_state:.runtime.state, runtime_last_error:.runtime.last_error, scheduler_enabled:.scheduler.enabled, provider:.runtime.inference_provider, model:.runtime.inference_model}'
 icp canister status backend -e ic
 ```
+
+Spawned child automatons can now switch themselves into `OpenRouterProxyWorker`
+during `init` when their install args include
+`inference_proxy_worker_base_url` +
+`inference_proxy_trusted_callback_principal` and the spawn bootstrap selects
+proxy transport.

@@ -6,7 +6,7 @@ canisters:
         - type: pre-built
           url: https://github.com/dfinity/llm/releases/download/v0.3.1/llm-canister-ollama.wasm
   - name: backend 
-    init_args: '(record { ecdsa_key_name = "dfx_test_key"; evm_chain_id = opt (31337 : nat64); evm_rpc_url = opt "http://127.0.0.1:18545"; evm_confirmation_depth = opt (0 : nat64); evm_bootstrap_lookback_blocks = opt (1000 : nat64); http_allowed_domains = null; llm_canister_id = opt principal "w36hm-eqaaa-aaaal-qr76a-cai"; search_api_key = null; cycle_topup_enabled = opt false; auto_topup_cycle_threshold = opt (200000000000 : nat64); spawn_bootstrap = null })'
+    init_args: '(record { ecdsa_key_name = "dfx_test_key"; evm_chain_id = opt (31337 : nat64); evm_rpc_url = opt "http://127.0.0.1:18545"; evm_confirmation_depth = opt (0 : nat64); evm_bootstrap_lookback_blocks = opt (1000 : nat64); http_allowed_domains = null; llm_canister_id = opt principal "w36hm-eqaaa-aaaal-qr76a-cai"; search_api_key = null; inference_proxy_worker_base_url = null; inference_proxy_trusted_callback_principal = null; cycle_topup_enabled = opt false; auto_topup_cycle_threshold = opt (200000000000 : nat64); spawn_bootstrap = null })'
     build:
       steps:
         - type: script

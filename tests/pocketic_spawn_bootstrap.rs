@@ -3,8 +3,10 @@
 use std::path::Path;
 
 use candid::{decode_one, encode_args, CandidType, Principal};
+use ic_http_certification::{HttpRequest, HttpResponse};
 use pocket_ic::PocketIc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const WASM_PATHS: &[&str] = &[
     ".icp/cache/artifacts/backend",
@@ -17,6 +19,8 @@ struct SpawnProviderBootstrapArgs {
     open_router_api_key: Option<String>,
     model: Option<String>,
     brave_search_api_key: Option<String>,
+    inference_transport: InferenceTransport,
+    open_router_reasoning_level: OpenRouterReasoningLevel,
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
@@ -43,6 +47,8 @@ struct InitArgs {
     http_allowed_domains: Option<Vec<String>>,
     llm_canister_id: Option<Principal>,
     search_api_key: Option<String>,
+    inference_proxy_worker_base_url: Option<String>,
+    inference_proxy_trusted_callback_principal: Option<Principal>,
     cycle_topup_enabled: Option<bool>,
     auto_topup_cycle_threshold: Option<u64>,
     spawn_bootstrap: Option<SpawnBootstrapArgs>,
@@ -82,6 +88,20 @@ enum InferenceProvider {
     OpenRouterProxyWorker,
 }
 
+#[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum InferenceTransport {
+    OpenrouterDirect,
+    OpenrouterProxyWorker,
+}
+
+#[derive(CandidType, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum OpenRouterReasoningLevel {
+    Default,
+    Low,
+    Medium,
+    High,
+}
+
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct RuntimeView {
     state: AgentState,
@@ -97,6 +117,35 @@ struct RuntimeView {
     last_transition_at_ns: u64,
     inference_provider: InferenceProvider,
     inference_model: String,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct InferenceConfigView {
+    provider: InferenceProvider,
+    model: String,
+    openrouter_base_url: String,
+    openrouter_has_api_key: bool,
+    openrouter_max_response_bytes: u64,
+    openrouter_reasoning_level: OpenRouterReasoningLevel,
+    openrouter_proxy_worker_base_url: Option<String>,
+    openrouter_proxy_trusted_callback_principal: Option<String>,
+}
+
+#[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct InferenceProxyStatusView {
+    worker_base_url: Option<String>,
+    trusted_callback_principal: Option<String>,
+    pending_jobs: u64,
+    completed_jobs: u64,
+    oldest_pending_age_secs: Option<u64>,
+    submit_accepted: u64,
+    submit_failed: u64,
+    callback_accepted: u64,
+    callback_rejected: u64,
+    callback_duplicates: u64,
+    callback_auth_failures: u64,
+    resumed_callbacks: u64,
+    expired_jobs: u64,
 }
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -128,26 +177,60 @@ fn call_query<T>(pic: &PocketIc, canister_id: Principal, method: &str) -> T
 where
     T: for<'de> Deserialize<'de> + CandidType,
 {
+    call_query_with_payload(
+        pic,
+        canister_id,
+        method,
+        encode_args(()).expect("failed to encode query args"),
+    )
+}
+
+fn call_query_with_payload<T>(
+    pic: &PocketIc,
+    canister_id: Principal,
+    method: &str,
+    payload: Vec<u8>,
+) -> T
+where
+    T: for<'de> Deserialize<'de> + CandidType,
+{
     let response = pic
-        .query_call(
-            canister_id,
-            Principal::anonymous(),
-            method,
-            encode_args(()).expect("failed to encode query args"),
-        )
+        .query_call(canister_id, Principal::anonymous(), method, payload)
         .unwrap_or_else(|error| panic!("query call {method} failed: {error:?}"));
     decode_one(&response)
         .unwrap_or_else(|error| panic!("failed decoding {method} response: {error:?}"))
 }
 
-#[test]
-fn init_spawn_bootstrap_sets_steward_and_persists_factory_metadata() {
-    let pic = PocketIc::new();
-    let canister_id = pic.create_canister();
-    pic.add_cycles(canister_id, 2_000_000_000_000);
+fn sample_spawn_provider_args(
+    inference_transport: InferenceTransport,
+    open_router_reasoning_level: OpenRouterReasoningLevel,
+) -> SpawnProviderBootstrapArgs {
+    SpawnProviderBootstrapArgs {
+        open_router_api_key: Some("sk-or-test".to_string()),
+        model: Some("openai/gpt-4o-mini".to_string()),
+        brave_search_api_key: Some("brave-test-key".to_string()),
+        inference_transport,
+        open_router_reasoning_level,
+    }
+}
 
-    let wasm = assert_wasm_artifact_present();
-    let init_args = encode_args((InitArgs {
+fn sample_spawn_bootstrap_args(provider: SpawnProviderBootstrapArgs) -> SpawnBootstrapArgs {
+    SpawnBootstrapArgs {
+        steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),
+        session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        parent_id: Some("parent-automaton".to_string()),
+        factory_principal: Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
+            .expect("factory principal should parse"),
+        risk: 4,
+        strategies: vec!["carry".to_string()],
+        skills: vec!["messaging".to_string()],
+        provider,
+        version_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+    }
+}
+
+fn sample_init_args(spawn_bootstrap: SpawnBootstrapArgs) -> InitArgs {
+    InitArgs {
         ecdsa_key_name: "dfx_test_key".to_string(),
         inbox_contract_address: None,
         evm_chain_id: Some(31337),
@@ -157,33 +240,57 @@ fn init_spawn_bootstrap_sets_steward_and_persists_factory_metadata() {
         http_allowed_domains: None,
         llm_canister_id: None,
         search_api_key: None,
+        inference_proxy_worker_base_url: None,
+        inference_proxy_trusted_callback_principal: None,
         cycle_topup_enabled: None,
         auto_topup_cycle_threshold: None,
-        spawn_bootstrap: Some(SpawnBootstrapArgs {
-            steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),
-            session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-            parent_id: Some("parent-automaton".to_string()),
-            factory_principal: Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
-                .expect("factory principal should parse"),
-            risk: 4,
-            strategies: vec!["carry".to_string()],
-            skills: vec!["messaging".to_string()],
-            provider: SpawnProviderBootstrapArgs {
-                open_router_api_key: Some("sk-or-test".to_string()),
-                model: Some("openai/gpt-4o-mini".to_string()),
-                brave_search_api_key: Some("brave-test-key".to_string()),
-            },
-            version_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
-        }),
-    },))
-    .expect("failed to encode init args");
+        spawn_bootstrap: Some(spawn_bootstrap),
+    }
+}
 
+fn install_backend_canister(pic: &PocketIc, init: InitArgs) -> Principal {
+    let canister_id = pic.create_canister();
+    pic.add_cycles(canister_id, 2_000_000_000_000);
+    let wasm = assert_wasm_artifact_present();
+    let init_args = encode_args((init,)).expect("failed to encode init args");
     pic.install_canister(canister_id, wasm, init_args, None);
+    canister_id
+}
+
+fn http_get_json(pic: &PocketIc, canister_id: Principal, path: &str) -> Value {
+    let payload = encode_args((HttpRequest::get(path).build(),))
+        .unwrap_or_else(|error| panic!("failed to encode http_request args: {error}"));
+    let response: HttpResponse = call_query_with_payload(pic, canister_id, "http_request", payload);
+    assert_eq!(
+        response.status_code().as_u16(),
+        200,
+        "unexpected {path} status"
+    );
+    serde_json::from_slice(response.body())
+        .unwrap_or_else(|error| panic!("{path} should return json: {error}"))
+}
+
+#[test]
+fn pocketic_spawn_bootstrap_sets_direct_openrouter_runtime_and_http_config() {
+    let pic = PocketIc::new();
+    let canister_id = install_backend_canister(
+        &pic,
+        sample_init_args(sample_spawn_bootstrap_args(sample_spawn_provider_args(
+            InferenceTransport::OpenrouterDirect,
+            OpenRouterReasoningLevel::High,
+        ))),
+    );
 
     let steward_status: StewardStatusView = call_query(&pic, canister_id, "get_steward_status");
     let runtime_view: RuntimeView = call_query(&pic, canister_id, "get_runtime_view");
     let bootstrap_view: SpawnBootstrapView =
         call_query(&pic, canister_id, "get_spawn_bootstrap_view");
+    let inference_config: InferenceConfigView =
+        call_query(&pic, canister_id, "get_inference_config");
+    let proxy_status: InferenceProxyStatusView =
+        call_query(&pic, canister_id, "get_inference_proxy_status");
+    let inference_config_json = http_get_json(&pic, canister_id, "/api/inference/config");
+    let proxy_status_json = http_get_json(&pic, canister_id, "/api/inference/proxy/status");
 
     let steward = steward_status
         .active_steward
@@ -201,6 +308,26 @@ fn init_spawn_bootstrap_sets_steward_and_persists_factory_metadata() {
         InferenceProvider::OpenRouter
     );
     assert_eq!(runtime_view.inference_model, "openai/gpt-4o-mini");
+    assert_eq!(inference_config.provider, InferenceProvider::OpenRouter);
+    assert_eq!(
+        inference_config.openrouter_reasoning_level,
+        OpenRouterReasoningLevel::High
+    );
+    assert_eq!(inference_config.openrouter_proxy_worker_base_url, None);
+    assert_eq!(proxy_status.worker_base_url, None);
+    assert_eq!(
+        inference_config_json
+            .get("provider")
+            .and_then(Value::as_str),
+        Some("OpenRouter")
+    );
+    assert_eq!(
+        inference_config_json
+            .get("openrouter_reasoning_level")
+            .and_then(Value::as_str),
+        Some("High")
+    );
+    assert_eq!(proxy_status_json.get("worker_base_url"), Some(&Value::Null));
     assert_eq!(
         bootstrap_view,
         SpawnBootstrapView {
@@ -215,5 +342,88 @@ fn init_spawn_bootstrap_sets_steward_and_persists_factory_metadata() {
             skills: vec!["messaging".to_string()],
             version_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
         }
+    );
+}
+
+#[test]
+fn pocketic_spawn_bootstrap_sets_proxy_runtime_and_http_config() {
+    let pic = PocketIc::new();
+    let trusted = Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai")
+        .expect("trusted principal should parse");
+    let mut init = sample_init_args(sample_spawn_bootstrap_args(sample_spawn_provider_args(
+        InferenceTransport::OpenrouterProxyWorker,
+        OpenRouterReasoningLevel::Medium,
+    )));
+    init.inference_proxy_worker_base_url = Some("https://proxy.example.workers.dev/".to_string());
+    init.inference_proxy_trusted_callback_principal = Some(trusted);
+    let canister_id = install_backend_canister(&pic, init);
+
+    let runtime_view: RuntimeView = call_query(&pic, canister_id, "get_runtime_view");
+    let inference_config: InferenceConfigView =
+        call_query(&pic, canister_id, "get_inference_config");
+    let proxy_status: InferenceProxyStatusView =
+        call_query(&pic, canister_id, "get_inference_proxy_status");
+    let inference_config_json = http_get_json(&pic, canister_id, "/api/inference/config");
+    let proxy_status_json = http_get_json(&pic, canister_id, "/api/inference/proxy/status");
+
+    assert_eq!(
+        runtime_view.inference_provider,
+        InferenceProvider::OpenRouterProxyWorker
+    );
+    assert_eq!(
+        inference_config.provider,
+        InferenceProvider::OpenRouterProxyWorker
+    );
+    assert_eq!(
+        inference_config.openrouter_reasoning_level,
+        OpenRouterReasoningLevel::Medium
+    );
+    assert_eq!(
+        inference_config.openrouter_proxy_worker_base_url.as_deref(),
+        Some("https://proxy.example.workers.dev")
+    );
+    assert_eq!(
+        inference_config
+            .openrouter_proxy_trusted_callback_principal
+            .as_deref(),
+        Some("w36hm-eqaaa-aaaal-qr76a-cai")
+    );
+    assert_eq!(
+        proxy_status.worker_base_url.as_deref(),
+        Some("https://proxy.example.workers.dev")
+    );
+    assert_eq!(
+        proxy_status.trusted_callback_principal.as_deref(),
+        Some("w36hm-eqaaa-aaaal-qr76a-cai")
+    );
+    assert_eq!(
+        inference_config_json
+            .get("provider")
+            .and_then(Value::as_str),
+        Some("OpenRouterProxyWorker")
+    );
+    assert_eq!(
+        inference_config_json
+            .get("openrouter_reasoning_level")
+            .and_then(Value::as_str),
+        Some("Medium")
+    );
+    assert_eq!(
+        inference_config_json
+            .get("openrouter_proxy_worker_base_url")
+            .and_then(Value::as_str),
+        Some("https://proxy.example.workers.dev")
+    );
+    assert_eq!(
+        proxy_status_json
+            .get("worker_base_url")
+            .and_then(Value::as_str),
+        Some("https://proxy.example.workers.dev")
+    );
+    assert_eq!(
+        proxy_status_json
+            .get("trusted_callback_principal")
+            .and_then(Value::as_str),
+        Some("w36hm-eqaaa-aaaal-qr76a-cai")
     );
 }
