@@ -2005,7 +2005,7 @@ fn web_search_ic_tool() -> IcLlmTool {
                     type_: "integer".to_string(),
                     name: "count".to_string(),
                     description: Some(
-                        "Optional result count from 1 to 6. Default 3. If the provider response is too large, the runtime may retry once with count 3 and no domain filters."
+                        "Optional result count from 1 to 6. Default 3. If the provider response is too large, the runtime progressively retries with fewer results, down to 1, and may finally drop domain filters as a last resort."
                             .to_string(),
                     ),
                     enum_values: None,

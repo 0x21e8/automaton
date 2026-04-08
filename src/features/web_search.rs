@@ -18,7 +18,7 @@ const WEB_SEARCH_MAX_QUERY_CHARS: usize = 320;
 const WEB_SEARCH_MAX_OUTPUT_CHARS: usize = 8_000;
 const WEB_SEARCH_MAX_SNIPPET_CHARS: usize = 320;
 const WEB_SEARCH_MAX_DOMAIN_FILTERS: usize = 5;
-const WEB_SEARCH_MAX_RESPONSE_BYTES: u64 = 32 * 1024;
+const WEB_SEARCH_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
 
 #[derive(Deserialize)]
 struct WebSearchArgs {
@@ -33,7 +33,7 @@ struct WebSearchArgs {
     exclude_domains: Option<Vec<String>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct NormalizedWebSearchArgs {
     query: String,
     count: usize,
@@ -131,52 +131,79 @@ async fn http_get_search_with_retry(
     args: &NormalizedWebSearchArgs,
     api_key: &str,
 ) -> Result<Vec<u8>, String> {
-    let url = build_brave_search_url(args);
-    let request_size_bytes =
-        u64::try_from(url.len().saturating_add(api_key.len()).saturating_add(256))
-            .unwrap_or(u64::MAX);
-    ensure_web_search_affordable(request_size_bytes, WEB_SEARCH_MAX_RESPONSE_BYTES)?;
-    match http_get_search(&url, api_key, WEB_SEARCH_MAX_RESPONSE_BYTES).await {
-        Ok(body) => Ok(body),
-        Err(error) => {
-            let Some(retry_args) = body_limit_retry_args(args, &error) else {
-                return Err(error);
-            };
-            let retry_url = build_brave_search_url(&retry_args);
-            let retry_request_size_bytes = u64::try_from(
-                retry_url
-                    .len()
-                    .saturating_add(api_key.len())
-                    .saturating_add(256),
-            )
-            .unwrap_or(u64::MAX);
-            ensure_web_search_affordable(retry_request_size_bytes, WEB_SEARCH_MAX_RESPONSE_BYTES)?;
-            http_get_search(&retry_url, api_key, WEB_SEARCH_MAX_RESPONSE_BYTES).await
+    let mut attempts = Vec::with_capacity(1 + WEB_SEARCH_RETRY_RESULTS + 1);
+    attempts.push(args.clone());
+
+    let mut retry_plan: Option<Vec<NormalizedWebSearchArgs>> = None;
+    let mut index = 0;
+    while index < attempts.len() {
+        let attempt = &attempts[index];
+        let url = build_brave_search_url(attempt);
+        let request_size_bytes =
+            u64::try_from(url.len().saturating_add(api_key.len()).saturating_add(256))
+                .unwrap_or(u64::MAX);
+        ensure_web_search_affordable(request_size_bytes, WEB_SEARCH_MAX_RESPONSE_BYTES)?;
+        match http_get_search(&url, api_key, WEB_SEARCH_MAX_RESPONSE_BYTES).await {
+            Ok(body) => return Ok(body),
+            Err(error) => {
+                if !is_response_too_large_error(&error) {
+                    return Err(error);
+                }
+
+                if retry_plan.is_none() {
+                    retry_plan = Some(body_limit_retry_sequence(args, &error));
+                    if let Some(plan) = &retry_plan {
+                        attempts.extend(plan.iter().cloned());
+                    }
+                }
+
+                if index + 1 >= attempts.len() {
+                    return Err(error);
+                }
+            }
         }
+        index += 1;
     }
+
+    Err("web_search failed after exhausting response-size fallbacks".to_string())
 }
 
-fn body_limit_retry_args(
+fn body_limit_retry_sequence(
     args: &NormalizedWebSearchArgs,
     error: &str,
-) -> Option<NormalizedWebSearchArgs> {
+) -> Vec<NormalizedWebSearchArgs> {
     if !is_response_too_large_error(error) {
-        return None;
+        return Vec::new();
     }
 
-    let stripped_filters = !args.include_domains.is_empty() || !args.exclude_domains.is_empty();
-    let reduced_count = args.count > WEB_SEARCH_RETRY_RESULTS;
-    if !stripped_filters && !reduced_count {
-        return None;
+    let mut retries = Vec::new();
+    for count in (1..=args.count.min(WEB_SEARCH_RETRY_RESULTS)).rev() {
+        let candidate = NormalizedWebSearchArgs {
+            query: args.query.clone(),
+            count,
+            freshness: args.freshness.clone(),
+            include_domains: args.include_domains.clone(),
+            exclude_domains: args.exclude_domains.clone(),
+        };
+        if candidate != *args && !retries.contains(&candidate) {
+            retries.push(candidate);
+        }
     }
 
-    Some(NormalizedWebSearchArgs {
-        query: args.query.clone(),
-        count: args.count.min(WEB_SEARCH_RETRY_RESULTS),
-        freshness: args.freshness.clone(),
-        include_domains: Vec::new(),
-        exclude_domains: Vec::new(),
-    })
+    if !args.include_domains.is_empty() || !args.exclude_domains.is_empty() {
+        let unscoped_single_result = NormalizedWebSearchArgs {
+            query: args.query.clone(),
+            count: 1,
+            freshness: args.freshness.clone(),
+            include_domains: Vec::new(),
+            exclude_domains: Vec::new(),
+        };
+        if unscoped_single_result != *args && !retries.contains(&unscoped_single_result) {
+            retries.push(unscoped_single_result);
+        }
+    }
+
+    retries
 }
 
 fn is_response_too_large_error(error: &str) -> bool {
@@ -505,26 +532,44 @@ mod tests {
     }
 
     #[test]
-    fn body_limit_retry_args_strips_filters_and_reduces_result_count() {
+    fn body_limit_retry_sequence_progressively_reduces_result_count() {
         let args = parse_web_search_args(
-            r#"{"query":"latest audits","count":6,"include_domains":["docs.uniswap.org"],"exclude_domains":["example.com"]}"#,
+            r#"{"query":"latest audits","count":6,"include_domains":["docs.uniswap.org"]}"#,
         )
         .expect("args should parse");
-        let retried = body_limit_retry_args(
+        let retried = body_limit_retry_sequence(
             &args,
             "web_search failed: Http body exceeds size limit of 32768 bytes.",
-        )
-        .expect("body limit should trigger a retry");
-        assert_eq!(retried.count, WEB_SEARCH_RETRY_RESULTS);
-        assert!(retried.include_domains.is_empty());
-        assert!(retried.exclude_domains.is_empty());
+        );
+        assert_eq!(retried.len(), 4);
+        assert_eq!(retried[0].count, 3);
+        assert_eq!(retried[0].include_domains, vec!["docs.uniswap.org"]);
+        assert_eq!(retried[1].count, 2);
+        assert_eq!(retried[2].count, 1);
+        assert_eq!(retried[3].count, 1);
+        assert!(retried[3].include_domains.is_empty());
+        assert!(retried[3].exclude_domains.is_empty());
     }
 
     #[test]
-    fn body_limit_retry_args_ignores_non_size_errors() {
+    fn body_limit_retry_sequence_ignores_non_size_errors() {
         let args = parse_web_search_args(r#"{"query":"latest audits","count":6}"#)
             .expect("args should parse");
-        assert!(body_limit_retry_args(&args, "web_search provider returned HTTP 500").is_none());
+        assert!(
+            body_limit_retry_sequence(&args, "web_search provider returned HTTP 500").is_empty()
+        );
+    }
+
+    #[test]
+    fn body_limit_retry_sequence_skips_unnecessary_duplicate_attempts() {
+        let args = parse_web_search_args(r#"{"query":"latest audits","count":2}"#)
+            .expect("args should parse");
+        let retried = body_limit_retry_sequence(
+            &args,
+            "web_search failed: Http body exceeds size limit of 32768 bytes.",
+        );
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].count, 1);
     }
 
     #[test]
