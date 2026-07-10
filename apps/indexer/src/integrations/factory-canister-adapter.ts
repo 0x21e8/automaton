@@ -30,7 +30,7 @@ import type { FactoryAdapter, FactoryHealthSnapshot } from "./factory-client.js"
 type Optional<T> = [] | [T];
 
 type CandidVariant<TName extends string, TValue = null> = {
-  [Name in TName]: TValue;
+  [Name in TName]?: TValue;
 };
 
 type CandidSpawnChain = CandidVariant<"Base">;
@@ -55,10 +55,13 @@ type CandidSessionAuditActor = CandidVariant<"System" | "User" | "Admin">;
 type CandidRepositoryStrategyStatus = CandidVariant<"Active" | "Deprecated" | "Revoked">;
 
 interface CandidProviderConfig {
-  brave_search_api_key: Optional<string>;
   inference_transport: CandidInferenceTransport;
   model: Optional<string>;
   open_router_reasoning_level: CandidOpenRouterReasoningLevel;
+}
+
+interface CandidSpawnProviderSecrets {
+  brave_search_api_key: Optional<string>;
   open_router_api_key: Optional<string>;
 }
 
@@ -75,6 +78,7 @@ interface CandidCreateSpawnSessionRequest {
   config: CandidSpawnConfig;
   gross_amount: string;
   parent_id: Optional<string>;
+  provider_secrets: CandidSpawnProviderSecrets;
   steward_address: string;
 }
 
@@ -336,7 +340,9 @@ function createFactoryIdl() {
         Low: candid.Null,
         Medium: candid.Null,
         High: candid.Null
-      }),
+      })
+    });
+    const SpawnProviderSecrets = candid.Record({
       open_router_api_key: candid.Opt(candid.Text),
       brave_search_api_key: candid.Opt(candid.Text)
     });
@@ -352,7 +358,8 @@ function createFactoryIdl() {
       parent_id: candid.Opt(candid.Text),
       config: SpawnConfig,
       steward_address: candid.Text,
-      gross_amount: candid.Text
+      gross_amount: candid.Text,
+      provider_secrets: SpawnProviderSecrets
     });
     const PaymentStatus = candid.Variant({
       Refunded: candid.Null,
@@ -902,9 +909,7 @@ function mapSpawnConfig(config: CandidSpawnConfig): CreateSpawnSessionRequest["c
       model: unwrapOptional(config.provider.model),
       openRouterReasoningLevel: mapOpenRouterReasoningLevel(
         config.provider.open_router_reasoning_level
-      ),
-      openRouterApiKey: unwrapOptional(config.provider.open_router_api_key),
-      braveSearchApiKey: unwrapOptional(config.provider.brave_search_api_key)
+      )
     }
   };
 }
@@ -1071,21 +1076,13 @@ function mapCreateRequest(
         Base: null
       },
       provider: {
-        brave_search_api_key:
-          request.config.provider.braveSearchApiKey === null
-            ? []
-            : [request.config.provider.braveSearchApiKey],
         inference_transport: toCandidInferenceTransport(
           request.config.provider.inferenceTransport
         ),
         model: request.config.provider.model === null ? [] : [request.config.provider.model],
         open_router_reasoning_level: toCandidOpenRouterReasoningLevel(
           request.config.provider.openRouterReasoningLevel
-        ),
-        open_router_api_key:
-          request.config.provider.openRouterApiKey === null
-            ? []
-            : [request.config.provider.openRouterApiKey]
+        )
       },
       risk: request.config.risk,
       skills: [...request.config.skills],
@@ -1093,7 +1090,17 @@ function mapCreateRequest(
     },
     gross_amount: request.grossAmount,
     parent_id: request.parentId ? [request.parentId] : [],
-    steward_address: request.stewardAddress
+    steward_address: request.stewardAddress,
+    provider_secrets: {
+      open_router_api_key:
+        request.providerSecrets.openRouterApiKey === null
+          ? []
+          : [request.providerSecrets.openRouterApiKey],
+      brave_search_api_key:
+        request.providerSecrets.braveSearchApiKey === null
+          ? []
+          : [request.providerSecrets.braveSearchApiKey]
+    }
   };
 }
 

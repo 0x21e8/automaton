@@ -6,6 +6,7 @@ use crate::retry::retry_failed_session;
 use crate::scheduler::enqueue_payment_poll;
 use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent};
 use crate::state::{read_state, write_state, FactoryState};
+use crate::state::store_spawn_provider_secrets;
 use crate::types::{
     amount_to_string, derive_claim_id, hash_quote_terms, parse_amount, CreateSpawnSessionRequest,
     CreateSpawnSessionResponse, FactoryError, PostRoomMessageRequest, RefundSpawnResponse,
@@ -308,6 +309,7 @@ pub(crate) fn create_spawn_session_with_session_id(
     now_ms: u64,
     session_id: String,
 ) -> Result<CreateSpawnSessionResponse, FactoryError> {
+    let provider_secrets = request.provider_secrets.clone();
     let (session, quote) = write_state(|state| {
         if state.pause {
             return Err(FactoryError::FactoryPaused { pause: true });
@@ -409,6 +411,8 @@ pub(crate) fn create_spawn_session_with_session_id(
 
         Ok((session, quote))
     })?;
+
+    store_spawn_provider_secrets(&session_id, provider_secrets);
 
     register_escrow_claim(&session, now_ms);
     enqueue_payment_poll(now_ms);

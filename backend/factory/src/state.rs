@@ -14,11 +14,12 @@ use crate::types::{
     AutomatonChildRuntimeConfig, AutomatonRuntimeState, CreationCostQuote, EscrowClaim,
     FactoryError, FactoryInitArgs, FeeConfig, PendingArtifactUpload, ReleaseBroadcastConfig,
     RepositoryStrategyRecord, RoomMessage, RoomState, SchedulerJob, SchedulerRuntime,
-    SessionAuditActor, SessionAuditEntry, SpawnSession, SpawnSessionState, SpawnedAutomatonRecord,
+    SessionAuditActor, SessionAuditEntry, SpawnProviderSecrets, SpawnSession, SpawnSessionState,
+    SpawnedAutomatonRecord,
 };
 
-const STORAGE_SCHEMA_VERSION: u32 = 4;
-const PREVIOUS_STORAGE_SCHEMA_VERSION: u32 = 3;
+const STORAGE_SCHEMA_VERSION: u32 = 5;
+const PREVIOUS_STORAGE_SCHEMA_VERSION: u32 = 4;
 const STORAGE_METADATA_MEMORY_ID: u8 = 0;
 const FACTORY_CONFIG_MEMORY_ID: u8 = 1;
 const SESSIONS_MEMORY_ID: u8 = 2;
@@ -31,6 +32,7 @@ const SCHEDULER_JOBS_MEMORY_ID: u8 = 8;
 const ROOM_STATE_MEMORY_ID: u8 = 9;
 const ROOM_MESSAGES_MEMORY_ID: u8 = 10;
 const STRATEGY_REPOSITORY_MEMORY_ID: u8 = 11;
+const SPAWN_PROVIDER_SECRETS_MEMORY_ID: u8 = 12;
 
 type StableMemory<M> = VirtualMemory<M>;
 
@@ -289,6 +291,7 @@ impl FactoryStableConfig {
 }
 
 impl_candid_storable!(SpawnSession);
+impl_candid_storable!(SpawnProviderSecrets);
 impl_candid_storable!(EscrowClaim);
 impl_candid_storable!(SpawnedAutomatonRecord);
 impl_candid_storable!(AutomatonRuntimeState);
@@ -309,6 +312,7 @@ struct FactoryStableStorage<M: Memory> {
     room_state: StableCell<RoomState, StableMemory<M>>,
     repository_strategies: StableBTreeMap<String, RepositoryStrategyRecord, StableMemory<M>>,
     sessions: StableBTreeMap<String, SpawnSession, StableMemory<M>>,
+    spawn_provider_secrets: StableBTreeMap<String, SpawnProviderSecrets, StableMemory<M>>,
     escrow_claims: StableBTreeMap<String, EscrowClaim, StableMemory<M>>,
     registry: StableBTreeMap<String, SpawnedAutomatonRecord, StableMemory<M>>,
     runtimes: StableBTreeMap<String, AutomatonRuntimeState, StableMemory<M>>,
@@ -350,6 +354,9 @@ impl<M: Memory> FactoryStableStorage<M> {
                 memory_manager.get(MemoryId::new(STRATEGY_REPOSITORY_MEMORY_ID)),
             ),
             sessions: StableBTreeMap::init(memory_manager.get(MemoryId::new(SESSIONS_MEMORY_ID))),
+            spawn_provider_secrets: StableBTreeMap::init(
+                memory_manager.get(MemoryId::new(SPAWN_PROVIDER_SECRETS_MEMORY_ID)),
+            ),
             escrow_claims: StableBTreeMap::init(
                 memory_manager.get(MemoryId::new(ESCROW_CLAIMS_MEMORY_ID)),
             ),
@@ -601,6 +608,22 @@ pub fn restore_state(snapshot: FactoryStateSnapshot) {
     with_storage_mut(|storage| storage.replace_state(&snapshot));
 }
 
+pub fn store_spawn_provider_secrets(session_id: &str, secrets: SpawnProviderSecrets) {
+    with_storage_mut(|storage| {
+        storage.spawn_provider_secrets.insert(session_id.to_string(), secrets);
+    });
+}
+
+pub fn load_spawn_provider_secrets(session_id: &str) -> Option<SpawnProviderSecrets> {
+    with_storage(|storage| storage.spawn_provider_secrets.get(&session_id.to_string()))
+}
+
+pub fn delete_spawn_provider_secrets(session_id: &str) {
+    with_storage_mut(|storage| {
+        storage.spawn_provider_secrets.remove(&session_id.to_string());
+    });
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn initialize_storage_after_upgrade() {
     let _ = read_state(|state| state.version_commit.clone());
@@ -705,12 +728,9 @@ pub fn insert_spawned_automaton_record(record: SpawnedAutomatonRecord) {
 }
 
 pub fn clear_provider_secrets(
-    session: &mut SpawnSession,
+    _session: &SpawnSession,
     runtime: Option<&mut AutomatonRuntimeState>,
 ) {
-    session.config.provider.open_router_api_key = None;
-    session.config.provider.brave_search_api_key = None;
-
     if let Some(runtime) = runtime {
         runtime.provider_keys_cleared = true;
     }

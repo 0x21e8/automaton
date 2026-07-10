@@ -275,9 +275,7 @@ mod tests {
                 strategies: vec!["base-aave-usdc-reserve-01".to_string()],
                 skills: vec!["search".to_string()],
                 provider: ProviderConfig {
-                    open_router_api_key: None,
                     model: Some("openrouter/auto".to_string()),
-                    brave_search_api_key: None,
                     inference_transport: InferenceTransport::OpenrouterDirect,
                     open_router_reasoning_level: OpenRouterReasoningLevel::Default,
                 },

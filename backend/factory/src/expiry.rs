@@ -1,5 +1,5 @@
 use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent};
-use crate::state::{write_state, FactoryState};
+use crate::state::{delete_spawn_provider_secrets, write_state, FactoryState};
 use crate::types::{FactoryError, SessionAuditActor, SpawnSession};
 
 pub(crate) fn expire_session_in_state(
@@ -20,7 +20,7 @@ pub(crate) fn expire_session_in_state(
 }
 
 pub fn expire_spawn_session(session_id: &str, now_ms: u64) -> Result<SpawnSession, FactoryError> {
-    write_state(|state| {
+    let result = write_state(|state| {
         expire_session_in_state(
             state,
             session_id,
@@ -28,5 +28,9 @@ pub fn expire_spawn_session(session_id: &str, now_ms: u64) -> Result<SpawnSessio
             now_ms,
             "session expired",
         )
-    })
+    });
+    if result.is_ok() {
+        delete_spawn_provider_secrets(session_id);
+    }
+    result
 }

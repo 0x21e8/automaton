@@ -20,7 +20,11 @@ use crate::init::{
 };
 use crate::retry::mark_session_failed_in_state;
 use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent};
-use crate::state::{clear_provider_secrets, read_state, write_state, FactoryState};
+use crate::state::{
+    clear_provider_secrets, delete_spawn_provider_secrets, read_state, write_state, FactoryState,
+};
+#[cfg(target_arch = "wasm32")]
+use crate::state::load_spawn_provider_secrets;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::types::{amount_to_string, parse_amount};
 use crate::types::{
@@ -462,7 +466,7 @@ async fn install_snapped_strategies_into_child(
         A: candid::utils::ArgumentEncoder,
         R: for<'de> candid::utils::ArgumentDecoder<'de>,
     {
-        let response = Call::unbounded_wait(*principal, method)
+        let response = Call::bounded_wait(*principal, method)
             .with_args(arg)
             .await
             .map_err(|error| FactoryError::ManagementCallFailed {
@@ -537,7 +541,7 @@ async fn load_spawned_automaton_bootstrap_evidence(
     where
         R: for<'de> candid::utils::ArgumentDecoder<'de>,
     {
-        let response = Call::unbounded_wait(*principal, method)
+        let response = Call::bounded_wait(*principal, method)
             .await
             .map_err(|error| FactoryError::ManagementCallFailed {
                 method: method.to_string(),
@@ -768,7 +772,7 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
         );
     }
 
-    write_state(|state| {
+    let result = write_state(|state| {
         apply_session_event_in_state(
             state,
             session_id,
@@ -985,7 +989,9 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             release_broadcast_at: Some(release_broadcast_at),
             completed_at: now_ms,
         })
-    })
+    });
+    delete_spawn_provider_secrets(session_id);
+    result
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1262,6 +1268,7 @@ pub async fn execute_spawn(
 
         let install_args = build_automaton_install_args(
             &session_snapshot,
+            load_spawn_provider_secrets(session_id).as_ref(),
             ic_cdk::api::canister_self(),
             &version_commit,
             &child_runtime,
@@ -1295,6 +1302,8 @@ pub async fn execute_spawn(
             )
             .await;
         }
+
+        delete_spawn_provider_secrets(session_id);
 
         let current_time = current_time_ms();
         if current_time > expires_at {
@@ -1558,6 +1567,8 @@ pub async fn execute_spawn(
         )
     })?;
 
+    delete_spawn_provider_secrets(session_id);
+
     Ok(SpawnExecutionReceipt {
         session_id: session_id.to_string(),
         automaton_canister_id: canister_id,
@@ -1610,9 +1621,7 @@ mod tests {
                 strategies: vec!["base-aave-usdc-reserve-01".to_string()],
                 skills: vec![" search ".to_string()],
                 provider: ProviderConfig {
-                    open_router_api_key: Some("or-key".to_string()),
                     model: Some("openrouter/auto".to_string()),
-                    brave_search_api_key: Some("brave-key".to_string()),
                     inference_transport: InferenceTransport::OpenrouterDirect,
                     open_router_reasoning_level: OpenRouterReasoningLevel::Default,
                 },

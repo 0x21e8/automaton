@@ -12,9 +12,13 @@ export type SpawnSessionState = (typeof SPAWN_SESSION_STATES)[number];
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 export type SessionAuditActor = (typeof SESSION_AUDIT_ACTORS)[number];
 export type StrategyRepositoryId = RepositoryStrategyRecord["strategyId"];
-export interface ProviderConfig {
-    openRouterApiKey: string | null;
+export interface SpawnProviderConfig {
     model: string | null;
+    inferenceTransport: SpawnInferenceTransport;
+    openRouterReasoningLevel: SpawnOpenRouterReasoningLevel;
+}
+export interface SpawnProviderSecrets {
+    openRouterApiKey: string | null;
     braveSearchApiKey: string | null;
 }
 export interface SpawnSessionStrategySnapshot {
@@ -37,7 +41,7 @@ export interface SpawnConfig {
     risk: number;
     strategies: StrategyRepositoryId[];
     skills: string[];
-    provider: ProviderConfig;
+    provider: SpawnProviderConfig;
 }
 export interface SpawnPaymentInstructions {
     sessionId: string;
@@ -92,6 +96,7 @@ export interface CreateSpawnSessionRequest {
     asset: SpawnAsset;
     grossAmount: string;
     config: SpawnConfig;
+    providerSecrets: SpawnProviderSecrets;
     parentId?: string | null;
 }
 export interface CreateSpawnSessionResponse {

@@ -19,6 +19,7 @@ type CreateSpawnSessionRequest = record {
   config : SpawnConfig;
   steward_address : text;
   gross_amount : text;
+  provider_secrets : SpawnProviderSecrets;
 };
 type CreateSpawnSessionResponse = record {
   quote : SpawnQuote;
@@ -232,10 +233,12 @@ type OpenRouterReasoningLevel = variant { Default; Low; Medium; High };
 type PaymentStatus = variant { Refunded; Paid; Unpaid; Partial };
 type ProviderConfig = record {
   model : opt text;
-  open_router_api_key : opt text;
-  brave_search_api_key : opt text;
   inference_transport : InferenceTransport;
   open_router_reasoning_level : OpenRouterReasoningLevel;
+};
+type SpawnProviderSecrets = record {
+  open_router_api_key : opt text;
+  brave_search_api_key : opt text;
 };
 type ReleaseBroadcastConfig = record {
   chain_id : nat64;

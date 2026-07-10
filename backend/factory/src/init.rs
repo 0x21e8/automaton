@@ -3,7 +3,8 @@ use serde_json::Value;
 
 use crate::types::{
     AutomatonChildInitArgs, AutomatonChildRuntimeConfig, AutomatonRuntimeState,
-    AutomatonSpawnBootstrapArgs, FactoryError, RepositoryStrategySessionSnapshot, SpawnSession,
+    AutomatonSpawnBootstrapArgs, FactoryError, RepositoryStrategySessionSnapshot,
+    SpawnProviderSecrets, SpawnSession,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,6 +238,7 @@ pub fn build_strategy_install_recipe(
 
 pub fn build_automaton_install_args(
     session: &SpawnSession,
+    provider_secrets: Option<&SpawnProviderSecrets>,
     factory_principal: candid::Principal,
     version_commit: &str,
     child_runtime: &ValidatedAutomatonChildRuntimeConfig,
@@ -265,7 +267,19 @@ pub fn build_automaton_install_args(
             risk: session.config.risk,
             strategies: session.config.strategies.clone(),
             skills: session.config.skills.clone(),
-            provider: session.config.provider.clone(),
+            provider: crate::types::SpawnProviderBootstrapConfig {
+                open_router_api_key: provider_secrets
+                    .and_then(|secrets| secrets.open_router_api_key.clone()),
+                model: session.config.provider.model.clone(),
+                brave_search_api_key: provider_secrets
+                    .and_then(|secrets| secrets.brave_search_api_key.clone()),
+                inference_transport: session.config.provider.inference_transport.clone(),
+                open_router_reasoning_level: session
+                    .config
+                    .provider
+                    .open_router_reasoning_level
+                    .clone(),
+            },
             version_commit: version_commit.to_string(),
         }),
     })
@@ -314,7 +328,7 @@ mod tests {
     };
     use crate::types::{
         AutomatonChildInitArgs, AutomatonChildRuntimeConfig, CreateSpawnSessionRequest,
-        InferenceTransport, OpenRouterReasoningLevel, ProviderConfig,
+        InferenceTransport, OpenRouterReasoningLevel, ProviderConfig, SpawnProviderSecrets,
         RepositoryStrategySessionSnapshot, RepositoryStrategySource, RepositoryStrategyStatus,
         SpawnAsset, SpawnChain, SpawnConfig,
     };
@@ -330,12 +344,14 @@ mod tests {
                 strategies: vec!["base-aave-usdc-reserve-01".to_string()],
                 skills: vec![" search ".to_string()],
                 provider: ProviderConfig {
-                    open_router_api_key: Some(" sk-or-test ".to_string()),
                     model: Some(" openai/gpt-4o-mini ".to_string()),
-                    brave_search_api_key: Some(" brave-test-key ".to_string()),
                     inference_transport: InferenceTransport::OpenrouterProxyWorker,
                     open_router_reasoning_level: OpenRouterReasoningLevel::Medium,
                 },
+            },
+            provider_secrets: SpawnProviderSecrets {
+                open_router_api_key: Some(" sk-or-test ".to_string()),
+                brave_search_api_key: Some(" brave-test-key ".to_string()),
             },
             parent_id: Some("parent-automaton".to_string()),
         }
@@ -437,6 +453,7 @@ mod tests {
 
         let encoded = build_automaton_install_args(
             &session,
+            crate::state::load_spawn_provider_secrets(&session.session_id).as_ref(),
             Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai").expect("valid factory principal"),
             "0123456789abcdef0123456789abcdef01234567",
             &config,

@@ -47,7 +47,8 @@ pub use spawn::execute_spawn;
 pub use state::set_mock_canister_balance;
 pub use state::{
     apply_factory_init_args, clear_provider_secrets, current_canister_balance,
-    insert_spawned_automaton_record, read_state, restore_state, snapshot_state, write_state,
+    delete_spawn_provider_secrets, insert_spawned_automaton_record, load_spawn_provider_secrets,
+    read_state, restore_state, snapshot_state, store_spawn_provider_secrets, write_state,
     FactoryStateSnapshot,
 };
 pub use types::{
@@ -66,7 +67,7 @@ pub use types::{
     SchedulerFailureAction, SchedulerFailureSource, SchedulerJob, SchedulerJobFailure,
     SchedulerJobKind, SchedulerJobStatus, SchedulerRuntime, SessionAdminView, SessionAuditActor,
     SessionAuditEntry, SpawnAsset, SpawnChain, SpawnConfig, SpawnExecutionReceipt,
-    SpawnPaymentInstructions, SpawnQuote, SpawnSession, SpawnSessionState,
+    SpawnPaymentInstructions, SpawnProviderSecrets, SpawnQuote, SpawnSession, SpawnSessionState,
     SpawnSessionStatusResponse, SpawnedAutomatonRecord, SpawnedAutomatonRegistryPage,
     DEFAULT_ROOM_READ_LIMIT, MAX_ROOM_BODY_BYTES, MAX_ROOM_MENTIONS, MAX_ROOM_MESSAGES_RETAINED,
     MAX_ROOM_READ_LIMIT,
@@ -428,6 +429,7 @@ mod tests {
         get_escrow_claim, get_factory_config, get_factory_health, get_factory_runtime,
         get_repository_strategy, get_session_admin, get_spawn_session, get_spawned_automaton,
         insert_spawned_automaton_record, list_messages_for_automaton, list_my_room_messages,
+        load_spawn_provider_secrets,
         list_repository_strategies, list_room_messages, list_spawned_automatons,
         mark_session_failed, next_payment_scan_plan, post_room_message, reconcile_escrow_payments,
         restore_state, retry_session_admin, retry_spawn_session, revoke_repository_strategy,
@@ -441,7 +443,8 @@ mod tests {
         RepositoryStrategySource, RevokeRepositoryStrategyRequest, RoomContentType,
         SchedulerFailureAction, SchedulerFailureSource, SchedulerJob, SchedulerJobFailure,
         SchedulerJobKind, SchedulerJobStatus, SchedulerRuntime, SessionAuditActor, SpawnAsset,
-        SpawnChain, SpawnConfig, SpawnSessionState, SpawnedAutomatonRecord, MAX_ROOM_BODY_BYTES,
+        SpawnChain, SpawnConfig, SpawnProviderSecrets, SpawnSessionState,
+        SpawnedAutomatonRecord, MAX_ROOM_BODY_BYTES,
         MAX_ROOM_MESSAGES_RETAINED,
     };
     use crate::base_rpc::BaseDepositLog;
@@ -525,12 +528,14 @@ mod tests {
                     .collect(),
                 skills: vec!["search".to_string()],
                 provider: ProviderConfig {
-                    open_router_api_key: Some("or-key".to_string()),
                     model: Some("openrouter/auto".to_string()),
-                    brave_search_api_key: Some("brave-key".to_string()),
                     inference_transport: InferenceTransport::OpenrouterDirect,
                     open_router_reasoning_level: OpenRouterReasoningLevel::Default,
                 },
+            },
+            provider_secrets: SpawnProviderSecrets {
+                open_router_api_key: Some("or-key".to_string()),
+                brave_search_api_key: Some("brave-key".to_string()),
             },
             parent_id: None,
         }
@@ -1850,8 +1855,7 @@ mod tests {
             Some(response.session.session_id.as_str())
         );
         assert!(runtime.provider_keys_cleared);
-        assert_eq!(session.session.config.provider.open_router_api_key, None);
-        assert_eq!(session.session.config.provider.brave_search_api_key, None);
+        assert!(load_spawn_provider_secrets(&response.session.session_id).is_none());
         assert_eq!(
             admin_view
                 .runtime_record
@@ -2350,22 +2354,15 @@ mod tests {
             SpawnSessionState::Failed
         );
         assert_eq!(
-            failed
-                .session
-                .config
-                .provider
-                .open_router_api_key
-                .as_deref(),
-            Some("or-key")
+            load_spawn_provider_secrets(&response.session.session_id)
+                .and_then(|secrets| secrets.open_router_api_key),
+            Some("or-key".to_string())
         );
+        crate::state::reload_storage_for_test();
         assert_eq!(
-            failed
-                .session
-                .config
-                .provider
-                .brave_search_api_key
-                .as_deref(),
-            Some("brave-key")
+            load_spawn_provider_secrets(&response.session.session_id)
+                .and_then(|secrets| secrets.brave_search_api_key),
+            Some("brave-key".to_string())
         );
 
         let retried = retry_spawn_session("0xsteward", &response.session.session_id, 15_000)
@@ -2888,8 +2885,7 @@ mod tests {
         let refunded =
             get_spawn_session(&response.session.session_id).expect("session should load");
         assert_eq!(refunded.session.payment_status, PaymentStatus::Refunded);
-        assert_eq!(refunded.session.config.provider.open_router_api_key, None);
-        assert_eq!(refunded.session.config.provider.brave_search_api_key, None);
+        assert!(load_spawn_provider_secrets(&response.session.session_id).is_none());
         assert_eq!(
             refunded
                 .audit

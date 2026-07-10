@@ -11,7 +11,8 @@ use crate::session_transitions::{
     apply_session_event_in_state, sync_session_derived_flags_in_state, SpawnSessionEvent,
 };
 use crate::state::{
-    clear_provider_secrets, read_state, record_session_audit, write_state, FactoryState,
+    clear_provider_secrets, delete_spawn_provider_secrets, read_state, record_session_audit,
+    write_state, FactoryState,
 };
 use crate::types::{
     amount_to_string, parse_amount, EscrowClaim, FactoryError, PaymentStatus, RefundSpawnResponse,
@@ -82,7 +83,7 @@ pub fn reconcile_escrow_payments(
         entry.1 = entry.1.max(log.block_number);
     }
 
-    write_state(|state| {
+    let result = write_state(|state| {
         state.payment_last_scanned_block = Some(scan_to_block);
 
         let active_session_ids: Vec<String> = state
@@ -184,7 +185,23 @@ pub fn reconcile_escrow_payments(
         sync_payment_poll_job_in_state(state, now_ms);
 
         Ok(updated_claims)
-    })
+    });
+
+    if result.is_ok() {
+        let expired_ids = read_state(|state| {
+            state
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.state == SpawnSessionState::Expired)
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>()
+        });
+        for session_id in expired_ids {
+            delete_spawn_provider_secrets(&session_id);
+        }
+    }
+
+    result
 }
 
 pub fn next_payment_scan_plan(latest_block: u64) -> Option<PaymentScanPlan> {
@@ -397,5 +414,9 @@ pub fn claim_escrow_refund(
     session_id: &str,
     now_ms: u64,
 ) -> Result<RefundSpawnResponse, FactoryError> {
-    write_state(|state| claim_escrow_refund_in_state(state, session_id, now_ms))
+    let result = write_state(|state| claim_escrow_refund_in_state(state, session_id, now_ms));
+    if result.is_ok() {
+        delete_spawn_provider_secrets(session_id);
+    }
+    result
 }

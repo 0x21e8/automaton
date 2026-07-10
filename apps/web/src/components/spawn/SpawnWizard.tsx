@@ -1090,18 +1090,20 @@ export function SpawnWizard({
         strategies: [...state.strategies],
         skills: [...state.skills],
         provider: {
-          openRouterApiKey:
-            state.openRouterApiKey.trim() === ""
-              ? null
-              : state.openRouterApiKey.trim(),
           model: getSelectedModel(state),
-          braveSearchApiKey:
-            state.braveSearchApiKey.trim() === ""
-              ? null
-              : state.braveSearchApiKey.trim(),
           inferenceTransport: "openrouter_direct",
           openRouterReasoningLevel: "default"
         }
+      },
+      providerSecrets: {
+        openRouterApiKey:
+          state.openRouterApiKey.trim() === ""
+            ? null
+            : state.openRouterApiKey.trim(),
+        braveSearchApiKey:
+          state.braveSearchApiKey.trim() === ""
+            ? null
+            : state.braveSearchApiKey.trim()
       }
     };
   }

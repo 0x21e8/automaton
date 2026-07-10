@@ -137,9 +137,7 @@ function redactProviderSecrets(
   return {
     ...config,
     provider: {
-      ...config.provider,
-      openRouterApiKey: null,
-      braveSearchApiKey: null
+      ...config.provider
     },
     strategies: [...config.strategies],
     skills: [...config.skills]

@@ -287,9 +287,7 @@ export function createSpawnSessionDetailFixture(
       strategies: ["base-aave-usdc-reserve-01"],
       skills: ["portfolio-reporting"],
       provider: {
-        openRouterApiKey: null,
         model: "openrouter/auto",
-        braveSearchApiKey: null,
         inferenceTransport: "openrouter_direct",
         openRouterReasoningLevel: "default"
       }

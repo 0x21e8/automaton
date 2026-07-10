@@ -45,9 +45,7 @@ function createSession(overrides: Partial<SpawnSession> = {}): SpawnSession {
       strategies: [],
       skills: [],
       provider: {
-        openRouterApiKey: null,
         model: null,
-        braveSearchApiKey: null,
         inferenceTransport: "openrouter_direct",
         openRouterReasoningLevel: "default"
       }

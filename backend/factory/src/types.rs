@@ -120,6 +120,15 @@ impl Default for OpenRouterReasoningLevel {
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    pub model: Option<String>,
+    #[serde(default)]
+    pub inference_transport: InferenceTransport,
+    #[serde(default)]
+    pub open_router_reasoning_level: OpenRouterReasoningLevel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct SpawnProviderBootstrapConfig {
     pub open_router_api_key: Option<String>,
     pub model: Option<String>,
     pub brave_search_api_key: Option<String>,
@@ -127,6 +136,12 @@ pub struct ProviderConfig {
     pub inference_transport: InferenceTransport,
     #[serde(default)]
     pub open_router_reasoning_level: OpenRouterReasoningLevel,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct SpawnProviderSecrets {
+    pub open_router_api_key: Option<String>,
+    pub brave_search_api_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
@@ -155,7 +170,7 @@ pub struct AutomatonSpawnBootstrapArgs {
     pub risk: u8,
     pub strategies: Vec<String>,
     pub skills: Vec<String>,
-    pub provider: ProviderConfig,
+    pub provider: SpawnProviderBootstrapConfig,
     pub version_commit: String,
 }
 
@@ -292,6 +307,7 @@ pub struct CreateSpawnSessionRequest {
     pub asset: SpawnAsset,
     pub gross_amount: String,
     pub config: SpawnConfig,
+    pub provider_secrets: SpawnProviderSecrets,
     pub parent_id: Option<String>,
 }
 

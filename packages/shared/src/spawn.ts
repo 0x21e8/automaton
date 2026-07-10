@@ -53,12 +53,15 @@ export type SpawnInferenceTransport = (typeof SPAWN_INFERENCE_TRANSPORTS)[number
 export type SpawnOpenRouterReasoningLevel =
   (typeof SPAWN_OPENROUTER_REASONING_LEVELS)[number];
 
-export interface ProviderConfig {
-  openRouterApiKey: string | null;
+export interface SpawnProviderConfig {
   model: string | null;
-  braveSearchApiKey: string | null;
   inferenceTransport: SpawnInferenceTransport;
   openRouterReasoningLevel: SpawnOpenRouterReasoningLevel;
+}
+
+export interface SpawnProviderSecrets {
+  openRouterApiKey: string | null;
+  braveSearchApiKey: string | null;
 }
 
 export interface SpawnSessionStrategySnapshot {
@@ -83,7 +86,7 @@ export interface SpawnConfig {
   // Repository-owned strategy IDs, not free-form labels.
   strategies: StrategyRepositoryId[];
   skills: string[];
-  provider: ProviderConfig;
+  provider: SpawnProviderConfig;
 }
 
 export interface SpawnPaymentInstructions {
@@ -145,6 +148,7 @@ export interface CreateSpawnSessionRequest {
   asset: SpawnAsset;
   grossAmount: string;
   config: SpawnConfig;
+  providerSecrets: SpawnProviderSecrets;
   parentId?: string | null;
 }
 

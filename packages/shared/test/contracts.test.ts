@@ -246,9 +246,7 @@ describe("shared contracts", () => {
           strategies: [selectedStrategy.strategyId],
           skills: ["portfolio-reporting"],
           provider: {
-            openRouterApiKey: null,
             model: null,
-            braveSearchApiKey: null,
             inferenceTransport: "openrouter_direct",
             openRouterReasoningLevel: "default"
           }
