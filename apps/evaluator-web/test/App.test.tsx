@@ -58,6 +58,7 @@ function createDashboard(): EvaluationDashboardRun {
         runtimeStatus: "active",
         lastObservedTurnAt: 1_712_345_678_500,
         lastError: null,
+        lastErrorDetails: null,
         errorHistogram: [],
         cyclesDelta: "2500",
         cyclesMovingAveragePerHour: "6000",
@@ -90,6 +91,7 @@ function createDashboard(): EvaluationDashboardRun {
         runtimeStatus: "stalled",
         lastObservedTurnAt: 1_712_345_678_250,
         lastError: "No new turns for 10m",
+        lastErrorDetails: null,
         errorHistogram: [
           {
             source: "scheduler",

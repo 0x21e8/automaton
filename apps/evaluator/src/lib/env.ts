@@ -1,7 +1,18 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import path, { join } from "node:path";
 
 import type { EvaluatorRuntimeEnv } from "../types.js";
+
+const FACTORY_PROXY_ENV_ALIASES = [
+  [
+    "EVAL_INFERENCE_PROXY_WORKER_BASE_URL",
+    "FACTORY_CHILD_INFERENCE_PROXY_WORKER_BASE_URL"
+  ],
+  [
+    "EVAL_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL",
+    "FACTORY_CHILD_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL"
+  ]
+] as const;
 
 function parseDotEnv(source: string): Record<string, string> {
   const entries: Record<string, string> = {};
@@ -35,6 +46,26 @@ function parseDotEnv(source: string): Record<string, string> {
   return entries;
 }
 
+function applyFactoryProxyEnvAliases(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const merged = {
+    ...env
+  };
+
+  for (const [sourceKey, targetKey] of FACTORY_PROXY_ENV_ALIASES) {
+    const targetValue = merged[targetKey]?.trim();
+    if (targetValue) {
+      continue;
+    }
+
+    const sourceValue = merged[sourceKey]?.trim();
+    if (sourceValue) {
+      merged[targetKey] = sourceValue;
+    }
+  }
+
+  return merged;
+}
+
 function readRepoDotEnv(repoRoot: string) {
   try {
     const source = readFileSync(join(repoRoot, ".env"), "utf8");
@@ -48,10 +79,10 @@ export function loadRepoEnv(
   repoRoot: string,
   baseEnv: NodeJS.ProcessEnv = process.env
 ): NodeJS.ProcessEnv {
-  return {
+  return applyFactoryProxyEnvAliases({
     ...readRepoDotEnv(repoRoot),
     ...baseEnv
-  };
+  });
 }
 
 function requireValue(
@@ -87,7 +118,12 @@ export function loadEvaluatorEnv(
     inferenceProxyTrustedCallbackPrincipal:
       merged.EVAL_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL?.trim() || null,
     localEvmForkUrl: requireValue(merged.LOCAL_EVM_FORK_URL, "LOCAL_EVM_FORK_URL", issues),
-    automatonRepoPath: requireValue(merged.IC_AUTOMATON_REPO, "IC_AUTOMATON_REPO", issues)
+    automatonRepoPath: path.resolve(
+      repoRoot,
+      merged.AUTOMATON_COMPONENT_ROOT?.trim() ||
+        merged.IC_AUTOMATON_REPO?.trim() ||
+        "components/ic-automaton"
+    )
   };
 
   if (issues.length > 0) {

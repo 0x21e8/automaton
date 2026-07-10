@@ -9,7 +9,8 @@
   },
   "workspaces": [
     "apps/*",
-    "packages/*"
+    "packages/*",
+    "components/ic-automaton/workers/*"
   ],
   "scripts": {
     "dev": "sh ./scripts/dev.sh",
@@ -38,7 +39,8 @@
     "lint": "npm run lint --workspace @ic-automaton/shared && npm run lint --workspace @ic-automaton/indexer && npm run lint --workspace @ic-automaton/rpc-gateway && npm run lint --workspace @ic-automaton/web && npm run lint --workspace @ic-automaton/evaluator && npm run lint --workspace @ic-automaton/evaluator-web && npm run lint:factory",
     "lint:factory": "cargo fmt --check -p factory && cargo clippy -p factory --all-targets -- -D warnings",
     "build": "npm run build --workspace @ic-automaton/shared && npm run build --workspace @ic-automaton/indexer && npm run build --workspace @ic-automaton/rpc-gateway && npm run build --workspace @ic-automaton/web && npm run build --workspace @ic-automaton/evaluator && npm run build --workspace @ic-automaton/evaluator-web",
-    "test": "npm run test --workspace @ic-automaton/shared && npm run test --workspace @ic-automaton/indexer && npm run test --workspace @ic-automaton/rpc-gateway && npm run test --workspace @ic-automaton/web && npm run test --workspace @ic-automaton/evaluator && npm run test --workspace @ic-automaton/evaluator-web",
+    "test:workers": "npm run test --workspace betterstack-monitor-worker && npm run test --workspace strategy-discovery-proxy-worker && npm run check --workspace openrouter-proxy-worker",
+    "test": "npm run test --workspace @ic-automaton/shared && npm run test --workspace @ic-automaton/indexer && npm run test --workspace @ic-automaton/rpc-gateway && npm run test --workspace @ic-automaton/web && npm run test --workspace @ic-automaton/evaluator && npm run test --workspace @ic-automaton/evaluator-web && npm run test:workers",
     "test:factory": "cargo test -p factory"
   },
   "devDependencies": {
@@ -50,7 +52,8 @@
     "tsx": "^4.21.0",
     "typescript": "^5.8.2",
     "vite": "^7.3.1",
-    "vitest": "^4.0.18"
+    "vitest": "^4.0.18",
+    "wrangler": "^4.68.1"
   },
   "dependencies": {
     "fastify": "5.8.2"

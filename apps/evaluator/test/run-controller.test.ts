@@ -396,7 +396,24 @@ describe("run controller", () => {
         async submitSpawnPayment() {},
         async waitForSessionCompletion(_indexerBaseUrl, sessionId) {
           if (sessionId === "session-model-beta") {
-            throw new Error("spawn session failed");
+            const error = new Error("spawn session failed");
+            (
+              error as Error & {
+                details?: unknown;
+              }
+            ).details = {
+              session: {
+                sessionId,
+                state: "spawning",
+                paymentStatus: "paid"
+              },
+              audit: [
+                {
+                  reason: "child bootstrap verification still pending"
+                }
+              ]
+            };
+            throw error;
           }
 
           return {
@@ -432,6 +449,7 @@ describe("run controller", () => {
             source: string;
             count: number;
           }>;
+          lastErrorDetails?: unknown;
         }>;
       };
       const report = await readFile(join(runDirectory, "report.md"), "utf8");
@@ -447,8 +465,21 @@ describe("run controller", () => {
           count: 1
         })
       ]);
+      expect(summary.automatonResults[1]?.lastErrorDetails).toEqual({
+        session: {
+          sessionId: "session-model-beta",
+          state: "spawning",
+          paymentStatus: "paid"
+        },
+        audit: [
+          {
+            reason: "child bootstrap verification still pending"
+          }
+        ]
+      });
       expect(report).toContain("## Rankings");
       expect(events.trim().split("\n").length).toBeGreaterThanOrEqual(4);
+      expect(events).toContain("\"lastErrorDetails\":{\"session\":{\"sessionId\":\"session-model-beta\"");
       expect(sampleLines.trim().split("\n")).toHaveLength(1);
     } finally {
       await loggerApp.close();
@@ -796,11 +827,13 @@ describe("run controller", () => {
 
       expect(createdRequests).toHaveLength(1);
       expect(createdRequests[0]?.config.provider).toMatchObject({
-        openRouterApiKey: "test-openrouter",
         model: "model-alpha",
-        braveSearchApiKey: null,
         inferenceTransport: "openrouter_proxy_worker",
         openRouterReasoningLevel: "medium"
+      });
+      expect(createdRequests[0]?.providerSecrets).toEqual({
+        openRouterApiKey: "test-openrouter",
+        braveSearchApiKey: null
       });
     } finally {
       await loggerApp.close();

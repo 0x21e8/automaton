@@ -3,6 +3,9 @@
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT_DIR/scripts/load-repo-env.sh"
+AUTOMATON_COMPONENT_ROOT=$(AUTOMATON_LAUNCHPAD_ROOT="$ROOT_DIR" sh "$ROOT_DIR/scripts/resolve-automaton-component.sh")
+export AUTOMATON_COMPONENT_ROOT
 TMP_DIR=${PLAYGROUND_TMP_DIR:-"$ROOT_DIR/tmp"}
 STATUS_FILE=${PLAYGROUND_STATUS_FILE:-"$TMP_DIR/playground-status.json"}
 SERVICE_DIR=${PLAYGROUND_SERVICE_DIR:-"$TMP_DIR/playground-services"}
@@ -65,6 +68,24 @@ export INDEXER_DB_PATH
 
 mkdir -p "$TMP_DIR" "$SERVICE_DIR" "$PLAYGROUND_ICP_HOME"
 
+require_command() {
+  tool_name=$1
+
+  if command -v "$tool_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Missing required tool: $tool_name" >&2
+  return 1
+}
+
+require_playground_prerequisites() {
+  require_command cast
+  require_command anvil
+  require_command icp
+  require_command ic-wasm
+}
+
 run_with_repo_node() {
   sh "$ROOT_DIR/scripts/with-repo-node.sh" "$@"
 }
@@ -74,22 +95,22 @@ derive_child_version_commit() {
     return 0
   fi
 
-  if [ -n "${IC_AUTOMATON_REPO:-}" ]; then
-    CHILD_VERSION_COMMIT=$(git -C "$IC_AUTOMATON_REPO" rev-parse HEAD)
+  if [ -n "${AUTOMATON_COMPONENT_ROOT:-}" ]; then
+    CHILD_VERSION_COMMIT=$(git -C "$AUTOMATON_COMPONENT_ROOT" rev-parse HEAD)
     export CHILD_VERSION_COMMIT
   fi
 }
 
-preferred_sibling_child_wasm_path() {
-  if [ -z "${IC_AUTOMATON_REPO:-}" ]; then
+preferred_component_child_wasm_path() {
+  if [ -z "${AUTOMATON_COMPONENT_ROOT:-}" ]; then
     return 1
   fi
 
-  printf '%s\n' "$IC_AUTOMATON_REPO/target/wasm32-wasip1/release/backend_nowasi.wasm"
+  printf '%s\n' "$AUTOMATON_COMPONENT_ROOT/target/wasm32-wasip1/release/backend_nowasi.wasm"
 }
 
-should_build_sibling_child_artifact() {
-  if [ -z "${IC_AUTOMATON_REPO:-}" ] || [ "$PLAYGROUND_BUILD_CHILD_ARTIFACT" != "1" ]; then
+should_build_component_child_artifact() {
+  if [ -z "${AUTOMATON_COMPONENT_ROOT:-}" ] || [ "$PLAYGROUND_BUILD_CHILD_ARTIFACT" != "1" ]; then
     return 1
   fi
 
@@ -98,7 +119,7 @@ should_build_sibling_child_artifact() {
   fi
 
   case "$CHILD_WASM_PATH" in
-    "$IC_AUTOMATON_REPO"/target/*)
+    "$AUTOMATON_COMPONENT_ROOT"/target/*)
       return 0
       ;;
     *)
@@ -107,28 +128,28 @@ should_build_sibling_child_artifact() {
   esac
 }
 
-build_sibling_child_artifact() {
-  if ! should_build_sibling_child_artifact; then
+build_component_child_artifact() {
+  if ! should_build_component_child_artifact; then
     return 0
   fi
 
-  build_script="$IC_AUTOMATON_REPO/scripts/build-backend-wasm.sh"
+  build_script="$AUTOMATON_COMPONENT_ROOT/scripts/build-backend-wasm.sh"
   if [ ! -f "$build_script" ]; then
-    echo "missing sibling child artifact build script at $build_script" >&2
+    echo "missing imported child artifact build script at $build_script" >&2
     return 1
   fi
 
   (
-    cd "$IC_AUTOMATON_REPO"
+    cd "$AUTOMATON_COMPONENT_ROOT"
     sh "$build_script"
   )
 }
 
 resolve_child_wasm_path() {
   preferred_path=
-  if preferred_path=$(preferred_sibling_child_wasm_path 2>/dev/null); then
+  if preferred_path=$(preferred_component_child_wasm_path 2>/dev/null); then
     case "$CHILD_WASM_PATH" in
-      ""|"$IC_AUTOMATON_REPO/target/wasm32-unknown-unknown/release/backend.wasm"|"$IC_AUTOMATON_REPO/target/wasm32-wasip1/release/backend.wasm")
+      ""|"$AUTOMATON_COMPONENT_ROOT/target/wasm32-unknown-unknown/release/backend.wasm"|"$AUTOMATON_COMPONENT_ROOT/target/wasm32-wasip1/release/backend.wasm")
         if [ -f "$preferred_path" ]; then
           if [ -n "$CHILD_WASM_PATH" ] && [ "$CHILD_WASM_PATH" != "$preferred_path" ]; then
             echo "switching CHILD_WASM_PATH to canister-ready sibling artifact $preferred_path" >&2
@@ -151,13 +172,13 @@ resolve_child_wasm_path() {
 
 ensure_child_artifact() {
   derive_child_version_commit
-  build_sibling_child_artifact
+  build_component_child_artifact
 
   if resolve_child_wasm_path; then
     return 0
   fi
 
-  echo "CHILD_WASM_PATH is required for playground bootstrap. Set IC_AUTOMATON_REPO so the sibling canister artifact can be built and resolved automatically, or point CHILD_WASM_PATH at a canister-ready child Wasm (for ic-automaton that is usually target/wasm32-wasip1/release/backend_nowasi.wasm)." >&2
+  echo "CHILD_WASM_PATH is required for playground bootstrap. The imported automaton component could not produce an artifact; alternatively point CHILD_WASM_PATH at a canister-ready child Wasm." >&2
   return 1
 }
 
@@ -205,6 +226,39 @@ stop_pid_file_process() {
   fi
 
   rm -f "$pid_file"
+}
+
+read_pid_file() {
+  pid_file=$1
+  if [ ! -f "$pid_file" ]; then
+    return 1
+  fi
+
+  pid=$(cat "$pid_file" 2>/dev/null || true)
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$pid_file"
+    return 1
+  fi
+
+  printf '%s\n' "$pid"
+}
+
+require_managed_service_ownership() {
+  url=$1
+  pid_file=$2
+  service_name=$3
+
+  if ! healthy_http "$url"; then
+    return 0
+  fi
+
+  if read_pid_file "$pid_file" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "$service_name is already responding at $url but is not owned by this playground instance (missing pid file $pid_file)" >&2
+  echo "stop the unmanaged service or rerun with dedicated playground service ports" >&2
+  return 1
 }
 
 rpc_chain_id() {
@@ -274,7 +328,7 @@ deploy_factory() {
   fi
 
   CHILD_WASM_PATH="$CHILD_WASM_PATH" \
-  IC_AUTOMATON_REPO="${IC_AUTOMATON_REPO:-}" \
+  AUTOMATON_COMPONENT_ROOT="$AUTOMATON_COMPONENT_ROOT" \
     run_with_repo_node node "$ROOT_DIR/scripts/validate-child-canister-interface.mjs"
 
   FACTORY_VERSION_COMMIT="$CHILD_VERSION_COMMIT" \
@@ -403,11 +457,11 @@ deploy_automaton_inbox() {
     return 0
   fi
 
-  if [ -z "${IC_AUTOMATON_REPO:-}" ]; then
+  if [ -z "${AUTOMATON_COMPONENT_ROOT:-}" ]; then
     return 0
   fi
 
-  IC_AUTOMATON_REPO="$IC_AUTOMATON_REPO" \
+  AUTOMATON_COMPONENT_ROOT="$AUTOMATON_COMPONENT_ROOT" \
   LOCAL_EVM_RPC_URL="$LOCAL_EVM_RPC_URL" \
   LOCAL_EVM_DEPLOYMENT_FILE="$LOCAL_EVM_DEPLOYMENT_FILE" \
   AUTOMATON_INBOX_DEPLOYMENT_FILE="$AUTOMATON_INBOX_DEPLOYMENT_FILE" \
@@ -435,9 +489,15 @@ seed_bootstrap_wallet() {
 }
 
 start_indexer() {
-  if healthy_http "$PLAYGROUND_INDEXER_BASE_URL/health" && [ ! -f "$PLAYGROUND_INDEXER_PID_FILE" ]; then
+  if read_pid_file "$PLAYGROUND_INDEXER_PID_FILE" >/dev/null 2>&1 &&
+    healthy_http "$PLAYGROUND_INDEXER_BASE_URL/health"; then
     return 0
   fi
+
+  require_managed_service_ownership \
+    "$PLAYGROUND_INDEXER_BASE_URL/health" \
+    "$PLAYGROUND_INDEXER_PID_FILE" \
+    "indexer"
 
   stop_pid_file_process "$PLAYGROUND_INDEXER_PID_FILE"
 
@@ -469,10 +529,16 @@ start_indexer() {
 }
 
 start_rpc_gateway() {
-  if healthy_http "$PLAYGROUND_RPC_GATEWAY_URL/health" && [ ! -f "$PLAYGROUND_RPC_GATEWAY_PID_FILE" ]; then
+  if read_pid_file "$PLAYGROUND_RPC_GATEWAY_PID_FILE" >/dev/null 2>&1 &&
+    healthy_http "$PLAYGROUND_RPC_GATEWAY_URL/health"; then
     verify_rpc_endpoint "$PLAYGROUND_RPC_GATEWAY_URL"
     return 0
   fi
+
+  require_managed_service_ownership \
+    "$PLAYGROUND_RPC_GATEWAY_URL/health" \
+    "$PLAYGROUND_RPC_GATEWAY_PID_FILE" \
+    "rpc gateway"
 
   stop_pid_file_process "$PLAYGROUND_RPC_GATEWAY_PID_FILE"
 
@@ -501,6 +567,7 @@ ensure_services() {
   verify_rpc_endpoint "$PLAYGROUND_RPC_GATEWAY_URL"
 }
 
+require_playground_prerequisites
 ensure_child_artifact
 
 PLAYGROUND_STATUS_ENVIRONMENT_VERSION="$CHILD_VERSION_COMMIT" \

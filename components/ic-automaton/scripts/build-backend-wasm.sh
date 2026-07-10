@@ -16,8 +16,15 @@ done
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 
-wasm_build_path="${repo_root}/target/wasm32-wasip1/release/backend.wasm"
-wasm_nowasi_path="${repo_root}/target/wasm32-wasip1/release/backend_nowasi.wasm"
+if [[ -f "${repo_root}/../../Cargo.toml" ]] && grep -q 'components/ic-automaton' "${repo_root}/../../Cargo.toml"; then
+  workspace_root="$(cd "${repo_root}/../.." && pwd)"
+else
+  workspace_root="${repo_root}"
+fi
+target_root="${CARGO_TARGET_DIR:-${workspace_root}/target}"
+
+wasm_build_path="${target_root}/wasm32-wasip1/release/backend.wasm"
+wasm_nowasi_path="${target_root}/wasm32-wasip1/release/backend_nowasi.wasm"
 
 if [[ $# -eq 1 ]]; then
   if [[ "$1" = /* ]]; then
@@ -28,7 +35,7 @@ if [[ $# -eq 1 ]]; then
 elif [[ -n "${ICP_WASM_OUTPUT_PATH:-}" ]]; then
   output_path="${ICP_WASM_OUTPUT_PATH}"
 else
-  output_path="${wasm_nowasi_path}"
+  output_path="${repo_root}/target/wasm32-wasip1/release/backend_nowasi.wasm"
 fi
 
 tmp_dir="$(mktemp -d)"

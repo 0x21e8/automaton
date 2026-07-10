@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveAutomatonComponentRoot } from "./resolve-automaton-component.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const defaultDeploymentPath = path.join(rootDir, "tmp", "local-escrow-deployment.json");
@@ -9,7 +10,7 @@ const deploymentPath = process.env.LOCAL_EVM_DEPLOYMENT_FILE ?? defaultDeploymen
 const localInboxDeploymentPath =
   process.env.AUTOMATON_INBOX_DEPLOYMENT_FILE ??
   path.join(rootDir, "tmp", "automaton-inbox-deployment.json");
-const siblingRepo = normalizeOptionalString(process.env.IC_AUTOMATON_REPO);
+const componentRoot = resolveAutomatonComponentRoot();
 const renderTarget = normalizeOptionalString(process.env.FACTORY_RENDER_TARGET) ?? "init";
 
 const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
@@ -135,16 +136,16 @@ const localInboxContractAddress = normalizeOptionalString(
   localInboxDeployment?.inboxContractAddress
 );
 const localInboxUsdcAddress = normalizeOptionalString(localInboxDeployment?.usdcTokenAddress);
-const siblingInboxContractAddress = siblingRepo
-  ? readOptionalTrimmedFile(path.join(siblingRepo, ".local", "inbox_contract_address"))
+const componentInboxContractAddress = componentRoot
+  ? readOptionalTrimmedFile(path.join(componentRoot, ".local", "inbox_contract_address"))
   : null;
-const siblingInboxUsdcAddress = siblingRepo
-  ? readOptionalTrimmedFile(path.join(siblingRepo, ".local", "usdc_token_address"))
+const componentInboxUsdcAddress = componentRoot
+  ? readOptionalTrimmedFile(path.join(componentRoot, ".local", "usdc_token_address"))
   : null;
 const childInboxContractAddress =
   normalizeOptionalString(process.env.FACTORY_CHILD_INBOX_CONTRACT_ADDRESS) ??
   localInboxContractAddress ??
-  siblingInboxContractAddress;
+  componentInboxContractAddress;
 const childEvmChainId =
   normalizeOptionalInteger(process.env.FACTORY_CHILD_EVM_CHAIN_ID) ?? deployment.chainId ?? 8453;
 const childEvmRpcUrl =
@@ -215,13 +216,13 @@ if (
 if (
   childInboxContractAddress !== null &&
   deploymentUsdcAddress !== null &&
-  siblingInboxUsdcAddress !== null &&
-  siblingInboxUsdcAddress.toLowerCase() !== deploymentUsdcAddress.toLowerCase()
+  componentInboxUsdcAddress !== null &&
+  componentInboxUsdcAddress.toLowerCase() !== deploymentUsdcAddress.toLowerCase()
 ) {
   throw new Error(
     [
       "ic-automaton inbox deployment is wired to the wrong USDC contract for this launchpad local stack.",
-      `expected inbox USDC ${deploymentUsdcAddress}, got ${siblingInboxUsdcAddress}.`,
+      `expected inbox USDC ${deploymentUsdcAddress}, got ${componentInboxUsdcAddress}.`,
       "Deploy Inbox.sol against the launchpad configured USDC token on the same Anvil/Base-fork before rendering factory init args."
     ].join(" ")
   );
@@ -238,7 +239,7 @@ const childRuntimeRecord = `record {
   llm_canister_id = ${renderOptPrincipal(childLlmCanisterId)};
   search_api_key = ${renderOptText(childSearchApiKey)};
   inference_proxy_worker_base_url = ${renderOptText(childInferenceProxyWorkerBaseUrl)};
-  inference_proxy_trusted_callback_principal = ${renderOptPrincipal(childInferenceProxyTrustedCallbackPrincipal)};
+  inference_proxy_trusted_callback_principal = ${renderOptText(childInferenceProxyTrustedCallbackPrincipal)};
   cycle_topup_enabled = ${renderOptBool(childCycleTopupEnabled)};
   auto_topup_cycle_threshold = ${renderOptNat(childAutoTopupCycleThreshold)};
 }`;

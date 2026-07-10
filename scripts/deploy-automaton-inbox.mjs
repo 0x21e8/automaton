@@ -2,13 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { resolveAutomatonComponentRoot } from "./resolve-automaton-component.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const siblingRepo = process.env.IC_AUTOMATON_REPO;
-
-if (!siblingRepo) {
-  throw new Error("IC_AUTOMATON_REPO is required");
-}
+const componentRoot = resolveAutomatonComponentRoot();
 
 const deploymentPath =
   process.env.LOCAL_EVM_DEPLOYMENT_FILE ??
@@ -22,7 +19,7 @@ if (!fs.existsSync(deploymentPath)) {
 }
 
 const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
-const evmRoot = path.join(siblingRepo, "evm");
+const evmRoot = path.join(componentRoot, "evm");
 const rpcUrl = process.env.LOCAL_EVM_RPC_URL ?? deployment.rpcUrl;
 const deployer =
   process.env.LOCAL_EVM_DEPLOYER ?? deployment.deployer ?? "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
@@ -106,7 +103,7 @@ const summary = {
   rpcUrl,
   chainId,
   deployer,
-  sourceRepo: siblingRepo,
+  sourceRepo: componentRoot,
   usdcTokenAddress,
   inboxContractAddress: contractAddress,
   txHash

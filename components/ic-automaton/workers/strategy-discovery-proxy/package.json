@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "check": "node --check src/worker.js",
     "deploy": "wrangler deploy",
     "test": "node --test test/worker.test.mjs"
   },

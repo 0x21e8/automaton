@@ -1,4 +1,3 @@
 [workspace]
-members = ["backend/factory"]
+members = ["backend/factory", "components/ic-automaton"]
 resolver = "2"
-

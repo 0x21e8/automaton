@@ -3,6 +3,8 @@
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+AUTOMATON_COMPONENT_ROOT=$(AUTOMATON_LAUNCHPAD_ROOT="$ROOT_DIR" sh "$ROOT_DIR/scripts/resolve-automaton-component.sh")
+export AUTOMATON_COMPONENT_ROOT
 PLAYGROUND_LOCAL_ENV_FILE=${PLAYGROUND_LOCAL_ENV_FILE:-"$ROOT_DIR/playground.local.env"}
 
 if [ -f "$PLAYGROUND_LOCAL_ENV_FILE" ]; then
@@ -47,11 +49,6 @@ require_value() {
 if [ "$PLAYGROUND_REQUIRE_FORK" = "1" ]; then
   require_value "LOCAL_EVM_FORK_URL" \
     "LOCAL_EVM_FORK_URL is required. Copy playground.local.env.example to playground.local.env and set your Base RPC fork URL."
-fi
-
-if [ -z "${IC_AUTOMATON_REPO:-}" ] && [ -z "${FACTORY_CHILD_INBOX_CONTRACT_ADDRESS:-}" ] && [ ! -f "$AUTOMATON_INBOX_DEPLOYMENT_FILE" ]; then
-  echo "IC_AUTOMATON_REPO is required for playground:dev so the sibling Inbox.sol can be deployed on the same Anvil fork. If you already deployed it manually, set FACTORY_CHILD_INBOX_CONTRACT_ADDRESS or AUTOMATON_INBOX_DEPLOYMENT_FILE." >&2
-  exit 1
 fi
 
 sh "$ROOT_DIR/scripts/playground-bootstrap.sh"

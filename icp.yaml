@@ -1,4 +1,10 @@
 canisters:
+  - name: automaton
+    build:
+      steps:
+        - type: script
+          commands:
+            - ./components/ic-automaton/scripts/build-backend-wasm.sh "$ICP_WASM_OUTPUT_PATH"
   - name: factory
     recipe:
       type: "@dfinity/rust@v3.2.0"

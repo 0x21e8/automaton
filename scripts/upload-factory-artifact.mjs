@@ -5,13 +5,15 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { IDL } from "@dfinity/candid";
+import { resolveAutomatonComponentRoot } from "./resolve-automaton-component.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tmpDir = path.join(rootDir, "tmp");
 const canister = process.env.FACTORY_CANISTER ?? "factory";
 const environment = process.env.FACTORY_ENVIRONMENT ?? "local";
-const wasmPath = process.env.CHILD_WASM_PATH;
-const siblingRepo = process.env.IC_AUTOMATON_REPO;
+const componentRoot = resolveAutomatonComponentRoot();
+const wasmPath = process.env.CHILD_WASM_PATH ??
+  path.join(componentRoot, "target", "wasm32-wasip1", "release", "backend_nowasi.wasm");
 const chunkSizeBytes = Number.parseInt(
   process.env.FACTORY_ARTIFACT_CHUNK_SIZE_BYTES ?? `${512 * 1024}`,
   10
@@ -48,8 +50,8 @@ function resolveVersionCommit() {
     return normalizeCommit(process.env.FACTORY_VERSION_COMMIT);
   }
 
-  if (siblingRepo) {
-    const head = execFileSync("git", ["-C", siblingRepo, "rev-parse", "HEAD"], {
+  if (componentRoot) {
+    const head = execFileSync("git", ["-C", componentRoot, "rev-parse", "HEAD"], {
       cwd: rootDir,
       encoding: "utf8"
     }).trim();
@@ -57,7 +59,7 @@ function resolveVersionCommit() {
   }
 
   throw new Error(
-    "CHILD_VERSION_COMMIT or FACTORY_VERSION_COMMIT is required unless IC_AUTOMATON_REPO is set"
+    "CHILD_VERSION_COMMIT or FACTORY_VERSION_COMMIT is required"
   );
 }
 

@@ -31,7 +31,7 @@ describe("evaluator env loading", () => {
         "EVAL_STEWARD_ADDRESS=0x00000000000000000000000000000000000000aa",
         "EVAL_OPENROUTER_API_KEY=dotenv-openrouter",
         "LOCAL_EVM_FORK_URL=https://dotenv.invalid/base",
-        "IC_AUTOMATON_REPO=/tmp/from-dotenv"
+        "AUTOMATON_COMPONENT_ROOT=/tmp/automaton-component"
       ].join("\n"),
       "utf8"
     );
@@ -44,7 +44,7 @@ describe("evaluator env loading", () => {
     expect(merged.EVAL_STEWARD_ADDRESS).toBe("0x00000000000000000000000000000000000000aa");
     expect(merged.EVAL_OPENROUTER_API_KEY).toBe("env-openrouter");
     expect(merged.LOCAL_EVM_FORK_URL).toBe("https://dotenv.invalid/base");
-    expect(merged.IC_AUTOMATON_REPO).toBe("/tmp/from-dotenv");
+    expect(merged.AUTOMATON_COMPONENT_ROOT).toBe("/tmp/automaton-component");
     expect(merged.EXTRA_VALUE).toBe("kept");
 
     const runtimeEnv = loadEvaluatorEnv(repoRoot, {
@@ -58,7 +58,7 @@ describe("evaluator env loading", () => {
       inferenceProxyWorkerBaseUrl: null,
       inferenceProxyTrustedCallbackPrincipal: null,
       localEvmForkUrl: "https://dotenv.invalid/base",
-      automatonRepoPath: "/tmp/from-dotenv"
+      automatonRepoPath: "/tmp/automaton-component"
     });
   });
 
@@ -72,7 +72,7 @@ describe("evaluator env loading", () => {
         "EVAL_INFERENCE_PROXY_WORKER_BASE_URL=https://proxy.example.com",
         "EVAL_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL=aaaaa-aa",
         "LOCAL_EVM_FORK_URL=https://dotenv.invalid/base",
-        "IC_AUTOMATON_REPO=/tmp/from-dotenv"
+        "AUTOMATON_COMPONENT_ROOT=/tmp/automaton-component"
       ].join("\n"),
       "utf8"
     );
@@ -81,5 +81,46 @@ describe("evaluator env loading", () => {
 
     expect(runtimeEnv.inferenceProxyWorkerBaseUrl).toBe("https://proxy.example.com");
     expect(runtimeEnv.inferenceProxyTrustedCallbackPrincipal).toBe("aaaaa-aa");
+  });
+
+  it("forwards evaluator proxy env into factory child runtime env by default", async () => {
+    const repoRoot = await createTempDirectory("evaluator-env-proxy-aliases-");
+    await writeFile(
+      join(repoRoot, ".env"),
+      [
+        "EVAL_INFERENCE_PROXY_WORKER_BASE_URL=https://proxy-from-eval.example.com",
+        "EVAL_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL=aaaaa-aa"
+      ].join("\n"),
+      "utf8"
+    );
+
+    const merged = loadRepoEnv(repoRoot);
+
+    expect(merged.FACTORY_CHILD_INFERENCE_PROXY_WORKER_BASE_URL).toBe(
+      "https://proxy-from-eval.example.com"
+    );
+    expect(merged.FACTORY_CHILD_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL).toBe("aaaaa-aa");
+  });
+
+  it("preserves explicit factory child proxy env overrides", async () => {
+    const repoRoot = await createTempDirectory("evaluator-env-proxy-factory-override-");
+    await writeFile(
+      join(repoRoot, ".env"),
+      [
+        "EVAL_INFERENCE_PROXY_WORKER_BASE_URL=https://proxy-from-eval.example.com",
+        "EVAL_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL=aaaaa-aa"
+      ].join("\n"),
+      "utf8"
+    );
+
+    const merged = loadRepoEnv(repoRoot, {
+      FACTORY_CHILD_INFERENCE_PROXY_WORKER_BASE_URL: "https://proxy-from-factory.example.com",
+      FACTORY_CHILD_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL: "bbbbb-bb"
+    });
+
+    expect(merged.FACTORY_CHILD_INFERENCE_PROXY_WORKER_BASE_URL).toBe(
+      "https://proxy-from-factory.example.com"
+    );
+    expect(merged.FACTORY_CHILD_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL).toBe("bbbbb-bb");
   });
 });

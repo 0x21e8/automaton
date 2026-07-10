@@ -1,0 +1,294 @@
+# Plan 003: Import ic-automaton as a behavior-preserving monorepo component
+
+> **Executor instructions**: This is a history and path migration, not a
+> refactor. Preserve both repositories' code and history. Follow each step and
+> stop on any STOP condition. Update row 003 in `plans/README.md` when done.
+>
+> **Drift check (run first)**:
+> `git diff --stat 09fdfe2..HEAD -- . ':!plans'`
+> and
+> `git -C ../ic-automaton diff --stat eda66fd..HEAD -- .`
+> The operator must first commit or otherwise preserve every pre-existing
+> working-tree change. Do not start the subtree import from a dirty worktree.
+
+## Status
+
+- **Status**: IN PROGRESS — `icp` CLI unavailable in the execution environment; ICP build recipes remain unverified.
+- **Priority**: P1
+- **Effort**: L
+- **Risk**: HIGH
+- **Depends on**: `plans/001-redact-spawn-provider-secrets.md`, `plans/002-execute-steward-signed-commands.md`
+- **Category**: migration
+- **Planned at**: destination commit `09fdfe2`, source commit `eda66fd`, 2026-07-10
+
+## Why this matters
+
+Launchpad already derives the sibling runtime's Git revision, invokes its Wasm
+build script, deploys its Inbox contract, validates exports, and uploads the
+artifact. Evaluator and local-playground setup require an absolute sibling path.
+Importing the runtime into one checkout removes that choreography and allows one
+CI revision to describe the full product. This plan deliberately keeps the
+runtime internally intact under `components/ic-automaton`; later plans remove
+contract and asset duplication after the path migration is stable.
+
+## Current state
+
+- Destination repository: `automaton-launchpad`, commit `09fdfe2` at planning
+  time; npm workspaces are `apps/*` and `packages/*` in `package.json:10-13`.
+- Source repository: sibling `../ic-automaton`, commit `eda66fd` at planning
+  time; it is a standalone Rust package named `backend`.
+- `scripts/playground-bootstrap.sh:91-179` reads `IC_AUTOMATON_REPO`, derives its
+  HEAD, invokes `scripts/build-backend-wasm.sh`, and guesses artifact paths.
+- `scripts/deploy-automaton-inbox.mjs:7-41` needs the sibling path to find the
+  Inbox Foundry project.
+- `.env.example:26-27` documents the sibling path as required.
+- Root `Cargo.toml` currently contains only `backend/factory` as a workspace
+  member.
+- Factory and child must stay separate deployable canisters. The controller
+  handoff in `backend/factory/src/controllers.rs:41-126` is a hard boundary.
+
+At planning time the destination had operator-owned uncommitted changes in
+evaluator, factory spawn, environment, and playground scripts. The source had
+an untracked `NEXT_LEVEL_REVIEW.md`. Do not discard or accidentally import that
+untracked file.
+
+## Commands you will need
+
+| Purpose | Command | Expected on success |
+|---------|---------|---------------------|
+| Destination baseline | `npm test && cargo test -p factory && npm run evm:test` | all pass |
+| Source baseline | `cargo test --manifest-path ../ic-automaton/Cargo.toml --lib --no-default-features` | 574 pass, 1 ignored or a documented larger passing count |
+| Import history | `git subtree add --prefix=components/ic-automaton ic-automaton-local <approved-source-ref>` | exit 0; subtree commit created |
+| Root Rust gate | `cargo test --workspace` | factory and automaton tests pass |
+| Root JS gate | `npm test` | all app/package/worker tests configured by the root pass |
+| Child build | `./components/ic-automaton/scripts/build-backend-wasm.sh` | canister-ready `backend_nowasi.wasm` exists |
+| Artifact check | `CHILD_WASM_PATH=components/ic-automaton/target/wasm32-wasip1/release/backend_nowasi.wasm node scripts/validate-child-canister-interface.mjs` | compatibility check passes |
+
+## Scope
+
+**In scope**:
+
+- Git history import under `components/ic-automaton/**`
+- Root `Cargo.toml` and `Cargo.lock`
+- Root `package.json` and `package-lock.json`
+- Root `icp.yaml`
+- `.env.example`, `playground.local.env.example`, and root `README.md`
+- `scripts/playground-bootstrap.sh`
+- `scripts/deploy-automaton-inbox.mjs`
+- `scripts/upload-factory-artifact.mjs`
+- `scripts/render-factory-local-init-args.mjs`
+- `apps/evaluator/src/lib/env.ts` and its tests
+- CI only as needed to keep existing validation green; atomic release changes
+  belong to plan 005
+
+**Out of scope**:
+
+- Moving files inside the imported component after import.
+- Renaming Rust crate `backend` or canister methods.
+- Merging factory and automaton canisters, state, controllers, or schedulers.
+- Deduplicating strategy files, Candid types, HTTP types, or terminal code.
+- Changing application behavior or visual design.
+- Deploying, pushing, deleting the old repository, or changing remote hosting.
+
+## Git workflow
+
+- Before starting, require both repositories to be clean and all operator-owned
+  changes committed on named branches.
+- Branch: `advisor/003-import-runtime-monorepo-component`
+- Add a local remote; do not rewrite either repository's existing history.
+- Import without `--squash` so the source commit graph remains reachable.
+- Suggested commits:
+  1. subtree import generated by `git subtree add`;
+  2. `build: add automaton component to root workspaces`;
+  3. `refactor(playground): resolve automaton from monorepo`;
+  4. `docs: describe unified automaton workspace`.
+- Do not push or open a PR unless instructed.
+
+## Steps
+
+### Step 1: Establish clean, reproducible baselines
+
+1. Run `git status --short` in both repositories. Both must be empty.
+2. Record the exact destination and source full SHAs in the implementation PR
+   description or commit message.
+3. Run the destination and source baseline commands from the table above.
+4. Confirm plans 001 and 002 are `DONE` in `plans/README.md`.
+
+**Verify**: all baseline commands exit 0 and both worktrees remain clean.
+
+### Step 2: Import source history under a non-colliding prefix
+
+From `automaton-launchpad`:
+
+```bash
+git remote add ic-automaton-local ../ic-automaton
+git fetch ic-automaton-local
+git subtree add --prefix=components/ic-automaton ic-automaton-local <approved-source-ref>
+```
+
+Use the operator-approved source branch or exact SHA, not an inferred remote
+default. Do not use `--squash`. Do not import untracked source files.
+
+**Verify**:
+
+```bash
+test -f components/ic-automaton/Cargo.toml
+test -f components/ic-automaton/AGENTS.md
+test -f components/ic-automaton/scripts/build-backend-wasm.sh
+git log --oneline -- components/ic-automaton | head -20
+```
+
+All files exist and the log shows source history, not only one synthetic file
+addition.
+
+### Step 3: Create one Rust workspace and lockfile
+
+1. Add `components/ic-automaton` to root `Cargo.toml` workspace members.
+2. Keep the imported package name and features unchanged.
+3. Regenerate the root lockfile through Cargo; remove the nested lockfile only
+   after root workspace tests pass.
+4. Do not deduplicate dependencies in this step. Version alignment is allowed
+   only when Cargo resolution requires it and both component test suites remain
+   green.
+
+**Verify**:
+
+```bash
+cargo metadata --no-deps --format-version 1
+cargo test --workspace
+```
+
+Metadata lists both `factory` and `backend`; every workspace test passes.
+
+### Step 4: Add imported workers to the root npm installation
+
+1. Extend root workspaces with `components/ic-automaton/workers/*`.
+2. Add one root Wrangler development dependency at the version already used by
+   the Better Stack worker.
+3. Ensure each worker has explicit `test`, `build/check`, and `deploy` scripts
+   appropriate to its current implementation. A deploy script may remain
+   independently invoked.
+4. Regenerate root `package-lock.json`; remove nested worker lockfiles only after
+   worker tests/checks pass from the root installation.
+5. Do not deploy workers.
+
+**Verify**:
+
+```bash
+npm install
+npm test
+npm test --workspace betterstack-monitor-worker
+npm test --workspace strategy-discovery-proxy-worker
+```
+
+If a worker has no test script, use its documented check command and add that
+command to the root CI script. All configured checks must exit 0.
+
+### Step 5: Make local paths deterministic and retain a temporary override
+
+In launchpad scripts, define one resolver with this precedence:
+
+1. explicit `AUTOMATON_COMPONENT_ROOT` advanced override;
+2. default `$ROOT_DIR/components/ic-automaton`.
+
+For one migration release, accept deprecated `IC_AUTOMATON_REPO` only as an
+alias that prints a deprecation warning. Remove all “required sibling checkout”
+validation and all path guessing outside the resolved component root.
+
+Update:
+
+- child HEAD/provenance resolution;
+- child Wasm build-script and artifact paths;
+- Inbox Foundry project path;
+- evaluator environment loading;
+- `.env` examples and README commands.
+
+Keep `CHILD_WASM_PATH` as an explicit advanced override for testing a pinned
+external artifact.
+
+**Verify**:
+
+```bash
+rg -n 'absolute/path/to/ic-automaton|Required.*IC_AUTOMATON_REPO|sibling `ic-automaton`' .env.example playground.local.env.example README.md scripts apps/evaluator
+```
+
+No required-sibling wording remains. Then run the child build and artifact check
+from the command table; both pass without setting either repository-path env var.
+
+### Step 6: Add a root ICP build entry without changing deployment topology
+
+Add an `automaton` canister build recipe to root `icp.yaml` that invokes the
+imported component's existing build script and writes to `ICP_WASM_OUTPUT_PATH`.
+Keep environment deployment lists explicit: the factory and automaton are not
+silently installed together, and an automaton build does not upgrade existing
+children.
+
+**Verify**:
+
+```bash
+icp build automaton
+icp build factory
+```
+
+Both exit 0 and produce separate Wasm artifacts.
+
+### Step 7: Update product documentation and run all gates
+
+Update root README architecture and quick start to describe one checkout and
+the separate runtime artifacts. Keep component-specific deep documentation under
+`components/ic-automaton` until a later documentation move.
+
+Run:
+
+```bash
+npm run lint
+npm test
+cargo test --workspace
+npm run evm:test
+./components/ic-automaton/scripts/build-backend-wasm.sh
+CHILD_WASM_PATH=components/ic-automaton/target/wasm32-wasip1/release/backend_nowasi.wasm node scripts/validate-child-canister-interface.mjs
+```
+
+**Verify**: every command in the gate exits 0 and `git status --short` shows only
+the intended migration changes.
+
+## Test plan
+
+- Existing destination JS, factory, and EVM tests.
+- Existing automaton host unit tests from the root workspace.
+- Every imported worker's existing tests/checks.
+- Child canister-ready Wasm build and current artifact compatibility check.
+- Evaluator env test proving no repository-path variable is required.
+- Path override test proving `AUTOMATON_COMPONENT_ROOT` still works.
+- Deprecated alias test proving it warns but behaves correctly during the one
+  release compatibility window.
+
+## Done criteria
+
+- [ ] Source history is reachable in the destination repository.
+- [ ] One clean checkout can build/test factory, automaton, apps, and workers.
+- [ ] No required sibling path remains.
+- [ ] Root Cargo and npm lockfiles cover imported packages.
+- [ ] Factory and automaton remain separate build artifacts.
+- [ ] All validation commands exit 0.
+- [ ] No remote repository was deleted and no deployment occurred.
+- [ ] `plans/README.md` row 003 is `DONE`.
+
+## STOP conditions
+
+- Either starting worktree is dirty.
+- The operator has not approved the exact source ref to import.
+- `git subtree` would overwrite an existing `components/ic-automaton` path.
+- Importing without squash cannot be completed without rewriting existing
+  history.
+- Cargo resolution requires behavior-changing dependency upgrades.
+- Any script can only work by restoring an absolute sibling path.
+- The imported runtime's nested `AGENTS.md` conflicts with this plan.
+- A validation command fails twice after one focused correction.
+
+## Maintenance notes
+
+Keep `components/ic-automaton/AGENTS.md`; its autonomy, TDD, PocketIC, Candid,
+and validation rules apply inside that subtree. Do not normalize the imported
+layout in the same PR. Reviewers should focus on history preservation, clean
+root workspaces, deterministic paths, and unchanged deployment boundaries.

@@ -117,6 +117,7 @@ function createAutomatonState(config: RuntimeAutomatonState["config"]): RuntimeA
     finalObservedAt: null,
     lastObservedTurnAt: null,
     lastError: null,
+    lastErrorDetails: null,
     turnCount: 0,
     toolCallCount: 0,
     providerInferenceCount: "unavailable",
@@ -135,6 +136,35 @@ function createAutomatonState(config: RuntimeAutomatonState["config"]): RuntimeA
     errorHistogram: new Map(),
     lastObservedErrorBySource: createEmptyObservedErrorMap()
   };
+}
+
+function serializeErrorDetails(details: unknown): unknown | null {
+  if (details === undefined) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(JSON.stringify(details)) as unknown;
+  } catch {
+    if (details instanceof Error) {
+      return {
+        name: details.name,
+        message: details.message
+      };
+    }
+
+    return {
+      value: String(details)
+    };
+  }
+}
+
+function getErrorDetails(error: unknown): unknown | null {
+  if (typeof error !== "object" || error === null || !("details" in error)) {
+    return null;
+  }
+
+  return serializeErrorDetails((error as { details?: unknown }).details);
 }
 
 function recordCyclesConsumedPoint(
@@ -409,12 +439,14 @@ export class RunController {
           strategies: [...automaton.config.strategies],
           skills: [],
           provider: {
-            openRouterApiKey: this.deps.env.openRouterApiKey,
             model: automaton.config.model,
-            braveSearchApiKey: this.deps.env.braveSearchApiKey,
             inferenceTransport: automaton.config.transport,
             openRouterReasoningLevel: automaton.config.reasoningLevel
           }
+        },
+        providerSecrets: {
+          openRouterApiKey: this.deps.env.openRouterApiKey,
+          braveSearchApiKey: this.deps.env.braveSearchApiKey
         }
       };
 
@@ -452,6 +484,7 @@ export class RunController {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         automaton.lastError = message;
+        automaton.lastErrorDetails = null;
         recordErrorOccurrence(automaton, "sampling", message, this.now());
       }
       await this.persistManifest();
@@ -461,6 +494,7 @@ export class RunController {
       automaton.runtimeStatus = "spawn_failed";
       const message = error instanceof Error ? error.message : String(error);
       automaton.lastError = message;
+      automaton.lastErrorDetails = getErrorDetails(error);
       recordErrorOccurrence(automaton, "spawn", message, this.now());
       await this.emitAutomatonUpdated(automaton);
     }
@@ -575,6 +609,7 @@ export class RunController {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         automaton.lastError = message;
+        automaton.lastErrorDetails = null;
         recordErrorOccurrence(automaton, "sampling", message, this.now());
         await this.emitAutomatonUpdated(automaton);
       }
@@ -679,7 +714,8 @@ export class RunController {
         automatonId: automaton.config.id,
         spawnStatus: automaton.spawnStatus,
         runtimeStatus: automaton.runtimeStatus,
-        lastError: automaton.lastError
+        lastError: automaton.lastError,
+        lastErrorDetails: automaton.lastErrorDetails
       }
     });
   }
