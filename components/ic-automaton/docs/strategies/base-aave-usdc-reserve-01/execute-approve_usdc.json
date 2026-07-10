@@ -1,0 +1,20 @@
+{
+  "key": {
+    "protocol": "aave-v3",
+    "primitive": "lend_supply",
+    "chain_id": 8453,
+    "template_id": "base-aave-usdc-reserve-01"
+  },
+  "action_id": "approve_usdc",
+  "typed_params": {
+    "calls": [
+      {
+        "value_wei": "0",
+        "args": {
+          "spender": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+          "value": "1000000"
+        }
+      }
+    ]
+  }
+}

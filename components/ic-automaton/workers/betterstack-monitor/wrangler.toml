@@ -1,0 +1,29 @@
+name = "ic-automaton-betterstack-monitor"
+main = "src/worker.js"
+compatibility_date = "2026-02-25"
+
+[triggers]
+# Tune this interval for your alerting/cost profile.
+crons = ["*/1 * * * *"]
+
+[vars]
+# Example: "https://<canister-id>.icp0.io"
+CANISTER_BASE_URL = "https://oc3hk-viaaa-aaaak-qxcuq-cai.icp0.io"
+# Example: "s123456.eu-nbg-2.betterstackdata.com"
+BETTERSTACK_INGESTING_HOST = "s1761427.eu-fsn-3.betterstackdata.com"
+# Optional, defaults to "/api/snapshot"
+SNAPSHOT_PATH = "/api/snapshot"
+# Optional, defaults to 10000
+HTTP_TIMEOUT_MS = "10000"
+# Optional, defaults to 86400 (24h)
+ERROR_DEDUPE_TTL_SECS = "86400"
+# Optional, defaults to false
+EMIT_HEALTH_LOG = "false"
+# Optional, defaults to ic-automaton-monitor
+LOG_SOURCE = "ic-automaton-monitor"
+
+# Recommended for cross-run dedupe persistence:
+# [[kv_namespaces]]
+# binding = "MONITOR_STATE_KV"
+# id = "<prod-kv-namespace-id>"
+# preview_id = "<preview-kv-namespace-id>"

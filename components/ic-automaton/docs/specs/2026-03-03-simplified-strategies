@@ -1,0 +1,368 @@
+Strategy Subsystem Simplification + Agent Self-Authoring                                                                                      │
+│                                                                                                                                               │
+│ Context                                                                                                                                       │
+│                                                                                                                                               │
+│ The strategy subsystem (src/strategy/, ~2,925 lines) has design issues identified during review:                                              │
+│                                                                                                                                               │
+│ 1. Learner computes unused metrics — scoring model never consumed programmatically                                                            │
+│ 2. Preflight validator can't work on IC — block_on_with_spin panics with real HTTP outcalls                                                   │
+│ 3. Template versioning fully built but unused — only v1.0.0 deployed, no multi-version management                                             │
+│ 4. Canary probe duplicates compile_intent — overlapping validation                                                                            │
+│ 5. ~15 duplicate utility functions across the codebase                                                                                        │
+│ 6. Agent can't create strategies — template registration is controller-only, the agent is a consumer never an author                          │
+│                                                                                                                                               │
+│ User decisions: simplify learner, remove preflight, remove versioning, replace canary with dry-run compile, include dedup, add agent-facing   │
+│ register_strategy tool with simplified format, single PR.                                                                                     │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Step 1: Extract shared utilities                                                                                                              │
+│                                                                                                                                               │
+│ Create src/util.rs with shared functions, register mod util; in the crate root, then replace all copies.                                      │
+│                                                                                                                                               │
+│ 1a. pub(crate) fn normalize_evm_address(raw: &str) -> Result<String, String>                                                                  │
+│                                                                                                                                               │
+│ - Canonical: src/features/cycle_topup/mod.rs:697 (normalize_evm_hex_address)                                                                  │
+│ - Remove from: src/strategy/compiler.rs:226, src/strategy/validator.rs:682, src/features/evm.rs:1183, src/storage/stable.rs:1423              │
+│                                                                                                                                               │
+│ 1b. pub(crate) fn normalize_hex_blob(raw: &str, field: &str) -> Result<String, String>                                                        │
+│                                                                                                                                               │
+│ - Remove from: src/strategy/compiler.rs:241, src/strategy/validator.rs:664, src/features/evm.rs:1567, src/features/cycle_topup/mod.rs:649     │
+│                                                                                                                                               │
+│ 1c. pub(crate) fn normalize_selector_hex(raw: &str) -> Result<String, String>                                                                 │
+│                                                                                                                                               │
+│ - Use lenient version from src/strategy/abi.rs:338 (tolerates missing 0x prefix)                                                              │
+│ - Remove from: src/strategy/compiler.rs:208                                                                                                   │
+│                                                                                                                                               │
+│ 1d. pub(crate) fn block_on_with_spin<F: Future>(future: F) -> F::Output                                                                       │
+│                                                                                                                                               │
+│ - Move from: src/strategy/validator.rs:717                                                                                                    │
+│ - Remove 8 test copies from: src/agent.rs:1985, src/scheduler.rs:1373, src/tools.rs:1548, src/features/inference.rs:2261,                     │
+│ src/features/cycle_topup/mod.rs:1712, src/features/evm.rs:2519, src/features/canister_call.rs:230, src/features/http_fetch.rs:523             │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Step 2: Remove preflight validator layer                                                                                                      │
+│                                                                                                                                               │
+│ File: src/strategy/validator.rs                                                                                                               │
+│                                                                                                                                               │
+│ - Delete validate_preflight_layer (lines 524-600)                                                                                             │
+│ - Remove its call from validate_execution_plan (line 70)                                                                                      │
+│ - Remove imports: HttpEvmRpcClient, Future, Context, Poll, RawWaker, RawWakerVTable, Waker                                                    │
+│ - Update module doc to remove Preflight from the layer table                                                                                  │
+│ - Keep ValidationLayer::Preflight variant in src/domain/types.rs for serialization compat (add #[deprecated] doc note)                        │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Step 3: Simplify the learner                                                                                                                  │
+│                                                                                                                                               │
+│ File: src/strategy/learner.rs                                                                                                                 │
+│                                                                                                                                               │
+│ 3a. Remove scoring math                                                                                                                       │
+│                                                                                                                                               │
+│ - Delete apply_learning_updates (lines 74-122) and ratio_bps (lines 125-134)                                                                  │
+│ - In record_outcome: persist raw event via stable::record_strategy_outcome, then call auto-deactivation check. Don't recompute derived        │
+│ scores.                                                                                                                                       │
+│                                                                                                                                               │
+│ 3b. Trim StrategyOutcomeStats in src/domain/types.rs                                                                                          │
+│                                                                                                                                               │
+│ - Remove confidence_bps, ranking_score_bps, parameter_priors fields                                                                           │
+│ - Remove StrategyParameterPriors struct and its Default impl                                                                                  │
+│ - Keep: total_runs, success_runs, deterministic_failures, nondeterministic_failures, deterministic_failure_streak, last_error, last_tx_hash,  │
+│ last_observed_at_ns, key                                                                                                                      │
+│                                                                                                                                               │
+│ 3c. Add human-readable summary                                                                                                                │
+│                                                                                                                                               │
+│ - Add pub fn summary_for_llm(stats: &StrategyOutcomeStats) -> String in learner.rs                                                            │
+│ - Example: "23 runs: 18 succeeded, 3 deterministic failures (last: insufficient balance), 2 transient. Streak: 0 consecutive deterministic    │
+│ failures."                                                                                                                                    │
+│ - Use in get_strategy_outcomes tool response (src/tools.rs:1578) as a "summary" field                                                         │
+│                                                                                                                                               │
+│ 3d. Update storage                                                                                                                            │
+│                                                                                                                                               │
+│ - src/storage/stable.rs record_strategy_outcome (~line 2727): stop setting removed fields                                                     │
+│ - src/storage/sqlite.rs: update queries (columns can remain for backward compat but won't be written)                                         │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Step 4: Remove template versioning                                                                                                            │
+│                                                                                                                                               │
+│ 88 references across 14 files. All in one pass.                                                                                               │
+│                                                                                                                                               │
+│ 4a. Domain types (src/domain/types.rs)                                                                                                        │
+│                                                                                                                                               │
+│ - Keep TemplateVersion struct definition for Candid backward compat                                                                           │
+│ - Remove version field from: StrategyTemplate (line 1068), AbiArtifactKey (line 1083), StrategyExecutionIntent (line 1115), ExecutionPlan     │
+│ (line 1139), StrategyOutcomeEvent (line 1191), StrategyOutcomeStats (line 1207), TemplateActivationState (line 1253), TemplateRevocationState │
+│  (line 1264)                                                                                                                                  │
+│ - Remove version from StewardCommand::ActivateStrategyTemplate, DeprecateStrategyTemplate, RevokeStrategyTemplate                             │
+│                                                                                                                                               │
+│ 4b. Storage (src/storage/stable.rs, src/storage/sqlite.rs)                                                                                    │
+│                                                                                                                                               │
+│ - Remove version param from all strategy functions                                                                                            │
+│ - Delete: list_strategy_template_versions(), list_abi_artifact_versions(), validate_template_version(), template_version_sort_key(),          │
+│ canonicalize_version_list()                                                                                                                   │
+│ - Update record key builders to exclude version component                                                                                     │
+│                                                                                                                                               │
+│ 4c. Strategy modules                                                                                                                          │
+│                                                                                                                                               │
+│ - registry.rs: Remove version params from all functions, delete list_template_versions(), list_abi_artifact_versions()                        │
+│ - compiler.rs: Remove intent.version from compile_intent(), AbiArtifactKey construction                                                       │
+│ - validator.rs: Remove plan.version usage                                                                                                     │
+│ - learner.rs: Remove version from record_outcome(), outcome_stats(), auto-deactivation                                                        │
+│ - abi.rs: Remove version from AbiArtifactKey, delete validate_template_version()                                                              │
+│                                                                                                                                               │
+│ 4d. Tools + LLM interface                                                                                                                     │
+│                                                                                                                                               │
+│ - src/tools.rs: Remove version from StrategyIntentArgs, StrategyOutcomesArgs, parsers, responses                                              │
+│ - src/features/inference.rs: Remove "version" property and "version" from required arrays in simulate_strategy_action,                        │
+│ execute_strategy_action, get_strategy_outcomes tool schemas                                                                                   │
+│                                                                                                                                               │
+│ 4e. Lib + steward + Candid                                                                                                                    │
+│                                                                                                                                               │
+│ - src/lib.rs: Remove version from command handlers, require_strategy_template(), query endpoints                                              │
+│ - ic-automaton.did: Update Candid interface                                                                                                   │
+│                                                                                                                                               │
+│ 4f. Tests                                                                                                                                     │
+│                                                                                                                                               │
+│ - tests/pocketic_strategy_controls.rs: Remove local TemplateVersion, version fields from test data                                            │
+│ - All test helpers (sample_version(), version()): delete                                                                                      │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Step 5: Replace canary probe with dry-run compile                                                                                             │
+│                                                                                                                                               │
+│ 5a. Add dry-run helper in src/strategy/compiler.rs                                                                                            │
+│                                                                                                                                               │
+│ pub fn dry_run_compile(key: &StrategyTemplateKey) -> Result<(), String>                                                                       │
+│ - Loads template, picks first action                                                                                                          │
+│ - Builds synthetic StrategyExecutionIntent with zero-value params per call (zero addresses for address, "0" for uint*, false for bool, "0x"   │
+│ for bytes)                                                                                                                                    │
+│ - Calls compile_intent(), discards result on success                                                                                          │
+│ - Validates the full compilation path end-to-end                                                                                              │
+│                                                                                                                                               │
+│ 5b. Replace call site in src/lib.rs (~line 964)                                                                                               │
+│                                                                                                                                               │
+│ - registry::canary_probe_template(&key, &version) → compiler::dry_run_compile(&key)                                                           │
+│                                                                                                                                               │
+│ 5c. Delete canary_probe_template from src/strategy/registry.rs (lines 160-379 including tests)                                                │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Step 6: Add register_strategy agent tool                                                                                                      │
+│                                                                                                                                               │
+│ This is the key new capability — the agent can author its own strategies.                                                                     │
+│                                                                                                                                               │
+│ 6a. Simplified recipe format                                                                                                                  │
+│                                                                                                                                               │
+│ The agent provides a compact "recipe" JSON. The system expands it into the full internal types.                                               │
+│                                                                                                                                               │
+│ {                                                                                                                                             │
+│   "protocol": "uniswap-v3",                                                                                                                   │
+│   "primitive": "swap",                                                                                                                        │
+│   "chain_id": 8453,                                                                                                                           │
+│   "template_id": "exact-input-single",                                                                                                        │
+│   "contracts": [                                                                                                                              │
+│     {                                                                                                                                         │
+│       "role": "router",                                                                                                                       │
+│       "address": "0x2626664c2603336E57B271c5C0b26F421741e481",                                                                                │
+│       "abi_json": "[{\"type\":\"function\",\"name\":\"exactInputSingle\",...}]",                                                              │
+│       "source_ref": "https://basescan.org/address/0x2626..."                                                                                  │
+│     }                                                                                                                                         │
+│   ],                                                                                                                                          │
+│   "actions": [                                                                                                                                │
+│     {                                                                                                                                         │
+│       "action_id": "swap_exact_in",                                                                                                           │
+│       "calls": [                                                                                                                              │
+│         { "role": "router", "function": "exactInputSingle" }                                                                                  │
+│       ],                                                                                                                                      │
+│       "postconditions": ["output_amount_above_minimum"]                                                                                       │
+│     }                                                                                                                                         │
+│   ],                                                                                                                                          │
+│   "max_value_wei_per_call": "1000000000000000000",                                                                                            │
+│   "template_budget_wei": "10000000000000000000"                                                                                               │
+│ }                                                                                                                                             │
+│                                                                                                                                               │
+│ Key simplifications vs current StrategyTemplate:                                                                                              │
+│ - No version (removed in step 4)                                                                                                              │
+│ - No AbiFunctionSpec — the agent just names the function; the system finds it in the ABI                                                      │
+│ - No selector_hex, inputs, outputs, state_mutability — extracted from ABI automatically                                                       │
+│ - contracts[].abi_json replaces separate ABI artifact ingestion                                                                               │
+│ - Budget constraints are top-level fields, not a nested constraints_json blob                                                                 │
+│ - preconditions and risk_checks are optional (default to empty)                                                                               │
+│                                                                                                                                               │
+│ 6b. Implementation in src/tools.rs                                                                                                            │
+│                                                                                                                                               │
+│ New function: fn register_strategy_tool(args_json: &str) -> Result<String, String>                                                            │
+│                                                                                                                                               │
+│ Pipeline:                                                                                                                                     │
+│ 1. Parse the recipe JSON into a StrategyRecipe struct (new, defined in tools.rs or a shared location)                                         │
+│ 2. For each contract in recipe.contracts:                                                                                                     │
+│   - Call abi::normalize_abi_artifact() to parse and validate the raw ABI JSON                                                                 │
+│   - Extract functions referenced by the recipe's actions                                                                                      │
+│   - Store via registry::upsert_abi_artifact()                                                                                                 │
+│ 3. Build a full StrategyTemplate:                                                                                                             │
+│   - key from recipe fields                                                                                                                    │
+│   - status: TemplateStatus::Draft initially                                                                                                   │
+│   - contract_roles from recipe.contracts (role, address, source_ref)                                                                          │
+│   - actions from recipe.actions — for each call, match function name to the normalized ABI functions, build AbiFunctionSpec                   │
+│   - constraints_json serialized from recipe budget fields, with safe defaults (see 6d)                                                        │
+│ 4. Store via registry::upsert_template()                                                                                                      │
+│ 5. Run compiler::dry_run_compile(&key) to validate the full path                                                                              │
+│ 6. If dry-run passes: auto-activate via registry::set_activation() with enabled: true                                                         │
+│ 7. Return the stored template as JSON confirmation                                                                                            │
+│                                                                                                                                               │
+│ 6c. Tool schema in src/features/inference.rs                                                                                                  │
+│                                                                                                                                               │
+│ Add register_strategy tool with descriptive schema. Key properties:                                                                           │
+│ - protocol (string, required)                                                                                                                 │
+│ - primitive (string, required)                                                                                                                │
+│ - chain_id (integer, required)                                                                                                                │
+│ - template_id (string, required)                                                                                                              │
+│ - contracts (array, required) — each with role, address, abi_json, source_ref                                                                 │
+│ - actions (array, required) — each with action_id, calls (array of {role, function}), postconditions                                          │
+│ - max_value_wei_per_call (string, optional)                                                                                                   │
+│ - template_budget_wei (string, optional)                                                                                                      │
+│                                                                                                                                               │
+│ Description should guide the agent: "Register a new strategy template from contract ABIs. Use http_fetch to retrieve ABIs from block          │
+│ explorers first. The system validates selectors, runs a dry-run compile, and auto-activates on success."                                      │
+│                                                                                                                                               │
+│ 6d. Safe defaults for agent-created templates                                                                                                 │
+│                                                                                                                                               │
+│ When the recipe omits budget fields, apply conservative defaults:                                                                             │
+│ - max_calls: 5                                                                                                                                │
+│ - max_value_wei_per_call: "100000000000000000" (0.1 ETH)                                                                                      │
+│ - template_budget_wei: "1000000000000000000" (1 ETH lifetime)                                                                                 │
+│ - max_total_value_wei: same as max_value_wei_per_call                                                                                         │
+│                                                                                                                                               │
+│ These can be overridden by the agent in the recipe, but the defaults prevent unbounded spending.                                              │
+│                                                                                                                                               │
+│ 6e. Tool policy in src/tools.rs ToolManager                                                                                                   │
+│                                                                                                                                               │
+│ policies.insert(                                                                                                                              │
+│     "register_strategy".to_string(),                                                                                                          │
+│     ToolPolicy {                                                                                                                              │
+│         enabled: true,                                                                                                                        │
+│         allowed_states: vec![AgentState::ExecutingActions],                                                                                   │
+│     },                                                                                                                                        │
+│ );                                                                                                                                            │
+│                                                                                                                                               │
+│ 6f. Security classification in src/sanitize.rs                                                                                                │
+│                                                                                                                                               │
+│ - Add "register_strategy" to SENSITIVE_TOOLS — it modifies canister state (creates templates, activates them)                                 │
+│ - Do NOT add to UNTRUSTED_OUTPUT_TOOLS — the output is system-generated confirmation, not external data                                       │
+│                                                                                                                                               │
+│ This means the agent cannot call register_strategy immediately after http_fetch (which is untrusted). The agent must have an intermediate     │
+│ non-sensitive step (like memorize or recall) between fetching an ABI and registering it. This is the right behavior — it forces the agent to  │
+│ reason about the ABI before blindly registering it from an external source.                                                                   │
+│                                                                                                                                               │
+│ 6g. Tool dispatch in src/tools.rs dispatch_tool_call                                                                                          │
+│                                                                                                                                               │
+│ Add match arm:                                                                                                                                │
+│ "register_strategy" => register_strategy_tool(&call.args_json),                                                                               │
+│                                                                                                                                               │
+│ No survival backoff needed (this is a local operation, not an external call).                                                                 │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Step 7: Fix max_notional_wei semantic overlap                                                                                                 │
+│                                                                                                                                               │
+│ File: src/strategy/validator.rs                                                                                                               │
+│                                                                                                                                               │
+│ - Remove the total-value check on max_notional_wei (lines 455-469, code "total_notional_exceeded")                                            │
+│ - Clarify: max_value_wei_per_call = per-call cap, max_total_value_wei = total cap                                                             │
+│ - Remove max_notional_wei from ConstraintPolicy entirely (it's redundant with max_value_wei_per_call)                                         │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Step 8: Minor cleanups                                                                                                                        │
+│                                                                                                                                               │
+│ - compiler.rs:610: Simplify encode_u256_word to value.to_be_bytes::<32>().to_vec()                                                            │
+│ - compiler.rs:516: Change encode_dynamic_bytes return to Vec<u8> (never errors)                                                               │
+│ - compiler.rs:144 + registry.rs:259: Replace abi::verify_function_selector() in matching loops with direct selector_hex string comparison     │
+│ (selectors already verified at ingestion)                                                                                                     │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Consistency Check                                                                                                                             │
+│                                                                                                                                               │
+│ Verified no conflicts between steps:                                                                                                          │
+│                                                                                                                                               │
+│ ┌───────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────┐  │
+│ │                    Interaction                    │                                        Status                                        │  │
+│ ├───────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤  │
+│ │ Step 4 (remove versioning) + Step 6               │ OK — recipe format has no version field, AbiArtifactKey keyed by                     │  │
+│ │ (register_strategy)                               │ protocol+chain_id+role only                                                          │  │
+│ ├───────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤  │
+│ │ Step 3 (simplify learner) + Step 6                │ OK — outcome tracking still works per StrategyTemplateKey, just without scoring math │  │
+│ │ (register_strategy)                               │                                                                                      │  │
+│ ├───────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤  │
+│ │ Step 5 (dry-run compile) + Step 6                 │ OK — register_strategy calls dry_run_compile for validation. Both use the same code  │  │
+│ │ (register_strategy)                               │ path.                                                                                │  │
+│ ├───────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤  │
+│ │ Step 2 (remove preflight) + Step 6                │ OK — validation is now schema+address+policy+postcondition only, applies equally to  │  │
+│ │ (register_strategy)                               │ admin and agent-created templates                                                    │  │
+│ ├───────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤  │
+│ │ Step 7 (remove max_notional) + Step 6             │ OK — defaults use max_value_wei_per_call and template_budget_wei, not                │  │
+│ │ (register_strategy defaults)                      │ max_notional_wei                                                                     │  │
+│ ├───────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤  │
+│ │ Step 1 (shared utils) + all others                │ OK — preparatory, no conflicts                                                       │  │
+│ ├───────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤  │
+│ │ Step 6f (SENSITIVE_TOOLS) + http_fetch            │ OK — forces non-sensitive step between ABI fetch and registration, preventing        │  │
+│ │ (UNTRUSTED_OUTPUT)                                │ injection                                                                            │  │
+│ ├───────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────┤  │
+│ │ register_strategy + execute_strategy_action       │ OK — agent registers then executes using existing tools; same key, same guardrails   │  │
+│ └───────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Execution Order                                                                                                                               │
+│                                                                                                                                               │
+│ Steps should be done in order (each builds on the previous):                                                                                  │
+[x] 1.Shared utilities (unlocks cleanup in later steps)                                                                                         │
+[x] 2. Remove preflight (simplifies validator before version removal touches it)                                                                 │
+[x] 3. Simplify learner (reduces type surface before version removal)                                                                            │
+[x] 4. Remove versioning (big refactor, easier with fewer fields/functions)                                                                       │
+[x] 5. Replace canary with dry-run compile                                                                                                        │
+[x] 6. Add register_strategy tool (depends on steps 3-5 for simplified types)                                                                     │
+[x] 7. Fix max_notional overlap                                                                                                                  │
+[x] 8. Minor cleanups                                                                                                                            │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Verification                                                                                                                                  │
+│                                                                                                                                               │
+│ 1. cargo check — all type errors resolved                                                                                                     │
+│ 2. cargo test — existing tests pass (some deleted/updated)                                                                                    │
+│ 3. cargo build --target wasm32-unknown-unknown — canister compiles                                                                            │
+│ 4. cargo clippy — no new warnings                                                                                                             │
+│ 5. Grep for stale TemplateVersion references (should only exist in the kept struct definition)                                                │
+│ 6. Grep for stale parameter_priors / confidence_bps / ranking_score_bps references                                                            │
+│ 7. Manual test: verify register_strategy schema appears in LLM tool list                                                                      │
+│ 8. Verify Candid interface matches updated types                                                                                               │
+│                                                                                                                                               │
+│ ---                                                                                                                                           │
+│ Notes                                                                                                                                         │
+│                                                                                                                                               │
+│ - `normalize_selector_hex` is now shared via `src/util.rs` and reused in `strategy/abi.rs` as well as `strategy/compiler.rs`.              │
+│ - Replacing all test-local `block_on_with_spin` copies also removed one unbounded polling loop (`features/canister_call.rs`) in favor of    │
+│ the shared 10,000-spin guard, which avoids potential hang-on-pending behavior.                                                                │
+│ - Step 2 exposed a stale subsystem doc reference to EVM preflight simulation in `src/strategy/mod.rs`; updated to match the new validator    │
+│ layers so implementation docs stay aligned with runtime behavior.                                                                              │
+│ - Step 3d (`src/storage/sqlite.rs`) required no query changes: strategy outcome stats are already persisted as whole JSON payloads (single    │
+│ `payload_json` column), so removing derived fields changed serialized content but not SQL column shape.                                       │
+│ - Step 3c summary wording nuance: `StrategyOutcomeStats` tracks only a generic `last_error`, not "last deterministic error"; if the latest    │
+│ failure was transient, summary error detail can be transient even when deterministic failures > 0.                                            │
+│ - Step 4 removed template versioning from strategy types/APIs and regenerated `ic-automaton.did`. `TemplateVersion` is intentionally retained │
+│ in `src/domain/types.rs` for backward Candid decode compatibility only.                                                                        │
+│ - Historical note (resolved): full `cargo test` previously failed in two scheduler wallet-sync tests due mocked `eth_getLogs` span behavior     │
+│ (`status 400`), unrelated to strategy versioning changes.                                                                                       │
+│ - Historical note (resolved): `cargo test --features pocketic_tests --test pocketic_strategy_controls` previously failed before test logic due   │
+│ a PocketIC Wasm import compatibility error (`wasi_snapshot_preview1::fd_readdir`).                                                            │
+│ - Step 5 spec gap: beyond the noted `src/lib.rs` activation call, scheduler reconciliation still depended on `registry::canary_probe_template`; │
+│ both runtime callsites were migrated to `compiler::dry_run_compile` so Step 5 can fully delete canary code without breakage.                   │
+│ - Dry-run compile now synthesizes zero-value ABI args for arrays/tuples/primitives and fails fast on unsupported ABI kinds, so registration and │
+│ activation fail closed if a template includes types the compiler cannot yet encode.                                                             │
+│ - Prior test-failure notes for scheduler wallet-sync and PocketIC strategy controls no longer reproduce on this branch; `cargo test` now passes │
+│ end-to-end after the Step 5 changes plus accumulated fixes from earlier steps.                                                                   │
+│ - Step 6 gap resolved during implementation: `registry::set_activation(enabled=true)` alone is insufficient because validator policy also         │
+│ requires `TemplateStatus::Active`. `register_strategy` now persists `Draft`, runs `dry_run_compile`, then promotes to `Active` and writes        │
+│ activation so newly registered templates are immediately executable.                                                                              │
+│ - Step 6 behavior note: recipe call references are function-name based; overloaded functions in the same ABI role are rejected to avoid          │
+│ ambiguous selector/input resolution in the simplified recipe format.                                                                              │
+│ - Step 7 removed `max_notional_wei` from validator constraint parsing/enforcement. Runtime semantics are now explicit:                            │
+│ `max_value_wei_per_call` is the per-call cap, and `max_total_value_wei` is the total plan cap. Legacy templates relying only on                 │
+│ `max_notional_wei` should be migrated to one or both explicit fields.                                                                            │
+│ - Step 8 implementation note: the spec reference to `registry.rs:259` is stale on this branch (that selector-matching loop no longer exists      │
+│ after Step 5 canary removal and Step 6 tool wiring). Selector-loop cleanup was applied to `strategy/compiler.rs`, which is the active runtime path.│
+│ - Verification note: this repo's canonical canister build path is `icp build` (WASI workflow). Running `cargo build --target wasm32-unknown-     │
+│ unknown` can require network fetches for extra target artifacts and is not required for Step 8 validation here.                                   │

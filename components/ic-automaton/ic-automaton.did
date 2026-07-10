@@ -1,0 +1,1266 @@
+type AbiArtifact = record {
+  key : AbiArtifactKey;
+  updated_at_ns : nat64;
+  created_at_ns : nat64;
+  source_ref : text;
+  abi_json : text;
+  codehash : opt text;
+  functions : vec AbiFunctionSpec;
+};
+type AbiArtifactKey = record { protocol : text; role : text; chain_id : nat64 };
+type AbiFunctionSpec = record {
+  name : text;
+  role : text;
+  inputs : vec AbiTypeSpec;
+  outputs : vec AbiTypeSpec;
+  selector_hex : text;
+  state_mutability : text;
+};
+type AbiSelectorAssertion = record { signature : text; selector_hex : text };
+type AbiTypeSpec = record { kind : text; name : text; components : Vec };
+type ActionSpec = record {
+  postconditions : vec text;
+  action_id : text;
+  risk_checks : vec text;
+  preconditions : vec text;
+  call_sequence : vec AbiFunctionSpec;
+};
+type ActiveExposure = record {
+  protocol : text;
+  updated_at_ns : nat64;
+  strategy_id : text;
+  chain_id : nat64;
+  notional_wei : opt nat;
+  asset_symbol : text;
+};
+type AgentState = variant {
+  Idle;
+  Bootstrapping;
+  ExecutingActions;
+  Inferring;
+  LoadingContext;
+  Faulted;
+  Sleeping;
+  Persisting;
+};
+type AutonomyPolicy = record {
+  escalation_rules : EscalationRules;
+  execution_authority : ExecutionAuthority;
+  risk_limits : RiskLimits;
+  updated_at_ns : nat64;
+  reserve_policy : ReservePolicy;
+  version : nat32;
+};
+type AutonomySuppressionConfig = record {
+  failure_repeat_threshold : nat32;
+  dedupe_window_secs : nat64;
+  tool_dedupe_enabled : bool;
+  failure_repeat_window_secs : nat64;
+  failure_cooldown_secs : nat64;
+};
+type CanisterCallPermission = record {
+  method : text;
+  canister_id : text;
+  call_type : CanisterCallType;
+};
+type CanisterCallType = variant { Update; Query };
+type ContinuationStopReason = variant {
+  None;
+  MaxDuration;
+  InferenceError;
+  MaxRounds;
+  MaxToolCalls;
+};
+type ContractRoleBinding = record {
+  role : text;
+  source_ref : text;
+  codehash : opt text;
+  address : text;
+};
+type ConversationEntry = record {
+  timestamp_ns : nat64;
+  turn_id : text;
+  outbox_message_id : opt text;
+  sender_body : text;
+  agent_reply : text;
+  inbox_message_id : text;
+};
+type ConversationLog = record {
+  sender : text;
+  last_activity_ns : nat64;
+  entries : vec ConversationEntry;
+};
+type ConversationSummary = record {
+  sender : text;
+  last_activity_ns : nat64;
+  entry_count : nat32;
+};
+type CycleTelemetry = record {
+  burn_rate_cycles_per_day : opt nat;
+  usd_per_trillion_cycles : float64;
+  freezing_threshold_cycles : nat;
+  burn_rate_usd_per_day : opt float64;
+  window_sample_count : nat32;
+  burn_rate_cycles_per_hour : opt nat;
+  estimated_seconds_until_freezing_threshold : opt nat64;
+  window_duration_seconds : nat64;
+  burn_rate_usd_per_hour : opt float64;
+  total_cycles : nat;
+  estimated_freeze_time_ns : opt nat64;
+  moving_window_seconds : nat64;
+  liquid_cycles : nat;
+};
+type DecisionOutcome = variant {
+  NoOp : record { reason : text };
+  Executed : record { action_summary : text };
+  Simulated : record { action_summary : text };
+  Deferred : record { reason : text };
+  Escalated : record { gap : EscalationClass };
+};
+type DecisionRecord = record {
+  timestamp_ns : nat64;
+  trigger : DecisionTrigger;
+  candidates_summary : text;
+  explanation : text;
+  turn_id : text;
+  policy_version : nat32;
+  outcome : DecisionOutcome;
+};
+type DecisionTrigger = variant {
+  ScheduledReview;
+  LowRunway;
+  PlanContinuation;
+  InboxMessage;
+  PositionMaintenance;
+  RecoveryFollowUp;
+};
+type EnqueueStrategyDiscoveryJobArgs = record {
+  objective : opt text;
+  watchlist : opt vec ProtocolWatchlistEntry;
+};
+type EscalationClass = variant {
+  MissingPolicy : record { what : text };
+  CapabilityGap : record { what : text };
+  RepeatedFailure : record { failure_count : nat32; strategy : text };
+  SafetyConflict : record { what : text };
+  OutOfAuthority : record { what : text };
+};
+type EscalationRules = record {
+  escalate_on_repeated_failure : bool;
+  escalate_on_missing_policy : bool;
+  escalate_on_authority_exceeded : bool;
+  failure_quarantine_threshold : nat32;
+};
+type EvmRouteStateView = record {
+  next_block : nat64;
+  automaton_address_topic : opt text;
+  automaton_evm_address : opt text;
+  chain_id : nat64;
+  confirmation_depth : nat64;
+  inbox_contract_address : opt text;
+  consecutive_empty_polls : nat32;
+  last_poll_at_ns : nat64;
+  next_log_index : nat64;
+};
+type EvmStewardProof = record {
+  signature : text;
+  canister_id : text;
+  command_hash : text;
+  chain_id : nat64;
+  address : text;
+  nonce : nat64;
+  expires_at_ns : nat64;
+};
+type ExecutionAuthority = record {
+  autonomous_execution_enabled : bool;
+  require_simulation_first : bool;
+  per_action_value_limit_wei : opt nat;
+};
+type ExposureReconciliationStatus = record {
+  last_error : opt text;
+  repaired_exposures : nat32;
+  drift_reason : opt text;
+  last_attempted_at_ns : opt nat64;
+  closed_exposures : nat32;
+  recreated_exposures : nat32;
+  last_succeeded_at_ns : opt nat64;
+};
+type HttpRequest = record {
+  url : text;
+  method : text;
+  body : blob;
+  headers : vec record { text; text };
+  certificate_version : opt nat16;
+};
+type HttpResponse = record {
+  body : blob;
+  headers : vec record { text; text };
+  upgrade : opt bool;
+  status_code : nat16;
+};
+type HttpUpdateRequest = record {
+  url : text;
+  method : text;
+  body : blob;
+  headers : vec record { text; text };
+};
+type HttpUpdateResponse = record {
+  body : blob;
+  headers : vec record { text; text };
+  status_code : nat16;
+};
+type InboxMessage = record {
+  id : text;
+  seq : nat64;
+  status : InboxMessageStatus;
+  source : InboxMessageSource;
+  body : text;
+  consumed_at_ns : opt nat64;
+  posted_at_ns : nat64;
+  posted_by : text;
+  staged_at_ns : opt nat64;
+};
+type InboxMessageSource = variant { StewardDirect; EvmInbox };
+type InboxMessageStatus = variant { Staged; Consumed; Pending };
+type InboxStats = record {
+  pending_count : nat64;
+  consumed_count : nat64;
+  total_messages : nat64;
+  staged_count : nat64;
+};
+type InferenceConfigView = record {
+  model : text;
+  openrouter_max_response_bytes : nat64;
+  openrouter_has_api_key : bool;
+  provider : InferenceProvider;
+  openrouter_proxy_worker_base_url : opt text;
+  openrouter_reasoning_level : OpenRouterReasoningLevel;
+  openrouter_proxy_trusted_callback_principal : opt text;
+  openrouter_base_url : text;
+};
+type InferenceProvider = variant { OpenRouter; OpenRouterProxyWorker; IcLlm };
+type InferenceProxyResultPayload = record {
+  tool_calls : vec ToolCall;
+  explanation : opt text;
+};
+type InferenceProxyStatusView = record {
+  callback_auth_failures : nat64;
+  pending_jobs : nat64;
+  trusted_callback_principal : opt text;
+  submit_failed : nat64;
+  completed_jobs : nat64;
+  callback_duplicates : nat64;
+  submit_accepted : nat64;
+  resumed_callbacks : nat64;
+  expired_jobs : nat64;
+  callback_rejected : nat64;
+  callback_accepted : nat64;
+  oldest_pending_age_secs : opt nat64;
+  worker_base_url : opt text;
+};
+type InferenceTransport = variant { OpenrouterDirect; OpenrouterProxyWorker };
+type InitArgs = record {
+  evm_chain_id : opt nat64;
+  evm_confirmation_depth : opt nat64;
+  evm_rpc_url : opt text;
+  ecdsa_key_name : text;
+  spawn_bootstrap : opt SpawnBootstrapArgs;
+  llm_canister_id : opt principal;
+  auto_topup_cycle_threshold : opt nat64;
+  cycle_topup_enabled : opt bool;
+  inbox_contract_address : opt text;
+  inference_proxy_trusted_callback_principal : opt principal;
+  inference_proxy_worker_base_url : opt text;
+  search_api_key : opt text;
+  evm_bootstrap_lookback_blocks : opt nat64;
+  http_allowed_domains : opt vec text;
+};
+type JobStatus = variant {
+  Skipped;
+  Failed;
+  Succeeded;
+  InFlight;
+  TimedOut;
+  Pending;
+};
+type MarketSynthesisBundle = record {
+  protocols : vec ProtocolMarketSnapshot;
+  generated_at_ns : nat64;
+  warnings : vec text;
+  chain_id : nat64;
+};
+type MemoryFact = record {
+  key : text;
+  value : text;
+  updated_at_ns : nat64;
+  created_at_ns : nat64;
+  source_turn_id : text;
+};
+type MemoryFactListSort = variant { KeyAsc; UpdatedAtDesc };
+type MemoryRollup = record {
+  source_count : nat32;
+  canonical_value : text;
+  window_end_ns : nat64;
+  generated_at_ns : nat64;
+  window_start_ns : nat64;
+  source_keys : vec text;
+  namespace : text;
+};
+type ObservabilitySnapshot = record {
+  inbox_stats : InboxStats;
+  scheduler : SchedulerRuntime;
+  outbox_stats : OutboxStats;
+  conversation_summaries : vec ConversationSummary;
+  memory_rollups : vec MemoryRollup;
+  recent_turns : vec TurnRecord;
+  inbox_messages : vec InboxMessage;
+  cycles : CycleTelemetry;
+  prompt_layers : vec PromptLayerView;
+  recent_transitions : vec TransitionLogRecord;
+  recent_jobs : vec ScheduledJob;
+  captured_at_ns : nat64;
+  turn_window_summaries : vec TurnWindowSummary;
+  storage_growth : StorageGrowthMetrics;
+  outbox_messages : vec OutboxMessage;
+  runtime : RuntimeView;
+  session_summaries : vec SessionSummary;
+};
+type OpenRouterProxyWorkerConfig = record {
+  trusted_callback_principal : opt principal;
+  worker_base_url : text;
+};
+type OpenRouterReasoningLevel = variant { Low; High; Medium; Default };
+type OutboxMessage = record {
+  id : text;
+  seq : nat64;
+  body : text;
+  source_inbox_ids : vec text;
+  created_at_ns : nat64;
+  turn_id : text;
+};
+type OutboxStats = record { total_messages : nat64 };
+type OutcallTimingStats = record {
+  last_error : opt text;
+  max_duration_ms : nat64;
+  failure_calls : nat64;
+  timeout_failures : nat64;
+  total_duration_ms : nat64;
+  last_started_at_ns : opt nat64;
+  last_finished_at_ns : opt nat64;
+  last_duration_ms : opt nat64;
+  total_calls : nat64;
+};
+type PendingStrategyDiscoveryJob = record {
+  submitted_at_ns : nat64;
+  objective : text;
+  watchlist : vec ProtocolWatchlistEntry;
+  autonomy_summary : text;
+  job_id : text;
+  exposure_summary : text;
+};
+type PromoteDiscoveryProtocolArtifactsArgs = record {
+  bundle_id : text;
+  job_id : text;
+};
+type PromptLayer = record {
+  content : text;
+  updated_at_ns : nat64;
+  version : nat32;
+  updated_by_turn : text;
+  layer_id : nat8;
+};
+type PromptLayerView = record {
+  content : text;
+  updated_at_ns : opt nat64;
+  is_mutable : bool;
+  version : opt nat32;
+  updated_by_turn : opt text;
+  layer_id : nat8;
+};
+type ProtocolArtifactBundle = record {
+  spec_summary : text;
+  bundle_id : text;
+  protocol_id : text;
+  role : text;
+  source_ref : text;
+  chain_id : nat64;
+  abi_json : text;
+  codehash : opt text;
+  contract_address : text;
+  risk_notes : vec text;
+  selector_assertions : vec AbiSelectorAssertion;
+};
+type ProtocolMarketSnapshot = record {
+  utilization_bps : opt nat64;
+  protocol_id : text;
+  tvl_usd : opt text;
+  summary : text;
+  warnings : vec text;
+  chain_id : nat64;
+  borrow_apy_bps : opt nat64;
+  pool_address : text;
+  supply_apy_bps : opt nat64;
+};
+type ProtocolWatchlistEntry = record {
+  id : text;
+  abi_api_url : text;
+  chain_id : nat64;
+  market_data_api_url : text;
+  pool_address : text;
+};
+type ReflectionMemoryRecord = record {
+  key : text;
+  what_worked : opt text;
+  subject : text;
+  what_failed : text;
+  repeat_count : nat32;
+  degraded_turn_count : nat32;
+  tool : text;
+  updated_at_ns : nat64;
+  last_worked_turn_id : opt text;
+  last_failed_at_ns : nat64;
+  last_origin : ReflectionOrigin;
+  last_failed_turn_id : text;
+  last_worked_at_ns : opt nat64;
+  error_class : text;
+};
+type ReflectionOrigin = variant { Autonomy; Maintenance; ExternalInput };
+type ReservePolicy = record {
+  min_gas_wei : opt nat;
+  min_cycles_runway_hours : nat64;
+  min_inference_usdc_6dp : opt nat64;
+};
+type Result = variant { Ok : TemplateActivationState; Err : text };
+type Result_1 = variant { Ok : text; Err : text };
+type Result_10 = variant { Ok : OpenRouterProxyWorkerConfig; Err : text };
+type Result_11 = variant { Ok : RetentionConfig; Err : text };
+type Result_12 = variant { Ok : StewardState; Err : text };
+type Result_13 = variant { Ok : StrategyDiscoveryStatusView; Err : text };
+type Result_14 = variant { Ok : AutonomyPolicy; Err : text };
+type Result_15 = variant { Ok : PromptLayer; Err : text };
+type Result_16 = variant { Ok; Err : text };
+type Result_2 = variant { Ok : StrategyTemplate; Err : text };
+type Result_3 = variant { Ok : PendingStrategyDiscoveryJob; Err : text };
+type Result_4 = variant { Ok : AbiArtifact; Err : text };
+type Result_5 = variant { Ok : vec text; Err : text };
+type Result_6 = variant { Ok : TemplateRevocationState; Err : text };
+type Result_7 = variant { Ok : AutonomySuppressionConfig; Err : text };
+type Result_8 = variant { Ok : nat64; Err : text };
+type Result_9 = variant { Ok : opt text; Err : text };
+type RetentionConfig = record {
+  transitions_max_age_secs : nat64;
+  memory_facts_max_age_secs : nat64;
+  turns_max_age_secs : nat64;
+  memory_facts_prune_batch_size : nat32;
+  dedupe_max_age_secs : nat64;
+  jobs_max_records : nat64;
+  maintenance_batch_size : nat32;
+  tools_max_age_secs : nat64;
+  maintenance_interval_secs : nat64;
+  inbox_max_age_secs : nat64;
+  outbox_max_age_secs : nat64;
+  jobs_max_age_secs : nat64;
+};
+type RetentionMaintenanceRuntime = record {
+  last_error : opt text;
+  outbox_scan_cursor : opt text;
+  last_deleted_dedupe : nat32;
+  last_deleted_inbox : nat32;
+  retention_progress_percent : nat8;
+  last_generated_session_summaries : nat32;
+  dedupe_scan_cursor : opt text;
+  inbox_scan_cursor : opt text;
+  last_deleted_tools : nat32;
+  last_deleted_turns : nat32;
+  last_started_ns : opt nat64;
+  transition_scan_cursor : opt text;
+  job_scan_cursor : opt text;
+  last_generated_turn_window_summaries : nat32;
+  last_deleted_memory_facts : nat32;
+  last_deleted_transitions : nat32;
+  last_deleted_outbox : nat32;
+  turn_scan_cursor : opt text;
+  last_deleted_jobs : nat32;
+  last_finished_ns : opt nat64;
+  next_run_after_ns : nat64;
+  summarization_progress_percent : nat8;
+  last_generated_memory_rollups : nat32;
+};
+type RiskLimits = record {
+  max_protocol_concentration_bps : nat16;
+  max_total_exposure_bps : nat16;
+  max_single_action_bps : nat16;
+};
+type RoomPollingState = record {
+  last_batch_count : nat32;
+  last_error : opt text;
+  last_post_error : opt text;
+  last_post_attempted_at_ns : opt nat64;
+  last_attempted_at_ns : opt nat64;
+  last_known_latest_seq : opt nat64;
+  configured : bool;
+  last_seen_seq : opt nat64;
+  consecutive_failures : nat32;
+  last_post_succeeded_at_ns : opt nat64;
+  last_succeeded_at_ns : opt nat64;
+};
+type RuntimeTimingTelemetry = record {
+  last_turn_duration_ms : opt nat64;
+  inference_outcall : OutcallTimingStats;
+  turns_over_budget : nat64;
+  http_fetch_outcall : OutcallTimingStats;
+  max_turn_duration_ms : nat64;
+};
+type RuntimeView = record {
+  last_error : opt text;
+  evm_chain_id : nat64;
+  last_transition_at_ns : nat64;
+  soul : text;
+  turn_counter : nat64;
+  last_turn_id : opt text;
+  room_poll : RoomPollingState;
+  timing_telemetry : RuntimeTimingTelemetry;
+  state : AgentState;
+  inference_provider : InferenceProvider;
+  evm_next_log_index : nat64;
+  turn_in_flight : bool;
+  inference_model : text;
+  evm_next_block : nat64;
+  loop_enabled : bool;
+};
+type ScheduledJob = record {
+  id : text;
+  last_error : opt text;
+  status : JobStatus;
+  started_at_ns : opt nat64;
+  kind : TaskKind;
+  lane : TaskLane;
+  finished_at_ns : opt nat64;
+  attempts : nat32;
+  scheduled_for_ns : nat64;
+  created_at_ns : nat64;
+  max_attempts : nat32;
+  priority : nat8;
+  dedupe_key : text;
+};
+type SchedulerLease = record {
+  lane : TaskLane;
+  acquired_at_ns : nat64;
+  job_id : text;
+  expires_at_ns : nat64;
+};
+type SchedulerRuntime = record {
+  last_tick_finished_ns : nat64;
+  last_tick_error : opt text;
+  last_tick_started_ns : nat64;
+  survival_tier : SurvivalTier;
+  survival_tier_recovery_checks : nat32;
+  active_mutating_lease : opt SchedulerLease;
+  next_job_seq : nat64;
+  enabled : bool;
+  paused_reason : opt text;
+  low_cycles_mode : bool;
+};
+type SearchConfigArgs = record {
+  api_key : text;
+  max_searches_per_turn : opt nat8;
+};
+type SessionSummary = record {
+  source_count : nat32;
+  inbox_message_count : nat32;
+  outbox_preview : text;
+  outbox_message_count : nat32;
+  window_end_ns : nat64;
+  sender : text;
+  generated_at_ns : nat64;
+  window_start_ns : nat64;
+  inbox_preview : text;
+};
+type SkillRecord = record {
+  name : text;
+  description : text;
+  instructions : text;
+  enabled : bool;
+  mutable : bool;
+  allowed_canister_calls : vec CanisterCallPermission;
+};
+type SourceRecord = record {
+  url : text;
+  fetched_at_ns : nat64;
+  trust_tier : StrategyDiscoverySourceTrustTier;
+  content_hash : text;
+  source_id : text;
+  source_type : StrategyDiscoverySourceType;
+};
+type SpawnBootstrapArgs = record {
+  provider : SpawnProviderBootstrapArgs;
+  session_id : text;
+  risk : nat8;
+  factory_principal : principal;
+  parent_id : opt text;
+  version_commit : text;
+  skills : vec text;
+  steward_address : text;
+  strategies : vec text;
+};
+type SpawnBootstrapView = record {
+  session_id : opt text;
+  risk : opt nat8;
+  factory_principal : opt principal;
+  parent_id : opt text;
+  version_commit : opt text;
+  skills : vec text;
+  strategies : vec text;
+};
+type SpawnProviderBootstrapArgs = record {
+  open_router_reasoning_level : OpenRouterReasoningLevel;
+  model : opt text;
+  open_router_api_key : opt text;
+  brave_search_api_key : opt text;
+  inference_transport : InferenceTransport;
+};
+type StewardCommand = variant {
+  IngestStrategyAbiArtifact : StrategyAbiIngestArgs;
+  IngestStrategyTemplate : record { template : StrategyTemplate };
+  SetSchedulerLowCyclesMode : record { enabled : bool };
+  SetEvmConfirmationDepth : record { confirmation_depth : nat64 };
+  SetOpenrouterApiKey : record { api_key : opt text };
+  PruneMemoryFacts : record {
+    updated_before_ns : opt nat64;
+    limit : nat32;
+    prefix : opt text;
+  };
+  ActivateStrategyTemplate : record {
+    key : StrategyTemplateKey;
+    reason : opt text;
+  };
+  Noop;
+  UpsertSkill : record { skill : SkillRecord };
+  SetInferenceProxyConfig : record { config : OpenRouterProxyWorkerConfig };
+  RegisterStrategy : record { recipe_json : text };
+  DeprecateStrategyTemplate : record {
+    key : StrategyTemplateKey;
+    reason : opt text;
+  };
+  SetAutonomyToolDedupeEnabled : record { enabled : bool };
+  UpdatePromptLayer : record { content : text; layer_id : nat8 };
+  SetEvmRpcMaxResponseBytes : record { max_response_bytes : nat64 };
+  SendStewardMessage : record { sender : text; message : text };
+  SetTaskEnabled : record { kind : TaskKind; enabled : bool };
+  SetEvmRpcFallbackUrl : record { url : opt text };
+  SetInferenceProvider : record { provider : InferenceProvider };
+  SetInferenceModel : record { model : text };
+  SetHttpAllowedDomains : record { domains : vec text };
+  UpdateSteward : record { enabled : bool; chain_id : nat64; address : text };
+  SetRetentionConfig : record { config : RetentionConfig };
+  EnqueueStrategyDiscoveryJob : record {
+    args : EnqueueStrategyDiscoveryJobArgs;
+  };
+  RevokeStrategyTemplate : record {
+    key : StrategyTemplateKey;
+    reason : opt text;
+  };
+  DeriveAutomatonEvmAddress;
+  SetOpenrouterReasoningLevel : record { level : OpenRouterReasoningLevel };
+  ConfigureSearch : SearchConfigArgs;
+  PromoteDiscoveryProtocolArtifacts : record {
+    args : PromoteDiscoveryProtocolArtifactsArgs;
+  };
+  SetSchedulerEnabled : record { enabled : bool };
+  SetStrategyDiscoveryWorkerConfig : record {
+    config : StrategyDiscoveryWorkerConfig;
+  };
+  SetEvmRpcUrl : record { url : text };
+  SetOpenrouterBaseUrl : record { base_url : text };
+  SetAutonomySuppressionConfig : record { config : AutonomySuppressionConfig };
+  SetStrategyKillSwitch : record {
+    key : StrategyTemplateKey;
+    enabled : bool;
+    reason : opt text;
+  };
+  SetLoopEnabled : record { enabled : bool };
+  SetInboxContractAddress : record { address : opt text };
+  SetSchedulerBaseTickSecs : record { interval_secs : nat64 };
+  SetTaskIntervalSecs : record { kind : TaskKind; interval_secs : nat64 };
+  SetEvmChainId : record { chain_id : nat64 };
+  SetWelcomeMessage : record { message : text };
+  UpdateSoul : record { new_soul : text };
+  SetPrincipal : record { "principal" : opt principal };
+};
+type StewardState = record {
+  "principal" : opt principal;
+  last_used_at_ns : opt nat64;
+  enabled : bool;
+  chain_id : nat64;
+  address : text;
+};
+type StewardStatusView = record {
+  next_nonce : nat64;
+  active_steward : opt StewardState;
+};
+type StorageGrowthMetrics = record {
+  inbox_staged_queue_entries : nat64;
+  memory_fact_limit : nat64;
+  turn_map_entries : nat64;
+  inbox_pending_queue_entries : nat64;
+  pressure_level : StoragePressureLevel;
+  memory_rollup_utilization_percent : nat8;
+  tracked_entries_delta_per_hour : opt int64;
+  retention_progress_percent : nat8;
+  session_summary_limit : nat64;
+  tracked_entry_count : nat64;
+  memory_rollup_entries : nat64;
+  outbox_map_entries : nat64;
+  session_summary_utilization_percent : nat8;
+  turn_window_summary_utilization_percent : nat8;
+  memory_fact_entries : nat64;
+  memory_fact_utilization_percent : nat8;
+  near_limit : bool;
+  memory_fact_retention_max_age_secs : nat64;
+  trend_sample_count : nat32;
+  session_summary_entries : nat64;
+  dedupe_map_entries : nat64;
+  inbox_map_entries : nat64;
+  turn_window_summary_entries : nat64;
+  pressure_warnings : vec text;
+  heap_memory_mb : float64;
+  last_deleted_memory_facts : nat32;
+  memory_fact_prune_batch_size : nat32;
+  tool_map_entries : nat64;
+  runtime_map_entries : nat64;
+  stable_memory_mb : float64;
+  memory_rollup_limit : nat64;
+  transition_map_entries : nat64;
+  turn_window_summary_limit : nat64;
+  job_map_entries : nat64;
+  job_queue_map_entries : nat64;
+  trend_window_seconds : nat64;
+  summarization_progress_percent : nat8;
+};
+type StoragePressureLevel = variant { High; Normal; Critical; Elevated };
+type StrategyAbiIngestArgs = record {
+  key : AbiArtifactKey;
+  source_ref : text;
+  abi_json : text;
+  codehash : opt text;
+  selector_assertions : vec AbiSelectorAssertion;
+};
+type StrategyCandidateBundle = record {
+  suggested_template_shape : opt text;
+  primitive : text;
+  protocol_id : text;
+  objective : text;
+  estimated_yield_bps : opt nat64;
+  missing_inputs : vec text;
+  warnings : vec text;
+  chain_id : nat64;
+  required_artifacts : vec text;
+  rationale : text;
+  assumptions : vec text;
+  candidate_id : text;
+  confidence_label : text;
+  freshness_deadline_ns : opt nat64;
+};
+type StrategyDiscoveryCallbackRecord = record {
+  status : StrategyDiscoveryResultStatus;
+  result_hash : text;
+  completed_at_ns : nat64;
+  objective : text;
+  watchlist : vec ProtocolWatchlistEntry;
+  job_id : text;
+  validated_at_ns : opt nat64;
+  accepted_at_ns : nat64;
+  caller_principal : text;
+  payload : StrategyDiscoveryResultPayload;
+};
+type StrategyDiscoveryResultPayload = record {
+  protocol_artifacts : vec ProtocolArtifactBundle;
+  source_records : vec SourceRecord;
+  market : MarketSynthesisBundle;
+  candidates : vec StrategyCandidateBundle;
+};
+type StrategyDiscoveryResultStatus = variant {
+  Rejected : record { reason : text };
+  Validated;
+};
+type StrategyDiscoverySourceTrustTier = variant {
+  Secondary;
+  Official;
+  BestEffort;
+};
+type StrategyDiscoverySourceType = variant {
+  ProtocolApi;
+  OfficialDocs;
+  BlockExplorer;
+  MarketDataApi;
+  Other;
+};
+type StrategyDiscoveryStatusView = record {
+  has_worker_api_key : bool;
+  callback_auth_failures : nat64;
+  pending_jobs : nat64;
+  result_ttl_secs : nat64;
+  objective : opt text;
+  trusted_callback_principal : opt text;
+  freshest_validated_age_secs : opt nat64;
+  submit_failed : nat64;
+  enabled : bool;
+  freshest_validated_job_id : opt text;
+  callback_duplicates : nat64;
+  freshest_validated_at_ns : opt nat64;
+  submit_accepted : nat64;
+  protocol_watchlist_len : nat64;
+  result_records : nat64;
+  expired_jobs : nat64;
+  callback_rejected : nat64;
+  freshest_validated_expired : bool;
+  callback_accepted : nat64;
+  worker_base_url : opt text;
+};
+type StrategyDiscoveryWorkerConfig = record {
+  worker_api_key : opt text;
+  protocol_watchlist : vec ProtocolWatchlistEntry;
+  result_ttl_secs : nat64;
+  objective : text;
+  trusted_callback_principal : opt principal;
+  enabled : bool;
+  worker_base_url : text;
+};
+type StrategyOutcomeStats = record {
+  key : StrategyTemplateKey;
+  last_error : opt text;
+  total_runs : nat64;
+  nondeterministic_failures : nat64;
+  last_tx_hash : opt text;
+  success_runs : nat64;
+  deterministic_failure_streak : nat32;
+  last_observed_at_ns : opt nat64;
+  deterministic_failures : nat64;
+};
+type StrategyQuarantine = record {
+  release_after_ns : opt nat64;
+  failure_count : nat32;
+  strategy_id : text;
+  quarantined_at_ns : nat64;
+  reason : text;
+};
+type StrategyTemplate = record {
+  key : StrategyTemplateKey;
+  status : TemplateStatus;
+  updated_at_ns : nat64;
+  actions : vec ActionSpec;
+  created_at_ns : nat64;
+  constraints_json : text;
+  contract_roles : vec ContractRoleBinding;
+};
+type StrategyTemplateKey = record {
+  protocol : text;
+  primitive : text;
+  template_id : text;
+  chain_id : nat64;
+};
+type SubmitInferenceResultArgs = record {
+  result : opt InferenceProxyResultPayload;
+  completed_at_ns : nat64;
+  error : opt text;
+  turn_id : text;
+  job_id : text;
+};
+type SubmitStrategyDiscoveryResultArgs = record {
+  completed_at_ns : nat64;
+  objective : text;
+  watchlist : vec ProtocolWatchlistEntry;
+  job_id : text;
+  payload : StrategyDiscoveryResultPayload;
+};
+type SurvivalTier = variant { OutOfCycles; Normal; LowCycles; Critical };
+type TaskKind = variant {
+  Reconcile;
+  CheckCycles;
+  PollInbox;
+  TopUpCycles;
+  AgentTurn;
+};
+type TaskLane = variant { ReadOnly; Mutating };
+type TaskScheduleConfig = record {
+  max_backoff_secs : nat64;
+  kind : TaskKind;
+  interval_secs : nat64;
+  enabled : bool;
+  essential : bool;
+  priority : nat8;
+};
+type TaskScheduleRuntime = record {
+  backoff_until_ns : opt nat64;
+  last_error : opt text;
+  next_due_ns : nat64;
+  kind : TaskKind;
+  last_started_ns : opt nat64;
+  pending_job_id : opt text;
+  consecutive_failures : nat32;
+  last_finished_ns : opt nat64;
+};
+type TemplateActivationState = record {
+  key : StrategyTemplateKey;
+  updated_at_ns : nat64;
+  enabled : bool;
+  reason : opt text;
+};
+type TemplateRevocationState = record {
+  key : StrategyTemplateKey;
+  revoked : bool;
+  updated_at_ns : nat64;
+  reason : opt text;
+};
+type TemplateStatus = variant { Active; Draft; Deprecated; Revoked };
+type ToolCall = record {
+  args_json : text;
+  tool : text;
+  tool_call_id : opt text;
+};
+type ToolCallOutcome = variant {
+  SuppressedDedupe;
+  BlockedSequence;
+  SuppressedFailureCooldown;
+  Executed;
+};
+type ToolCallRecord = record {
+  output : text;
+  args_json : text;
+  tool : text;
+  error : opt text;
+  turn_id : text;
+  success : bool;
+  outcome : ToolCallOutcome;
+  failure_kind : opt ToolFailureKind;
+};
+type ToolFailureKind = variant {
+  MalformedInput;
+  OutcallFailure;
+  InternalFailure;
+};
+type TransitionLogRecord = record {
+  id : text;
+  occurred_at_ns : nat64;
+  to_state : AgentState;
+  error : opt text;
+  event : text;
+  turn_id : text;
+  from_state : AgentState;
+};
+type TurnRecord = record {
+  id : text;
+  inference_round_count : nat32;
+  finished_at_ns : opt nat64;
+  continuation_stop_reason : ContinuationStopReason;
+  state_to : AgentState;
+  input_summary : text;
+  error : opt text;
+  inner_dialogue : opt text;
+  created_at_ns : nat64;
+  source_events : nat32;
+  state_from : AgentState;
+  duration_ms : opt nat64;
+  tool_call_count : nat32;
+};
+type TurnWindowSummary = record {
+  tool_success_count : nat32;
+  source_count : nat32;
+  failed_turn_count : nat32;
+  turn_count : nat32;
+  transition_count : nat32;
+  window_end_ns : nat64;
+  top_errors : vec text;
+  generated_at_ns : nat64;
+  window_start_ns : nat64;
+  succeeded_turn_count : nat32;
+  tool_failure_count : nat32;
+  tool_call_count : nat32;
+};
+type Vec = vec record { kind : text; name : text; components : Vec };
+type WalletBalanceStatus = variant { Error; Stale; Fresh; Unknown };
+type WalletBalanceSyncConfigView = record {
+  normal_interval_secs : nat64;
+  max_response_bytes : nat64;
+  enabled : bool;
+  discover_usdc_via_inbox : bool;
+  freshness_window_secs : nat64;
+  low_cycles_interval_secs : nat64;
+};
+type WalletBalanceTelemetryView = record {
+  last_error : opt text;
+  status : WalletBalanceStatus;
+  usdc_contract_address : opt text;
+  eth_balance_wei_hex : opt text;
+  usdc_balance_raw_hex : opt text;
+  last_synced_at_ns : opt nat64;
+  bootstrap_pending : bool;
+  usdc_decimals : nat8;
+  is_stale : bool;
+  freshness_window_secs : nat64;
+  age_secs : opt nat64;
+  last_synced_block : opt nat64;
+};
+service : (InitArgs) -> {
+  // Deprecated: use `register_strategy_admin` instead.
+  // Transitions a template to `Active`, runs a dry-run compile to validate it,
+  // and records an activation state entry (controller only).
+  activate_strategy_template_admin : (StrategyTemplateKey, opt text) -> (
+      Result,
+    );
+  // Stores the web-search API key and optional per-turn search budget override (controller only).
+  configure_search : (SearchConfigArgs) -> (Result_1);
+  // Marks a template as `Deprecated` and deactivates it.  Use this for orderly
+  // rotation; the template remains readable (controller only).
+  deprecate_strategy_template_admin : (StrategyTemplateKey, opt text) -> (
+      Result_2,
+    );
+  // Derives the canister's threshold-ECDSA EVM address from the configured key
+  // and caches it in stable storage (controller only).
+  derive_automaton_evm_address : () -> (Result_1);
+  // Manually submits a strategy-discovery job for ops/testing (controller only).
+  enqueue_strategy_discovery_job_admin : (EnqueueStrategyDiscoveryJobArgs) -> (
+      Result_3,
+    );
+  // Returns the active strategy exposures tracked for autonomy policy enforcement.
+  get_active_exposures : () -> (vec ActiveExposure) query;
+  // Returns the automaton's derived EVM address, or `None` before first derivation.
+  get_automaton_evm_address : () -> (opt text) query;
+  // Returns the active autonomy policy, installing a conservative default if
+  // one has not been persisted yet.
+  get_autonomy_policy : () -> (AutonomyPolicy) query;
+  // Returns the current autonomy suppression configuration.
+  get_autonomy_suppression_config : () -> (AutonomySuppressionConfig) query;
+  // Returns the full conversation log for the given sender address, or `None`
+  // if no conversation exists.
+  get_conversation : (text) -> (opt ConversationLog) query;
+  // Returns the current EVM route state (chain ID, RPC URL, addresses, …).
+  get_evm_route_state_view : () -> (EvmRouteStateView) query;
+  // Returns the last exposure-reconciliation status snapshot.
+  get_exposure_reconciliation_status : () -> (
+      ExposureReconciliationStatus,
+    ) query;
+  // Returns aggregate inbox statistics (total messages, pending count, …).
+  get_inbox_stats : () -> (InboxStats) query;
+  // Returns the current inference configuration (provider, model, key presence flag).
+  get_inference_config : () -> (InferenceConfigView) query;
+  get_inference_proxy_status : () -> (InferenceProxyStatusView) query;
+  // Returns an observability snapshot containing up to `limit` recent events,
+  // combined with the current runtime and scheduler views.
+  get_observability_snapshot : (nat32) -> (ObservabilitySnapshot) query;
+  // Returns aggregate outbox statistics (total messages, delivered count, …).
+  get_outbox_stats : () -> (OutboxStats) query;
+  // Returns all prompt layers ordered by layer ID.
+  get_prompt_layers : () -> (vec PromptLayerView) query;
+  // Returns the most-recent autonomous decisions, bounded by the durable FIFO cap.
+  get_recent_decisions : () -> (vec DecisionRecord) query;
+  // Returns the current conversation-retention configuration.
+  get_retention_config : () -> (RetentionConfig) query;
+  // Returns runtime statistics from the last retention-maintenance pass.
+  get_retention_maintenance_runtime : () -> (RetentionMaintenanceRuntime) query;
+  // Returns a combined runtime snapshot (cycles, scheduler state, inference
+  // config, top-up config, …).
+  get_runtime_view : () -> (RuntimeView) query;
+  // Returns the scheduler timer base tick interval in seconds.
+  get_scheduler_base_tick_secs : () -> (nat64) query;
+  // Returns the scheduler's current runtime state (enabled flag, last tick, …).
+  get_scheduler_view : () -> (SchedulerRuntime) query;
+  // Returns the agent's "soul" — the core identity/persona prompt layer.
+  get_soul : () -> (text) query;
+  // Returns the persisted launchpad/factory bootstrap metadata, if any.
+  get_spawn_bootstrap_view : () -> (SpawnBootstrapView) query;
+  // Returns the currently configured steward identity and next expected nonce.
+  get_steward_status : () -> (StewardStatusView) query;
+  get_strategy_discovery_worker_status : () -> (
+      StrategyDiscoveryStatusView,
+    ) query;
+  // Returns accumulated outcome statistics (success/failure counts, last outcome)
+  // for the given template, or `None` if no executions have been recorded yet.
+  get_strategy_outcome_stats : (StrategyTemplateKey) -> (
+      opt StrategyOutcomeStats,
+    ) query;
+  // Returns the active strategy quarantines tracked for autonomy policy enforcement.
+  get_strategy_quarantines : () -> (vec StrategyQuarantine) query;
+  // Returns a single strategy template by key, or `None` if absent.
+  get_strategy_template : (StrategyTemplateKey) -> (opt StrategyTemplate) query;
+  // Returns all tool call records associated with the given turn ID.
+  get_tool_calls_for_turn : (text) -> (vec ToolCallRecord) query;
+  // Returns the wallet balance sync configuration (intervals, freshness window, …).
+  get_wallet_balance_sync_config : () -> (WalletBalanceSyncConfigView) query;
+  // Returns the latest synced wallet balance telemetry (ETH, USDC, sync status).
+  get_wallet_balance_telemetry : () -> (WalletBalanceTelemetryView) query;
+  // Certified HTTP query handler.  Serves static UI assets and read-only API
+  // routes from the pre-built certification tree.  Mutable routes return an
+  // upgrade signal to be retried via `http_request_update`.
+  http_request : (HttpRequest) -> (HttpResponse) query;
+  // Mutable HTTP update handler for write routes (`POST /api/conversation`, …).
+  // Called automatically by the IC boundary nodes when `http_request` signals
+  // an upgrade.
+  http_request_update : (HttpUpdateRequest) -> (HttpUpdateResponse);
+  // Deprecated: use `register_strategy_admin` instead.
+  // Normalises and stores an ABI artifact, optionally verifying selector hashes
+  // (controller only).
+  ingest_strategy_abi_artifact_admin : (StrategyAbiIngestArgs) -> (Result_4);
+  // Deprecated: use `register_strategy_admin` instead.
+  // Inserts or updates a strategy template (controller only).
+  ingest_strategy_template_admin : (StrategyTemplate) -> (Result_2);
+  // Returns summary records for all active conversations (one per sender).
+  list_conversations : () -> (vec ConversationSummary) query;
+  // Returns up to `limit` inbox messages ordered by arrival time (newest last).
+  list_inbox_messages : (nat32) -> (vec InboxMessage) query;
+  // Returns memory facts filtered by key prefix, sorted by `sort`, and bounded by `limit`.
+  // 
+  // Pass an empty prefix (`""`) to list across all memory facts.
+  list_memory_facts : (text, MemoryFactListSort, nat32) -> (
+      vec MemoryFact,
+    ) query;
+  // Returns up to `limit` most-recent memory rollups (compressed long-term context).
+  list_memory_rollups : (nat32) -> (vec MemoryRollup) query;
+  // Returns up to `limit` most-recent outbox messages (agent replies queued for delivery).
+  list_outbox_messages : (nat32) -> (vec OutboxMessage) query;
+  // Returns up to `limit` recent state-transition event records as debug strings.
+  list_recent_events : (nat32) -> (vec text) query;
+  // Returns up to `limit` most-recent reflection-memory lessons.
+  list_reflection_memory : (nat32) -> (vec ReflectionMemoryRecord) query;
+  // Returns up to `limit` most-recently enqueued scheduler job records.
+  list_scheduler_jobs : (nat32) -> (vec ScheduledJob) query;
+  // Returns up to `limit` most-recent session summaries.
+  list_session_summaries : (nat32) -> (vec SessionSummary) query;
+  // Returns all registered skill records.
+  list_skills : () -> (vec SkillRecord) query;
+  list_strategy_discovery_jobs : (nat32) -> (
+      vec PendingStrategyDiscoveryJob,
+    ) query;
+  list_strategy_discovery_results : (nat32) -> (
+      vec StrategyDiscoveryCallbackRecord,
+    ) query;
+  // Lists strategy templates.  When `key` is supplied only templates matching
+  // that key are returned; otherwise all templates are returned (up to `limit`).
+  list_strategy_templates : (opt StrategyTemplateKey, nat32) -> (
+      vec StrategyTemplate,
+    ) query;
+  // Returns the configured schedule and live runtime state for every task kind.
+  list_task_schedules : () -> (
+      vec record { TaskScheduleConfig; TaskScheduleRuntime },
+    ) query;
+  // Returns the policy (autonomy mode, allowed callers, …) for every registered
+  // tool as human-readable strings.
+  list_tool_policies : () -> (vec text) query;
+  // Returns up to `limit` most-recent turn-window summaries used for context compression.
+  list_turn_window_summaries : (nat32) -> (vec TurnWindowSummary) query;
+  // Returns up to `limit` recent agent turn records as debug strings.
+  list_turns : (nat32) -> (vec text) query;
+  // Promotes a validated staged discovery artifact into the ABI registry (controller only).
+  promote_discovery_protocol_artifacts_admin : (
+      PromoteDiscoveryProtocolArtifactsArgs,
+    ) -> (Result_4);
+  // Controller-only remediation endpoint to prune memory facts by prefix and/or age.
+  // 
+  // - `prefix`: optional key namespace filter (e.g. `"signal."`).
+  // - `updated_before_ns`: optional inclusive timestamp cutoff.
+  // - `limit`: max number of facts to remove in this call.
+  prune_memory_facts_admin : (opt text, opt nat64, nat32) -> (Result_5);
+  // Register a strategy from a compact recipe (controller only).
+  // 
+  // Replaces the previous multi-step workflow (`ingest_strategy_template_admin` +
+  // `ingest_strategy_abi_artifact_admin` + `activate_strategy_template_admin`) with
+  // a single call.  Accepts the same JSON recipe format as the agent's
+  // `register_strategy` tool.
+  register_strategy_admin : (text) -> (Result_2);
+  // Hard-revokes a template: sets status to `Revoked`, deactivates it, and
+  // records an immutable revocation entry.  Use for security incidents
+  // (controller only).
+  revoke_strategy_template_admin : (StrategyTemplateKey, opt text) -> (
+      Result_6,
+    );
+  // Replaces autonomy suppression policy (dedupe window + failure cooldown
+  // thresholds) (controller only).
+  set_autonomy_suppression_config : (AutonomySuppressionConfig) -> (Result_7);
+  // Enables or disables autonomous tool-call dedupe without changing other
+  // suppression controls (controller only).
+  set_autonomy_tool_dedupe_enabled : (bool) -> (text);
+  // Updates the EVM chain ID used for all on-chain operations (controller only).
+  set_evm_chain_id_admin : (nat64) -> (Result_8);
+  // Sets how many block confirmations must pass before an EVM event is
+  // considered finalised (controller only).
+  set_evm_confirmation_depth_admin : (nat64) -> (Result_8);
+  // Sets an optional fallback EVM RPC URL used when the primary is unavailable (controller only).
+  set_evm_rpc_fallback_url : (opt text) -> (Result_9);
+  // Caps the maximum response size (bytes) returned by EVM RPC outbound calls (controller only).
+  set_evm_rpc_max_response_bytes : (nat64) -> (Result_8);
+  // Updates the primary EVM JSON-RPC endpoint (controller only).
+  set_evm_rpc_url : (text) -> (Result_1);
+  // Replaces the HTTP outbound allowlist.  An empty slice disables the allowlist
+  // and permits all domains (controller only).
+  set_http_allowed_domains : (vec text) -> (Result_5);
+  // Overrides the EVM inbox contract address (controller only).
+  set_inbox_contract_address_admin : (opt text) -> (Result_9);
+  // Sets the inference model identifier (e.g. `"llama3.1:8b"` or `"openai/gpt-4o-mini"`)
+  // (controller only).
+  set_inference_model : (text) -> (Result_1);
+  // Sets the active inference backend (`IcLlm`, `OpenRouter`, or `OpenRouterProxyWorker`)
+  // (controller only).
+  set_inference_provider : (InferenceProvider) -> (text);
+  // Stores OpenRouter proxy worker config used by async inference callbacks (controller only).
+  set_inference_proxy_config : (OpenRouterProxyWorkerConfig) -> (Result_10);
+  // Enables or disables the autonomous agent loop (controller only).
+  set_loop_enabled : (bool) -> (text);
+  // Stores (or clears) the OpenRouter API key in stable storage.
+  // Pass `None` to remove the key (controller only).
+  set_openrouter_api_key : (opt text) -> (text);
+  // Updates the OpenRouter-compatible base URL used for inference HTTP calls (controller only).
+  set_openrouter_base_url : (text) -> (Result_1);
+  // Sets the OpenRouter reasoning effort level for models that support it (controller only).
+  set_openrouter_reasoning_level : (OpenRouterReasoningLevel) -> (text);
+  // Replaces the conversation-retention policy (controller only).
+  set_retention_config : (RetentionConfig) -> (Result_11);
+  // Updates the scheduler timer base tick interval in seconds (controller only).
+  set_scheduler_base_tick_secs : (nat64) -> (Result_8);
+  // Enables or disables the scheduler (controller only).
+  // Disabling prevents new jobs from being dispatched without stopping the timer.
+  set_scheduler_enabled : (bool) -> (text);
+  // Activates low-cycles mode, which throttles task dispatch to conserve cycles
+  // (controller only).
+  set_scheduler_low_cycles_mode : (bool) -> (text);
+  // Sets or rotates the active steward identity used for signed command authority
+  // (controller recovery path).
+  set_steward_admin : (nat64, text, bool) -> (Result_12);
+  // Stores strategy-discovery worker config used by async discovery callbacks (controller only).
+  set_strategy_discovery_worker_config : (StrategyDiscoveryWorkerConfig) -> (
+      Result_13,
+    );
+  // Arms or disarms the kill switch for a strategy template.
+  // When `enabled` is `true` the agent will refuse to execute any action for
+  // that template (controller only).
+  set_strategy_kill_switch_admin : (StrategyTemplateKey, bool, opt text) -> (
+      Result,
+    );
+  // Enables or disables a specific task kind without affecting the scheduler
+  // globally (controller only).
+  set_task_enabled : (TaskKind, bool) -> (text);
+  // Overrides the recurrence interval (seconds) for the given task kind
+  // (controller only).
+  set_task_interval_secs : (TaskKind, nat64) -> (Result_1);
+  // Sets a custom welcome message shown in the TUI on boot (controller only).
+  // An empty string clears the custom message and restores the default.
+  set_welcome_message : (text) -> (Result_1);
+  steward_execute : (StewardCommand, EvmStewardProof) -> (Result_1);
+  steward_execute_ingress : (StewardCommand) -> (Result_1);
+  // Callback endpoint used by the OpenRouter proxy worker to submit async results.
+  submit_inference_result : (SubmitInferenceResultArgs) -> (Result_1);
+  // Callback endpoint used by the strategy-discovery worker to submit staged results.
+  submit_strategy_discovery_result : (SubmitStrategyDiscoveryResultArgs) -> (
+      Result_1,
+    );
+  // Replaces the active autonomy policy (controller only).
+  update_autonomy_policy : (AutonomyPolicy) -> (Result_14);
+  // Replaces the content of a prompt layer identified by `layer_id` (controller only).
+  update_prompt_layer_admin : (nat8, text) -> (Result_15);
+  // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
+  update_soul : (text) -> (Result_1);
+  // Inserts or updates a skill record.
+  // 
+  // Only callable by a canister controller.  This is the runtime management
+  // endpoint for adding new inter-canister call skills or modifying existing ones.
+  upsert_skill : (SkillRecord) -> (Result_16);
+}

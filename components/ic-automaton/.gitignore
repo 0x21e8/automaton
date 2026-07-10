@@ -1,0 +1,48 @@
+# Various IDEs and Editors
+.vscode/
+.idea/
+**/*~
+
+# Mac OSX temporary files
+.DS_Store
+**/.DS_Store
+
+# environment variables
+.env
+
+# rust
+target/
+
+# ingore the icp-cli cache
+.icp/
+.icp/cache/
+.local/
+
+# ark index files
+.ark/
+
+# canbench
+.canbench/
+
+# claude
+.claude/
+
+# local agent worktrees
+.pi-worktrees/
+autoresearch.config.json
+
+# local-only design docs (not tracked in git)
+docs/design/
+docs/specs/
+
+# githooks
+.githooks/*
+!.githooks/pre-commit
+!.githooks/pre-push
+
+# JavaScript workers
+workers/**/node_modules/
+workers/**/.wrangler/
+workers/**/.dev.vars
+workers/**/.env
+workers/**/.env.*
