@@ -114,15 +114,42 @@ Grafana is also profile-gated and loopback-only:
 docker compose --env-file /etc/automaton-playground/playground.env -f ops/playground/docker-compose.yml --profile monitoring up -d grafana
 ```
 
-## Release Deploys
+## Release creation and actions
 
-Phase 10 adds a manifest-driven deploy entrypoint at [`scripts/deploy-playground-release.sh`](/Users/domwoe/Dev/projects/automaton-launchpad/scripts/deploy-playground-release.sh).
+The reusable `Publish Atomic Playground Release` workflow checks out one clean
+commit, runs the full Plan 004 contract gates, builds the factory and child
+Wasm artifacts, publishes digest-addressed images, and uploads one immutable
+bundle containing the schema-v2 manifest, exact bytes, checksums, and a
+source/ops archive. It does not deploy an environment.
 
-The contract is:
+The manifest is shaped like [`ops/playground/release-manifest.example.json`](/Users/domwoe/Dev/projects/automaton-launchpad/ops/playground/release-manifest.example.json).
+It contains source provenance, image digests, raw Wasm digests, and the ops
+revision. It contains no deployment mode or secret.
 
-- build and push exact image digests for `web`, `indexer`, and `rpc-gateway` via the reusable `Publish Playground Images` workflow
-- write a release manifest shaped like [`ops/playground/release-manifest.example.json`](/Users/domwoe/Dev/projects/automaton-launchpad/ops/playground/release-manifest.example.json)
-- run the deploy script on the VPS with the shared env file already in place
+The four actions are intentionally separate:
+
+1. `--mode soft` updates only the `web`, `indexer`, and `rpc-gateway` images,
+   then runs smoke checks. It never uploads an artifact, reinstalls the
+   factory, resets Anvil, or upgrades a child.
+2. `--mode hard-reset` is the manual environment-approved reset path. It uses
+   the manifest-selected factory and child bytes while recreating ephemeral
+   playground state.
+3. `--mode admit-child` uploads the selected child bytes to the existing
+   factory and verifies factory health. It does not upgrade existing children.
+4. `--mode upgrade-named --canister-id <principal>` takes a pre-upgrade
+   snapshot and upgrades exactly that canister with ICP upgrade mode. The VPS
+   requires `PLAYGROUND_UPGRADE_APPROVED=1` in addition to the protected CI
+   environment.
+
+The mode is selected by the workflow or command line, never read from the
+immutable manifest. Manual local validation can render a manifest without
+deploying:
+
+```sh
+npm run build:factory-wasm
+./components/ic-automaton/scripts/build-backend-wasm.sh dist/automaton.wasm
+node scripts/render-release-manifest.mjs --mode dry-run --output tmp/release-manifest.json
+```
 
 Manual example:
 
@@ -134,16 +161,17 @@ set +a
 bash ./scripts/deploy-playground-release.sh --manifest /path/to/release-manifest.json
 ```
 
-If `GHCR_USERNAME` and `GHCR_TOKEN` are exported, the deploy script logs into `ghcr.io` before pulling the exact image digests from the manifest.
+If `GHCR_USERNAME` and `GHCR_TOKEN` are exported, the soft/hard deploy script
+logs into `ghcr.io` before pulling the exact image digests from the manifest.
 
 The script records each applied manifest under `PLAYGROUND_RELEASES_DIR` and keeps `current.json` there as the latest deployed manifest.
 
-If you want to publish the runtime images without touching the VPS, use the GitHub Actions workflow [`Publish Playground Images`](../../.github/workflows/publish-playground-images.yml). It pushes the `web`, `indexer`, and `rpc-gateway` images to GHCR and uploads:
+If you want to publish a release without touching the VPS, use [`Publish Atomic Playground Release`](../../.github/workflows/publish-playground-images.yml). Its single bundle is the source of truth for all three image refs and both Wasm artifacts.
 
-- `playground-image-manifest`
-- `playground-image-refs`
-
-Those artifacts are the source of truth for the digest-pinned `PLAYGROUND_WEB_IMAGE`, `PLAYGROUND_INDEXER_IMAGE`, and `PLAYGROUND_RPC_GATEWAY_IMAGE` values used during VPS setup.
+Rollback is component-scoped: select a prior manifest and repeat only the
+requested action. Rolling back images does not admit a factory artifact or
+upgrade existing children; rolling back an admitted artifact does not change
+running containers or existing children.
 
 ## Notes
 

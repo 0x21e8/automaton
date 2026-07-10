@@ -86,9 +86,8 @@ Set at least these values before continuing:
 - `INDEXER_CORS_ALLOWED_ORIGINS`
 - `LOCAL_EVM_FORK_URL`
 - `PLAYGROUND_VPS_REPO_ROOT` is not in the env file; if you use a different repo path, update the `systemd` unit and GitHub Actions variable instead
-- `CHILD_WASM_PATH`
-- `CHILD_VERSION_COMMIT`
-- `PLAYGROUND_ENV_VERSION`
+- `PLAYGROUND_ENV_VERSION` for legacy/manual bootstrap only; release workflows
+  derive provenance from the manifest
 
 For manual bring-up before a VPS deploy, point the runtime images at immutable digest refs that were published by GitHub Actions:
 
@@ -96,12 +95,10 @@ For manual bring-up before a VPS deploy, point the runtime images at immutable d
 - `PLAYGROUND_INDEXER_IMAGE`
 - `PLAYGROUND_RPC_GATEWAY_IMAGE`
 
-The easiest source is the `Publish Playground Images` workflow in GitHub Actions. It pushes the `web`, `indexer`, and `rpc-gateway` images to GHCR and uploads:
-
-- `playground-image-manifest` for the exact digest refs
-- `playground-image-refs` for a ready-to-source `.env` fragment
-
-The deploy workflows call that same reusable workflow, so the image publish step and the deploy step stay in sync.
+Use the `Publish Atomic Playground Release` workflow in GitHub Actions. It
+publishes the three image digests and both canister Wasms from one commit, then
+uploads a single release bundle. Deploy workflows stage the source/ops archive
+from that bundle and verify its revision before running any action.
 
 Keep these Phase 5/10 defaults unchanged unless you have a reason to change the topology:
 
@@ -256,6 +253,17 @@ This is the first real environment initialization. It will:
 - wait for the loopback indexer and RPC gateway
 - run `scripts/playground-smoke.sh`
 - mark maintenance off only after smoke succeeds
+
+After bootstrap, normal operations use the explicit release workflows:
+
+- `Deploy Soft Playground Release`
+- `Deploy Hard Reset Playground Release`
+- `Admit Child Artifact`
+- `Upgrade Named Automaton`
+
+The first action is the normal public-service rollout. The other three are
+protected/manual actions with separate blast radii. Existing child automatons
+are never implicitly upgraded by a release or image rollback.
 
 ## 9. Validate over Tailscale first, then validate the public surface
 

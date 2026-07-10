@@ -1,41 +1,37 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "release": {
-    "mode": "hard-reset",
-    "gitCommit": "0123456789abcdef0123456789abcdef01234567",
+    "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
     "environmentVersion": "playground-0123456789ab",
-    "createdAt": "2026-03-26T21:00:00Z"
+    "createdAt": "2026-07-10T00:00:00Z"
   },
   "images": {
     "web": {
-      "repository": "ghcr.io/example/automaton-playground-web",
-      "tag": "0123456789abcdef0123456789abcdef01234567",
-      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-      "ref": "ghcr.io/example/automaton-playground-web@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      "ref": "ghcr.io/example/automaton-playground-web@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
     },
     "indexer": {
-      "repository": "ghcr.io/example/automaton-playground-indexer",
-      "tag": "0123456789abcdef0123456789abcdef01234567",
-      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-      "ref": "ghcr.io/example/automaton-playground-indexer@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+      "ref": "ghcr.io/example/automaton-playground-indexer@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
     },
     "rpcGateway": {
-      "repository": "ghcr.io/example/automaton-playground-rpc-gateway",
-      "tag": "0123456789abcdef0123456789abcdef01234567",
-      "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-      "ref": "ghcr.io/example/automaton-playground-rpc-gateway@sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      "ref": "ghcr.io/example/automaton-playground-rpc-gateway@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
     }
   },
-  "childArtifact": {
-    "url": "https://artifacts.example.com/ic-automaton/child-automaton-0123456789abcdef0123456789abcdef01234567.wasm.gz",
-    "fileName": "child-automaton-0123456789abcdef0123456789abcdef01234567.wasm.gz",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "versionCommit": "89abcdef0123456789abcdef0123456789abcdef"
+  "artifacts": {
+    "automatonWasm": {
+      "fileName": "automaton.wasm",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sourceCommit": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "factoryWasm": {
+      "fileName": "factory.wasm",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sourceCommit": "0123456789abcdef0123456789abcdef01234567"
+    }
   },
-  "fork": {
-    "chainId": 20260326,
-    "upstreamRpcUrlEnv": "LOCAL_EVM_FORK_URL",
-    "blockNumber": 31234567
+  "ops": {
+    "sourceCommit": "0123456789abcdef0123456789abcdef01234567"
   }
 }
-
