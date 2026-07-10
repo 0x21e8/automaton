@@ -115,6 +115,13 @@ for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
 callCanister("commit_artifact_upload");
 
 const healthOutput = callCanister("get_factory_health");
+const expectedHealthSha256 = process.env.FACTORY_EXPECTED_SHA256 ?? expectedSha256;
+const expectedHealthVersion = process.env.FACTORY_EXPECTED_VERSION_COMMIT ?? versionCommit;
+if (!healthOutput.includes(expectedHealthSha256) || !healthOutput.includes(expectedHealthVersion)) {
+  throw new Error(
+    `factory health did not report the admitted artifact ${expectedHealthSha256} at ${expectedHealthVersion}`
+  );
+}
 
 const summary = {
   canister,

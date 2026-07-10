@@ -1,396 +1,179 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 PLAYGROUND_ENV_FILE=${PLAYGROUND_ENV_FILE:-/etc/automaton-playground/playground.env}
 PLAYGROUND_COMPOSE_FILE=${PLAYGROUND_COMPOSE_FILE:-"$ROOT_DIR/ops/playground/docker-compose.yml"}
+PLAYGROUND_STATE_DIR=${PLAYGROUND_STATE_DIR:-"$ROOT_DIR/tmp"}
+PLAYGROUND_RELEASES_DIR=${PLAYGROUND_RELEASES_DIR:-"$PLAYGROUND_STATE_DIR/releases"}
+PLAYGROUND_ARTIFACTS_DIR=${PLAYGROUND_ARTIFACTS_DIR:-"$PLAYGROUND_STATE_DIR/artifacts"}
 MANIFEST_PATH=""
-MODE_OVERRIDE=""
+MODE=""
+NAMED_CANISTER_ID=""
+REQUIRE_STAGED_SOURCE=0
 
 usage() {
-  cat <<'EOF' >&2
-Usage: scripts/deploy-playground-release.sh --manifest <path> [--mode soft|hard-reset]
+  cat >&2 <<'EOF'
+Usage: scripts/deploy-playground-release.sh --manifest <path> --mode <soft|hard-reset|admit-child|upgrade-named> [options]
+
+Options:
+  --canister-id <principal>  Required for --mode upgrade-named.
+  --require-staged-source    Require source-commit.txt beside the staged runner.
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --manifest)
-      MANIFEST_PATH=${2:-}
-      shift 2
-      ;;
-    --mode)
-      MODE_OVERRIDE=${2:-}
-      shift 2
-      ;;
-    --help|-h)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Unknown argument: $1" >&2
-      usage
-      exit 1
-      ;;
+    --manifest) MANIFEST_PATH=${2:-}; shift 2 ;;
+    --mode) MODE=${2:-}; shift 2 ;;
+    --canister-id) NAMED_CANISTER_ID=${2:-}; shift 2 ;;
+    --require-staged-source) REQUIRE_STAGED_SOURCE=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
   esac
 done
 
-if [ -z "$MANIFEST_PATH" ]; then
-  echo "--manifest is required" >&2
-  usage
-  exit 1
-fi
+[ -n "$MANIFEST_PATH" ] || { echo "--manifest is required" >&2; usage; exit 1; }
+[ -n "$MODE" ] || { echo "--mode is required; deployment action is never read from the manifest" >&2; usage; exit 1; }
+case "$MODE" in soft|hard-reset|admit-child|upgrade-named) ;; *) echo "unsupported mode: $MODE" >&2; exit 1 ;; esac
+[ -f "$MANIFEST_PATH" ] || { echo "Release manifest not found: $MANIFEST_PATH" >&2; exit 1; }
+[ -f "$PLAYGROUND_ENV_FILE" ] || { echo "Playground env file not found: $PLAYGROUND_ENV_FILE" >&2; exit 1; }
 
-if [ ! -f "$MANIFEST_PATH" ]; then
-  echo "Release manifest not found: $MANIFEST_PATH" >&2
-  exit 1
-fi
-
-if [ ! -f "$PLAYGROUND_ENV_FILE" ]; then
-  echo "Playground env file not found: $PLAYGROUND_ENV_FILE" >&2
-  exit 1
-fi
-
-if [ ! -f "$PLAYGROUND_COMPOSE_FILE" ]; then
-  echo "Compose file not found: $PLAYGROUND_COMPOSE_FILE" >&2
-  exit 1
-fi
-
-require_command() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "Missing required command: $1" >&2
-    exit 1
-  fi
-}
-
+require_command() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; exit 1; }; }
 require_command bash
-require_command curl
-require_command docker
 require_command node
 require_command sha256sum
-
-run_with_repo_node() {
-  sh "$ROOT_DIR/scripts/with-repo-node.sh" "$@"
-}
+require_command icp
+if [ "$MODE" = soft ] || [ "$MODE" = hard-reset ]; then
+  require_command curl
+  require_command docker
+  [ -f "$PLAYGROUND_COMPOSE_FILE" ] || { echo "Compose file not found: $PLAYGROUND_COMPOSE_FILE" >&2; exit 1; }
+fi
 
 set -a
 . "$PLAYGROUND_ENV_FILE"
 set +a
 
-PLAYGROUND_STATE_DIR=${PLAYGROUND_STATE_DIR:-"$ROOT_DIR/tmp"}
-PLAYGROUND_RELEASES_DIR=${PLAYGROUND_RELEASES_DIR:-"$PLAYGROUND_STATE_DIR/releases"}
-PLAYGROUND_ARTIFACTS_DIR=${PLAYGROUND_ARTIFACTS_DIR:-"$PLAYGROUND_STATE_DIR/artifacts"}
-PLAYGROUND_INDEXER_BASE_URL=${PLAYGROUND_INDEXER_BASE_URL:-http://127.0.0.1:${PLAYGROUND_INDEXER_PORT:-3001}}
-PLAYGROUND_RPC_GATEWAY_URL=${PLAYGROUND_RPC_GATEWAY_URL:-http://127.0.0.1:${PLAYGROUND_RPC_GATEWAY_PORT:-3002}}
-
 mkdir -p "$PLAYGROUND_RELEASES_DIR" "$PLAYGROUND_ARTIFACTS_DIR"
-
 manifest_env_file=$(mktemp)
-artifact_download_tmp=""
-cleanup() {
-  rm -f "$manifest_env_file"
-  if [ -n "$artifact_download_tmp" ]; then
-    rm -f "$artifact_download_tmp"
-  fi
-}
+cleanup() { rm -f "$manifest_env_file"; }
 trap cleanup EXIT
 
-run_with_repo_node node --input-type=module - "$MANIFEST_PATH" "$MODE_OVERRIDE" >"$manifest_env_file" <<'NODE'
+sh "$ROOT_DIR/scripts/with-repo-node.sh" node --input-type=module - "$MANIFEST_PATH" "$ROOT_DIR" "$REQUIRE_STAGED_SOURCE" >"$manifest_env_file" <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
+const { readReleaseManifest } = await import(new URL(`file://${rootDir}/scripts/lib/release-manifest.mjs`).href);
 
-const [manifestPath, modeOverride] = process.argv.slice(2);
-const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-
-function fail(message) {
-  console.error(message);
-  process.exit(1);
-}
-
-function shellQuote(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
-
-function printAssignment(key, value) {
-  console.log(`${key}=${shellQuote(value ?? "")}`);
-}
-
-function requireObject(value, label) {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    fail(`${label} must be an object`);
+const [manifestPath, rootDir, requireStaged] = process.argv.slice(2);
+const manifest = readReleaseManifest(manifestPath);
+const sourceRevisionPath = path.join(rootDir, "source-commit.txt");
+if (requireStaged === "1") {
+  if (!fs.existsSync(sourceRevisionPath)) throw new Error(`missing staged source revision ${sourceRevisionPath}`);
+  const revision = fs.readFileSync(sourceRevisionPath, "utf8").trim();
+  if (revision !== manifest.release.sourceCommit || revision !== manifest.ops.sourceCommit) {
+    throw new Error("staged runner revision does not match release.sourceCommit and ops.sourceCommit");
   }
-  return value;
 }
-
-function requireString(value, label, options = {}) {
-  if (typeof value !== "string" || value.trim() === "") {
-    fail(`${label} must be a non-empty string`);
-  }
-  const normalized = value.trim();
-  if (options.pattern && !options.pattern.test(normalized)) {
-    fail(`${label} is invalid: ${JSON.stringify(value)}`);
-  }
-  return normalized;
-}
-
-function optionalString(value) {
-  if (value === undefined || value === null) {
-    return "";
-  }
-  return String(value).trim();
-}
-
-function optionalIntegerString(value, label) {
-  if (value === undefined || value === null || String(value).trim() === "") {
-    return "";
-  }
-  const normalized = String(value).trim();
-  if (!/^\d+$/.test(normalized)) {
-    fail(`${label} must be an integer string or number`);
-  }
-  return normalized;
-}
-
-const release = requireObject(manifest.release, "release");
-const images = requireObject(manifest.images, "images");
-const childArtifact = requireObject(manifest.childArtifact, "childArtifact");
-const fork = requireObject(manifest.fork, "fork");
-
-const mode = (modeOverride || release.mode || "").trim();
-if (!["soft", "hard-reset"].includes(mode)) {
-  fail(`release.mode must be "soft" or "hard-reset"; received ${JSON.stringify(mode || release.mode)}`);
-}
-
-const gitCommit = requireString(release.gitCommit, "release.gitCommit", {
-  pattern: /^[0-9a-f]{40}$/
-});
-const environmentVersion = requireString(
-  release.environmentVersion ?? gitCommit,
-  "release.environmentVersion"
-);
-
-function validateImage(name) {
-  const image = requireObject(images[name], `images.${name}`);
-  const repository = requireString(image.repository, `images.${name}.repository`);
-  const tag = requireString(image.tag, `images.${name}.tag`);
-  const digest = requireString(image.digest, `images.${name}.digest`, {
-    pattern: /^sha256:[a-f0-9]{64}$/
-  });
-  const ref = requireString(image.ref, `images.${name}.ref`);
-  const expectedRef = `${repository}@${digest}`;
-  if (ref !== expectedRef) {
-    fail(`images.${name}.ref must match ${JSON.stringify(expectedRef)}`);
-  }
-  return {
-    repository,
-    tag,
-    digest,
-    ref
-  };
-}
-
-const webImage = validateImage("web");
-const indexerImage = validateImage("indexer");
-const rpcGatewayImage = validateImage("rpcGateway");
-
-const childVersionCommit = requireString(childArtifact.versionCommit, "childArtifact.versionCommit", {
-  pattern: /^[0-9a-f]{40}$/
-});
-const childSha256 = requireString(childArtifact.sha256, "childArtifact.sha256", {
-  pattern: /^[a-f0-9]{64}$/
-});
-const childUrl = optionalString(childArtifact.url);
-const childPath = optionalString(childArtifact.path);
-const childFileName =
-  optionalString(childArtifact.fileName) ||
-  (childUrl !== "" ? path.basename(new URL(childUrl).pathname) : "") ||
-  (childPath !== "" ? path.basename(childPath) : "");
-
-if (childUrl === "" && childPath === "") {
-  fail("childArtifact.url or childArtifact.path must be set");
-}
-
-const chainId = Number.parseInt(
-  requireString(String(fork.chainId ?? ""), "fork.chainId", { pattern: /^\d+$/ }),
-  10
-);
-const forkBlockNumber = optionalIntegerString(fork.blockNumber, "fork.blockNumber");
-
-printAssignment("RELEASE_MODE", mode);
-printAssignment("RELEASE_GIT_COMMIT", gitCommit);
-printAssignment("PLAYGROUND_ENV_VERSION", environmentVersion);
-printAssignment("PLAYGROUND_CHAIN_ID", String(chainId));
-printAssignment("PLAYGROUND_WEB_IMAGE", webImage.ref);
-printAssignment("PLAYGROUND_INDEXER_IMAGE", indexerImage.ref);
-printAssignment("PLAYGROUND_RPC_GATEWAY_IMAGE", rpcGatewayImage.ref);
-printAssignment("CHILD_VERSION_COMMIT", childVersionCommit);
-printAssignment("CHILD_ARTIFACT_SHA256", childSha256);
-printAssignment("CHILD_ARTIFACT_URL", childUrl);
-printAssignment("CHILD_ARTIFACT_FILE_NAME", childFileName);
-printAssignment("CHILD_ARTIFACT_PATH", childPath);
-printAssignment("LOCAL_EVM_FORK_BLOCK_NUMBER", forkBlockNumber);
+const bundleDir = process.env.PLAYGROUND_RELEASE_BUNDLE_DIR?.trim() || rootDir;
+const quote = (value) => `'${String(value).replaceAll("'", `'\\''`)}'`;
+const assign = (key, value) => console.log(`${key}=${quote(value)}`);
+assign("RELEASE_SOURCE_COMMIT", manifest.release.sourceCommit);
+assign("PLAYGROUND_ENV_VERSION", manifest.release.environmentVersion);
+assign("PLAYGROUND_WEB_IMAGE", manifest.images.web.ref);
+assign("PLAYGROUND_INDEXER_IMAGE", manifest.images.indexer.ref);
+assign("PLAYGROUND_RPC_GATEWAY_IMAGE", manifest.images.rpcGateway.ref);
+assign("CHILD_VERSION_COMMIT", manifest.artifacts.automatonWasm.sourceCommit);
+assign("CHILD_ARTIFACT_SHA256", manifest.artifacts.automatonWasm.sha256);
+assign("CHILD_WASM_PATH", path.join(bundleDir, manifest.artifacts.automatonWasm.fileName));
+assign("PLAYGROUND_FACTORY_WASM_PATH", path.join(bundleDir, manifest.artifacts.factoryWasm.fileName));
+assign("FACTORY_ARTIFACT_SHA256", manifest.artifacts.factoryWasm.sha256);
 NODE
 
 set -a
 . "$manifest_env_file"
 set +a
+export CHILD_WASM_PATH PLAYGROUND_FACTORY_WASM_PATH
 
-if [ -z "${CHILD_ARTIFACT_FILE_NAME:-}" ]; then
-  CHILD_ARTIFACT_FILE_NAME="child-${CHILD_VERSION_COMMIT}.wasm.gz"
-fi
+verify_artifact() {
+  local expected="$1" path="$2"
+  [ -f "$path" ] || { echo "release artifact missing: $path" >&2; exit 1; }
+  printf '%s  %s\n' "$expected" "$path" | sha256sum -c >/dev/null
+}
+verify_artifact "$CHILD_ARTIFACT_SHA256" "$CHILD_WASM_PATH"
+verify_artifact "$FACTORY_ARTIFACT_SHA256" "$PLAYGROUND_FACTORY_WASM_PATH"
 
-if [ -z "${CHILD_WASM_PATH:-}" ]; then
-  CHILD_WASM_PATH="$PLAYGROUND_ARTIFACTS_DIR/$CHILD_ARTIFACT_FILE_NAME"
-fi
-export CHILD_WASM_PATH
-
-if [ -n "${CHILD_ARTIFACT_URL:-}" ]; then
-  artifact_download_tmp="${CHILD_WASM_PATH}.download"
-  curl -LfsS "$CHILD_ARTIFACT_URL" -o "$artifact_download_tmp"
-  printf '%s  %s\n' "$CHILD_ARTIFACT_SHA256" "$artifact_download_tmp" | sha256sum -c >/dev/null
-  mv "$artifact_download_tmp" "$CHILD_WASM_PATH"
-  artifact_download_tmp=""
-elif [ -n "${CHILD_ARTIFACT_PATH:-}" ]; then
-  CHILD_WASM_PATH="$CHILD_ARTIFACT_PATH"
-  export CHILD_WASM_PATH
-fi
-
-if [ ! -f "$CHILD_WASM_PATH" ]; then
-  echo "Child artifact file not found: $CHILD_WASM_PATH" >&2
-  exit 1
-fi
-
-printf '%s  %s\n' "$CHILD_ARTIFACT_SHA256" "$CHILD_WASM_PATH" | sha256sum -c >/dev/null
-
-if [ -n "${GHCR_USERNAME:-}" ] && [ -n "${GHCR_TOKEN:-}" ]; then
+if [ -n "${GHCR_USERNAME:-}" ] && [ -n "${GHCR_TOKEN:-}" ] && { [ "$MODE" = soft ] || [ "$MODE" = hard-reset ]; }; then
   printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin >/dev/null
 fi
 
-compose() {
-  docker compose -f "$PLAYGROUND_COMPOSE_FILE" "$@"
-}
-
+compose() { docker compose -f "$PLAYGROUND_COMPOSE_FILE" "$@"; }
 wait_for_http() {
-  local url="$1"
-  local label="$2"
-  local attempts="${3:-60}"
-  local index=0
-
+  local url="$1" label="$2" attempts="${3:-60}" index=0
   while [ "$index" -lt "$attempts" ]; do
-    if curl -fsS "$url" >/dev/null 2>&1; then
-      return 0
-    fi
-
-    index=$((index + 1))
-    sleep 1
+    curl -fsS "$url" >/dev/null 2>&1 && return 0
+    index=$((index + 1)); sleep 1
   done
-
-  echo "$label did not become ready at $url" >&2
-  return 1
+  echo "$label did not become ready at $url" >&2; return 1
 }
-
-rpc_chain_id() {
-  run_with_repo_node node -e '
-    const url = process.argv[1];
-    fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] })
-    })
-      .then(async (response) => {
-        const body = await response.json();
-        if (!response.ok || body.error || typeof body.result !== "string") {
-          throw new Error(JSON.stringify(body));
-        }
-        process.stdout.write(body.result);
-      })
-      .catch((error) => {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exit(1);
-      });
-  ' "$1"
-}
-
-wait_for_rpc() {
-  local url="$1"
-  local label="$2"
-  local attempts="${3:-60}"
-  local index=0
-
-  while [ "$index" -lt "$attempts" ]; do
-    if rpc_chain_id "$url" >/dev/null 2>&1; then
-      return 0
-    fi
-
-    index=$((index + 1))
-    sleep 1
-  done
-
-  echo "$label did not become ready at $url" >&2
-  return 1
-}
-
-write_status() {
-  run_with_repo_node node "$ROOT_DIR/scripts/write-playground-status.mjs"
-}
-
+wait_for_rpc() { wait_for_http "$1" "$2"; }
 pull_release_images() {
   docker pull "$PLAYGROUND_WEB_IMAGE"
   docker pull "$PLAYGROUND_INDEXER_IMAGE"
   docker pull "$PLAYGROUND_RPC_GATEWAY_IMAGE"
-
-  if [ "$RELEASE_MODE" = "hard-reset" ] && [ -n "${PLAYGROUND_ANVIL_IMAGE:-}" ]; then
-    docker pull "$PLAYGROUND_ANVIL_IMAGE"
-  fi
 }
-
-update_runtime_services() {
-  compose up -d --force-recreate web rpc-gateway indexer
-}
-
-record_release_manifest() {
-  local timestamp
+update_runtime_services() { compose up -d --force-recreate web rpc-gateway indexer; }
+write_status() { sh "$ROOT_DIR/scripts/with-repo-node.sh" node "$ROOT_DIR/scripts/write-playground-status.mjs"; }
+record_release() {
+  local timestamp action_file
   timestamp=$(date -u +"%Y%m%dT%H%M%SZ")
-  local target_path="$PLAYGROUND_RELEASES_DIR/${timestamp}-${RELEASE_GIT_COMMIT}-${RELEASE_MODE}.json"
-  cp "$MANIFEST_PATH" "$target_path"
+  cp "$MANIFEST_PATH" "$PLAYGROUND_RELEASES_DIR/${timestamp}-${RELEASE_SOURCE_COMMIT}-${MODE}.json"
   cp "$MANIFEST_PATH" "$PLAYGROUND_RELEASES_DIR/current.json"
+  action_file="$PLAYGROUND_RELEASES_DIR/${timestamp}-${RELEASE_SOURCE_COMMIT}-${MODE}.action"
+  printf '%s\n' "$MODE" >"$action_file"
 }
 
 run_soft_deploy() {
+  pull_release_images
   update_runtime_services
-  wait_for_http "$PLAYGROUND_INDEXER_BASE_URL/health" "indexer"
-  wait_for_http "$PLAYGROUND_RPC_GATEWAY_URL/health" "rpc gateway"
-  wait_for_rpc "$PLAYGROUND_RPC_GATEWAY_URL" "rpc gateway"
+  wait_for_http "${PLAYGROUND_INDEXER_BASE_URL:-http://127.0.0.1:${PLAYGROUND_INDEXER_PORT:-3001}}/health" indexer
+  wait_for_http "${PLAYGROUND_RPC_GATEWAY_URL:-http://127.0.0.1:${PLAYGROUND_RPC_GATEWAY_PORT:-3002}}/health" rpc-gateway
   sh "$ROOT_DIR/scripts/playground-smoke.sh"
-  PLAYGROUND_STATUS_ENVIRONMENT_VERSION="$PLAYGROUND_ENV_VERSION" \
-  PLAYGROUND_STATUS_MAINTENANCE="false" \
-  PLAYGROUND_STATUS_UPDATED_AT="now" \
-    write_status >/dev/null
+  PLAYGROUND_STATUS_ENVIRONMENT_VERSION="$PLAYGROUND_ENV_VERSION" PLAYGROUND_STATUS_MAINTENANCE=false write_status >/dev/null
 }
 
-run_hard_reset_deploy() {
+run_hard_reset() {
+  pull_release_images
   update_runtime_services
-
   PLAYGROUND_ANVIL_RESET_COMMAND="docker compose -f '$PLAYGROUND_COMPOSE_FILE' up -d --force-recreate --no-deps anvil" \
     sh "$ROOT_DIR/scripts/playground-reset.sh"
 }
 
-pull_release_images
+run_admit_child() {
+  FACTORY_CANISTER="${PLAYGROUND_FACTORY_CANISTER:-factory}" \
+  FACTORY_ENVIRONMENT="${PLAYGROUND_ICP_ENVIRONMENT:-local}" \
+  CHILD_VERSION_COMMIT="$CHILD_VERSION_COMMIT" \
+  FACTORY_EXPECTED_SHA256="$CHILD_ARTIFACT_SHA256" \
+  FACTORY_EXPECTED_VERSION_COMMIT="$CHILD_VERSION_COMMIT" \
+  CHILD_WASM_PATH="$CHILD_WASM_PATH" \
+    sh "$ROOT_DIR/scripts/with-repo-node.sh" node "$ROOT_DIR/scripts/upload-factory-artifact.mjs"
+}
 
-case "$RELEASE_MODE" in
-  soft)
-    run_soft_deploy
-    ;;
-  hard-reset)
-    run_hard_reset_deploy
-    ;;
-  *)
-    echo "Unsupported release mode: $RELEASE_MODE" >&2
-    exit 1
-    ;;
+run_upgrade_named() {
+  [ -n "$NAMED_CANISTER_ID" ] || { echo "--canister-id is required for upgrade-named" >&2; exit 1; }
+  [ "${PLAYGROUND_UPGRADE_APPROVED:-0}" = 1 ] || { echo "PLAYGROUND_UPGRADE_APPROVED=1 is required" >&2; exit 1; }
+  pre="$PLAYGROUND_RELEASES_DIR/${RELEASE_SOURCE_COMMIT}-${NAMED_CANISTER_ID}.pre-upgrade.txt"
+  post="$PLAYGROUND_RELEASES_DIR/${RELEASE_SOURCE_COMMIT}-${NAMED_CANISTER_ID}.post-upgrade.txt"
+  icp canister call -e "${PLAYGROUND_ICP_ENVIRONMENT:-local}" "$NAMED_CANISTER_ID" get_runtime_view >"$pre"
+  icp canister install -e "${PLAYGROUND_ICP_ENVIRONMENT:-local}" "$NAMED_CANISTER_ID" --mode upgrade --wasm "$CHILD_WASM_PATH" --yes
+  icp canister call -e "${PLAYGROUND_ICP_ENVIRONMENT:-local}" "$NAMED_CANISTER_ID" get_runtime_view >"$post"
+  [ -s "$post" ] || { echo "post-upgrade verification returned no runtime view" >&2; exit 1; }
+}
+
+case "$MODE" in
+  soft) run_soft_deploy ;;
+  hard-reset) run_hard_reset ;;
+  admit-child) run_admit_child ;;
+  upgrade-named) run_upgrade_named ;;
 esac
-
-record_release_manifest
-
-printf '%s\n' "Deployed $RELEASE_MODE release $RELEASE_GIT_COMMIT"
+record_release
+printf 'Applied %s action for release %s\n' "$MODE" "$RELEASE_SOURCE_COMMIT"

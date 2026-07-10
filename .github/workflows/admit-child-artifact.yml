@@ -1,12 +1,12 @@
-name: Deploy Soft Playground Release
+name: Admit Child Artifact
 
 on:
-  push:
-    branches: [main]
-
-concurrency:
-  group: playground-vps-deploy
-  cancel-in-progress: false
+  workflow_dispatch:
+    inputs:
+      environment_version:
+        description: Optional release label.
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -15,9 +15,11 @@ permissions:
 jobs:
   build-release:
     uses: ./.github/workflows/publish-playground-images.yml
+    with:
+      environment_version: ${{ inputs.environment_version }}
     secrets: inherit
 
-  deploy:
+  admit:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: playground-vps
@@ -28,7 +30,6 @@ jobs:
         with:
           name: ${{ needs.build-release.outputs.release_artifact_name }}
           path: ${{ runner.temp }}/release
-
       - name: Prepare SSH files
         shell: bash
         env:
@@ -40,15 +41,12 @@ jobs:
           printf '%s\n' "$VPS_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           printf '%s\n' "$VPS_SSH_KEY" > "$HOME/.ssh/id_ed25519"
           chmod 600 "$HOME/.ssh/id_ed25519"
-
-      - name: Stage exact source and run soft action
+      - name: Stage exact source and admit only the child artifact
         shell: bash
         env:
           VPS_HOST: ${{ secrets.PLAYGROUND_VPS_HOST }}
           VPS_PORT: ${{ secrets.PLAYGROUND_VPS_PORT }}
           VPS_USER: ${{ secrets.PLAYGROUND_VPS_USER }}
-          GHCR_USERNAME: ${{ secrets.PLAYGROUND_GHCR_USERNAME }}
-          GHCR_TOKEN: ${{ secrets.PLAYGROUND_GHCR_TOKEN }}
           PLAYGROUND_ENV_FILE: /etc/automaton-playground/playground.env
           PLAYGROUND_STATE_DIR: /srv/automaton-playground/state
         run: |
@@ -60,4 +58,4 @@ jobs:
           ssh -p "$port" "$VPS_USER@$VPS_HOST" "rm -rf '$remote_bundle' '$state_root'; mkdir -p '$remote_bundle' '$state_root/source'"
           scp -P "$port" -r "$RUNNER_TEMP/release/." "$VPS_USER@$VPS_HOST:$remote_bundle/"
           ssh -p "$port" "$VPS_USER@$VPS_HOST" \
-            "set -euo pipefail; cd '$remote_bundle'; sha256sum -c source-ops.tar.gz.sha256; tar -xzf source-ops.tar.gz --strip-components=1 -C '$state_root/source'; cp release-manifest.json automaton.wasm factory.wasm automaton.wasm.sha256 factory.wasm.sha256 source-commit.txt '$state_root/'; cp source-commit.txt '$state_root/source/source-commit.txt'; PLAYGROUND_ENV_FILE='$PLAYGROUND_ENV_FILE' PLAYGROUND_RELEASE_BUNDLE_DIR='$state_root' PLAYGROUND_RELEASES_DIR='$PLAYGROUND_STATE_DIR/releases/applied' GHCR_USERNAME='${GHCR_USERNAME}' GHCR_TOKEN='${GHCR_TOKEN}' bash '$state_root/source/scripts/deploy-playground-release.sh' --manifest '$state_root/release-manifest.json' --mode soft --require-staged-source; rm -rf '$remote_bundle'"
+            "set -euo pipefail; cd '$remote_bundle'; sha256sum -c source-ops.tar.gz.sha256; tar -xzf source-ops.tar.gz --strip-components=1 -C '$state_root/source'; cp release-manifest.json automaton.wasm factory.wasm automaton.wasm.sha256 factory.wasm.sha256 source-commit.txt '$state_root/'; cp source-commit.txt '$state_root/source/source-commit.txt'; PLAYGROUND_ENV_FILE='$PLAYGROUND_ENV_FILE' PLAYGROUND_RELEASE_BUNDLE_DIR='$state_root' PLAYGROUND_RELEASES_DIR='$PLAYGROUND_STATE_DIR/releases/applied' bash '$state_root/source/scripts/deploy-playground-release.sh' --manifest '$state_root/release-manifest.json' --mode admit-child --require-staged-source; rm -rf '$remote_bundle'"

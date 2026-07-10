@@ -54,6 +54,7 @@ PLAYGROUND_FAUCET_MAX_CLAIMS_PER_IP=${PLAYGROUND_FAUCET_MAX_CLAIMS_PER_IP:-20}
 PLAYGROUND_BOOTSTRAP_SEED_WALLET=${PLAYGROUND_BOOTSTRAP_SEED_WALLET:-1}
 PLAYGROUND_BOOTSTRAP_SEED_OUTPUT_FILE=${PLAYGROUND_BOOTSTRAP_SEED_OUTPUT_FILE:-"$TMP_DIR/playground-bootstrap-seed.json"}
 PLAYGROUND_BUILD_CHILD_ARTIFACT=${PLAYGROUND_BUILD_CHILD_ARTIFACT:-1}
+PLAYGROUND_FACTORY_WASM_PATH=${PLAYGROUND_FACTORY_WASM_PATH:-}
 
 CHILD_WASM_PATH=${CHILD_WASM_PATH:-}
 CHILD_VERSION_COMMIT=${CHILD_VERSION_COMMIT:-${PLAYGROUND_ENV_VERSION:-}}
@@ -331,11 +332,18 @@ deploy_factory() {
   AUTOMATON_COMPONENT_ROOT="$AUTOMATON_COMPONENT_ROOT" \
     run_with_repo_node node "$ROOT_DIR/scripts/validate-child-canister-interface.mjs"
 
-  FACTORY_VERSION_COMMIT="$CHILD_VERSION_COMMIT" \
-  FACTORY_CHILD_EVM_CHAIN_ID="$PLAYGROUND_CHAIN_ID" \
-  FACTORY_CHILD_EVM_RPC_URL="$LOCAL_EVM_RPC_URL" \
-  FACTORY_BASE_RPC_ENDPOINT="${FACTORY_BASE_RPC_ENDPOINT:-$LOCAL_EVM_RPC_URL}" \
-    icp --project-root-override "$ROOT_DIR" build
+  if [ -n "$PLAYGROUND_FACTORY_WASM_PATH" ]; then
+    if [ ! -f "$PLAYGROUND_FACTORY_WASM_PATH" ]; then
+      echo "PLAYGROUND_FACTORY_WASM_PATH does not exist: $PLAYGROUND_FACTORY_WASM_PATH" >&2
+      return 1
+    fi
+  else
+    FACTORY_VERSION_COMMIT="$CHILD_VERSION_COMMIT" \
+    FACTORY_CHILD_EVM_CHAIN_ID="$PLAYGROUND_CHAIN_ID" \
+    FACTORY_CHILD_EVM_RPC_URL="$LOCAL_EVM_RPC_URL" \
+    FACTORY_BASE_RPC_ENDPOINT="${FACTORY_BASE_RPC_ENDPOINT:-$LOCAL_EVM_RPC_URL}" \
+      icp --project-root-override "$ROOT_DIR" build
+  fi
 
   if ! icp --project-root-override "$ROOT_DIR" canister create "$PLAYGROUND_FACTORY_CANISTER" -e "$PLAYGROUND_ICP_ENVIRONMENT" >/dev/null 2>&1; then
     :
@@ -350,7 +358,13 @@ deploy_factory() {
       run_with_repo_node node "$ROOT_DIR/scripts/render-factory-local-init-args.mjs"
   )
 
-  icp --project-root-override "$ROOT_DIR" canister install "$PLAYGROUND_FACTORY_CANISTER" -e "$PLAYGROUND_ICP_ENVIRONMENT" --mode reinstall --args "$init_args"
+  if [ -n "$PLAYGROUND_FACTORY_WASM_PATH" ]; then
+    icp --project-root-override "$ROOT_DIR" canister install "$PLAYGROUND_FACTORY_CANISTER" \
+      -e "$PLAYGROUND_ICP_ENVIRONMENT" --mode reinstall --wasm "$PLAYGROUND_FACTORY_WASM_PATH" --args "$init_args"
+  else
+    icp --project-root-override "$ROOT_DIR" canister install "$PLAYGROUND_FACTORY_CANISTER" \
+      -e "$PLAYGROUND_ICP_ENVIRONMENT" --mode reinstall --args "$init_args"
+  fi
 }
 
 reconcile_factory_runtime_config() {

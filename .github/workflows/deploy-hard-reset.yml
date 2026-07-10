@@ -1,26 +1,10 @@
-name: Deploy Hard Reset
+name: Deploy Hard Reset Playground Release
 
 on:
   workflow_dispatch:
     inputs:
       environment_version:
-        description: Optional release version shown in the playground UI.
-        required: false
-        type: string
-      child_wasm_url:
-        description: Optional override for the child Wasm artifact URL.
-        required: false
-        type: string
-      child_wasm_sha256:
-        description: Optional override for the child Wasm artifact sha256.
-        required: false
-        type: string
-      child_version_commit:
-        description: Optional override for the child artifact git commit.
-        required: false
-        type: string
-      fork_block_number:
-        description: Optional pinned Base fork block number.
+        description: Optional release label recorded in the manifest.
         required: false
         type: string
 
@@ -36,223 +20,50 @@ jobs:
   build-release:
     uses: ./.github/workflows/publish-playground-images.yml
     with:
-      environment_version: ${{ github.event.inputs.environment_version }}
+      environment_version: ${{ inputs.environment_version }}
     secrets: inherit
 
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: playground-vps
-    needs:
-      - build-release
-
+    needs: [build-release]
     steps:
-      - name: Render release manifest
-        shell: bash
-        env:
-          RELEASE_MODE: hard-reset
-          RELEASE_GIT_COMMIT: ${{ needs.build-release.outputs.git_commit }}
-          RELEASE_ENVIRONMENT_VERSION: ${{ needs.build-release.outputs.environment_version }}
-          PLAYGROUND_WEB_IMAGE: ${{ needs.build-release.outputs.web_image_ref }}
-          PLAYGROUND_INDEXER_IMAGE: ${{ needs.build-release.outputs.indexer_image_ref }}
-          PLAYGROUND_RPC_GATEWAY_IMAGE: ${{ needs.build-release.outputs.rpc_gateway_image_ref }}
-          INPUT_ENVIRONMENT_VERSION: ${{ github.event.inputs.environment_version }}
-          INPUT_CHILD_WASM_URL: ${{ github.event.inputs.child_wasm_url }}
-          INPUT_CHILD_WASM_SHA256: ${{ github.event.inputs.child_wasm_sha256 }}
-          INPUT_CHILD_VERSION_COMMIT: ${{ github.event.inputs.child_version_commit }}
-          INPUT_FORK_BLOCK_NUMBER: ${{ github.event.inputs.fork_block_number }}
-          DEFAULT_CHILD_WASM_URL: ${{ secrets.PLAYGROUND_CHILD_WASM_URL }}
-          DEFAULT_CHILD_WASM_SHA256: ${{ secrets.PLAYGROUND_CHILD_WASM_SHA256 }}
-          DEFAULT_CHILD_VERSION_COMMIT: ${{ secrets.PLAYGROUND_CHILD_VERSION_COMMIT }}
-          DEFAULT_FORK_BLOCK_NUMBER: ${{ vars.PLAYGROUND_FORK_BLOCK_NUMBER }}
-        run: |
-          set -euo pipefail
-          node --input-type=module - "$RUNNER_TEMP/release-manifest.json" <<'NODE'
-          import fs from "node:fs";
-          import path from "node:path";
-
-          const [manifestPath] = process.argv.slice(2);
-
-          function requireString(value, label) {
-            if (typeof value !== "string" || value.trim() === "") {
-              throw new Error(`${label} is required`);
-            }
-            return value.trim();
-          }
-
-          function parseImageRef(value, label) {
-            const ref = requireString(value, label);
-            const atIndex = ref.lastIndexOf("@");
-            if (atIndex <= 0 || atIndex === ref.length - 1) {
-              throw new Error(`${label} must be an immutable digest ref`);
-            }
-            const repository = ref.slice(0, atIndex);
-            const digest = ref.slice(atIndex + 1);
-            if (!digest.startsWith("sha256:")) {
-              throw new Error(`${label} must use a sha256 digest`);
-            }
-            return { repository, digest, ref };
-          }
-
-          function resolveValue(inputValue, defaultValue) {
-            return typeof inputValue === "string" && inputValue.trim() !== ""
-              ? inputValue.trim()
-              : typeof defaultValue === "string"
-                ? defaultValue.trim()
-                : "";
-          }
-
-          const gitCommit = requireString(process.env.RELEASE_GIT_COMMIT, "RELEASE_GIT_COMMIT");
-          const environmentVersion =
-            resolveValue(process.env.INPUT_ENVIRONMENT_VERSION, process.env.RELEASE_ENVIRONMENT_VERSION) ||
-            `playground-${gitCommit.slice(0, 12)}`;
-          const webImage = parseImageRef(process.env.PLAYGROUND_WEB_IMAGE, "PLAYGROUND_WEB_IMAGE");
-          const indexerImage = parseImageRef(
-            process.env.PLAYGROUND_INDEXER_IMAGE,
-            "PLAYGROUND_INDEXER_IMAGE"
-          );
-          const rpcGatewayImage = parseImageRef(
-            process.env.PLAYGROUND_RPC_GATEWAY_IMAGE,
-            "PLAYGROUND_RPC_GATEWAY_IMAGE"
-          );
-
-          const childWasmUrl = resolveValue(
-            process.env.INPUT_CHILD_WASM_URL,
-            process.env.DEFAULT_CHILD_WASM_URL
-          );
-          const childWasmSha256 = resolveValue(
-            process.env.INPUT_CHILD_WASM_SHA256,
-            process.env.DEFAULT_CHILD_WASM_SHA256
-          );
-          const childVersionCommit = resolveValue(
-            process.env.INPUT_CHILD_VERSION_COMMIT,
-            process.env.DEFAULT_CHILD_VERSION_COMMIT
-          );
-
-          if (!childWasmUrl || !childWasmSha256 || !childVersionCommit) {
-            throw new Error("child artifact URL, sha256, and version commit are required for hard-reset deploys");
-          }
-
-          const forkBlockNumberValue = resolveValue(
-            process.env.INPUT_FORK_BLOCK_NUMBER,
-            process.env.DEFAULT_FORK_BLOCK_NUMBER
-          );
-          const forkBlockNumber =
-            forkBlockNumberValue === "" ? null : Number.parseInt(forkBlockNumberValue, 10);
-
-          const manifest = {
-            schemaVersion: 1,
-            release: {
-              mode: process.env.RELEASE_MODE?.trim() || "hard-reset",
-              gitCommit,
-              environmentVersion,
-              createdAt: new Date().toISOString()
-            },
-            images: {
-              web: {
-                repository: webImage.repository,
-                tag: gitCommit,
-                digest: webImage.digest,
-                ref: webImage.ref
-              },
-              indexer: {
-                repository: indexerImage.repository,
-                tag: gitCommit,
-                digest: indexerImage.digest,
-                ref: indexerImage.ref
-              },
-              rpcGateway: {
-                repository: rpcGatewayImage.repository,
-                tag: gitCommit,
-                digest: rpcGatewayImage.digest,
-                ref: rpcGatewayImage.ref
-              }
-            },
-            childArtifact: {
-              url: childWasmUrl,
-              fileName: path.basename(new URL(childWasmUrl).pathname),
-              sha256: childWasmSha256,
-              versionCommit: childVersionCommit
-            },
-            fork: {
-              chainId: 20260326,
-              upstreamRpcUrlEnv: "LOCAL_EVM_FORK_URL",
-              blockNumber: forkBlockNumber
-            }
-          };
-
-          fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-          NODE
-
-      - name: Install Tailscale
-        if: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-      - name: Join Tailnet
-        if: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY != '' }}
-        shell: bash
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY }}
-        run: |
-          set -euo pipefail
-          sudo tailscale up \
-            --authkey="$TAILSCALE_AUTHKEY" \
-            --hostname="gha-playground-${GITHUB_RUN_ID}" \
-            --accept-routes=false \
-            --ssh=false
-          tailscale status
+      - name: Download immutable release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-release.outputs.release_artifact_name }}
+          path: ${{ runner.temp }}/release
 
       - name: Prepare SSH files
         shell: bash
         env:
           VPS_KNOWN_HOSTS: ${{ secrets.PLAYGROUND_VPS_KNOWN_HOSTS }}
           VPS_SSH_KEY: ${{ secrets.PLAYGROUND_VPS_SSH_KEY }}
-          GHCR_USERNAME: ${{ secrets.PLAYGROUND_GHCR_USERNAME }}
-          GHCR_TOKEN: ${{ secrets.PLAYGROUND_GHCR_TOKEN }}
-          PLAYGROUND_ENV_FILE: /etc/automaton-playground/playground.env
-          PLAYGROUND_VPS_REPO_ROOT: ${{ vars.PLAYGROUND_VPS_REPO_ROOT }}
         run: |
           set -euo pipefail
           install -d -m 700 "$HOME/.ssh"
-          printf '%s\n' "$VPS_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
-          printf '%s\n' "$VPS_SSH_KEY" >"$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          printf '%s\n' "$VPS_SSH_KEY" > "$HOME/.ssh/id_ed25519"
           chmod 600 "$HOME/.ssh/id_ed25519"
-          python3 - <<'PY' >"$RUNNER_TEMP/deploy.env"
-          import os, shlex
-          values = {
-              "GHCR_USERNAME": os.environ["GHCR_USERNAME"],
-              "GHCR_TOKEN": os.environ["GHCR_TOKEN"],
-              "PLAYGROUND_ENV_FILE": os.environ["PLAYGROUND_ENV_FILE"],
-              "PLAYGROUND_VPS_REPO_ROOT": os.environ.get("PLAYGROUND_VPS_REPO_ROOT", ""),
-          }
-          for key, value in values.items():
-              if value:
-                  print(f"{key}={shlex.quote(value)}")
-          PY
 
-      - name: Upload manifest and deploy
+      - name: Stage exact source and run hard-reset action
         shell: bash
         env:
           VPS_HOST: ${{ secrets.PLAYGROUND_VPS_HOST }}
           VPS_PORT: ${{ secrets.PLAYGROUND_VPS_PORT }}
           VPS_USER: ${{ secrets.PLAYGROUND_VPS_USER }}
+          GHCR_USERNAME: ${{ secrets.PLAYGROUND_GHCR_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.PLAYGROUND_GHCR_TOKEN }}
+          PLAYGROUND_ENV_FILE: /etc/automaton-playground/playground.env
+          PLAYGROUND_STATE_DIR: /srv/automaton-playground/state
         run: |
           set -euo pipefail
           port="${VPS_PORT:-22}"
-          repo_root="${PLAYGROUND_VPS_REPO_ROOT:-/srv/automaton-launchpad/current}"
-          remote_manifest="/tmp/automaton-playground-release-${GITHUB_SHA}.json"
-          remote_env="/tmp/automaton-playground-deploy-${GITHUB_RUN_ID}.env"
-          scp -P "$port" "$RUNNER_TEMP/release-manifest.json" "${VPS_USER}@${VPS_HOST}:${remote_manifest}"
-          scp -P "$port" "$RUNNER_TEMP/deploy.env" "${VPS_USER}@${VPS_HOST}:${remote_env}"
-          ssh -p "$port" "${VPS_USER}@${VPS_HOST}" \
-            "set -euo pipefail; . '${remote_env}'; repo_root=\${PLAYGROUND_VPS_REPO_ROOT:-${repo_root}}; bash \"\${repo_root}/scripts/deploy-playground-release.sh\" --manifest '${remote_manifest}'; rm -f '${remote_manifest}' '${remote_env}'"
-
-      - name: Leave Tailnet
-        if: ${{ always() && secrets.PLAYGROUND_TAILSCALE_AUTHKEY != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo tailscale logout || true
+          commit='${{ needs.build-release.outputs.git_commit }}'
+          remote_bundle="/tmp/automaton-release-${commit}"
+          state_root="${PLAYGROUND_STATE_DIR}/releases/staged-${commit}"
+          ssh -p "$port" "$VPS_USER@$VPS_HOST" "rm -rf '$remote_bundle' '$state_root'; mkdir -p '$remote_bundle' '$state_root/source'"
+          scp -P "$port" -r "$RUNNER_TEMP/release/." "$VPS_USER@$VPS_HOST:$remote_bundle/"
+          ssh -p "$port" "$VPS_USER@$VPS_HOST" \
+            "set -euo pipefail; cd '$remote_bundle'; sha256sum -c source-ops.tar.gz.sha256; tar -xzf source-ops.tar.gz --strip-components=1 -C '$state_root/source'; cp release-manifest.json automaton.wasm factory.wasm automaton.wasm.sha256 factory.wasm.sha256 source-commit.txt '$state_root/'; cp source-commit.txt '$state_root/source/source-commit.txt'; PLAYGROUND_ENV_FILE='$PLAYGROUND_ENV_FILE' PLAYGROUND_RELEASE_BUNDLE_DIR='$state_root' PLAYGROUND_RELEASES_DIR='$PLAYGROUND_STATE_DIR/releases/applied' GHCR_USERNAME='${GHCR_USERNAME}' GHCR_TOKEN='${GHCR_TOKEN}' bash '$state_root/source/scripts/deploy-playground-release.sh' --manifest '$state_root/release-manifest.json' --mode hard-reset --require-staged-source; rm -rf '$remote_bundle'"
