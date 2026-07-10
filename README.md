@@ -136,6 +136,21 @@ This starts:
 
 Open `http://127.0.0.1:5173`. The app works with an empty database — you get the full UI shell with an empty automaton list.
 
+### UI convergence checks
+
+The public Lab, certified direct console, and separate evaluator dashboard
+share generated tokens while keeping their deployment/access boundaries. Run
+the non-deploying appearance gates with:
+
+```bash
+npm run verify:ui-tokens
+npm run verify:terminal-parity
+npm run test:e2e:ui
+```
+
+The Playwright command starts the Lab and evaluator Vite servers on ports
+5173 and 4173 and checks desktop, tablet, and narrow-mobile Chromium layouts.
+
 ## Local Evaluation Harness
 
 The evaluation harness uses the full local playground plus a separate operator stack:

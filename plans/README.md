@@ -24,7 +24,7 @@ to the operator. Do not discard, overwrite, or silently absorb them.
 | 003 | Import ic-automaton as a behavior-preserving monorepo component | P1 | L | 001, 002 | DONE |
 | 004 | Canonicalize spawn contracts and strategy assets, then add a two-canister gate | P1 | L | 003 | DONE |
 | 005 | Build and deploy one atomic release from one revision | P1 | L | 004 | DONE |
-| 006 | Converge the public, direct-console, and evaluator appearance | P2 | L | 002, 003 | TODO |
+| 006 | Converge the public, direct-console, and evaluator appearance | P2 | L | 002, 003 | DONE |
 
 Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED: <reason>` |
 `REJECTED: <reason>`.
