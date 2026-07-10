@@ -60,6 +60,7 @@ use ic_cdk_timers::{clear_timer, set_timer_interval_serial, TimerId};
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
 use serde::Deserialize;
 use sha3::{Digest, Keccak256};
+use spawn_protocol::{InitArgs, SpawnBootstrapArgs, SpawnProviderBootstrapArgs};
 #[cfg(all(not(target_arch = "wasm32"), test))]
 use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
@@ -134,68 +135,6 @@ thread_local! {
 #[cfg(all(not(target_arch = "wasm32"), test))]
 thread_local! {
     static TEST_STEWARD_INGRESS_CALLER: RefCell<Option<Principal>> = const { RefCell::new(None) };
-}
-
-/// Arguments supplied once at canister creation via `dfx deploy --argument`.
-#[derive(CandidType, Deserialize)]
-struct InitArgs {
-    ecdsa_key_name: String,
-    #[serde(default)]
-    inbox_contract_address: Option<String>,
-    #[serde(default)]
-    evm_chain_id: Option<u64>,
-    #[serde(default)]
-    evm_rpc_url: Option<String>,
-    #[serde(default)]
-    evm_confirmation_depth: Option<u64>,
-    #[serde(default)]
-    evm_bootstrap_lookback_blocks: Option<u64>,
-    #[serde(default)]
-    http_allowed_domains: Option<Vec<String>>,
-    #[serde(default)]
-    llm_canister_id: Option<Principal>,
-    #[serde(default)]
-    search_api_key: Option<String>,
-    #[serde(default)]
-    inference_proxy_worker_base_url: Option<String>,
-    #[serde(default)]
-    inference_proxy_trusted_callback_principal: Option<Principal>,
-    #[serde(default)]
-    cycle_topup_enabled: Option<bool>,
-    #[serde(default)]
-    auto_topup_cycle_threshold: Option<u64>,
-    #[serde(default)]
-    spawn_bootstrap: Option<SpawnBootstrapArgs>,
-}
-
-#[derive(CandidType, Deserialize)]
-struct SpawnProviderBootstrapArgs {
-    #[serde(default)]
-    open_router_api_key: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    brave_search_api_key: Option<String>,
-    #[serde(default)]
-    inference_transport: InferenceTransport,
-    #[serde(default)]
-    open_router_reasoning_level: OpenRouterReasoningLevel,
-}
-
-#[derive(CandidType, Deserialize)]
-struct SpawnBootstrapArgs {
-    steward_address: String,
-    session_id: String,
-    #[serde(default)]
-    parent_id: Option<String>,
-    factory_principal: Principal,
-    risk: u8,
-    #[serde(default)]
-    strategies: Vec<String>,
-    #[serde(default)]
-    skills: Vec<String>,
-    provider: SpawnProviderBootstrapArgs,
-    version_commit: String,
 }
 
 /// Arguments for the `ingest_strategy_abi_artifact_admin` update call.

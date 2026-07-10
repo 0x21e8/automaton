@@ -16,6 +16,8 @@ use crate::timing;
 use candid::{CandidType, Principal};
 use serde::{Deserialize, Serialize};
 
+pub use spawn_protocol::{InferenceTransport, OpenRouterReasoningLevel, SpawnBootstrapView};
+
 /// Deserializes a `u64` from either a JSON number or a JSON string.
 ///
 /// Nanosecond timestamps exceed JavaScript's `Number.MAX_SAFE_INTEGER`, so the
@@ -1872,24 +1874,6 @@ pub struct RuntimeView {
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
-pub struct SpawnBootstrapView {
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub parent_id: Option<String>,
-    #[serde(default)]
-    pub factory_principal: Option<Principal>,
-    #[serde(default)]
-    pub risk: Option<u8>,
-    #[serde(default)]
-    pub strategies: Vec<String>,
-    #[serde(default)]
-    pub skills: Vec<String>,
-    #[serde(default)]
-    pub version_commit: Option<String>,
-}
-
-#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct RoomPollingState {
     #[serde(default)]
     pub configured: bool,
@@ -2308,27 +2292,6 @@ pub enum InferenceProvider {
 }
 
 /// Bootstrap-time transport selection for OpenRouter-backed inference.
-#[derive(
-    CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
-)]
-pub enum InferenceTransport {
-    #[default]
-    OpenrouterDirect,
-    OpenrouterProxyWorker,
-}
-
-/// Runtime reasoning-effort level used for OpenRouter requests.
-#[derive(
-    CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default,
-)]
-pub enum OpenRouterReasoningLevel {
-    #[default]
-    Default,
-    Low,
-    Medium,
-    High,
-}
-
 /// User-facing steward reasoning variants used by the signed HTTP command plane.
 #[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

@@ -4,6 +4,8 @@ use std::fmt::{Display, Formatter};
 use candid::{CandidType, Principal};
 use serde::{Deserialize, Serialize};
 
+pub use spawn_protocol::{InferenceTransport, OpenRouterReasoningLevel};
+
 pub const QUOTE_TERMS_HASH_FIELD: &str = "quoteTermsHash";
 pub const EXPIRES_AT_FIELD: &str = "expiresAt";
 pub const SESSION_ID_FIELD: &str = "sessionId";
@@ -92,22 +94,6 @@ pub enum SessionAuditActor {
     Admin,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
-pub enum InferenceTransport {
-    #[default]
-    OpenrouterDirect,
-    OpenrouterProxyWorker,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
-pub enum OpenRouterReasoningLevel {
-    #[default]
-    Default,
-    Low,
-    Medium,
-    High,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub model: Option<String>,
@@ -117,16 +103,7 @@ pub struct ProviderConfig {
     pub open_router_reasoning_level: OpenRouterReasoningLevel,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
-pub struct SpawnProviderBootstrapConfig {
-    pub open_router_api_key: Option<String>,
-    pub model: Option<String>,
-    pub brave_search_api_key: Option<String>,
-    #[serde(default)]
-    pub inference_transport: InferenceTransport,
-    #[serde(default)]
-    pub open_router_reasoning_level: OpenRouterReasoningLevel,
-}
+pub type SpawnProviderBootstrapConfig = spawn_protocol::SpawnProviderBootstrapArgs;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct SpawnProviderSecrets {
@@ -151,36 +128,8 @@ pub struct AutomatonChildRuntimeConfig {
     pub auto_topup_cycle_threshold: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
-pub struct AutomatonSpawnBootstrapArgs {
-    pub steward_address: String,
-    pub session_id: String,
-    pub parent_id: Option<String>,
-    pub factory_principal: Principal,
-    pub risk: u8,
-    pub strategies: Vec<String>,
-    pub skills: Vec<String>,
-    pub provider: SpawnProviderBootstrapConfig,
-    pub version_commit: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
-pub struct AutomatonChildInitArgs {
-    pub ecdsa_key_name: String,
-    pub inbox_contract_address: Option<String>,
-    pub evm_chain_id: Option<u64>,
-    pub evm_rpc_url: Option<String>,
-    pub evm_confirmation_depth: Option<u64>,
-    pub evm_bootstrap_lookback_blocks: Option<u64>,
-    pub http_allowed_domains: Option<Vec<String>>,
-    pub llm_canister_id: Option<Principal>,
-    pub search_api_key: Option<String>,
-    pub inference_proxy_worker_base_url: Option<String>,
-    pub inference_proxy_trusted_callback_principal: Option<Principal>,
-    pub cycle_topup_enabled: Option<bool>,
-    pub auto_topup_cycle_threshold: Option<u64>,
-    pub spawn_bootstrap: Option<AutomatonSpawnBootstrapArgs>,
-}
+pub type AutomatonSpawnBootstrapArgs = spawn_protocol::SpawnBootstrapArgs;
+pub type AutomatonChildInitArgs = spawn_protocol::InitArgs;
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct SpawnConfig {
