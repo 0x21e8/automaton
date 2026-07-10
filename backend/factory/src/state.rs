@@ -672,6 +672,9 @@ pub fn apply_factory_init_args(args: FactoryInitArgs, init_caller: Option<String
     }
     if let Some(child_runtime) = args.child_runtime {
         state.child_runtime = child_runtime;
+        if let Some(chain_id) = state.child_runtime.evm_chain_id {
+            state.release_broadcast_config.chain_id = chain_id;
+        }
     }
 
     state.pause = args.pause;

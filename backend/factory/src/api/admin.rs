@@ -56,6 +56,9 @@ pub fn set_release_broadcast_config(
     write_state(|state| -> Result<(), FactoryError> {
         ensure_admin_in_state(state, caller)?;
         state.release_broadcast_config = config.clone();
+        if state.child_runtime.evm_chain_id.is_some() {
+            state.child_runtime.evm_chain_id = Some(config.chain_id);
+        }
         Ok(())
     })?;
 
@@ -69,6 +72,9 @@ pub fn set_child_runtime_config(
     write_state(|state| -> Result<(), FactoryError> {
         ensure_admin_in_state(state, caller)?;
         state.child_runtime = config.clone();
+        if let Some(chain_id) = config.evm_chain_id {
+            state.release_broadcast_config.chain_id = chain_id;
+        }
         Ok(())
     })?;
 

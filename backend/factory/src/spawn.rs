@@ -14,7 +14,7 @@ use crate::evm::derive_child_evm_address_for_key_name;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::expiry::expire_spawn_session;
 #[cfg(target_arch = "wasm32")]
-use crate::init::build_automaton_install_args;
+use crate::init::{build_automaton_install_args, canonical_deployment_chain_id};
 use crate::init::{
     build_strategy_install_recipe, initialize_automaton, validate_automaton_child_runtime_config,
 };
@@ -851,7 +851,7 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             &runtime,
             &candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
                 .expect("test factory principal should parse"),
-            state.release_broadcast_config.chain_id,
+            child_runtime.evm_chain_id,
             &version_commit,
             now_ms,
         ));
@@ -1404,7 +1404,9 @@ pub async fn execute_spawn(
     });
     runtime.evm_address = expected_evm_address.clone();
     runtime.evm_address_derived_at.get_or_insert(started_at_ms);
-    let expected_child_chain_id = read_state(|state| state.release_broadcast_config.chain_id);
+    let expected_child_chain_id = read_state(|state| {
+        canonical_deployment_chain_id(&state.child_runtime, &state.release_broadcast_config)
+    })?;
     let verification_evidence = match load_spawned_automaton_bootstrap_evidence(&canister_id).await
     {
         Ok(evidence) => evidence,

@@ -431,12 +431,13 @@ mod tests {
         insert_spawned_automaton_record, list_messages_for_automaton, list_my_room_messages,
         list_repository_strategies, list_room_messages, list_spawned_automatons,
         load_spawn_provider_secrets, mark_session_failed, next_payment_scan_plan,
-        post_room_message, reconcile_escrow_payments, restore_state, retry_session_admin,
-        retry_spawn_session, revoke_repository_strategy, set_child_runtime_config,
-        set_creation_cost_quote, set_fee_config, set_mock_canister_balance, set_operational_config,
-        set_pause, set_release_broadcast_config, snapshot_state, update_artifact, write_state,
-        AddRepositoryStrategyRequest, AutomatonChildRuntimeConfig, CreateSpawnSessionRequest,
-        CreationCostQuote, DeprecateRepositoryStrategyRequest, FactoryError, FactoryInitArgs,
+        post_room_message, read_state, reconcile_escrow_payments, restore_state,
+        retry_session_admin, retry_spawn_session, revoke_repository_strategy,
+        set_child_runtime_config, set_creation_cost_quote, set_fee_config,
+        set_mock_canister_balance, set_operational_config, set_pause, set_release_broadcast_config,
+        snapshot_state, update_artifact, write_state, AddRepositoryStrategyRequest,
+        AutomatonChildRuntimeConfig, CreateSpawnSessionRequest, CreationCostQuote,
+        DeprecateRepositoryStrategyRequest, FactoryError, FactoryInitArgs,
         FactoryOperationalConfig, FactoryStateSnapshot, FeeConfig, PaymentStatus,
         PostRoomMessageRequest, ProviderConfig, ReleaseBroadcastConfig, RepositoryStrategyMetadata,
         RepositoryStrategySource, RevokeRepositoryStrategyRequest, RoomContentType,
@@ -653,7 +654,7 @@ mod tests {
         assert!(snapshot.admin_principals.contains("aaaaa-aa"));
         assert_eq!(snapshot.fee_config.usdc_fee, "7000000");
         assert_eq!(snapshot.creation_cost_quote.usdc_cost, "43000000");
-        assert_eq!(snapshot.release_broadcast_config.chain_id, 31_337);
+        assert_eq!(snapshot.release_broadcast_config.chain_id, 8_453);
         assert_eq!(snapshot.release_broadcast_config.max_fee_per_gas, 22);
         assert_eq!(snapshot.child_runtime, sample_child_runtime_config());
         assert!(snapshot.pause);
@@ -695,6 +696,48 @@ mod tests {
 
         assert_eq!(config.chain_id, 31_337);
         assert_eq!(snapshot.release_broadcast_config, config);
+    }
+
+    #[test]
+    fn changing_deployment_chain_updates_install_and_release_configuration() {
+        reset_factory_state();
+
+        let mut child_runtime = sample_child_runtime_config();
+        child_runtime.evm_chain_id = Some(31_337);
+        set_child_runtime_config("admin", child_runtime.clone())
+            .expect("child runtime chain should update");
+
+        let snapshot = get_factory_config("admin").expect("config should load");
+        assert_eq!(snapshot.child_runtime.evm_chain_id, Some(31_337));
+        assert_eq!(snapshot.release_broadcast_config.chain_id, 31_337);
+
+        let mut release_config = snapshot.release_broadcast_config;
+        release_config.max_fee_per_gas = 77;
+        release_config.chain_id = 8_453;
+        set_release_broadcast_config("admin", release_config)
+            .expect("release chain should update canonically");
+        let snapshot = get_factory_config("admin").expect("config should load");
+        assert_eq!(snapshot.child_runtime.evm_chain_id, Some(8_453));
+        assert_eq!(snapshot.release_broadcast_config.chain_id, 8_453);
+    }
+
+    #[test]
+    fn mismatched_deployment_chain_is_rejected_before_paid_spawn() {
+        reset_factory_state();
+        let child_runtime = sample_child_runtime_config();
+        write_state(|state| {
+            state.child_runtime = child_runtime;
+            state.release_broadcast_config.chain_id = 31_337;
+        });
+
+        let error = create_spawn_session(sample_request("60000000"), 1_700_000)
+            .expect_err("mismatched deployment chain must block session creation");
+        assert!(matches!(
+            error,
+            FactoryError::InvalidChildRuntimeConfig { ref field, .. }
+                if field == "child_runtime.evm_chain_id"
+        ));
+        assert!(read_state(|state| state.sessions.is_empty()));
     }
 
     #[test]
@@ -914,6 +957,7 @@ mod tests {
 
         write_state(|state| {
             state.child_runtime.evm_chain_id = Some(31_337);
+            state.release_broadcast_config.chain_id = 31_337;
         });
         let created = create_spawn_session(
             sample_request_with_strategies(

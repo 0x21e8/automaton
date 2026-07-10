@@ -3,9 +3,29 @@ use serde_json::Value;
 
 use crate::types::{
     AutomatonChildInitArgs, AutomatonChildRuntimeConfig, AutomatonRuntimeState,
-    AutomatonSpawnBootstrapArgs, FactoryError, RepositoryStrategySessionSnapshot,
-    SpawnProviderSecrets, SpawnSession,
+    AutomatonSpawnBootstrapArgs, FactoryError, ReleaseBroadcastConfig,
+    RepositoryStrategySessionSnapshot, SpawnProviderSecrets, SpawnSession,
 };
+
+pub fn canonical_deployment_chain_id(
+    child_runtime: &AutomatonChildRuntimeConfig,
+    release_broadcast: &ReleaseBroadcastConfig,
+) -> Result<u64, FactoryError> {
+    if let Some(child_chain_id) = child_runtime.evm_chain_id {
+        if child_chain_id != release_broadcast.chain_id {
+            return Err(FactoryError::InvalidChildRuntimeConfig {
+                field: "child_runtime.evm_chain_id".to_string(),
+                message: format!(
+                    "deployment chain {child_chain_id} does not match release broadcast chain {}",
+                    release_broadcast.chain_id
+                ),
+            });
+        }
+        return Ok(child_chain_id);
+    }
+
+    Ok(release_broadcast.chain_id)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedAutomatonChildRuntimeConfig {

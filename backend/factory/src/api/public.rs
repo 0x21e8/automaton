@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, Bound};
 
 use crate::escrow::{claim_escrow_refund, register_escrow_claim};
 use crate::expiry::expire_spawn_session;
+use crate::init::canonical_deployment_chain_id;
 use crate::retry::retry_failed_session;
 use crate::scheduler::enqueue_payment_poll;
 use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent};
@@ -314,6 +315,8 @@ pub(crate) fn create_spawn_session_with_session_id(
         if state.pause {
             return Err(FactoryError::FactoryPaused { pause: true });
         }
+
+        canonical_deployment_chain_id(&state.child_runtime, &state.release_broadcast_config)?;
 
         let selected_strategies = snapshot_selected_repository_strategies(state, &request, now_ms)?;
 
