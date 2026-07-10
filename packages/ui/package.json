@@ -1,0 +1,14 @@
+{
+  "name": "@ic-automaton/ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/generated/tokens.ts",
+      "import": "./src/generated/tokens.ts"
+    },
+    "./generated/themes.css": "./src/generated/themes.css"
+  },
+  "files": ["src"]
+}

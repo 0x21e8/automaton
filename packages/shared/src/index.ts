@@ -6,3 +6,4 @@ export * from "./catalog.js";
 export * from "./playground.js";
 export * from "./evaluation.js";
 export * from "./release.js";
+export * from "./terminal-commands.js";

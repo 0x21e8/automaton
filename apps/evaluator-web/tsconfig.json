@@ -7,6 +7,9 @@
     "paths": {
       "@ic-automaton/shared": [
         "packages/shared/src/index.ts"
+      ],
+      "@ic-automaton/ui": [
+        "packages/ui/src/generated/tokens.ts"
       ]
     },
     "jsx": "react-jsx",

@@ -1,0 +1,38 @@
+/* GENERATED FILE - DO NOT HAND-EDIT. Run npm run generate:ui-assets. */
+
+:root {
+  --ui-display: "Instrument Serif", Georgia, serif;
+  --ui-body: "Azeret Mono", "SFMono-Regular", monospace;
+  --ui-operator: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --ui-mono: "IBM Plex Mono", "SFMono-Regular", monospace;
+  --ui-2xs: 0.375rem;
+  --ui-xs: 0.75rem;
+  --ui-sm: 1rem;
+  --ui-md: 1.5rem;
+  --ui-lg: 2rem;
+  --ui-xl: 3rem;
+  --ui-2xl: 4.5rem;
+  --ui-hairline: 1px;
+  --ui-strong: 2px;
+  --ui-fast: 160ms;
+  --ui-base: 240ms;
+  --ui-reduced: 0ms;
+  --ui-success: #177245;
+  --ui-warning: #9a5b00;
+  --ui-critical: #b42318;
+  --ui-info: #185adb;
+  --ui-neutral: #6f665b;
+}
+:root {
+  --ui-background: #05070a;
+  --ui-panel: #0b1016;
+  --ui-panel-strong: #111923;
+  --ui-ink: #d8f3dc;
+  --ui-line: #2c4540;
+  --ui-accent: #7fffd4;
+  --ui-accent-soft: #14382f;
+  --ui-muted: #7f9b92;
+  --ui-muted-strong: #a8c4b9;
+  --ui-inverse: #000000;
+  --ui-focus: #ffd166;
+}

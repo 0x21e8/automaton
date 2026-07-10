@@ -1,6 +1,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 
+import "@ic-automaton/ui/generated/themes.css";
+
 import App from "./App";
 import "./styles.css";
 

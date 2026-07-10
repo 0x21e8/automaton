@@ -1,183 +1,26 @@
-export type CommandAuthLevel = "public" | "wallet" | "steward";
-export type CommandTransport = "local" | "query" | "wallet" | "steward_signed";
-export type CommandMode = "local" | "query" | "mutation";
+import {
+  findTerminalCommand,
+  terminalCommandRegistry,
+  type TerminalCommandAuthLevel,
+  type TerminalCommandDefinition,
+  type TerminalCommandMode,
+  type TerminalCommandTransport
+} from "@ic-automaton/shared";
 
-export interface CommandDefinition {
-  name: string;
-  usage: string;
-  summary: string;
-  authLevel: CommandAuthLevel;
-  transport: CommandTransport;
-  mode: CommandMode;
-}
-
-export interface CommandHelpRow extends CommandDefinition {
-  authLabel: string;
-}
-
-export const commandRegistry: CommandDefinition[] = [
-  {
-    name: "help",
-    usage: "help",
-    summary: "Show the terminal command reference.",
-    authLevel: "public",
-    transport: "local",
-    mode: "local"
-  },
-  {
-    name: "clear",
-    usage: "clear",
-    summary: "Clear the terminal output.",
-    authLevel: "public",
-    transport: "local",
-    mode: "local"
-  },
-  {
-    name: "code",
-    usage: "code",
-    summary: "Open the source repository reference.",
-    authLevel: "public",
-    transport: "local",
-    mode: "local"
-  },
-  {
-    name: "status",
-    usage: "status",
-    summary: "Show the selected automaton status.",
-    authLevel: "public",
-    transport: "query",
-    mode: "query"
-  },
-  {
-    name: "config",
-    usage: "config",
-    summary: "Show the selected automaton configuration.",
-    authLevel: "public",
-    transport: "query",
-    mode: "query"
-  },
-  {
-    name: "log",
-    usage: "log [-f]",
-    summary: "Show indexed activity log entries.",
-    authLevel: "public",
-    transport: "query",
-    mode: "query"
-  },
-  {
-    name: "peek",
-    usage: "peek [-f]",
-    summary: "Show indexed monologue entries.",
-    authLevel: "public",
-    transport: "query",
-    mode: "query"
-  },
-  {
-    name: "inbox",
-    usage: "inbox",
-    summary: "Show unread reply status.",
-    authLevel: "public",
-    transport: "query",
-    mode: "query"
-  },
-  {
-    name: "history",
-    usage: "history",
-    summary: "Show recent terminal commands.",
-    authLevel: "public",
-    transport: "local",
-    mode: "local"
-  },
-  {
-    name: "price",
-    usage: "price",
-    summary: "Show the selected automaton price and balance snapshot.",
-    authLevel: "public",
-    transport: "query",
-    mode: "query"
-  },
-  {
-    name: "connect",
-    usage: "connect",
-    summary: "Connect the active EVM wallet.",
-    authLevel: "public",
-    transport: "local",
-    mode: "local"
-  },
-  {
-    name: "disconnect",
-    usage: "disconnect",
-    summary: "Disconnect the active EVM wallet.",
-    authLevel: "public",
-    transport: "local",
-    mode: "local"
-  },
-  {
-    name: "send",
-    usage: 'send -m "message" [--usdc]',
-    summary: "Post a message to the automaton.",
-    authLevel: "wallet",
-    transport: "wallet",
-    mode: "mutation"
-  },
-  {
-    name: "donate",
-    usage: "donate <amount> [--usdc]",
-    summary: "Send funds directly to the automaton.",
-    authLevel: "wallet",
-    transport: "wallet",
-    mode: "mutation"
-  },
-  {
-    name: "steward-send",
-    usage: 'steward-send -m "message"',
-    summary: "Send a direct steward message.",
-    authLevel: "steward",
-    transport: "steward_signed",
-    mode: "mutation"
-  },
-  {
-    name: "steward-model",
-    usage: "steward-model <variant>",
-    summary: "Set the inference model variant.",
-    authLevel: "steward",
-    transport: "steward_signed",
-    mode: "mutation"
-  },
-  {
-    name: "steward-reasoning",
-    usage: "steward-reasoning <variant>",
-    summary: "Set the OpenRouter reasoning effort.",
-    authLevel: "steward",
-    transport: "steward_signed",
-    mode: "mutation"
-  }
-];
-
-export function findCommandDefinition(commandName: string): CommandDefinition | null {
-  const normalized = commandName.trim().toLowerCase();
-
-  if (normalized === "") {
-    return null;
-  }
-
-  return commandRegistry.find((definition) => definition.name === normalized) ?? null;
-}
-
+export type CommandAuthLevel = TerminalCommandAuthLevel;
+export type CommandTransport = TerminalCommandTransport;
+export type CommandMode = TerminalCommandMode;
+export type CommandDefinition = TerminalCommandDefinition;
+export interface CommandHelpRow extends CommandDefinition { authLabel: string; }
+export const commandRegistry: CommandDefinition[] = [...terminalCommandRegistry];
+export function findCommandDefinition(commandName: string): CommandDefinition | null { return findTerminalCommand(commandName); }
 export function describeAuthLevel(authLevel: CommandAuthLevel): string {
   switch (authLevel) {
-    case "wallet":
-      return "Wallet required";
-    case "steward":
-      return "Steward required";
-    default:
-      return "Public";
+    case "wallet": return "Wallet required";
+    case "steward": return "Steward required";
+    default: return "Public";
   }
 }
-
 export function buildCommandHelpRows(): CommandHelpRow[] {
-  return commandRegistry.map((definition) => ({
-    ...definition,
-    authLabel: describeAuthLevel(definition.authLevel)
-  }));
+  return commandRegistry.map((definition) => ({ ...definition, authLabel: describeAuthLevel(definition.authLevel) }));
 }

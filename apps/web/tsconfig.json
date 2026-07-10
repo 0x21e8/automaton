@@ -10,6 +10,9 @@
       ],
       "@ic-automaton/canister-clients": [
         "packages/canister-clients/src/index.ts"
+      ],
+      "@ic-automaton/ui": [
+        "packages/ui/src/generated/tokens.ts"
       ]
     },
     "jsx": "react-jsx",

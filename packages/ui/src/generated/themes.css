@@ -1,0 +1,64 @@
+/* GENERATED FILE - DO NOT HAND-EDIT. Run npm run generate:ui-assets. */
+
+:root {
+  --ui-display: "Instrument Serif", Georgia, serif;
+  --ui-body: "Azeret Mono", "SFMono-Regular", monospace;
+  --ui-operator: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --ui-mono: "IBM Plex Mono", "SFMono-Regular", monospace;
+  --ui-2xs: 0.375rem;
+  --ui-xs: 0.75rem;
+  --ui-sm: 1rem;
+  --ui-md: 1.5rem;
+  --ui-lg: 2rem;
+  --ui-xl: 3rem;
+  --ui-2xl: 4.5rem;
+  --ui-hairline: 1px;
+  --ui-strong: 2px;
+  --ui-fast: 160ms;
+  --ui-base: 240ms;
+  --ui-reduced: 0ms;
+  --ui-success: #177245;
+  --ui-warning: #9a5b00;
+  --ui-critical: #b42318;
+  --ui-info: #185adb;
+  --ui-neutral: #6f665b;
+}
+[data-ui-theme="lab"] {
+  --ui-background: #f0ece4;
+  --ui-panel: #f7f2ea;
+  --ui-panel-strong: #e9dfd0;
+  --ui-ink: #1a1a1a;
+  --ui-line: #211d1a;
+  --ui-accent: #e63312;
+  --ui-accent-soft: #f4d2ca;
+  --ui-muted: #8d857b;
+  --ui-muted-strong: #5c564f;
+  --ui-inverse: #161311;
+  --ui-focus: #185adb;
+}
+[data-ui-theme="direct-console"] {
+  --ui-background: #05070a;
+  --ui-panel: #0b1016;
+  --ui-panel-strong: #111923;
+  --ui-ink: #d8f3dc;
+  --ui-line: #2c4540;
+  --ui-accent: #7fffd4;
+  --ui-accent-soft: #14382f;
+  --ui-muted: #7f9b92;
+  --ui-muted-strong: #a8c4b9;
+  --ui-inverse: #000000;
+  --ui-focus: #ffd166;
+}
+[data-ui-theme="operator"] {
+  --ui-background: #eee8dc;
+  --ui-panel: #fff8ee;
+  --ui-panel-strong: #e2d5c1;
+  --ui-ink: #10131f;
+  --ui-line: #263143;
+  --ui-accent: #1f7c6b;
+  --ui-accent-soft: #d8eee7;
+  --ui-muted: #6b6458;
+  --ui-muted-strong: #4d493f;
+  --ui-inverse: #10131f;
+  --ui-focus: #185adb;
+}
