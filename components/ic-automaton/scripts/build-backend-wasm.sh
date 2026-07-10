@@ -23,6 +23,10 @@ else
 fi
 target_root="${CARGO_TARGET_DIR:-${workspace_root}/target}"
 
+if [[ -f "${workspace_root}/package.json" ]] && grep -q 'verify:ui-tokens' "${workspace_root}/package.json"; then
+  npm --prefix "${workspace_root}" run verify:ui-tokens
+fi
+
 wasm_build_path="${target_root}/wasm32-wasip1/release/backend.wasm"
 wasm_nowasi_path="${target_root}/wasm32-wasip1/release/backend_nowasi.wasm"
 

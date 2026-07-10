@@ -1,3 +1,5 @@
+import { CANONICAL_TERMINAL_COMMANDS } from "./ui_terminal_commands.js";
+
 /**
  * AUTOMATON TERMINAL — ui_app.js
  * Phase 1: Terminal shell, command parser, help/clear, command history,
@@ -878,22 +880,10 @@ function parseInput(raw) {
 const BASE_HELP_LINES = [
   { text: "AVAILABLE COMMANDS", cls: "system bright" },
   { text: "────────────────────────────────────", cls: "separator" },
-  { text: "  connect              Connect EVM wallet (MetaMask, etc.)", cls: "system" },
-  { text: "  disconnect           Disconnect wallet", cls: "system" },
-  { text: "  send -m \"message\"    Post a message to the automaton", cls: "system" },
-  { text: "       [--usdc]          Pay with USDC + ETH (default: ETH only)", cls: "system dim" },
-  { text: "  price                Show message cost (ETH and USDC)", cls: "system" },
-  { text: "  status               Live automaton status view", cls: "system" },
-  { text: "  config               Configuration overview", cls: "system" },
-  { text: "  log [-f]             Activity log  (jobs + transitions)", cls: "system" },
-  { text: "  peek [-f]            Internal monologue", cls: "system" },
-  { text: "  inbox                Unread automaton replies", cls: "system" },
-  { text: "  history              Past messages and automaton responses", cls: "system" },
-  { text: "  donate <amount>      Send ETH directly to automaton", cls: "system" },
-  { text: "       [--usdc]          Donate USDC instead", cls: "system dim" },
-  { text: "  code                 Open source code on Github", cls: "system" },
-  { text: "  clear                Clear terminal", cls: "system" },
-  { text: "  help                 Show this message", cls: "system" },
+  ...CANONICAL_TERMINAL_COMMANDS.map(({ usage, summary }) => ({
+    text: `  ${usage.padEnd(22, " ")}${summary}`,
+    cls: "system"
+  })),
   { text: null },
   { text: "  Tip: status is live by default; use -f for log/peek; press q or Esc to stop.", cls: "system dim" },
 ];

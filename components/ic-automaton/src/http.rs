@@ -13,7 +13,9 @@
 /// | GET    | `/`                           | query       |
 /// | GET    | `/index.html`                 | query       |
 /// | GET    | `/styles.css`                 | query       |
+/// | GET    | `/ui_tokens.css`              | query       |
 /// | GET    | `/app.js`                     | query       |
+/// | GET    | `/ui_terminal_commands.js`     | query       |
 /// | GET    | `/api/snapshot`               | query       |
 /// | GET    | `/api/steward/status`         | query       |
 /// | GET    | `/api/wallet/balance`         | query       |
@@ -56,7 +58,9 @@ const CACHE_NO_STORE: &str = "no-store";
 const DEFAULT_SNAPSHOT_LIMIT: usize = 25;
 const UI_INDEX_HTML: &str = include_str!("ui_index.html");
 const UI_STYLES_CSS: &str = include_str!("ui_styles.css");
+const UI_TOKENS_CSS: &str = include_str!("ui_tokens.css");
 const UI_APP_JS: &str = include_str!("ui_app.js");
+const UI_TERMINAL_COMMANDS_JS: &str = include_str!("ui_terminal_commands.js");
 const EVM_STEWARD_SIGNING_DOMAIN: &str = "ic-automaton:steward-execute:v1";
 const STEWARD_DIRECT_MESSAGE_PROOF_TTL_NS: u64 = 5 * 60 * 1_000_000_000;
 
@@ -832,9 +836,23 @@ fn build_certification_state() -> HttpCertificationState {
         ),
         static_asset_route(
             Method::GET,
+            "/ui_tokens.css",
+            "/ui_tokens.css",
+            UI_TOKENS_CSS.as_bytes(),
+            CONTENT_TYPE_CSS,
+        ),
+        static_asset_route(
+            Method::GET,
             "/app.js",
             "/app.js",
             UI_APP_JS.as_bytes(),
+            CONTENT_TYPE_JS,
+        ),
+        static_asset_route(
+            Method::GET,
+            "/ui_terminal_commands.js",
+            "/ui_terminal_commands.js",
+            UI_TERMINAL_COMMANDS_JS.as_bytes(),
             CONTENT_TYPE_JS,
         ),
         json_route(Method::GET, "/api/snapshot", &snapshot),
@@ -1268,6 +1286,23 @@ mod tests {
     }
 
     #[test]
+    fn serves_generated_ui_tokens_and_terminal_metadata() {
+        init_certification();
+
+        let css = handle_http_request(HttpRequest::get("/ui_tokens.css").build());
+        assert_eq!(css.status_code(), StatusCode::OK);
+        assert!(std::str::from_utf8(css.body())
+            .expect("generated token CSS should be utf8")
+            .contains("GENERATED FILE"));
+
+        let metadata = handle_http_request(HttpRequest::get("/ui_terminal_commands.js").build());
+        assert_eq!(metadata.status_code(), StatusCode::OK);
+        assert!(std::str::from_utf8(metadata.body())
+            .expect("generated terminal metadata should be utf8")
+            .contains("steward-reasoning"));
+    }
+
+    #[test]
     fn serves_app_asset_with_history_and_config_commands_wired() {
         init_certification();
 
@@ -1281,12 +1316,15 @@ mod tests {
         );
 
         let body = std::str::from_utf8(response.body()).expect("app.js body should be utf8");
+        let metadata_response = handle_http_request(HttpRequest::get("/ui_terminal_commands.js").build());
+        let metadata = std::str::from_utf8(metadata_response.body())
+            .expect("terminal metadata body should be utf8");
         assert!(
-            body.contains("Past messages and automaton responses"),
+            metadata.contains("Show recent terminal commands."),
             "help output should mention the history command"
         );
         assert!(
-            body.contains("Configuration overview"),
+            metadata.contains("Show the selected automaton configuration."),
             "help output should mention the config command"
         );
         assert!(

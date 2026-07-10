@@ -5,14 +5,14 @@
 
 /* --- Custom Properties ------------------------------------------------------- */
 :root {
-  --color-bg: #000000;
-  --color-phosphor: #ccff00;
-  --color-phosphor-dim: rgba(204, 255, 0, 0.12);
-  --color-phosphor-mid: rgba(204, 255, 0, 0.4);
+  --color-bg: var(--ui-background, #000000);
+  --color-phosphor: var(--ui-accent, #ccff00);
+  --color-phosphor-dim: color-mix(in srgb, var(--ui-accent, #ccff00) 12%, transparent);
+  --color-phosphor-mid: color-mix(in srgb, var(--ui-accent, #ccff00) 40%, transparent);
   --color-white: #ffffff;
-  --color-error: #ff3333;
-  --font: "Space Mono", "Courier New", monospace;
-  --glow-text: 0 0 8px rgba(204, 255, 0, 0.55);
+  --color-error: var(--ui-critical, #ff3333);
+  --font: var(--ui-body, "Space Mono", "Courier New", monospace);
+  --glow-text: 0 0 8px color-mix(in srgb, var(--ui-accent, #ccff00) 55%, transparent);
   --glow-spread: 0 0 10px var(--color-phosphor), 0 0 24px var(--color-phosphor);
   --glow-error: 0 0 8px rgba(255, 51, 51, 0.5);
   --term-px: 24px; /* horizontal padding inside terminal */
@@ -320,6 +320,11 @@ body::after {
   outline: none;
   caret-color: var(--color-phosphor);
   text-shadow: 0 0 4px rgba(255, 255, 255, 0.18);
+}
+
+.terminal-input:focus-visible {
+  outline: 2px solid var(--ui-focus, #ffd166);
+  outline-offset: 3px;
 }
 
 .terminal-input::placeholder {
