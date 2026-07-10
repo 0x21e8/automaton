@@ -226,7 +226,7 @@ fn spawn_contract() {
             .to_str()
             .expect("child wasm path should be valid UTF-8"),
     );
-    let (_, factory_wasm) = read_artifact("FACTORY_WASM_PATH", ".icp/cache/artifacts/factory");
+    let (_, factory_wasm) = read_artifact("FACTORY_WASM_PATH", "dist/factory.wasm");
     assert!(!child_wasm.is_empty());
     assert!(!factory_wasm.is_empty());
 

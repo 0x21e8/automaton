@@ -30,7 +30,7 @@ if [[ $# -eq 1 ]]; then
   if [[ "$1" = /* ]]; then
     output_path="$1"
   else
-    output_path="${repo_root}/$1"
+    output_path="$(pwd)/$1"
   fi
 elif [[ -n "${ICP_WASM_OUTPUT_PATH:-}" ]]; then
   output_path="${ICP_WASM_OUTPUT_PATH}"
