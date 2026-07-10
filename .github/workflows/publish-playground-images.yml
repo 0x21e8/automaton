@@ -1,239 +1,212 @@
-name: Publish Playground Images
+name: Publish Atomic Playground Release
 
 on:
   workflow_call:
     inputs:
       environment_version:
-        description: Optional release label recorded in the image manifest.
+        description: Optional release label recorded in the manifest.
         required: false
         type: string
     outputs:
       git_commit:
-        description: Git commit used to tag and publish the images.
-        value: ${{ jobs.publish-images.outputs.git_commit }}
+        description: Release source commit.
+        value: ${{ jobs.build-release.outputs.git_commit }}
       environment_version:
-        description: Release label recorded in the image manifest.
-        value: ${{ jobs.publish-images.outputs.environment_version }}
+        description: Release environment version.
+        value: ${{ jobs.build-release.outputs.environment_version }}
       web_image_ref:
         description: Digest-pinned web image ref.
-        value: ${{ jobs.publish-images.outputs.web_image_ref }}
+        value: ${{ jobs.build-release.outputs.web_image_ref }}
       indexer_image_ref:
         description: Digest-pinned indexer image ref.
-        value: ${{ jobs.publish-images.outputs.indexer_image_ref }}
+        value: ${{ jobs.build-release.outputs.indexer_image_ref }}
       rpc_gateway_image_ref:
-        description: Digest-pinned rpc-gateway image ref.
-        value: ${{ jobs.publish-images.outputs.rpc_gateway_image_ref }}
+        description: Digest-pinned RPC gateway image ref.
+        value: ${{ jobs.build-release.outputs.rpc_gateway_image_ref }}
+      release_artifact_name:
+        description: Immutable workflow artifact bundle containing the manifest and release bytes.
+        value: ${{ jobs.build-release.outputs.release_artifact_name }}
   workflow_dispatch:
     inputs:
       environment_version:
-        description: Optional release label recorded in the image manifest.
+        description: Optional release label recorded in the manifest.
         required: false
         type: string
 
 concurrency:
-  group: playground-vps-images
+  group: atomic-playground-release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
   packages: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
-  publish-images:
+  build-release:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     outputs:
       git_commit: ${{ steps.manifest.outputs.git_commit }}
       environment_version: ${{ steps.manifest.outputs.environment_version }}
       web_image_ref: ${{ steps.manifest.outputs.web_image_ref }}
       indexer_image_ref: ${{ steps.manifest.outputs.indexer_image_ref }}
       rpc_gateway_image_ref: ${{ steps.manifest.outputs.rpc_gateway_image_ref }}
+      release_artifact_name: ${{ steps.bundle.outputs.release_artifact_name }}
 
     steps:
-      - name: Checkout
+      - name: Checkout exact release revision
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Require default branch
+      - name: Require clean release source
         shell: bash
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
-            echo "Run this workflow from ${DEFAULT_BRANCH} so the :main image tags stay aligned with deploys." >&2
-            exit 1
-          fi
+          test -z "$(git status --porcelain --untracked-files=all)"
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install locked Node dependencies
+        run: npm ci
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1,wasm32-unknown-unknown
+
+      - name: Setup Foundry
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L https://foundry.paradigm.xyz | bash
+          "$HOME/.foundry/bin/foundryup"
+          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+
+      - name: Install Wasm tooling
+        shell: bash
+        run: cargo install --locked wasi2ic candid-extractor ic-wasm
+
+      - name: Validate source and workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run lint
+          npm test
+          cargo test --workspace
+          npm run evm:test
+          npm run verify:strategies
+
+      - name: Build child artifact
+        shell: bash
+        run: ./components/ic-automaton/scripts/build-backend-wasm.sh dist/automaton.wasm
+
+      - name: Build factory artifact
+        shell: bash
+        run: ./scripts/build-factory-wasm.sh dist/factory.wasm
+
+      - name: Validate built contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHILD_WASM_PATH=dist/automaton.wasm npm run verify:child-contract
+          mkdir -p "$RUNNER_TEMP/pocketic"
+          curl -LfsS https://github.com/dfinity/pocketic/releases/download/9.0.3/pocket-ic-x86_64-linux.gz -o "$RUNNER_TEMP/pocketic/server.gz"
+          gzip -df "$RUNNER_TEMP/pocketic/server.gz"
+          chmod +x "$RUNNER_TEMP/pocketic/server"
+          POCKET_IC_BIN="$RUNNER_TEMP/pocketic/server" \
+          AUTOMATON_WASM_PATH=dist/automaton.wasm \
+          FACTORY_WASM_PATH=dist/factory.wasm \
+            cargo test -p integration-tests --test spawn_contract spawn_contract -- --exact
 
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Setup buildx
-        run: docker buildx create --driver docker-container --name "playground-builder-${GITHUB_RUN_ID}" --use
+        run: docker buildx create --driver docker-container --name "atomic-builder-${GITHUB_RUN_ID}" --use
 
-      - name: Build and publish images
+      - name: Build and publish digest-addressed images
         shell: bash
         env:
           IMAGE_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
           owner=$(printf '%s' "$IMAGE_OWNER" | tr '[:upper:]' '[:lower:]')
-          tag="$GITHUB_SHA"
-
           build_and_push() {
             local name="$1"
             local dockerfile="$2"
-            shift 2
-            local image="ghcr.io/${owner}/automaton-playground-${name}"
             local metadata_file="$RUNNER_TEMP/${name}-metadata.json"
-            docker buildx build \
-              --platform linux/amd64 \
-              --push \
+            docker buildx build --platform linux/amd64 --push \
               --metadata-file "$metadata_file" \
               -f "$dockerfile" \
-              -t "${image}:${tag}" \
-              -t "${image}:main" \
-              "$@" \
-              .
+              -t "ghcr.io/${owner}/automaton-playground-${name}:$GITHUB_SHA" \
+              -t "ghcr.io/${owner}/automaton-playground-${name}:main" \
+              "$@" .
           }
-
           build_and_push web apps/web/Dockerfile --build-arg VITE_INDEXER_BASE_URL=
           build_and_push indexer apps/indexer/Dockerfile
           build_and_push rpc-gateway apps/rpc-gateway/Dockerfile
 
-      - name: Write image manifest
+      - name: Render schema-v2 release manifest
         id: manifest
         shell: bash
         env:
-          IMAGE_OWNER: ${{ github.repository_owner }}
-          WORKFLOW_CALL_ENVIRONMENT_VERSION: ${{ inputs.environment_version }}
-          WORKFLOW_DISPATCH_ENVIRONMENT_VERSION: ${{ github.event.inputs.environment_version }}
+          RELEASE_ENVIRONMENT_VERSION: ${{ inputs.environment_version || github.event.inputs.environment_version }}
         run: |
           set -euo pipefail
-          owner=$(printf '%s' "$IMAGE_OWNER" | tr '[:upper:]' '[:lower:]')
-          input_environment_version="${WORKFLOW_CALL_ENVIRONMENT_VERSION:-$WORKFLOW_DISPATCH_ENVIRONMENT_VERSION}"
-          node --input-type=module - "$RUNNER_TEMP" "$owner" "$GITHUB_SHA" "$input_environment_version" <<'NODE'
+          owner=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          for name in web indexer rpc-gateway; do
+            metadata="$RUNNER_TEMP/${name}-metadata.json"
+            digest=$(node --input-type=module -e 'import fs from "node:fs"; const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8"))["containerimage.digest"]; if (!v?.startsWith("sha256:")) process.exit(1); console.log(v)' "$metadata")
+            case "$name" in
+              web) key=WEB ;;
+              indexer) key=INDEXER ;;
+              rpc-gateway) key=RPC_GATEWAY ;;
+            esac
+            printf '%s=%s\n' "RELEASE_${key}_IMAGE_REF" "ghcr.io/${owner}/automaton-playground-${name}@${digest}" >> "$RUNNER_TEMP/image-refs.env"
+          done
+          set -a
+          . "$RUNNER_TEMP/image-refs.env"
+          set +a
+          node scripts/render-release-manifest.mjs --mode publish --output "$RUNNER_TEMP/release-manifest.json"
+          node --input-type=module - "$RUNNER_TEMP/release-manifest.json" "$GITHUB_OUTPUT" <<'NODE'
           import fs from "node:fs";
-          import path from "node:path";
-
-          const [tempDir, owner, gitCommit, inputEnvironmentVersion] = process.argv.slice(2);
-
-          function readDigest(name) {
-            const metadata = JSON.parse(
-              fs.readFileSync(path.join(tempDir, `${name}-metadata.json`), "utf8")
-            );
-            const digest = metadata["containerimage.digest"];
-            if (typeof digest !== "string" || !digest.startsWith("sha256:")) {
-              throw new Error(`missing registry digest for ${name}`);
-            }
-            return digest;
-          }
-
-          const environmentVersion =
-            typeof inputEnvironmentVersion === "string" && inputEnvironmentVersion.trim() !== ""
-              ? inputEnvironmentVersion.trim()
-              : `playground-${gitCommit.slice(0, 12)}`;
-
-          const images = {
-            web: {
-              repository: `ghcr.io/${owner}/automaton-playground-web`,
-              tag: gitCommit,
-              digest: readDigest("web")
-            },
-            indexer: {
-              repository: `ghcr.io/${owner}/automaton-playground-indexer`,
-              tag: gitCommit,
-              digest: readDigest("indexer")
-            },
-            rpcGateway: {
-              repository: `ghcr.io/${owner}/automaton-playground-rpc-gateway`,
-              tag: gitCommit,
-              digest: readDigest("rpc-gateway")
-            }
-          };
-
-          for (const image of Object.values(images)) {
-            image.ref = `${image.repository}@${image.digest}`;
-          }
-
-          const manifest = {
-            schemaVersion: 1,
-            release: {
-              gitCommit,
-              environmentVersion,
-              createdAt: new Date().toISOString()
-            },
-            images
-          };
-
-          const manifestPath = path.join(tempDir, "playground-image-manifest.json");
-          const envPath = path.join(tempDir, "playground-image-refs.env");
-          fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-          fs.writeFileSync(
-            envPath,
-            [
-              `PLAYGROUND_WEB_IMAGE=${images.web.ref}`,
-              `PLAYGROUND_INDEXER_IMAGE=${images.indexer.ref}`,
-              `PLAYGROUND_RPC_GATEWAY_IMAGE=${images.rpcGateway.ref}`,
-              ""
-            ].join("\n")
-          );
-
-          const outputFile = process.env.GITHUB_OUTPUT;
-          if (!outputFile) {
-            throw new Error("GITHUB_OUTPUT is required");
-          }
-
-          fs.appendFileSync(
-            outputFile,
-            [
-              `git_commit=${gitCommit}`,
-              `environment_version=${environmentVersion}`,
-              `web_image_ref=${images.web.ref}`,
-              `indexer_image_ref=${images.indexer.ref}`,
-              `rpc_gateway_image_ref=${images.rpcGateway.ref}`,
-              ""
-            ].join("\n")
-          );
-
+          const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const output = process.argv[3];
+          const lines = [
+            `git_commit=${manifest.release.sourceCommit}`,
+            `environment_version=${manifest.release.environmentVersion}`,
+            `web_image_ref=${manifest.images.web.ref}`,
+            `indexer_image_ref=${manifest.images.indexer.ref}`,
+            `rpc_gateway_image_ref=${manifest.images.rpcGateway.ref}`
+          ];
+          fs.appendFileSync(output, `${lines.join("\n")}\n`);
           NODE
 
-      - name: Upload image artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: playground-image-manifest
-          path: ${{ runner.temp }}/playground-image-manifest.json
-          if-no-files-found: error
-
-      - name: Upload image env fragment
-        uses: actions/upload-artifact@v4
-        with:
-          name: playground-image-refs
-          path: ${{ runner.temp }}/playground-image-refs.env
-          if-no-files-found: error
-
-      - name: Summarize image refs
+      - name: Bundle source, ops, manifest, artifacts, and checksums
+        id: bundle
         shell: bash
         run: |
           set -euo pipefail
-          {
-            echo "Published playground runtime images:"
-            echo ""
-            node --input-type=module -e '
-              import fs from "node:fs";
+          bundle="atomic-playground-release-${GITHUB_SHA}"
+          mkdir -p "$RUNNER_TEMP/$bundle"
+          cp "$RUNNER_TEMP/release-manifest.json" "$RUNNER_TEMP/$bundle/release-manifest.json"
+          cp dist/automaton.wasm dist/automaton.wasm.sha256 dist/factory.wasm dist/factory.wasm.sha256 "$RUNNER_TEMP/$bundle/"
+          printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/$bundle/source-commit.txt"
+          git archive --format=tar.gz --prefix="source-${GITHUB_SHA}/" "$GITHUB_SHA" > "$RUNNER_TEMP/$bundle/source-ops.tar.gz"
+          (cd "$RUNNER_TEMP/$bundle" && sha256sum source-ops.tar.gz > source-ops.tar.gz.sha256)
+          printf 'release_artifact_name=%s\n' "$bundle" >> "$GITHUB_OUTPUT"
 
-              const manifestPath = process.argv[1];
-              const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-              for (const [name, image] of Object.entries(manifest.images)) {
-                console.log(`- ${name}: ${image.ref}`);
-              }
-            ' "$RUNNER_TEMP/playground-image-manifest.json"
-            echo ""
-            echo "Artifacts:"
-            echo "- playground-image-manifest"
-            echo "- playground-image-refs"
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload one immutable release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: atomic-playground-release-${{ github.sha }}
+          path: ${{ runner.temp }}/atomic-playground-release-${{ github.sha }}
+          if-no-files-found: error
