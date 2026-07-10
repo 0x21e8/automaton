@@ -12,12 +12,13 @@ import {
   type CommandSessionState,
   type TerminalEntry
 } from "./command-session-model";
-import { fetchAutomatonContext, fetchStewardStatus } from "../api/automaton";
+import { fetchStewardStatus } from "../api/automaton";
 import { buildCliCommandPayload } from "../lib/cli-command-builder";
 import { executeWalletCommand } from "../lib/wallet-command-executor";
 import { executeStewardCommand } from "../lib/steward-command-executor";
 import { findCommandDefinition } from "../lib/cli-command-registry";
 import type { WalletSession } from "../wallet/useWalletSession";
+import { loadLiveAutomatonContext } from "./live-context";
 
 export type { CommandSessionContext, TerminalEntry, TerminalEntryKind } from "./command-session-model";
 
@@ -43,7 +44,8 @@ function reindexEntries(startId: number, entries: readonly TerminalEntry[]): Ter
 
 export function useCommandSession(
   context: CommandSessionContext,
-  walletSession: WalletSession | null = null
+  walletSession: WalletSession | null = null,
+  enabled = true
 ): UseCommandSessionResult {
   const [session, setSession] = useState<CommandSessionState>(() => createCommandSessionState(context));
   const [automatonContext, setAutomatonContext] = useState<CommandSessionContext["automatonContext"]>(null);
@@ -55,16 +57,15 @@ export function useCommandSession(
   }, [context.automaton, context.viewerAddress]);
 
   useEffect(() => {
-    if (context.automaton === null) {
+    if (!enabled || context.automaton === null) {
       setAutomatonContext(null);
       return;
     }
 
     const controller = new AbortController();
-
     setAutomatonContext(null);
 
-    void fetchAutomatonContext(context.automaton.canisterUrl, controller.signal)
+    void loadLiveAutomatonContext(context.automaton.canisterUrl, controller.signal)
       .then((nextAutomatonContext) => {
         if (!controller.signal.aborted) {
           setAutomatonContext(nextAutomatonContext);
@@ -79,7 +80,7 @@ export function useCommandSession(
     return () => {
       controller.abort();
     };
-  }, [context.automaton]);
+  }, [context.automaton, enabled]);
 
   const helpRows = useMemo(() => buildCommandHelpRows(), []);
   const authLabel = useMemo(() => describeCommandSessionAuth(context), [context.automaton, context.viewerAddress]);

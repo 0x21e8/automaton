@@ -1,13 +1,7 @@
 :root {
-  color: #10131f;
-  background:
-    radial-gradient(circle at top left, rgba(255, 213, 128, 0.5), transparent 28%),
-    radial-gradient(circle at top right, rgba(31, 124, 107, 0.2), transparent 30%),
-    linear-gradient(180deg, #f3eee4 0%, #ddd2bf 100%);
-  font-family:
-    "IBM Plex Sans",
-    "Segoe UI",
-    sans-serif;
+  color: var(--ui-ink, #10131f);
+  background: linear-gradient(180deg, var(--ui-background, #eee8dc) 0%, var(--ui-panel-strong, #e2d5c1) 100%);
+  font-family: var(--ui-operator, "IBM Plex Sans", "Segoe UI", sans-serif);
   line-height: 1.5;
   font-weight: 400;
   font-synthesis: none;
@@ -24,6 +18,15 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+}
+
+.operator-label {
+  margin: 0 0 8px;
+  color: var(--ui-accent, #1f7c6b);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
 }
 
 button,
@@ -75,7 +78,7 @@ select {
 .control-strip,
 .automaton-card {
   backdrop-filter: blur(14px);
-  background: rgba(255, 248, 238, 0.82);
+  background: color-mix(in srgb, var(--ui-panel, #fff8ee) 82%, transparent);
   border: 1px solid rgba(16, 19, 31, 0.11);
   box-shadow:
     0 24px 70px rgba(54, 36, 8, 0.12),

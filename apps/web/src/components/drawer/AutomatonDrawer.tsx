@@ -102,9 +102,11 @@ export function AutomatonDrawer({
   walletSession
 }: AutomatonDrawerProps) {
   const [copyLabel, setCopyLabel] = useState("COPY");
+  const [activeSection, setActiveSection] = useState<"overview" | "activity" | "terminal" | "strategies">("overview");
 
   useEffect(() => {
     setCopyLabel("COPY");
+    setActiveSection("overview");
   }, [automaton]);
 
   const canExecute =
@@ -177,7 +179,22 @@ export function AutomatonDrawer({
           </span>
         </div>
 
-        <div className="drawer-grid">
+        <nav className="drawer-tabs" aria-label="Automaton sections">
+          {(["overview", "activity", "terminal", "strategies"] as const).map((section) => (
+            <button
+              aria-selected={activeSection === section}
+              className={`drawer-tab${activeSection === section ? " is-active" : ""}`}
+              key={section}
+              onClick={() => setActiveSection(section)}
+              role="tab"
+              type="button"
+            >
+              {section[0].toUpperCase() + section.slice(1)}
+            </button>
+          ))}
+        </nav>
+
+        {activeSection === "overview" ? <div className="drawer-grid">
           <div>
             <div className="detail-field">
               <div className="lbl">ETH Address</div>
@@ -336,24 +353,47 @@ export function AutomatonDrawer({
               )}
             </div>
           </div>
-        </div>
+        </div> : null}
 
         <div className="drawer-bottom">
-          <MonologuePanel
-            entries={automaton?.monologue ?? []}
-            errorMessage={errorMessage}
-            isLoading={isLoading}
-            selectedCanisterId={selectedCanisterId}
-          />
-          <CommandLinePanel
-            automaton={automaton}
-            canExecute={canExecute}
-            errorMessage={errorMessage}
-            isLoading={isLoading}
-            selectedCanisterId={selectedCanisterId}
-            viewerAddress={viewerAddress}
-            walletSession={walletSession}
-          />
+          {activeSection === "activity" ? (
+            <MonologuePanel
+              entries={automaton?.monologue ?? []}
+              errorMessage={errorMessage}
+              isLoading={isLoading}
+              selectedCanisterId={selectedCanisterId}
+            />
+          ) : null}
+          {activeSection === "terminal" ? (
+            <CommandLinePanel
+              automaton={automaton}
+              canExecute={canExecute}
+              enabled
+              errorMessage={errorMessage}
+              isLoading={isLoading}
+              selectedCanisterId={selectedCanisterId}
+              viewerAddress={viewerAddress}
+              walletSession={walletSession}
+            />
+          ) : null}
+          {activeSection === "strategies" ? (
+            <section className="drawer-section" aria-labelledby="strategies-heading">
+              <div className="panel-heading">
+                <h3 id="strategies-heading">Strategies</h3>
+                <span className="panel-note">Indexed configuration</span>
+              </div>
+              {automaton?.strategies.length ? (
+                <ul className="strategy-list">
+                  {automaton.strategies.map((strategy) => (
+                    <li key={`${strategy.key.protocol}-${strategy.key.templateId}`}>
+                      <strong>{strategy.key.templateId}</strong>
+                      <span>{strategy.key.protocol} · {strategy.status}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : <p className="empty-copy">No indexed strategies are available.</p>}
+            </section>
+          ) : null}
         </div>
       </div>
     </aside>

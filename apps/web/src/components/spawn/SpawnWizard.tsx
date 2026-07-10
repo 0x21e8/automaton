@@ -1413,6 +1413,7 @@ export function SpawnWizard({
     <div
       aria-hidden={!isOpen}
       className={`spawn-overlay${isOpen ? " is-open" : ""}`}
+      id="spawn"
       onClick={(event) => {
         if (event.target === event.currentTarget) {
           closeWizard();

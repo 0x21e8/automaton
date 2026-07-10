@@ -8,6 +8,7 @@ describe("App", () => {
     const markup = renderToStaticMarkup(<App />);
 
     expect(markup).toContain("automaton lab");
+    expect(markup).toContain("Automaton Lab");
     expect(markup).toContain("Self-sovereign AI agents");
     expect(markup).toContain("LIVE");
     expect(markup).toContain("Wallet not detected");
@@ -19,8 +20,12 @@ describe("App", () => {
     expect(markup).toContain("Step 1 of 4");
     expect(markup).toContain("Risk Appetite");
     expect(markup).toContain("Select an automaton");
-    expect(markup).toContain("Command Surface");
-    expect(markup).not.toContain(">Strategies<");
-    expect(markup).not.toContain(">Skills<");
+    expect(markup).toContain("Public Lab sections");
+    expect(markup).toContain("Visitor / Supporter access");
+    expect(markup).toContain("Overview");
+    expect(markup).toContain("Activity");
+    expect(markup).toContain("Terminal");
+    expect(markup).toContain("Strategies");
+    expect(markup).not.toContain("Operator Controls");
   });
 });

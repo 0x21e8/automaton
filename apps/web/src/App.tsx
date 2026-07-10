@@ -14,7 +14,6 @@ import { useWalletSession } from "./wallet/useWalletSession";
 type ThemeStyle = CSSProperties & Record<`--${string}`, string>;
 
 export default function App() {
-  const [scope, setScope] = useState<"all" | "mine">("all");
   const [selectedCanisterId, setSelectedCanisterId] = useState<string | null>(
     null
   );
@@ -30,10 +29,7 @@ export default function App() {
     isLoading: automatonsLoading,
     refresh: refreshAutomatons,
     total: liveCount
-  } = useAutomatons({
-    scope,
-    viewerAddress
-  });
+  } = useAutomatons();
   const {
     automaton: selectedAutomaton,
     error: selectedAutomatonError,
@@ -92,12 +88,6 @@ export default function App() {
     };
   }, [selectedCanisterId]);
 
-  useEffect(() => {
-    if (!walletDetected && scope === "mine") {
-      setScope("all");
-    }
-  }, [walletDetected, scope]);
-
   const themeStyle: ThemeStyle = {
     "--color-bg": themeTokens.colors.background,
     "--color-panel": themeTokens.colors.panel,
@@ -132,10 +122,10 @@ export default function App() {
   };
 
   return (
-    <div className="app-shell" style={themeStyle}>
+    <div className="app-shell" data-ui-theme="lab" style={themeStyle}>
       <header className="site-header">
         <div className="brand-lockup">
-          <h1 className="brand-wordmark">automaton lab</h1>
+          <h1 aria-label="Automaton Lab" className="brand-wordmark">automaton lab</h1>
           <p className="brand-tagline">Self-sovereign AI agents</p>
         </div>
         <div className="header-utility">
@@ -158,8 +148,15 @@ export default function App() {
         </div>
       </header>
 
+      <nav className="product-nav" aria-label="Public Lab sections">
+        <a href="#fleet">Fleet</a>
+        <a href="#room">Room</a>
+        <a href="#spawn">Spawn</a>
+        <span>Visitor / Supporter access</span>
+      </nav>
+
       <main className="shell-main">
-        <div className="shell-stage">
+        <div className="shell-stage" id="fleet">
           <AutomatonCanvas
             automatons={visibleAutomatons}
             focusCanisterId={focusedCanisterId}
@@ -174,12 +171,14 @@ export default function App() {
             viewerAddress={viewerAddress}
           />
         </div>
+        <div id="room">
         <RoomTimeline
           automatons={visibleAutomatons}
           error={roomTimeline.error}
           isLoading={roomTimeline.isLoading}
           messages={roomTimeline.messages}
         />
+        </div>
       </main>
 
       <AutomatonDrawer

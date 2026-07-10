@@ -10,17 +10,19 @@ interface CommandLinePanelProps {
   selectedCanisterId: string | null;
   viewerAddress: string | null;
   walletSession: WalletSession | null;
+  enabled?: boolean;
 }
 
 export function CommandLinePanel({
   automaton,
   viewerAddress,
-  walletSession
+  walletSession,
+  enabled = true
 }: CommandLinePanelProps) {
   const session = useCommandSession({
     automaton,
     viewerAddress
-  }, walletSession);
+  }, walletSession, enabled);
 
   return (
     <section className="cli-section" aria-labelledby="command-line-heading">

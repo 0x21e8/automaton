@@ -180,7 +180,7 @@ export default function App({
   const eventCountLabel = `${events.length} recent event${events.length === 1 ? "" : "s"}`;
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-ui-theme="operator">
       <div className="app-shell__chrome" />
       <main className="app-layout">
         <RunHeader
@@ -192,6 +192,7 @@ export default function App({
 
         <section className="control-strip">
           <div>
+            <p className="operator-label">Operator / Evaluation</p>
             <p className="eyebrow">Operator Controls</p>
             <h2>Active run control plane</h2>
             <p className="control-strip__copy">

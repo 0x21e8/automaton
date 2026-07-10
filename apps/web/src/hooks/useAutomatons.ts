@@ -5,11 +5,6 @@ import { fetchAutomatons } from "../api/indexer";
 import { subscribeToRealtimeEvents } from "../api/ws";
 import { getErrorMessage } from "../lib/errors";
 
-interface UseAutomatonsOptions {
-  scope: "all" | "mine";
-  viewerAddress: string | null;
-}
-
 const emptyResponse: AutomatonListResponse = {
   automatons: [],
   total: 0,
@@ -18,7 +13,7 @@ const emptyResponse: AutomatonListResponse = {
   }
 };
 
-export function useAutomatons({ scope, viewerAddress }: UseAutomatonsOptions) {
+export function useAutomatons() {
   const [response, setResponse] = useState<AutomatonListResponse>(emptyResponse);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -31,7 +26,6 @@ export function useAutomatons({ scope, viewerAddress }: UseAutomatonsOptions) {
     setError(null);
 
     void fetchAutomatons({
-      steward: scope === "mine" ? viewerAddress ?? undefined : undefined,
       signal: controller.signal
     })
       .then((nextResponse) => {
@@ -54,7 +48,7 @@ export function useAutomatons({ scope, viewerAddress }: UseAutomatonsOptions) {
     return () => {
       controller.abort();
     };
-  }, [refreshToken, scope, viewerAddress]);
+  }, [refreshToken]);
 
   useEffect(() => {
     return subscribeToRealtimeEvents(
