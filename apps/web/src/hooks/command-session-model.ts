@@ -560,6 +560,16 @@ function buildWalletEntry(
   commandName: string,
   parsed: ParsedCommand
 ): TerminalEntry[] {
+  if (commandName.startsWith("steward")) {
+    return [
+      createEntry(
+        startId,
+        "error",
+        "Internal routing error: steward commands require the signed command executor."
+      )
+    ];
+  }
+
   if (context.viewerAddress === null) {
     return [
       createEntry(startId, "error", `Wallet required for ${commandName}. Connect a wallet first.`)

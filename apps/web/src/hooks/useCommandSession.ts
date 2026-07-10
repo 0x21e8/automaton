@@ -12,9 +12,10 @@ import {
   type CommandSessionState,
   type TerminalEntry
 } from "./command-session-model";
-import { fetchAutomatonContext } from "../api/automaton";
+import { fetchAutomatonContext, fetchStewardStatus } from "../api/automaton";
 import { buildCliCommandPayload } from "../lib/cli-command-builder";
 import { executeWalletCommand } from "../lib/wallet-command-executor";
+import { executeStewardCommand } from "../lib/steward-command-executor";
 import { findCommandDefinition } from "../lib/cli-command-registry";
 import type { WalletSession } from "../wallet/useWalletSession";
 
@@ -95,22 +96,38 @@ export function useCommandSession(
 
     if (
       definition !== null &&
-      definition.transport === "wallet" &&
+      (definition.transport === "wallet" || definition.transport === "steward_signed") &&
       context.viewerAddress !== null &&
       walletSession !== null
     ) {
       setIsSubmitting(true);
 
       try {
-        const result = await executeWalletCommand(
-          trimmed,
-          {
-            automaton: context.automaton,
-            automatonContext,
-            viewerAddress: context.viewerAddress
-          },
-          walletSession
-        );
+        const result = definition.transport === "wallet"
+          ? await executeWalletCommand(
+              trimmed,
+              {
+                automaton: context.automaton,
+                automatonContext,
+                viewerAddress: context.viewerAddress
+              },
+              walletSession
+            )
+          : context.automaton === null
+            ? {
+                entries: [
+                  { id: 1, kind: "command" as const, text: `> ${trimmed}` },
+                  { id: 2, kind: "error" as const, text: "Select an automaton before using steward commands." }
+                ]
+              }
+            : await executeStewardCommand(trimmed, {
+                automaton: context.automaton,
+                canisterUrl: context.automaton.canisterUrl,
+                connectedAddress: context.viewerAddress,
+                connectedChainId: walletSession.chainId ?? context.automaton.chainId,
+                request: walletSession.request,
+                refreshStewardStatus: () => fetchStewardStatus(context.automaton!.canisterUrl)
+              });
 
         if (result === null) {
           setSession((current) =>

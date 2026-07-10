@@ -20,7 +20,7 @@ to the operator. Do not discard, overwrite, or silently absorb them.
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
 | 001 | Remove provider secrets from public spawn-session data | P0 | M | — | DONE |
-| 002 | Execute Lab steward commands instead of simulating success | P0 | M | — | TODO |
+| 002 | Execute Lab steward commands instead of simulating success | P0 | M | — | DONE |
 | 003 | Import ic-automaton as a behavior-preserving monorepo component | P1 | L | 001, 002 | TODO |
 | 004 | Canonicalize spawn contracts and strategy assets, then add a two-canister gate | P1 | L | 003 | TODO |
 | 005 | Build and deploy one atomic release from one revision | P1 | L | 004 | TODO |

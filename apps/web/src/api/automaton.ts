@@ -105,6 +105,17 @@ async function requestLiveAutomatonJson<T>(
   return (await response.json()) as T;
 }
 
+export async function fetchStewardStatus(
+  canisterUrl: string,
+  signal?: AbortSignal
+): Promise<AutomatonStewardStatusResponse> {
+  return requestLiveAutomatonJson<AutomatonStewardStatusResponse>(
+    canisterUrl,
+    "/api/steward/status",
+    signal
+  );
+}
+
 export async function fetchAutomatonContext(
   canisterUrl: string,
   signal?: AbortSignal

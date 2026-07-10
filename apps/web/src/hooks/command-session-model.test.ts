@@ -277,4 +277,20 @@ describe("command session model", () => {
     expect(inboxState.entries.some((entry) => entry.text === "Steward nonce: 17")).toBe(true);
     expect(priceState.entries.some((entry) => entry.text === "USDC balance: 100.000 USDC")).toBe(true);
   });
+
+  it("never reports a steward command as locally accepted", () => {
+    const context = {
+      automaton: createAutomatonDetail(),
+      viewerAddress: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    };
+    const state = submitCommandSessionInput(
+      setCommandSessionInput(createCommandSessionState(context), "steward-model x"),
+      context,
+      "steward-model x"
+    );
+
+    expect(state.entries.at(-1)?.kind).toBe("error");
+    expect(state.entries.at(-1)?.text).toContain("Internal routing error");
+    expect(state.entries.some((entry) => entry.text.includes("accepted"))).toBe(false);
+  });
 });
