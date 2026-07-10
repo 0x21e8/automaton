@@ -41,6 +41,7 @@
     "build": "npm run build --workspace @ic-automaton/shared && npm run build --workspace @ic-automaton/indexer && npm run build --workspace @ic-automaton/rpc-gateway && npm run build --workspace @ic-automaton/web && npm run build --workspace @ic-automaton/evaluator && npm run build --workspace @ic-automaton/evaluator-web",
     "test:workers": "npm run test --workspace betterstack-monitor-worker && npm run test --workspace strategy-discovery-proxy-worker && npm run check --workspace openrouter-proxy-worker",
     "verify:child-contract": "node ./scripts/validate-child-canister-interface.mjs",
+    "verify:strategies": "node ./scripts/verify-strategies.mjs",
     "test:child-contract": "node --test ./scripts/validate-child-canister-interface.test.mjs",
     "test": "npm run test --workspace @ic-automaton/shared && npm run test --workspace @ic-automaton/indexer && npm run test --workspace @ic-automaton/rpc-gateway && npm run test --workspace @ic-automaton/web && npm run test --workspace @ic-automaton/evaluator && npm run test --workspace @ic-automaton/evaluator-web && npm run test:workers",
     "test:factory": "cargo test -p factory"

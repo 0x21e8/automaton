@@ -8,13 +8,13 @@ use crate::types::{
     RepositoryStrategyStatus, SpawnChain,
 };
 
-const STRATEGY_SEED_MANIFEST_JSON: &str = include_str!("../../../strategy-seeds/manifest.json");
+const STRATEGY_MANIFEST_JSON: &str = include_str!("../../../strategies/manifest.json");
 const BASE_AAVE_USDC_RESERVE_RECIPE_JSON: &str =
-    include_str!("../../../strategy-seeds/base-aave-usdc-reserve-01.recipe.json");
+    include_str!("../../../strategies/base-aave-usdc-reserve-01/recipe.json");
 const BASE_MOONWELL_USDC_RESERVE_RECIPE_JSON: &str =
-    include_str!("../../../strategy-seeds/base-moonwell-usdc-reserve-01.recipe.json");
+    include_str!("../../../strategies/base-moonwell-usdc-reserve-01/recipe.json");
 const BASE_USDC_CARRY_CBBTC_RECIPE_JSON: &str =
-    include_str!("../../../strategy-seeds/base-usdc-carry-cbbtc-01.recipe.json");
+    include_str!("../../../strategies/base-usdc-carry-cbbtc-01/recipe.json");
 
 #[derive(Clone, Debug, Deserialize)]
 struct StrategySeedManifest {
@@ -88,9 +88,9 @@ fn parse_strategy_status(
 
 fn embedded_recipe_json(recipe_file: &str) -> Result<&'static str, FactoryError> {
     match recipe_file {
-        "base-aave-usdc-reserve-01.recipe.json" => Ok(BASE_AAVE_USDC_RESERVE_RECIPE_JSON),
-        "base-moonwell-usdc-reserve-01.recipe.json" => Ok(BASE_MOONWELL_USDC_RESERVE_RECIPE_JSON),
-        "base-usdc-carry-cbbtc-01.recipe.json" => Ok(BASE_USDC_CARRY_CBBTC_RECIPE_JSON),
+        "base-aave-usdc-reserve-01/recipe.json" => Ok(BASE_AAVE_USDC_RESERVE_RECIPE_JSON),
+        "base-moonwell-usdc-reserve-01/recipe.json" => Ok(BASE_MOONWELL_USDC_RESERVE_RECIPE_JSON),
+        "base-usdc-carry-cbbtc-01/recipe.json" => Ok(BASE_USDC_CARRY_CBBTC_RECIPE_JSON),
         _ => Err(invalid_repository_strategy(
             "strategy_seeds.recipe_file",
             format!("missing embedded recipe asset: {recipe_file}"),
@@ -248,20 +248,20 @@ pub fn repository_updated_at(
 }
 
 pub fn seed_repository_records(now_ms: u64) -> BTreeMap<String, RepositoryStrategyRecord> {
-    let manifest: StrategySeedManifest = serde_json::from_str(STRATEGY_SEED_MANIFEST_JSON)
-        .expect("embedded strategy seed manifest should decode");
+    let manifest: StrategySeedManifest =
+        serde_json::from_str(STRATEGY_MANIFEST_JSON).expect("embedded strategy manifest should decode");
     let mut records = BTreeMap::new();
 
     for entry in manifest.strategies {
         let canonical_chain =
-            parse_spawn_chain(&entry.canonical_chain, "strategy_seeds.canonical_chain")
-                .expect("embedded strategy seed chain should be valid");
+            parse_spawn_chain(&entry.canonical_chain, "strategies.canonical_chain")
+                .expect("embedded strategy chain should be valid");
         let compatible_spawn_chains = entry
             .compatible_spawn_chains
             .iter()
-            .map(|chain| parse_spawn_chain(chain, "strategy_seeds.compatible_spawn_chains"))
+            .map(|chain| parse_spawn_chain(chain, "strategies.compatible_spawn_chains"))
             .collect::<Result<Vec<_>, _>>()
-            .expect("embedded strategy seed compatible chains should be valid");
+            .expect("embedded strategy compatible chains should be valid");
         let metadata = RepositoryStrategyMetadata {
             strategy_id: entry.strategy_id,
             name: entry.display_name,
@@ -283,9 +283,9 @@ pub fn seed_repository_records(now_ms: u64) -> BTreeMap<String, RepositoryStrate
                 .to_string(),
         };
         let mut record = build_repository_strategy_record(request, now_ms)
-            .expect("embedded strategy seed should validate");
-        record.status = parse_strategy_status(&entry.status, "strategy_seeds.status")
-            .expect("embedded strategy seed status should be valid");
+                .expect("embedded strategy should validate");
+        record.status = parse_strategy_status(&entry.status, "strategies.status")
+            .expect("embedded strategy status should be valid");
         if matches!(record.status, RepositoryStrategyStatus::Deprecated) {
             record.deprecated_at = Some(now_ms);
         }

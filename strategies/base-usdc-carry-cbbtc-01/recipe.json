@@ -14,12 +14,7 @@
   "actions": [
     {
       "action_id": "enter_supply",
-      "calls": [
-        {
-          "role": "morpho",
-          "function": "supply"
-        }
-      ],
+      "calls": [{ "role": "morpho", "function": "supply" }],
       "preconditions": [
         "market_supply_apy_gte_0.03",
         "market_liquidity_usd_gte_10000000",
@@ -37,12 +32,7 @@
     },
     {
       "action_id": "exit_supply",
-      "calls": [
-        {
-          "role": "morpho",
-          "function": "withdraw"
-        }
-      ],
+      "calls": [{ "role": "morpho", "function": "withdraw" }],
       "preconditions": [
         "market_supply_apy_lte_exit_threshold_or_better_opportunity_exists"
       ],

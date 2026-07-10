@@ -1,9 +1,9 @@
 {
-  "format": "launchpad.strategy-seed-manifest.v1",
+  "format": "launchpad.strategy-manifest.v2",
   "source_repository": {
     "name": "ic-automaton",
-    "commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
-    "base_path": "docs/strategies"
+    "component_path": "components/ic-automaton",
+    "commit": "eda66fd059785d52150de78a66d7c384e16955e9"
   },
   "strategies": [
     {
@@ -12,15 +12,14 @@
       "description": "Low-complexity Base reserve strategy for parking surplus USDC on Aave V3 and withdrawing it when survival runway or reallocation policy requires.",
       "canonical_chain": "base",
       "canonical_chain_id": 8453,
-      "compatible_spawn_chains": [
-        "base"
-      ],
+      "compatible_spawn_chains": ["base"],
       "protocol": "aave-v3",
       "primitive": "lend_supply",
       "status": "active",
-      "recipe_file": "base-aave-usdc-reserve-01.recipe.json",
+      "recipe_file": "base-aave-usdc-reserve-01/recipe.json",
       "source_path": "docs/strategies/base-aave-usdc-reserve-01/recipe.json",
-      "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+      "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
+      "recipe_sha256": "8f34884a3e8906e0c7883f9728bcbe88cfb828aa3f074f08d9cc84c2f26feb2d"
     },
     {
       "strategy_id": "base-moonwell-usdc-reserve-01",
@@ -28,15 +27,14 @@
       "description": "Low-complexity Base reserve strategy for parking surplus USDC in Moonwell and withdrawing it when survival runway or reallocation policy requires.",
       "canonical_chain": "base",
       "canonical_chain_id": 8453,
-      "compatible_spawn_chains": [
-        "base"
-      ],
+      "compatible_spawn_chains": ["base"],
       "protocol": "moonwell-v2",
       "primitive": "lend_supply",
       "status": "active",
-      "recipe_file": "base-moonwell-usdc-reserve-01.recipe.json",
+      "recipe_file": "base-moonwell-usdc-reserve-01/recipe.json",
       "source_path": "docs/strategies/base-moonwell-usdc-reserve-01/recipe.json",
-      "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+      "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
+      "recipe_sha256": "2f68ece1330ed65ee7497224ade69529925132bb0a9592a41f6734866a8f8c1a"
     },
     {
       "strategy_id": "base-usdc-carry-cbbtc-01",
@@ -44,15 +42,14 @@
       "description": "Example carry strategy registered via a single Morpho recipe JSON.",
       "canonical_chain": "base",
       "canonical_chain_id": 8453,
-      "compatible_spawn_chains": [
-        "base"
-      ],
+      "compatible_spawn_chains": ["base"],
       "protocol": "morpho-v1",
       "primitive": "lend_supply",
       "status": "active",
-      "recipe_file": "base-usdc-carry-cbbtc-01.recipe.json",
+      "recipe_file": "base-usdc-carry-cbbtc-01/recipe.json",
       "source_path": "docs/strategies/base-usdc-carry-cbbtc-01/recipe.json",
-      "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa"
+      "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
+      "recipe_sha256": "bbe400dc3984b99cf04da4293a23741da8b6cc1bd3f90563d0ac71fab1b64846"
     }
   ]
 }

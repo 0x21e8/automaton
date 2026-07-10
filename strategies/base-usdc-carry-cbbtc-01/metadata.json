@@ -1,0 +1,12 @@
+{
+  "strategy_id": "base-usdc-carry-cbbtc-01",
+  "display_name": "Base Morpho USDC Carry",
+  "description": "Example carry strategy registered via a single Morpho recipe JSON.",
+  "protocol": "morpho-v1",
+  "primitive": "lend_supply",
+  "canonical_chain": "base",
+  "canonical_chain_id": 8453,
+  "source_path": "docs/strategies/base-usdc-carry-cbbtc-01/recipe.json",
+  "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
+  "status": "active"
+}

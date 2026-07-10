@@ -147,7 +147,10 @@ A structured DeFi strategy execution framework (in `src/strategy/`) enables the 
 - **Authoring** -- Supports both controller-managed templates and agent-authored templates via `register_strategy`
 
 A kill-switch mechanism allows per-strategy emergency disablement independent of template lifecycle state.
-See [docs/strategies/README.md](docs/strategies/README.md) for user documentation and examples.
+See [docs/strategies/README.md](docs/strategies/README.md) for runtime documentation and examples.
+The canonical workspace assets consumed by the factory live under
+`../../strategies/`; run `npm run verify:strategies` from the workspace root
+when changing a recipe.
 
 ### Autonomous Cycle Top-Up
 The agent can replenish its own ICP cycles from its USDC balance without operator intervention:

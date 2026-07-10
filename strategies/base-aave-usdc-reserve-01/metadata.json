@@ -1,0 +1,12 @@
+{
+  "strategy_id": "base-aave-usdc-reserve-01",
+  "display_name": "Base Aave USDC Reserve",
+  "description": "Low-complexity Base reserve strategy for parking surplus USDC on Aave V3 and withdrawing it when survival runway or reallocation policy requires.",
+  "protocol": "aave-v3",
+  "primitive": "lend_supply",
+  "canonical_chain": "base",
+  "canonical_chain_id": 8453,
+  "source_path": "docs/strategies/base-aave-usdc-reserve-01/recipe.json",
+  "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
+  "status": "active"
+}
