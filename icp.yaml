@@ -15,8 +15,8 @@ canisters:
 environments:
   - name: local
     network: local
-    canisters: [factory]
+    canisters: [factory, automaton]
 
   - name: ic
     network: ic
-    canisters: [factory]
+    canisters: [factory, automaton]

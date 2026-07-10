@@ -13,7 +13,7 @@
 
 ## Status
 
-- **Status**: IN PROGRESS — `icp` CLI unavailable in the execution environment; ICP build recipes remain unverified.
+- **Status**: DONE
 - **Priority**: P1
 - **Effort**: L
 - **Risk**: HIGH
