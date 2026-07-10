@@ -2278,6 +2278,7 @@ mod tests {
         StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs, TemplateStatus,
     };
     use sha3::{Digest, Keccak256};
+    use spawn_protocol::SpawnProviderBootstrapArgs;
     use std::collections::{BTreeMap, BTreeSet};
 
     fn spawn_bootstrap_provider_args(

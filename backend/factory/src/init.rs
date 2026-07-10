@@ -292,12 +292,8 @@ pub fn build_automaton_install_args(
                 model: session.config.provider.model.clone(),
                 brave_search_api_key: provider_secrets
                     .and_then(|secrets| secrets.brave_search_api_key.clone()),
-                inference_transport: session.config.provider.inference_transport.clone(),
-                open_router_reasoning_level: session
-                    .config
-                    .provider
-                    .open_router_reasoning_level
-                    .clone(),
+                inference_transport: session.config.provider.inference_transport,
+                open_router_reasoning_level: session.config.provider.open_router_reasoning_level,
             },
             version_commit: version_commit.to_string(),
         }),
@@ -534,14 +530,14 @@ mod tests {
             decoded
                 .spawn_bootstrap
                 .as_ref()
-                .map(|bootstrap| bootstrap.provider.inference_transport.clone()),
+                .map(|bootstrap| bootstrap.provider.inference_transport),
             Some(InferenceTransport::OpenrouterProxyWorker)
         );
         assert_eq!(
             decoded
                 .spawn_bootstrap
                 .as_ref()
-                .map(|bootstrap| bootstrap.provider.open_router_reasoning_level.clone()),
+                .map(|bootstrap| bootstrap.provider.open_router_reasoning_level),
             Some(OpenRouterReasoningLevel::Medium)
         );
         assert_eq!(

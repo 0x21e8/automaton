@@ -12,8 +12,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use spawn_protocol::{
     InferenceTransport, InitArgs, OpenRouterReasoningLevel, SkillRecord, SpawnBootstrapView,
-    SpawnProviderBootstrapArgs, StewardStatusView, StrategyTemplate,
-    StrategyTemplateKey,
+    StewardStatusView, StrategyTemplate, StrategyTemplateKey,
 };
 
 const VERSION_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -223,7 +222,9 @@ fn spawn_contract() {
     };
     let (_, child_wasm) = read_artifact(
         "AUTOMATON_WASM_PATH",
-        child_path.to_str().expect("child wasm path should be valid UTF-8"),
+        child_path
+            .to_str()
+            .expect("child wasm path should be valid UTF-8"),
     );
     let (_, factory_wasm) = read_artifact("FACTORY_WASM_PATH", ".icp/cache/artifacts/factory");
     assert!(!child_wasm.is_empty());
