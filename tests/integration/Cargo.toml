@@ -1,0 +1,12 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+candid = "0.10.24"
+factory = { path = "../../backend/factory" }
+pocket-ic = "9.0.2"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10.9"
+spawn-protocol = { path = "../../crates/spawn-protocol" }

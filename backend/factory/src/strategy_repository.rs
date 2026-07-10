@@ -248,8 +248,8 @@ pub fn repository_updated_at(
 }
 
 pub fn seed_repository_records(now_ms: u64) -> BTreeMap<String, RepositoryStrategyRecord> {
-    let manifest: StrategySeedManifest =
-        serde_json::from_str(STRATEGY_MANIFEST_JSON).expect("embedded strategy manifest should decode");
+    let manifest: StrategySeedManifest = serde_json::from_str(STRATEGY_MANIFEST_JSON)
+        .expect("embedded strategy manifest should decode");
     let mut records = BTreeMap::new();
 
     for entry in manifest.strategies {
@@ -283,7 +283,7 @@ pub fn seed_repository_records(now_ms: u64) -> BTreeMap<String, RepositoryStrate
                 .to_string(),
         };
         let mut record = build_repository_strategy_record(request, now_ms)
-                .expect("embedded strategy should validate");
+            .expect("embedded strategy should validate");
         record.status = parse_strategy_status(&entry.status, "strategies.status")
             .expect("embedded strategy status should be valid");
         if matches!(record.status, RepositoryStrategyStatus::Deprecated) {

@@ -1,3 +1,8 @@
 [workspace]
-members = ["backend/factory", "components/ic-automaton", "crates/spawn-protocol"]
+members = [
+    "backend/factory",
+    "components/ic-automaton",
+    "crates/spawn-protocol",
+    "tests/integration",
+]
 resolver = "2"

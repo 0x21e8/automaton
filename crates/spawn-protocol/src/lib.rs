@@ -102,3 +102,111 @@ pub struct SpawnBootstrapView {
     #[serde(default)]
     pub version_commit: Option<String>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct StewardState {
+    pub chain_id: u64,
+    pub address: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub last_used_at_ns: Option<u64>,
+    #[serde(default)]
+    pub principal: Option<Principal>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct StewardStatusView {
+    #[serde(default)]
+    pub active_steward: Option<StewardState>,
+    #[serde(default)]
+    pub next_nonce: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub enum CanisterCallType {
+    Query,
+    Update,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct CanisterCallPermission {
+    pub canister_id: String,
+    pub method: String,
+    pub call_type: CanisterCallType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct SkillRecord {
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+    pub enabled: bool,
+    pub mutable: bool,
+    #[serde(default)]
+    pub allowed_canister_calls: Vec<CanisterCallPermission>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub enum TemplateStatus {
+    #[default]
+    Draft,
+    Active,
+    Deprecated,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, CandidType, Serialize, Deserialize)]
+pub struct StrategyTemplateKey {
+    pub protocol: String,
+    pub primitive: String,
+    pub chain_id: u64,
+    pub template_id: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct ContractRoleBinding {
+    pub role: String,
+    pub address: String,
+    pub source_ref: String,
+    #[serde(default)]
+    pub codehash: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct AbiTypeSpec {
+    #[serde(default)]
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub components: Vec<AbiTypeSpec>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct AbiFunctionSpec {
+    pub role: String,
+    pub name: String,
+    pub selector_hex: String,
+    pub inputs: Vec<AbiTypeSpec>,
+    pub outputs: Vec<AbiTypeSpec>,
+    pub state_mutability: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct ActionSpec {
+    pub action_id: String,
+    pub call_sequence: Vec<AbiFunctionSpec>,
+    pub preconditions: Vec<String>,
+    pub postconditions: Vec<String>,
+    pub risk_checks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct StrategyTemplate {
+    pub key: StrategyTemplateKey,
+    pub status: TemplateStatus,
+    pub contract_roles: Vec<ContractRoleBinding>,
+    pub actions: Vec<ActionSpec>,
+    pub constraints_json: String,
+    pub created_at_ns: u64,
+    pub updated_at_ns: u64,
+}
