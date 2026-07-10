@@ -1,0 +1,22 @@
+{
+  "name": "@ic-automaton/canister-clients",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "lint": "sh ../../scripts/with-repo-node.sh tsc -p tsconfig.json --noEmit",
+    "build": "sh ../../scripts/with-repo-node.sh tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@icp-sdk/core": "^4.2.3"
+  }
+}

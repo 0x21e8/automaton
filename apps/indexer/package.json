@@ -14,6 +14,7 @@
     "@dfinity/candid": "^3.4.3",
     "@fastify/websocket": "^11.2.0",
     "@ic-automaton/shared": "0.1.0",
+    "@ic-automaton/canister-clients": "0.1.0",
     "@icp-sdk/core": "^4.2.3",
     "better-sqlite3": "^12.6.2",
     "fastify": "^5.8.2"

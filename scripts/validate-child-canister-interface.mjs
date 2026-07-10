@@ -1,99 +1,119 @@
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { gunzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const wasmPath = normalizeOptionalString(process.env.CHILD_WASM_PATH);
+const childWasmPath = resolvePath(
+  process.env.CHILD_WASM_PATH,
+  "components/ic-automaton/target/wasm32-wasip1/release/backend_nowasi.wasm"
+);
+const checkedDidPath = resolvePath(
+  process.env.CHILD_DID_PATH,
+  "components/ic-automaton/ic-automaton.did"
+);
+const requiredMethods = JSON.parse(
+  fs.readFileSync(path.join(rootDir, "packages/canister-clients/automaton-methods.json"), "utf8")
+);
+const httpSourcePath = path.join(rootDir, "components/ic-automaton/src/http.rs");
+const clientSourcePath = path.join(rootDir, "packages/canister-clients/src/index.ts");
 
-const requiredMethodExports = [
-  {
-    methodName: "get_spawn_bootstrap_view",
-    exportLabels: ["canister_query get_spawn_bootstrap_view", "canister_update get_spawn_bootstrap_view"]
-  },
-  {
-    methodName: "get_steward_status",
-    exportLabels: ["canister_query get_steward_status", "canister_update get_steward_status"]
-  },
-  {
-    methodName: "get_automaton_evm_address",
-    exportLabels: ["canister_query get_automaton_evm_address", "canister_update get_automaton_evm_address"]
-  },
-  {
-    methodName: "derive_automaton_evm_address",
-    exportLabels: ["canister_update derive_automaton_evm_address"]
-  },
-  {
-    methodName: "register_strategy_admin",
-    exportLabels: ["canister_update register_strategy_admin"]
-  },
-  {
-    methodName: "list_strategy_templates",
-    exportLabels: ["canister_query list_strategy_templates"]
-  }
-];
-
-function normalizeOptionalString(value) {
-  if (value === undefined || value === null) {
-    return null;
-  }
-
-  const normalized = String(value).trim();
-  return normalized === "" ? null : normalized;
+function resolvePath(value, fallback) {
+  return path.resolve(rootDir, value?.trim() || fallback);
 }
 
-function resolveWasmBinary() {
-  if (wasmPath === null) {
-    throw new Error("CHILD_WASM_PATH is required to validate the child canister artifact.");
+function readArtifact(filePath) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`missing child artifact at ${filePath}`);
   }
 
-  const resolvedWasmPath = path.resolve(rootDir, wasmPath);
-  if (!fs.existsSync(resolvedWasmPath)) {
-    throw new Error(`missing CHILD_WASM_PATH at ${resolvedWasmPath}`);
+  const raw = fs.readFileSync(filePath);
+  return filePath.endsWith(".gz") ? gunzipSync(raw) : raw;
+}
+
+function extractDid(wasmPath) {
+  try {
+    return execFileSync("candid-extractor", [wasmPath], { encoding: "utf8" });
+  } catch (error) {
+    throw new Error(
+      `failed to extract Candid from ${wasmPath}: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
-
-  const rawWasm = fs.readFileSync(resolvedWasmPath);
-  return {
-    description: `child canister artifact ${resolvedWasmPath}`,
-    binary: resolvedWasmPath.endsWith(".gz") ? gunzipSync(rawWasm) : rawWasm,
-    resolvedWasmPath
-  };
 }
 
-function hasAnyExport(binary, exportLabels) {
-  return exportLabels.some((label) => binary.includes(Buffer.from(label, "utf8")));
-}
-
-const { description, binary, resolvedWasmPath } = resolveWasmBinary();
-const failures = [];
-
-for (const { methodName, exportLabels } of requiredMethodExports) {
-  if (hasAnyExport(binary, exportLabels)) {
-    continue;
+function assertExactDid(generatedDid, fixturePath) {
+  const checkedDid = fs.readFileSync(fixturePath, "utf8");
+  const normalizeDid = (did) =>
+    (did
+      .replace(/\/\/.*$/gm, "")
+      .replace(/;\s*}/g, "}")
+      .match(/[A-Za-z0-9_]+|[{}():;,<>?=]/g) || []
+    ).join(" ");
+  if (normalizeDid(generatedDid) !== normalizeDid(checkedDid)) {
+    throw new Error(
+      [
+        "generated child Candid differs from the checked contract:",
+        `- generated from ${childWasmPath}`,
+        `- checked file ${fixturePath}`,
+        "Run candid-extractor against the intended child artifact and review the DID change."
+      ].join("\n")
+    );
   }
-
-  failures.push(`missing exported canister method ${methodName}`);
 }
 
-if (failures.length > 0) {
-  const artifactHint =
-    resolvedWasmPath.endsWith("/target/wasm32-unknown-unknown/release/backend.wasm") ||
-    resolvedWasmPath.endsWith("\\target\\wasm32-unknown-unknown\\release\\backend.wasm")
-      ? [
-          "This looks like ic-automaton's raw wasm32-unknown-unknown build output.",
-          "For local playground installs, use the canister-ready artifact produced by ic-automaton/scripts/build-backend-wasm.sh.",
-          "That artifact is typically target/wasm32-wasip1/release/backend_nowasi.wasm."
-        ]
-      : [];
-  throw new Error(
-    [
-      `Child canister artifact is incompatible with automaton-launchpad spawn verification (${description}).`,
-      ...failures.map((failure) => `- ${failure}`),
-      ...artifactHint
-    ].join("\n")
+function assertRequiredMethods(did) {
+  const service = did.slice(did.indexOf("service :"));
+  const missing = requiredMethods.filter(
+    (methodName) => !new RegExp(`\\b${methodName}\\s*:`).test(service)
   );
+  if (missing.length > 0) {
+    throw new Error(`child Candid is missing required methods: ${missing.join(", ")}`);
+  }
 }
+
+function assertHttpSchemas() {
+  const httpSource = fs.readFileSync(httpSourcePath, "utf8");
+  const clientSource = fs.readFileSync(clientSourcePath, "utf8");
+  const requiredRoutes = [
+    "/api/build-info",
+    "/api/evm/config",
+    "/api/scheduler/config",
+    "/api/steward/status",
+    "/api/snapshot",
+    "/api/wallet/balance"
+  ];
+  const requiredClientFields = [
+    "commit",
+    "automaton_address",
+    "chain_id",
+    "base_tick_secs",
+    "active_steward",
+    "recent_turns",
+    "bootstrap_pending"
+  ];
+  const missingRoutes = requiredRoutes.filter((route) => !httpSource.includes(`\"${route}\"`));
+  const missingFields = requiredClientFields.filter((field) => !clientSource.includes(field));
+
+  if (missingRoutes.length > 0 || missingFields.length > 0) {
+    throw new Error(
+      [
+        "centralized automaton HTTP contract is incomplete:",
+        missingRoutes.length > 0 ? `missing runtime routes: ${missingRoutes.join(", ")}` : null,
+        missingFields.length > 0 ? `missing client fields: ${missingFields.join(", ")}` : null
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
+  }
+}
+
+const childBinary = readArtifact(childWasmPath);
+const generatedDid = extractDid(childWasmPath);
+assertExactDid(generatedDid, checkedDidPath);
+assertRequiredMethods(generatedDid);
+assertHttpSchemas();
 
 process.stdout.write(
-  `child canister artifact compatibility check passed (${description})\n`
+  `child canister contract check passed (Wasm ${childBinary.length} bytes, ${requiredMethods.length} required methods)\n`
 );

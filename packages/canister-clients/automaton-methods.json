@@ -1,0 +1,8 @@
+[
+  "get_spawn_bootstrap_view",
+  "get_steward_status",
+  "get_automaton_evm_address",
+  "derive_automaton_evm_address",
+  "register_strategy_admin",
+  "list_strategy_templates"
+]

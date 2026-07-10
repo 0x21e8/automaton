@@ -7,6 +7,9 @@
     "paths": {
       "@ic-automaton/shared": [
         "packages/shared/src/index.ts"
+      ],
+      "@ic-automaton/canister-clients": [
+        "packages/canister-clients/src/index.ts"
       ]
     },
     "jsx": "react-jsx",

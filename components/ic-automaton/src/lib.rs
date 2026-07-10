@@ -60,7 +60,7 @@ use ic_cdk_timers::{clear_timer, set_timer_interval_serial, TimerId};
 use ic_http_certification::{HttpRequest, HttpResponse, HttpUpdateRequest, HttpUpdateResponse};
 use serde::Deserialize;
 use sha3::{Digest, Keccak256};
-use spawn_protocol::{InitArgs, SpawnBootstrapArgs, SpawnProviderBootstrapArgs};
+use spawn_protocol::{InitArgs, SpawnBootstrapArgs};
 #[cfg(all(not(target_arch = "wasm32"), test))]
 use std::cell::RefCell;
 #[cfg(target_arch = "wasm32")]
