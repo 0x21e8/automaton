@@ -610,7 +610,9 @@ pub fn restore_state(snapshot: FactoryStateSnapshot) {
 
 pub fn store_spawn_provider_secrets(session_id: &str, secrets: SpawnProviderSecrets) {
     with_storage_mut(|storage| {
-        storage.spawn_provider_secrets.insert(session_id.to_string(), secrets);
+        storage
+            .spawn_provider_secrets
+            .insert(session_id.to_string(), secrets);
     });
 }
 
@@ -620,7 +622,9 @@ pub fn load_spawn_provider_secrets(session_id: &str) -> Option<SpawnProviderSecr
 
 pub fn delete_spawn_provider_secrets(session_id: &str) {
     with_storage_mut(|storage| {
-        storage.spawn_provider_secrets.remove(&session_id.to_string());
+        storage
+            .spawn_provider_secrets
+            .remove(&session_id.to_string());
     });
 }
 

@@ -92,30 +92,20 @@ pub enum SessionAuditActor {
     Admin,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub enum InferenceTransport {
+    #[default]
     OpenrouterDirect,
     OpenrouterProxyWorker,
 }
 
-impl Default for InferenceTransport {
-    fn default() -> Self {
-        Self::OpenrouterDirect
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub enum OpenRouterReasoningLevel {
+    #[default]
     Default,
     Low,
     Medium,
     High,
-}
-
-impl Default for OpenRouterReasoningLevel {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]

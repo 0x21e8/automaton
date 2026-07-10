@@ -20,11 +20,11 @@ use crate::init::{
 };
 use crate::retry::mark_session_failed_in_state;
 use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent};
+#[cfg(target_arch = "wasm32")]
+use crate::state::load_spawn_provider_secrets;
 use crate::state::{
     clear_provider_secrets, delete_spawn_provider_secrets, read_state, write_state, FactoryState,
 };
-#[cfg(target_arch = "wasm32")]
-use crate::state::load_spawn_provider_secrets;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::types::{amount_to_string, parse_amount};
 use crate::types::{

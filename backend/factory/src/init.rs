@@ -255,8 +255,7 @@ pub fn build_automaton_install_args(
         search_api_key: child_runtime.search_api_key.clone(),
         inference_proxy_worker_base_url: child_runtime.inference_proxy_worker_base_url.clone(),
         inference_proxy_trusted_callback_principal: child_runtime
-            .inference_proxy_trusted_callback_principal
-            .clone(),
+            .inference_proxy_trusted_callback_principal,
         cycle_topup_enabled: child_runtime.cycle_topup_enabled,
         auto_topup_cycle_threshold: child_runtime.auto_topup_cycle_threshold,
         spawn_bootstrap: Some(AutomatonSpawnBootstrapArgs {
@@ -328,9 +327,9 @@ mod tests {
     };
     use crate::types::{
         AutomatonChildInitArgs, AutomatonChildRuntimeConfig, CreateSpawnSessionRequest,
-        InferenceTransport, OpenRouterReasoningLevel, ProviderConfig, SpawnProviderSecrets,
+        InferenceTransport, OpenRouterReasoningLevel, ProviderConfig,
         RepositoryStrategySessionSnapshot, RepositoryStrategySource, RepositoryStrategyStatus,
-        SpawnAsset, SpawnChain, SpawnConfig,
+        SpawnAsset, SpawnChain, SpawnConfig, SpawnProviderSecrets,
     };
 
     fn sample_request() -> CreateSpawnSessionRequest {

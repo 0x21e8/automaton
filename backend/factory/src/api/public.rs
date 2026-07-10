@@ -5,8 +5,8 @@ use crate::expiry::expire_spawn_session;
 use crate::retry::retry_failed_session;
 use crate::scheduler::enqueue_payment_poll;
 use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent};
-use crate::state::{read_state, write_state, FactoryState};
 use crate::state::store_spawn_provider_secrets;
+use crate::state::{read_state, write_state, FactoryState};
 use crate::types::{
     amount_to_string, derive_claim_id, hash_quote_terms, parse_amount, CreateSpawnSessionRequest,
     CreateSpawnSessionResponse, FactoryError, PostRoomMessageRequest, RefundSpawnResponse,
@@ -86,7 +86,7 @@ fn normalize_room_body(body: &str) -> Result<String, FactoryError> {
         return Err(FactoryError::EmptyRoomMessageBody);
     }
 
-    let provided_bytes = trimmed.as_bytes().len();
+    let provided_bytes = trimmed.len();
     if provided_bytes > MAX_ROOM_BODY_BYTES {
         return Err(FactoryError::RoomMessageBodyTooLarge {
             provided_bytes,
