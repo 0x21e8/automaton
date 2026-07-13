@@ -263,6 +263,7 @@ pub fn build_automaton_install_args(
     version_commit: &str,
     child_runtime: &ValidatedAutomatonChildRuntimeConfig,
 ) -> Vec<u8> {
+    let (name, constitution) = session.resolved_genesis();
     Encode!(&AutomatonChildInitArgs {
         ecdsa_key_name: child_runtime.ecdsa_key_name.clone(),
         inbox_contract_address: child_runtime.inbox_contract_address.clone(),
@@ -279,6 +280,9 @@ pub fn build_automaton_install_args(
         cycle_topup_enabled: child_runtime.cycle_topup_enabled,
         auto_topup_cycle_threshold: child_runtime.auto_topup_cycle_threshold,
         spawn_bootstrap: Some(AutomatonSpawnBootstrapArgs {
+            contract_version: Some(crate::types::SPAWN_CONTRACT_VERSION),
+            name: Some(name),
+            constitution: Some(constitution),
             steward_address: session.steward_address.clone(),
             session_id: session.session_id.clone(),
             parent_id: session.parent_id.clone(),
@@ -350,6 +354,8 @@ mod tests {
 
     fn sample_request() -> CreateSpawnSessionRequest {
         CreateSpawnSessionRequest {
+            name: Some("Meridian".to_string()),
+            constitution: Some("I am Meridian. ".repeat(30)),
             steward_address: "0xsteward".to_string(),
             asset: SpawnAsset::Usdc,
             gross_amount: "75000000".to_string(),

@@ -76,6 +76,8 @@ const completedSession = await waitForSessionCompletion(
 const registryRecord = await fetchJson(
   `${runtime.indexerBaseUrl}/api/spawned-automatons/${completedSession.registryRecord.canisterId}`,
 );
+assert(registryRecord?.name === "Meridian", "registry did not surface genesis name", registryRecord);
+assert(/^[0-9a-f]{64}$/.test(registryRecord?.constitutionHash ?? ""), "registry did not surface constitution hash", registryRecord);
 
 const summary = {
   ok: true,

@@ -112,6 +112,8 @@ fn install_factory(pic: &PocketIc, factory_wasm: &[u8], chain_id: u64) -> Princi
 
 fn production_install_args(factory_id: Principal, transport: InferenceTransport) -> Vec<u8> {
     let session = SpawnSession {
+        name: None,
+        constitution: None,
         session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
         claim_id: "claim-1".to_string(),
         steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),

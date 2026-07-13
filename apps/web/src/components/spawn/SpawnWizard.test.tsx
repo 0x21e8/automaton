@@ -1,10 +1,50 @@
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import {
   deriveSpawnJourneyProgress,
   getEffectivePendingReceipts,
-  getPaymentSubmissionLockReason
+  getPaymentSubmissionLockReason,
+  SpawnWizard
 } from "./SpawnWizard";
+
+describe("SpawnWizard Genesis integration", () => {
+  it("opens on the Genesis rite and blocks advancement until it is valid", () => {
+    const markup = renderToStaticMarkup(
+      <SpawnWizard
+        isOpen
+        onClose={() => {}}
+        playgroundError={null}
+        playgroundIsFallback={false}
+        playgroundMetadata={null}
+        walletSession={{
+          address: null,
+          chainId: null,
+          hasProvider: false,
+          isConnecting: false,
+          isConnected: false,
+          errorMessage: null,
+          providers: [],
+          selectedProviderId: null,
+          selectedProviderName: null,
+          walletLabel: "Wallet not detected",
+          request: async () => {
+            throw new Error("wallet request is not expected during static rendering");
+          },
+          connect: async () => {},
+          disconnect: () => {},
+          setSelectedProvider: () => {}
+        }}
+      />
+    );
+
+    expect(markup).toContain("Step 1 of 5");
+    expect(markup).toContain("Genesis constitution");
+    expect(markup).toContain("Name must be 1–64 characters.");
+    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*>Next<\/button>/);
+    expect(markup).not.toContain("Risk appetite");
+  });
+});
 
 describe("SpawnWizard pending receipt state", () => {
   it("keeps locally pending receipts while the session is still unpaid", () => {
@@ -193,7 +233,7 @@ describe("deriveSpawnJourneyProgress", () => {
       false
     );
 
-    expect(progress?.currentLabel).toBe("Spawn complete");
+    expect(progress?.currentLabel).toBe("Birth complete");
     expect(progress?.completedCount).toBe(progress?.totalCount);
     expect(progress?.steps.every((step) => step.status === "complete")).toBe(true);
   });

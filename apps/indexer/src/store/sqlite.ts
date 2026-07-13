@@ -16,6 +16,7 @@ import type {
   SpawnSessionDetail,
   SpawnedAutomatonRecord
 } from "@ic-automaton/shared";
+import { verifyConstitution } from "../lib/genesis-integrity.js";
 
 const require = createRequire(import.meta.url);
 
@@ -140,6 +141,7 @@ function detailToSummary(detail: AutomatonDetail): AutomatonSummary {
     chain: detail.chain,
     chainId: detail.chainId,
     name: detail.name,
+    constitutionHash: detail.constitutionHash,
     tier: detail.tier,
     agentState: detail.runtime.agentState,
     ethBalanceWei: detail.financials.ethBalanceWei,
@@ -504,12 +506,24 @@ class BetterSqliteStore implements IndexerStore {
     }
 
     const detail = JSON.parse(row.detail_json) as AutomatonDetail;
+    const constitutionResult =
+      detail.constitutionVerification === undefined
+        ? verifyConstitution(
+            detail.constitution ?? null,
+            detail.constitutionHash ?? null
+          )
+        : {
+            constitution: detail.constitution ?? null,
+            verification: detail.constitutionVerification
+          };
     const monologue = await this.listMonologue(canisterId, {
       limit: 50
     });
 
     return {
       ...detail,
+      constitution: constitutionResult.constitution,
+      constitutionVerification: constitutionResult.verification,
       monologue: monologue.entries
     };
   }

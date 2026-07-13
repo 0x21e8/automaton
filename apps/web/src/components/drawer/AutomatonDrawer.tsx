@@ -353,6 +353,32 @@ export function AutomatonDrawer({
               )}
             </div>
           </div>
+          {automaton !== null &&
+          ((automaton.constitution !== null &&
+            automaton.constitution !== undefined) ||
+            automaton.constitutionVerification.status !== "unavailable") ? (
+            <section className="detail-field">
+              <div className="lbl">Founding document</div>
+              {automaton.constitutionVerification.status === "mismatch" ? (
+                <p role="alert">
+                  Integrity warning: the child document does not match the factory
+                  registry hash, so its contents are hidden.
+                </p>
+              ) : (
+                <p>{automaton.constitution ?? "Founding document unavailable."}</p>
+              )}
+              {automaton.constitutionVerification.status === "verified" ? (
+                <div className="addr-text">
+                  Verified SHA-256 {automaton.constitutionHash}
+                </div>
+              ) : null}
+              {automaton.constitutionVerification.status === "legacy_unverified" ? (
+                <div className="addr-text" role="status">
+                  Legacy document — no registry hash is available for verification.
+                </div>
+              ) : null}
+            </section>
+          ) : null}
         </div> : null}
 
         <div className="drawer-bottom">

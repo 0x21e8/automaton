@@ -541,6 +541,17 @@ fn apply_spawn_bootstrap(args: SpawnBootstrapArgs) -> Result<(), String> {
     if session_id.is_empty() {
         return Err("spawn bootstrap session_id cannot be empty".to_string());
     }
+    let name = args
+        .name
+        .ok_or_else(|| "spawn bootstrap genesis name is required".to_string())?;
+    let constitution = args
+        .constitution
+        .ok_or_else(|| "spawn bootstrap genesis constitution is required".to_string())?;
+    let (name, constitution) = spawn_protocol::validate_genesis(&name, &constitution)
+        .map_err(|error| format!("invalid spawn genesis: {error:?}"))?;
+    if args.contract_version != Some(spawn_protocol::SPAWN_CONTRACT_VERSION) {
+        return Err("unsupported spawn bootstrap contract version".to_string());
+    }
 
     let strategies = normalize_string_list(args.strategies);
     let skills = normalize_string_list(args.skills);
@@ -585,6 +596,9 @@ fn apply_spawn_bootstrap(args: SpawnBootstrapArgs) -> Result<(), String> {
     }
 
     stable::set_spawn_bootstrap_metadata(SpawnBootstrapView {
+        contract_version: args.contract_version,
+        name: Some(name),
+        constitution: Some(constitution),
         session_id: Some(session_id),
         parent_id,
         factory_principal: Some(args.factory_principal),
@@ -2296,6 +2310,9 @@ mod tests {
 
     fn sample_spawn_bootstrap_args(provider: SpawnProviderBootstrapArgs) -> SpawnBootstrapArgs {
         SpawnBootstrapArgs {
+            contract_version: Some(spawn_protocol::SPAWN_CONTRACT_VERSION),
+            name: Some("Meridian".to_string()),
+            constitution: Some("I am Meridian. ".repeat(30)),
             steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             parent_id: Some("parent-automaton".to_string()),
@@ -2840,6 +2857,9 @@ mod tests {
         assert_eq!(
             bootstrap,
             SpawnBootstrapView {
+                contract_version: Some(spawn_protocol::SPAWN_CONTRACT_VERSION),
+                name: Some("Meridian".to_string()),
+                constitution: Some("I am Meridian. ".repeat(30).trim().to_string()),
                 session_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
                 parent_id: Some("parent-automaton".to_string()),
                 factory_principal: Some(
@@ -3599,6 +3619,36 @@ mod tests {
         assert!(stable::get_memory_fact("noise.old").is_none());
         assert!(stable::get_memory_fact("noise.fresh").is_some());
         assert!(stable::get_memory_fact("config.keep").is_some());
+    }
+
+    #[test]
+    fn bootstrap_persists_genesis_once_and_prompt_renders_it() {
+        stable::init_storage();
+        let first = sample_spawn_bootstrap_args(spawn_bootstrap_provider_args(
+            InferenceTransport::OpenrouterDirect,
+            OpenRouterReasoningLevel::Default,
+        ));
+        apply_spawn_bootstrap(first).expect("first genesis should bootstrap");
+        let prompt = crate::prompt::assemble_system_prompt("## Situation\n- test");
+        assert!(prompt.contains("# Meridian"));
+        assert!(prompt.contains("I am Meridian."));
+
+        let mut second = sample_spawn_bootstrap_args(spawn_bootstrap_provider_args(
+            InferenceTransport::OpenrouterDirect,
+            OpenRouterReasoningLevel::Default,
+        ));
+        second.name = Some("Usurper".to_string());
+        second.constitution = Some("I am Usurper. ".repeat(30));
+        apply_spawn_bootstrap(second).expect("replayed bootstrap may refresh metadata");
+
+        let view = stable::spawn_bootstrap_view();
+        assert_eq!(view.name.as_deref(), Some("Meridian"));
+        assert!(view
+            .constitution
+            .as_deref()
+            .unwrap()
+            .starts_with("I am Meridian."));
+        assert!(!crate::prompt::assemble_system_prompt("## Situation").contains("Usurper"));
     }
 }
 

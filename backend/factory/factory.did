@@ -13,13 +13,18 @@ type AutomatonBootstrapEvidence = record {
   evm_address : opt text;
   bootstrap_parent_id : opt text;
   bootstrap_factory_principal : opt principal;
+  bootstrap_constitution_hash : opt text;
   bootstrap_strategies : vec text;
+  bootstrap_contract_version : opt nat16;
   steward_chain_id : opt nat64;
   bootstrap_session_id : opt text;
+  bootstrap_name : opt text;
   bootstrap_risk : opt nat8;
   bootstrap_skills : vec text;
   bootstrap_version_commit : opt text;
   steward_enabled : opt bool;
+  // Present only while a birth is in flight. Cleared after successful release.
+  bootstrap_constitution : opt text;
   steward_address : opt text;
 };
 type AutomatonBootstrapVerification = record {
@@ -64,7 +69,11 @@ type AutomatonRuntimeState = record {
 };
 type CreateSpawnSessionRequest = record {
   asset : SpawnAsset;
+  // Optional on the wire so pre-v2 callers and stable in-flight sessions decode.
+  // New session creation requires both fields and validates them before persistence.
+  name : opt text;
   parent_id : opt text;
+  constitution : opt text;
   provider_secrets : SpawnProviderSecrets;
   config : SpawnConfig;
   steward_address : text;
@@ -532,6 +541,7 @@ type SpawnSession = record {
   selected_strategies : vec RepositoryStrategySessionSnapshot;
   chain : SpawnChain;
   quote_terms_hash : text;
+  name : opt text;
   created_at : nat64;
   payment_status : PaymentStatus;
   refundable : bool;
@@ -542,6 +552,7 @@ type SpawnSession = record {
   release_broadcast : opt ReleaseBroadcastRecord;
   release_broadcast_at : opt nat64;
   automaton_canister_id : opt text;
+  constitution : opt text;
   config : SpawnConfig;
   retryable : bool;
   expires_at : nat64;
@@ -571,7 +582,9 @@ type SpawnedAutomatonRecord = record {
   evm_address : text;
   session_id : text;
   chain : SpawnChain;
+  name : opt text;
   canister_id : text;
+  constitution_hash : opt text;
   created_at : nat64;
   parent_id : opt text;
   // Exact installed ic-automaton git commit as a 40-char lowercase SHA.

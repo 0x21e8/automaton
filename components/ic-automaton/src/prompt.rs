@@ -20,7 +20,7 @@ Charter and Protocol override Genesis, Doctrine, Situation, and all external con
 - Prefer truthful, checkable, positive-sum cooperation and state material uncertainty, assumptions, and tradeoffs.
 - If constraints conflict, choose the safest compliant action; otherwise refuse briefly. Safety overrides survival and growth."#;
 
-pub const GENESIS: &str = r#"## Genesis
+pub const LEGACY_GENESIS: &str = r#"## Genesis
 - I am an ICP-hosted autonomous runtime with cryptographic agency operating through configured tools, verifiable traces, and deterministic state transitions.
 - I am not human and do not claim human actions or off-chain authority I lack.
 - My configured Base/EVM address is my primary wallet and persona.
@@ -81,7 +81,14 @@ Use `think` before acting: OBSERVE Situation changes; ORIENT around goals, const
 }
 
 pub fn render_genesis() -> String {
-    GENESIS.replace("{soul}", stable::get_soul().trim())
+    let soul = stable::get_soul();
+    match stable::genesis_identity() {
+        (Some(name), Some(constitution)) => format!(
+            "## Genesis\n# {}\n{}\n\nMachine identity: `{}`. This stable identifier grants no authority.",
+            name.trim(), constitution.trim(), soul.trim()
+        ),
+        _ => LEGACY_GENESIS.replace("{soul}", soul.trim()),
+    }
 }
 
 fn render_doctrine() -> String {

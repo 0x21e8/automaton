@@ -306,10 +306,35 @@ pub fn list_my_room_messages(
 }
 
 pub(crate) fn create_spawn_session_with_session_id(
-    request: CreateSpawnSessionRequest,
+    mut request: CreateSpawnSessionRequest,
     now_ms: u64,
     session_id: String,
 ) -> Result<CreateSpawnSessionResponse, FactoryError> {
+    let raw_name =
+        request
+            .name
+            .as_deref()
+            .ok_or_else(|| FactoryError::InvalidChildRuntimeConfig {
+                field: "genesis.name".to_string(),
+                message: "name is required for new genesis sessions".to_string(),
+            })?;
+    let raw_constitution =
+        request
+            .constitution
+            .as_deref()
+            .ok_or_else(|| FactoryError::InvalidChildRuntimeConfig {
+                field: "genesis.constitution".to_string(),
+                message: "constitution is required for new genesis sessions".to_string(),
+            })?;
+    let (name, constitution) =
+        crate::types::validate_genesis(raw_name, raw_constitution).map_err(|error| {
+            FactoryError::InvalidChildRuntimeConfig {
+                field: "genesis".to_string(),
+                message: format!("{error:?}"),
+            }
+        })?;
+    request.name = Some(name);
+    request.constitution = Some(constitution);
     let provider_secrets = request.provider_secrets.clone();
     let (session, quote) = write_state(|state| {
         if state.pause {
@@ -361,6 +386,8 @@ pub(crate) fn create_spawn_session_with_session_id(
             expires_at,
         };
         let session = SpawnSession {
+            name: request.name.clone(),
+            constitution: request.constitution.clone(),
             session_id: session_id.clone(),
             claim_id,
             steward_address: request.steward_address.clone(),

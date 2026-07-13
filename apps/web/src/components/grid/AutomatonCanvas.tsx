@@ -795,7 +795,7 @@ export function AutomatonCanvas({
           }}
           type="button"
         >
-          Spawn
+          Begin genesis
         </button>
         <div
           className={`canvas-tooltip${tooltip.visible ? " is-visible" : ""}`}

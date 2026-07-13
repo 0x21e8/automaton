@@ -151,7 +151,7 @@ export default function App() {
       <nav className="product-nav" aria-label="Public Lab sections">
         <a href="#fleet">Fleet</a>
         <a href="#room">Room</a>
-        <a href="#spawn">Spawn</a>
+        <a href="#spawn">Genesis</a>
         <span>Visitor / Supporter access</span>
       </nav>
 

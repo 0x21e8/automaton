@@ -5238,6 +5238,9 @@ mod tests {
     fn dynamic_context_renders_room_observations_only_inside_untrusted_section() {
         reset_runtime(AgentState::Sleeping, true, false, 12);
         stable::set_spawn_bootstrap_metadata(crate::domain::types::SpawnBootstrapView {
+            contract_version: None,
+            name: None,
+            constitution: None,
             session_id: None,
             parent_id: None,
             factory_principal: Some(

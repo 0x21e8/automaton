@@ -986,6 +986,12 @@ pub struct RuntimeSnapshot {
     #[serde(default)]
     pub spawn_session_id: Option<String>,
     #[serde(default)]
+    pub spawn_contract_version: Option<u16>,
+    #[serde(default)]
+    pub genesis_name: Option<String>,
+    #[serde(default)]
+    pub genesis_constitution: Option<String>,
+    #[serde(default)]
     pub spawn_parent_id: Option<String>,
     #[serde(default)]
     pub factory_principal: Option<String>,
@@ -1045,6 +1051,9 @@ impl Default for RuntimeSnapshot {
             autonomy_suppression: AutonomySuppressionConfig::default(),
             autonomy_inference_suppression: AutonomyInferenceSuppressionState::default(),
             spawn_session_id: None,
+            spawn_contract_version: None,
+            genesis_name: None,
+            genesis_constitution: None,
             spawn_parent_id: None,
             factory_principal: None,
             spawn_risk: None,
@@ -1935,6 +1944,9 @@ impl From<&RuntimeSnapshot> for RuntimeView {
 impl From<&RuntimeSnapshot> for SpawnBootstrapView {
     fn from(snapshot: &RuntimeSnapshot) -> Self {
         Self {
+            contract_version: snapshot.spawn_contract_version,
+            name: snapshot.genesis_name.clone(),
+            constitution: snapshot.genesis_constitution.clone(),
             session_id: snapshot.spawn_session_id.clone(),
             parent_id: snapshot.spawn_parent_id.clone(),
             factory_principal: snapshot

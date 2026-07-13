@@ -13,12 +13,12 @@ describe("App", () => {
     expect(markup).toContain("LIVE");
     expect(markup).toContain("Wallet not detected");
     expect(markup).toContain("Automaton grid");
-    expect(markup).toContain(">Spawn</button>");
+    expect(markup).toContain(">Begin genesis</button>");
     expect(markup).toContain("Room timeline");
     expect(markup).toContain("No indexed room messages yet.");
-    expect(markup).toContain("Spawn Automaton");
-    expect(markup).toContain("Step 1 of 4");
-    expect(markup).toContain("Risk Appetite");
+    expect(markup).toContain("Bring forth an Automaton");
+    expect(markup).toContain("Step 1 of 5");
+    expect(markup).toContain("Genesis constitution");
     expect(markup).toContain("Select an automaton");
     expect(markup).toContain("Public Lab sections");
     expect(markup).toContain("Visitor / Supporter access");

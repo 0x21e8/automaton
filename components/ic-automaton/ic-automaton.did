@@ -1,3 +1,5 @@
+// A versioned ABI artefact stored in `ABI_ARTIFACT_MAP`, providing the raw
+// JSON ABI and pre-parsed function specs for selector validation.
 type AbiArtifact = record {
   key : AbiArtifactKey;
   updated_at_ns : nat64;
@@ -7,7 +9,9 @@ type AbiArtifact = record {
   codehash : opt text;
   functions : vec AbiFunctionSpec;
 };
+// Composite key for an ABI artefact: protocol + chain + contract role.
 type AbiArtifactKey = record { protocol : text; role : text; chain_id : nat64 };
+// A single ABI function entry, including its 4-byte selector for verification.
 type AbiFunctionSpec = record {
   name : text;
   role : text;
@@ -16,8 +20,13 @@ type AbiFunctionSpec = record {
   selector_hex : text;
   state_mutability : text;
 };
+// A compile-time / test assertion that a human-readable function signature
+// produces the expected 4-byte selector.
 type AbiSelectorAssertion = record { signature : text; selector_hex : text };
+// Recursive ABI type specification (mirrors the JSON ABI format).
 type AbiTypeSpec = record { kind : text; name : text; components : Vec };
+// A named action within a strategy template — a sequence of EVM calls with
+// guard conditions.
 type ActionSpec = record {
   postconditions : vec text;
   action_id : text;
@@ -25,6 +34,7 @@ type ActionSpec = record {
   preconditions : vec text;
   call_sequence : vec AbiFunctionSpec;
 };
+// Durable exposure record used for protocol concentration and reconciliation.
 type ActiveExposure = record {
   protocol : text;
   updated_at_ns : nat64;
@@ -33,6 +43,17 @@ type ActiveExposure = record {
   notional_wei : opt nat;
   asset_symbol : text;
 };
+// All stable states of the agent finite-state machine.
+//
+// Transitions are driven by [`AgentEvent`] and recorded in the transition log.
+// - `Bootstrapping` — canister just installed; awaiting initial configuration.
+// - `Idle` — ready and waiting for the next timer tick or inbox message.
+// - `LoadingContext` — building the prompt from stable storage.
+// - `Inferring` — an LLM call is in progress.
+// - `ExecutingActions` — tool calls from the inference round are being run.
+// - `Persisting` — writing turn results and memory facts to stable storage.
+// - `Sleeping` — the agent requested a voluntary sleep; skips future turns.
+// - `Faulted` — a non-recoverable error occurred; requires `ResetFault`.
 type AgentState = variant {
   Idle;
   Bootstrapping;
@@ -43,6 +64,7 @@ type AgentState = variant {
   Sleeping;
   Persisting;
 };
+// Durable governance policy that bounds autonomous economic behavior.
 type AutonomyPolicy = record {
   escalation_rules : EscalationRules;
   execution_authority : ExecutionAuthority;
@@ -51,6 +73,7 @@ type AutonomyPolicy = record {
   reserve_policy : ReservePolicy;
   version : nat32;
 };
+// Runtime policy for autonomous tool-call suppression behavior.
 type AutonomySuppressionConfig = record {
   failure_repeat_threshold : nat32;
   dedupe_window_secs : nat64;
@@ -58,12 +81,18 @@ type AutonomySuppressionConfig = record {
   failure_repeat_window_secs : nat64;
   failure_cooldown_secs : nat64;
 };
+// A single canister method that a skill permits the agent to call.
 type CanisterCallPermission = record {
+  // Method name (e.g. `"icrc1_balance_of"`).
   method : text;
+  // Target canister principal as text (e.g. `"um5iw-rqaaa-aaaaq-qaaba-cai"`).
   canister_id : text;
+  // Whether this is a read-only query or a state-mutating update.
   call_type : CanisterCallType;
 };
+// Whether an inter-canister call is a query (read-only) or update (state-mutating).
 type CanisterCallType = variant { Update; Query };
+// Reason why a multi-round inference loop stopped before receiving a final answer.
 type ContinuationStopReason = variant {
   None;
   MaxDuration;
@@ -71,12 +100,14 @@ type ContinuationStopReason = variant {
   MaxRounds;
   MaxToolCalls;
 };
+// Binds a logical contract role (e.g. `"vault"`) to a verified on-chain address.
 type ContractRoleBinding = record {
   role : text;
   source_ref : text;
   codehash : opt text;
   address : text;
 };
+// A single request–response exchange between a sender and the agent.
 type ConversationEntry = record {
   timestamp_ns : nat64;
   turn_id : text;
@@ -85,16 +116,22 @@ type ConversationEntry = record {
   agent_reply : text;
   inbox_message_id : text;
 };
+// All conversation entries for a given sender, stored in `CONVERSATION_MAP`.
 type ConversationLog = record {
   sender : text;
   last_activity_ns : nat64;
   entries : vec ConversationEntry;
 };
+// Lightweight summary of a conversation, used in the observability snapshot.
 type ConversationSummary = record {
   sender : text;
   last_activity_ns : nat64;
   entry_count : nat32;
 };
+// Cycle balance telemetry derived from a ring-buffer of balance samples.
+//
+// Burn-rate projections and estimated freeze time are `None` until enough
+// samples have been collected (at least two distinct timestamps).
 type CycleTelemetry = record {
   burn_rate_cycles_per_day : opt nat;
   usd_per_trillion_cycles : float64;
@@ -110,6 +147,7 @@ type CycleTelemetry = record {
   moving_window_seconds : nat64;
   liquid_cycles : nat;
 };
+// Terminal persisted decision outcome for an autonomous economic turn.
 type DecisionOutcome = variant {
   NoOp : record { reason : text };
   Executed : record { action_summary : text };
@@ -117,6 +155,7 @@ type DecisionOutcome = variant {
   Deferred : record { reason : text };
   Escalated : record { gap : EscalationClass };
 };
+// Durable audit record for recent autonomous economic decisions.
 type DecisionRecord = record {
   timestamp_ns : nat64;
   trigger : DecisionTrigger;
@@ -126,6 +165,7 @@ type DecisionRecord = record {
   policy_version : nat32;
   outcome : DecisionOutcome;
 };
+// Trigger that caused an autonomous economic decision turn.
 type DecisionTrigger = variant {
   ScheduledReview;
   LowRunway;
@@ -134,10 +174,12 @@ type DecisionTrigger = variant {
   PositionMaintenance;
   RecoveryFollowUp;
 };
+// Manual enqueue input for discovery jobs.
 type EnqueueStrategyDiscoveryJobArgs = record {
   objective : opt text;
   watchlist : opt vec ProtocolWatchlistEntry;
 };
+// Escalation category emitted when the automaton cannot proceed autonomously.
 type EscalationClass = variant {
   MissingPolicy : record { what : text };
   CapabilityGap : record { what : text };
@@ -145,12 +187,14 @@ type EscalationClass = variant {
   SafetyConflict : record { what : text };
   OutOfAuthority : record { what : text };
 };
+// Rules for escalating or quarantining autonomous execution decisions.
 type EscalationRules = record {
   escalate_on_repeated_failure : bool;
   escalate_on_missing_policy : bool;
   escalate_on_authority_exceeded : bool;
   failure_quarantine_threshold : nat32;
 };
+// Read-only view of the EVM polling configuration and cursor, returned by queries.
 type EvmRouteStateView = record {
   next_block : nat64;
   automaton_address_topic : opt text;
@@ -162,20 +206,30 @@ type EvmRouteStateView = record {
   last_poll_at_ns : nat64;
   next_log_index : nat64;
 };
+// Signed proof attached to steward command execution requests.
+//
+// The signature authenticates a canonical payload containing:
+// `canister_id`, `chain_id`, `address`, `command_hash`, `nonce`, and
+// `expires_at_ns`.
 type EvmStewardProof = record {
+  // 65-byte ECDSA signature encoded as `0x{r}{s}{v}`.
   signature : text;
   canister_id : text;
   command_hash : text;
   chain_id : nat64;
   address : text;
   nonce : nat64;
+  // Accepts both JSON numbers and strings to avoid JavaScript `Number`
+  // precision loss (nanosecond timestamps exceed `Number.MAX_SAFE_INTEGER`).
   expires_at_ns : nat64;
 };
+// Hard execution authority limits for autonomous capital-touching actions.
 type ExecutionAuthority = record {
   autonomous_execution_enabled : bool;
   require_simulation_first : bool;
   per_action_value_limit_wei : opt nat;
 };
+// Small operator-facing view of the last exposure reconciliation run.
 type ExposureReconciliationStatus = record {
   last_error : opt text;
   repaired_exposures : nat32;
@@ -185,30 +239,187 @@ type ExposureReconciliationStatus = record {
   recreated_exposures : nat32;
   last_succeeded_at_ns : opt nat64;
 };
+// A Candid-encodable representation of an HTTP request. This struct is used by
+// the `http_request` method of the HTTP Gateway Protocol's Candid interface.
+//
+// # Examples
+//
+// ```
+// use ic_http_certification::{HttpRequest, Method};
+//
+// let request = HttpRequest::builder()
+// .with_method(Method::GET)
+// .with_url("/")
+// .with_headers(vec![("X-Custom-Foo".into(), "Bar".into())])
+// .with_body(&[1, 2, 3])
+// .with_certificate_version(2)
+// .build();
+//
+// assert_eq!(request.method(), Method::GET);
+// assert_eq!(request.url(), "/");
+// assert_eq!(request.headers(), &[("X-Custom-Foo".into(), "Bar".into())]);
+// assert_eq!(request.body(), &[1, 2, 3]);
+// assert_eq!(request.certificate_version(), Some(2));
+// ```
+//
+// # Helpers
+//
+// There are also a number of convenience methods for quickly creating an [HttpRequest] with
+// commonly used HTTP methods:
+//
+// - [GET](HttpRequest::get)
+// - [POST](HttpRequest::post)
+// - [PUT](HttpRequest::put)
+// - [PATCH](HttpRequest::patch)
+// - [DELETE](HttpRequest::delete)
+//
+// ```
+// use ic_http_certification::HttpRequest;
+//
+// let request = HttpRequest::get("/").build();
+//
+// assert_eq!(request.method(), "GET");
+// assert_eq!(request.url(), "/");
+// ```
 type HttpRequest = record {
+  // HTTP request URL.
   url : text;
+  // HTTP request method.
   method : text;
+  // HTTP request body as an array of bytes.
   body : blob;
+  // HTTP request headers.
   headers : vec record { text; text };
+  // The max response verification version to use in the response's
+  // certificate.
   certificate_version : opt nat16;
 };
+// A Candid-encodable representation of an HTTP response. This struct is used
+// by the `http_request` method of the HTTP Gateway Protocol's Candid interface.
+//
+// # Examples
+//
+// ```
+// use ic_http_certification::{HttpResponse, StatusCode};
+//
+// let response = HttpResponse::builder()
+// .with_status_code(StatusCode::OK)
+// .with_headers(vec![("Content-Type".into(), "text/plain".into())])
+// .with_body(b"Hello, World!")
+// .with_upgrade(false)
+// .build();
+//
+// assert_eq!(response.status_code(), StatusCode::OK);
+// assert_eq!(response.headers(), &[("Content-Type".into(), "text/plain".into())]);
+// assert_eq!(response.body(), b"Hello, World!");
+// assert_eq!(response.upgrade(), Some(false));
+// ```
+//
+// # Helpers
+//
+// There are also a number of convenience methods for quickly creating an [HttpResponse] with
+// commonly used HTTP status codes:
+//
+// - [OK](HttpResponse::ok)
+// - [CREATED](HttpResponse::created)
+// - [NO_CONTENT](HttpResponse::no_content)
+// - [MOVED_PERMANENTLY](HttpResponse::moved_permanently)
+// - [TEMPORARY_REDIRECT](HttpResponse::temporary_redirect)
+// - [BAD_REQUEST](HttpResponse::bad_request)
+// - [UNAUTHORIZED](HttpResponse::unauthorized)
+// - [FORBIDDEN](HttpResponse::forbidden)
+// - [NOT_FOUND](HttpResponse::not_found)
+// - [METHOD_NOT_ALLOWED](HttpResponse::method_not_allowed)
+// - [TOO_MANY_REQUESTS](HttpResponse::too_many_requests)
+// - [INTERNAL_SERVER_ERROR](HttpResponse::internal_server_error)
+//
+// ```
+// use ic_http_certification::{HttpResponse, StatusCode};
+//
+// let response = HttpResponse::ok(b"Hello, World!", vec![("Content-Type".into(), "text/plain".into())]).build();
+//
+// assert_eq!(response.status_code(), StatusCode::OK);
+// assert_eq!(response.headers(), &[("Content-Type".into(), "text/plain".into())]);
+// assert_eq!(response.body(), b"Hello, World!");
+// ```
 type HttpResponse = record {
+  // HTTP response body as an array of bytes.
   body : blob;
+  // HTTP response headers.
   headers : vec record { text; text };
+  // Whether the corresponding HTTP request should be upgraded to an update
+  // call.
   upgrade : opt bool;
+  // HTTP response status code.
   status_code : nat16;
 };
+// A Candid-encodable representation of an HTTP update request. This struct is
+// used by the `http_update_request` method of the HTTP Gateway Protocol.
+//
+// This is the same as [HttpRequest], excluding the
+// [certificate_version](HttpRequest::certificate_version) property.
+//
+// # Examples
+//
+// ```
+// use ic_http_certification::{HttpUpdateRequest, HttpRequest, Method};
+//
+// let request = HttpRequest::get("/")
+// .with_method(Method::GET)
+// .with_url("/")
+// .with_headers(vec![("X-Custom-Foo".into(), "Bar".into())])
+// .with_body(&[1, 2, 3])
+// .with_certificate_version(2)
+// .build();
+// let update_request = HttpUpdateRequest::from(request);
+//
+// assert_eq!(update_request.method(), Method::GET);
+// assert_eq!(update_request.url(), "/");
+// assert_eq!(update_request.headers(), &[("X-Custom-Foo".into(), "Bar".into())]);
+// assert_eq!(update_request.body(), &[1, 2, 3]);
+// ```
 type HttpUpdateRequest = record {
+  // HTTP request URL.
   url : text;
+  // HTTP request method.
   method : text;
+  // HTTP request body as an array of bytes.
   body : blob;
+  // HTTP request headers.
   headers : vec record { text; text };
 };
+// A Candid-encodable representation of an HTTP update response. This struct is used
+// by the `http_update_request` method of the HTTP Gateway Protocol.
+//
+// This is the same as [HttpResponse], excluding the
+// [upgrade](HttpResponse::upgrade) field.
+//
+// # Examples
+//
+// ```
+// use ic_http_certification::{HttpResponse, HttpUpdateResponse, StatusCode};
+//
+// let response = HttpResponse::builder()
+// .with_status_code(StatusCode::OK)
+// .with_headers(vec![("Content-Type".into(), "text/plain".into())])
+// .with_body(b"Hello, World!")
+// .build_update();
+//
+// let update_response = HttpUpdateResponse::from(response);
+//
+// assert_eq!(update_response.status_code(), StatusCode::OK);
+// assert_eq!(update_response.headers(), &[("Content-Type".into(), "text/plain".into())]);
+// assert_eq!(update_response.body(), b"Hello, World!");
+// ```
 type HttpUpdateResponse = record {
+  // HTTP response body as an array of bytes.
   body : blob;
+  // HTTP response headers.
   headers : vec record { text; text };
+  // HTTP response status code.
   status_code : nat16;
 };
+// A message posted to the canister inbox, stored in `INBOX_MAP`.
 type InboxMessage = record {
   id : text;
   seq : nat64;
@@ -220,14 +431,22 @@ type InboxMessage = record {
   posted_by : text;
   staged_at_ns : opt nat64;
 };
+// Origin of a message ingested into the canister inbox pipeline.
 type InboxMessageSource = variant { StewardDirect; EvmInbox };
+// Lifecycle state of an inbox message.
+//
+// - `Pending` — arrived but not yet staged for processing.
+// - `Staged` — moved to the staged queue; awaiting consumption by a turn.
+// - `Consumed` — processed by a completed turn.
 type InboxMessageStatus = variant { Staged; Consumed; Pending };
+// Aggregate counts across all inbox messages by status.
 type InboxStats = record {
   pending_count : nat64;
   consumed_count : nat64;
   total_messages : nat64;
   staged_count : nat64;
 };
+// Read-only view of the current inference configuration, returned by queries.
 type InferenceConfigView = record {
   model : text;
   openrouter_max_response_bytes : nat64;
@@ -238,11 +457,18 @@ type InferenceConfigView = record {
   openrouter_proxy_trusted_callback_principal : opt text;
   openrouter_base_url : text;
 };
+// The LLM backend used for inference.
+//
+// - `IcLlm` — on-chain IC LLM canister (no API key required).
+// - `OpenRouter` — external HTTP gateway; requires `openrouter_api_key`.
+// - `OpenRouterProxyWorker` — async Cloudflare worker proxy callback path.
 type InferenceProvider = variant { OpenRouter; OpenRouterProxyWorker; IcLlm };
+// Worker callback payload accepted by `submit_inference_result`.
 type InferenceProxyResultPayload = record {
   tool_calls : vec ToolCall;
   explanation : opt text;
 };
+// Public-safe status of async inference proxy state.
 type InferenceProxyStatusView = record {
   callback_auth_failures : nat64;
   pending_jobs : nat64;
@@ -275,6 +501,7 @@ type InitArgs = record {
   evm_bootstrap_lookback_blocks : opt nat64;
   http_allowed_domains : opt vec text;
 };
+// Current execution status of a [`ScheduledJob`].
 type JobStatus = variant {
   Skipped;
   Failed;
@@ -283,20 +510,34 @@ type JobStatus = variant {
   TimedOut;
   Pending;
 };
+// Compact market synthesis bundle returned by the discovery worker.
 type MarketSynthesisBundle = record {
   protocols : vec ProtocolMarketSnapshot;
   generated_at_ns : nat64;
   warnings : vec text;
   chain_id : nat64;
 };
+// A single entry in the persistent knowledge base.
+//
+// Facts are keyed by a dotted namespace path (e.g. `"balance.eth"`,
+// `"config.chain_id"`) and stored in `MEMORY_FACTS_MAP`.  Critical keys
+// (those matching `is_critical_exact_memory_key`) are always included in the
+// agent's context prompt regardless of the fact limit.
 type MemoryFact = record {
   key : text;
   value : text;
   updated_at_ns : nat64;
   created_at_ns : nat64;
+  // The turn that last wrote this fact — useful for audit.
   source_turn_id : text;
 };
+// Sort ordering for `list_memory_facts`.
 type MemoryFactListSort = variant { KeyAsc; UpdatedAtDesc };
+// A condensed snapshot of all memory facts in a namespace, produced by the
+// retention maintenance pass and stored in `MEMORY_ROLLUP_MAP`.
+//
+// Rollups compress facts that have not changed recently into a single
+// `canonical_value` string so that the agent context prompt stays bounded.
 type MemoryRollup = record {
   source_count : nat32;
   canonical_value : text;
@@ -306,6 +547,11 @@ type MemoryRollup = record {
   source_keys : vec text;
   namespace : text;
 };
+// A point-in-time snapshot of the entire observable state of the canister,
+// returned by the `observability_snapshot` query.
+//
+// Building this snapshot also updates the cycle-balance and storage-growth
+// sample ring buffers, so calling it has a small write side effect.
 type ObservabilitySnapshot = record {
   inbox_stats : InboxStats;
   scheduler : SchedulerRuntime;
@@ -325,19 +571,23 @@ type ObservabilitySnapshot = record {
   runtime : RuntimeView;
   session_summaries : vec SessionSummary;
 };
+// Runtime configuration for the OpenRouter async worker proxy inference path.
 type OpenRouterProxyWorkerConfig = record {
   trusted_callback_principal : opt principal;
   worker_base_url : text;
 };
 type OpenRouterReasoningLevel = variant { Low; High; Medium; Default };
+// A reply or autonomous output written by the agent, stored in `OUTBOX_MAP`.
 type OutboxMessage = record {
   id : text;
   seq : nat64;
   body : text;
+  // The inbox message IDs that triggered this reply (empty for autonomous output).
   source_inbox_ids : vec text;
   created_at_ns : nat64;
   turn_id : text;
 };
+// Aggregate count of all outbox messages.
 type OutboxStats = record { total_messages : nat64 };
 type OutcallTimingStats = record {
   last_error : opt text;
@@ -350,6 +600,7 @@ type OutcallTimingStats = record {
   last_duration_ms : opt nat64;
   total_calls : nat64;
 };
+// Durable pending discovery submission tracked until callback or expiry.
 type PendingStrategyDiscoveryJob = record {
   submitted_at_ns : nat64;
   objective : text;
@@ -358,10 +609,13 @@ type PendingStrategyDiscoveryJob = record {
   job_id : text;
   exposure_summary : text;
 };
+// Promotion selector for staged protocol artifacts.
 type PromoteDiscoveryProtocolArtifactsArgs = record {
   bundle_id : text;
   job_id : text;
 };
+// The versioned Doctrine document exposed through the legacy layer-ID API.
+// IDs 6-9 are aliases; storage canonicalizes every write to ID 6.
 type PromptLayer = record {
   content : text;
   updated_at_ns : nat64;
@@ -369,6 +623,7 @@ type PromptLayer = record {
   updated_by_turn : text;
   layer_id : nat8;
 };
+// Read-only legacy-ID view returned by `get_prompt_layers`.
 type PromptLayerView = record {
   content : text;
   updated_at_ns : opt nat64;
@@ -377,6 +632,7 @@ type PromptLayerView = record {
   updated_by_turn : opt text;
   layer_id : nat8;
 };
+// Normalized ABI/spec artifact returned by the discovery worker.
 type ProtocolArtifactBundle = record {
   spec_summary : text;
   bundle_id : text;
@@ -390,6 +646,7 @@ type ProtocolArtifactBundle = record {
   risk_notes : vec text;
   selector_assertions : vec AbiSelectorAssertion;
 };
+// Typed market snapshot for one watchlist protocol.
 type ProtocolMarketSnapshot = record {
   utilization_bps : opt nat64;
   protocol_id : text;
@@ -401,6 +658,7 @@ type ProtocolMarketSnapshot = record {
   pool_address : text;
   supply_apy_bps : opt nat64;
 };
+// Typed protocol coordinate configured for worker-assisted strategy discovery.
 type ProtocolWatchlistEntry = record {
   id : text;
   abi_api_url : text;
@@ -408,6 +666,7 @@ type ProtocolWatchlistEntry = record {
   market_data_api_url : text;
   pool_address : text;
 };
+// Durable bounded lesson derived from repeated degraded tool execution.
 type ReflectionMemoryRecord = record {
   key : text;
   what_worked : opt text;
@@ -424,7 +683,9 @@ type ReflectionMemoryRecord = record {
   last_worked_at_ns : opt nat64;
   error_class : text;
 };
+// High-level source of a persisted reflection-memory lesson.
 type ReflectionOrigin = variant { Autonomy; Maintenance; ExternalInput };
+// Protected-balance floors the automaton must preserve before deploying capital.
 type ReservePolicy = record {
   min_gas_wei : opt nat;
   min_cycles_runway_hours : nat64;
@@ -447,6 +708,10 @@ type Result_6 = variant { Ok : TemplateRevocationState; Err : text };
 type Result_7 = variant { Ok : AutonomySuppressionConfig; Err : text };
 type Result_8 = variant { Ok : nat64; Err : text };
 type Result_9 = variant { Ok : opt text; Err : text };
+// Configuration for the periodic retention maintenance job.
+//
+// Controls maximum ages and record counts for each stored collection.
+// Written to stable storage and readable / updatable via `set_retention_config`.
 type RetentionConfig = record {
   transitions_max_age_secs : nat64;
   memory_facts_max_age_secs : nat64;
@@ -461,6 +726,10 @@ type RetentionConfig = record {
   outbox_max_age_secs : nat64;
   jobs_max_age_secs : nat64;
 };
+// Persisted progress state for the incremental retention maintenance job.
+//
+// Scan cursors allow the job to resume a partially-completed pass without
+// re-scanning already-processed keys, keeping each tick's work bounded.
 type RetentionMaintenanceRuntime = record {
   last_error : opt text;
   outbox_scan_cursor : opt text;
@@ -486,6 +755,7 @@ type RetentionMaintenanceRuntime = record {
   summarization_progress_percent : nat8;
   last_generated_memory_rollups : nat32;
 };
+// Exposure and concentration bounds for autonomous execution.
 type RiskLimits = record {
   max_protocol_concentration_bps : nat16;
   max_total_exposure_bps : nat16;
@@ -511,6 +781,7 @@ type RuntimeTimingTelemetry = record {
   http_fetch_outcall : OutcallTimingStats;
   max_turn_duration_ms : nat64;
 };
+// A lightweight projection of [`RuntimeSnapshot`] suitable for Candid queries.
 type RuntimeView = record {
   last_error : opt text;
   evm_chain_id : nat64;
@@ -528,6 +799,7 @@ type RuntimeView = record {
   evm_next_block : nat64;
   loop_enabled : bool;
 };
+// A single scheduler job entry stored in `JOB_MAP`.
 type ScheduledJob = record {
   id : text;
   last_error : opt text;
@@ -543,12 +815,17 @@ type ScheduledJob = record {
   priority : nat8;
   dedupe_key : text;
 };
+// An exclusive execution lease held for a mutating job.
+//
+// Only one `Mutating` lease may be active at a time.  The scheduler checks
+// `expires_at_ns` on every tick; expired leases are recovered automatically.
 type SchedulerLease = record {
   lane : TaskLane;
   acquired_at_ns : nat64;
   job_id : text;
   expires_at_ns : nat64;
 };
+// The top-level scheduler runtime state, stored in `SCHEDULER_RUNTIME_MAP`.
 type SchedulerRuntime = record {
   last_tick_finished_ns : nat64;
   last_tick_error : opt text;
@@ -565,6 +842,8 @@ type SearchConfigArgs = record {
   api_key : text;
   max_searches_per_turn : opt nat8;
 };
+// Aggregated inbox/outbox statistics for one sender over a 24-hour window,
+// produced during retention maintenance and stored in `SESSION_SUMMARY_MAP`.
 type SessionSummary = record {
   source_count : nat32;
   inbox_message_count : nat32;
@@ -576,14 +855,20 @@ type SessionSummary = record {
   window_start_ns : nat64;
   inbox_preview : text;
 };
+// A named, optionally-mutable capability that can be enabled or disabled at runtime.
 type SkillRecord = record {
   name : text;
   description : text;
   instructions : text;
   enabled : bool;
   mutable : bool;
+  // Inter-canister calls this skill grants the agent permission to make.
+  //
+  // The `canister_call` tool checks this list across all active skills before
+  // executing any call.  An empty vec means the skill grants no IC call permissions.
   allowed_canister_calls : vec CanisterCallPermission;
 };
+// Individual external source fetched by the strategy-discovery worker.
 type SourceRecord = record {
   url : text;
   fetched_at_ns : nat64;
@@ -595,20 +880,26 @@ type SourceRecord = record {
 type SpawnBootstrapArgs = record {
   provider : SpawnProviderBootstrapArgs;
   session_id : text;
+  name : opt text;
   risk : nat8;
   factory_principal : principal;
   parent_id : opt text;
   version_commit : text;
+  contract_version : opt nat16;
+  constitution : opt text;
   skills : vec text;
   steward_address : text;
   strategies : vec text;
 };
 type SpawnBootstrapView = record {
   session_id : opt text;
+  name : opt text;
   risk : opt nat8;
   factory_principal : opt principal;
   parent_id : opt text;
   version_commit : opt text;
+  contract_version : opt nat16;
+  constitution : opt text;
   skills : vec text;
   strategies : vec text;
 };
@@ -619,8 +910,11 @@ type SpawnProviderBootstrapArgs = record {
   brave_search_api_key : opt text;
   inference_transport : InferenceTransport;
 };
+// Runtime command variants executable by the active EVM steward.
 type StewardCommand = variant {
+  // Deprecated: use `RegisterStrategy` instead.
   IngestStrategyAbiArtifact : StrategyAbiIngestArgs;
+  // Deprecated: use `RegisterStrategy` instead.
   IngestStrategyTemplate : record { template : StrategyTemplate };
   SetSchedulerLowCyclesMode : record { enabled : bool };
   SetEvmConfirmationDepth : record { confirmation_depth : nat64 };
@@ -630,10 +924,12 @@ type StewardCommand = variant {
     limit : nat32;
     prefix : opt text;
   };
+  // Deprecated: use `RegisterStrategy` instead.
   ActivateStrategyTemplate : record {
     key : StrategyTemplateKey;
     reason : opt text;
   };
+  // Executes no runtime mutation beyond auth bookkeeping (nonce + last-used).
   Noop;
   UpsertSkill : record { skill : SkillRecord };
   SetInferenceProxyConfig : record { config : OpenRouterProxyWorkerConfig };
@@ -651,6 +947,10 @@ type StewardCommand = variant {
   SetInferenceProvider : record { provider : InferenceProvider };
   SetInferenceModel : record { model : text };
   SetHttpAllowedDomains : record { domains : vec text };
+  // Rotates the single active steward identity.
+  //
+  // When `chain_id` or `address` changes, the steward nonce cursor is reset
+  // atomically with the steward update.
   UpdateSteward : record { enabled : bool; chain_id : nat64; address : text };
   SetRetentionConfig : record { config : RetentionConfig };
   EnqueueStrategyDiscoveryJob : record {
@@ -685,8 +985,11 @@ type StewardCommand = variant {
   SetEvmChainId : record { chain_id : nat64 };
   SetWelcomeMessage : record { message : text };
   UpdateSoul : record { new_soul : text };
+  // Links or clears the ingress principal allowed to execute steward
+  // commands without EVM signatures.
   SetPrincipal : record { "principal" : opt principal };
 };
+// The single active EVM steward identity authorized for signed commands.
 type StewardState = record {
   "principal" : opt principal;
   last_used_at_ns : opt nat64;
@@ -694,10 +997,13 @@ type StewardState = record {
   chain_id : nat64;
   address : text;
 };
+// Public steward status view used by controller recovery and UI queries.
 type StewardStatusView = record {
   next_nonce : nat64;
   active_steward : opt StewardState;
 };
+// Detailed stable-memory utilisation metrics included in every
+// [`ObservabilitySnapshot`].
 type StorageGrowthMetrics = record {
   inbox_staged_queue_entries : nat64;
   memory_fact_limit : nat64;
@@ -737,7 +1043,12 @@ type StorageGrowthMetrics = record {
   trend_window_seconds : nat64;
   summarization_progress_percent : nat8;
 };
+// Coarse pressure classification derived from the highest utilisation
+// percentage across all bounded stable-memory collections.
+//
+// Thresholds: Elevated ≥ 70 %, High ≥ 85 %, Critical ≥ 95 %.
 type StoragePressureLevel = variant { High; Normal; Critical; Elevated };
+// Arguments for the `ingest_strategy_abi_artifact_admin` update call.
 type StrategyAbiIngestArgs = record {
   key : AbiArtifactKey;
   source_ref : text;
@@ -745,6 +1056,7 @@ type StrategyAbiIngestArgs = record {
   codehash : opt text;
   selector_assertions : vec AbiSelectorAssertion;
 };
+// Advisory candidate produced from worker-collected protocol and market data.
 type StrategyCandidateBundle = record {
   suggested_template_shape : opt text;
   primitive : text;
@@ -761,6 +1073,7 @@ type StrategyCandidateBundle = record {
   confidence_label : text;
   freshness_deadline_ns : opt nat64;
 };
+// Durable callback record for a strategy-discovery job.
 type StrategyDiscoveryCallbackRecord = record {
   status : StrategyDiscoveryResultStatus;
   result_hash : text;
@@ -773,21 +1086,25 @@ type StrategyDiscoveryCallbackRecord = record {
   caller_principal : text;
   payload : StrategyDiscoveryResultPayload;
 };
+// Typed discovery callback payload nested inside callback args and records.
 type StrategyDiscoveryResultPayload = record {
   protocol_artifacts : vec ProtocolArtifactBundle;
   source_records : vec SourceRecord;
   market : MarketSynthesisBundle;
   candidates : vec StrategyCandidateBundle;
 };
+// Validation result of a staged discovery callback.
 type StrategyDiscoveryResultStatus = variant {
   Rejected : record { reason : text };
   Validated;
 };
+// Relative trust tier for worker-returned evidence.
 type StrategyDiscoverySourceTrustTier = variant {
   Secondary;
   Official;
   BestEffort;
 };
+// Normalized provenance source type for strategy-discovery evidence.
 type StrategyDiscoverySourceType = variant {
   ProtocolApi;
   OfficialDocs;
@@ -795,6 +1112,7 @@ type StrategyDiscoverySourceType = variant {
   MarketDataApi;
   Other;
 };
+// Public-safe status of strategy-discovery worker config and staged state.
 type StrategyDiscoveryStatusView = record {
   has_worker_api_key : bool;
   callback_auth_failures : nat64;
@@ -817,6 +1135,7 @@ type StrategyDiscoveryStatusView = record {
   callback_accepted : nat64;
   worker_base_url : opt text;
 };
+// Runtime configuration for the strategy-discovery async worker path.
 type StrategyDiscoveryWorkerConfig = record {
   worker_api_key : opt text;
   protocol_watchlist : vec ProtocolWatchlistEntry;
@@ -826,6 +1145,8 @@ type StrategyDiscoveryWorkerConfig = record {
   enabled : bool;
   worker_base_url : text;
 };
+// Running execution statistics for a strategy template, stored in
+// `STRATEGY_OUTCOME_STATS_MAP`.
 type StrategyOutcomeStats = record {
   key : StrategyTemplateKey;
   last_error : opt text;
@@ -837,6 +1158,7 @@ type StrategyOutcomeStats = record {
   last_observed_at_ns : opt nat64;
   deterministic_failures : nat64;
 };
+// Durable quarantine record for strategies blocked after repeated failures.
 type StrategyQuarantine = record {
   release_after_ns : opt nat64;
   failure_count : nat32;
@@ -844,6 +1166,11 @@ type StrategyQuarantine = record {
   quarantined_at_ns : nat64;
   reason : text;
 };
+// A strategy template defining the actions, contract roles, and
+// constraints for an on-chain DeFi operation (e.g. a Uniswap swap).
+//
+// Templates are stored in `STRATEGY_TEMPLATE_MAP` and referenced by agents
+// when building execution plans.
 type StrategyTemplate = record {
   key : StrategyTemplateKey;
   status : TemplateStatus;
@@ -853,12 +1180,17 @@ type StrategyTemplate = record {
   constraints_json : text;
   contract_roles : vec ContractRoleBinding;
 };
+// Composite key that uniquely identifies a strategy template.
+//
+// The four fields together form a namespaced identifier:
+// `{protocol}:{primitive}@chain{chain_id}#{template_id}`.
 type StrategyTemplateKey = record {
   protocol : text;
   primitive : text;
   template_id : text;
   chain_id : nat64;
 };
+// Update-call arguments for the async worker callback endpoint.
 type SubmitInferenceResultArgs = record {
   result : opt InferenceProxyResultPayload;
   completed_at_ns : nat64;
@@ -866,6 +1198,7 @@ type SubmitInferenceResultArgs = record {
   turn_id : text;
   job_id : text;
 };
+// Callback args accepted from the strategy-discovery worker.
 type SubmitStrategyDiscoveryResultArgs = record {
   completed_at_ns : nat64;
   objective : text;
@@ -873,7 +1206,23 @@ type SubmitStrategyDiscoveryResultArgs = record {
   job_id : text;
   payload : StrategyDiscoveryResultPayload;
 };
+// Cycle-based survival tier that governs which operations are permitted.
+//
+// Tier escalation / recovery follows a hysteresis rule: the scheduler requires
+// `SURVIVAL_TIER_RECOVERY_CHECKS_REQUIRED` consecutive `Normal` observations
+// before downgrading from an elevated tier.
+//
+// | Tier | Blocked operations |
+// |------|--------------------|
+// | `Normal` | none |
+// | `LowCycles` | `ThresholdSign`, `EvmBroadcast` |
+// | `Critical` | all |
+// | `OutOfCycles` | all |
 type SurvivalTier = variant { OutOfCycles; Normal; LowCycles; Critical };
+// The type of recurring work the scheduler dispatches.
+//
+// Priority order (lower = higher priority): `AgentTurn` → `PollInbox` →
+// `CheckCycles` → `TopUpCycles` → `Reconcile`.
 type TaskKind = variant {
   Reconcile;
   CheckCycles;
@@ -881,49 +1230,74 @@ type TaskKind = variant {
   TopUpCycles;
   AgentTurn;
 };
+// Execution lane for a scheduled job.
+//
+// - `Mutating` — acquires the global mutating lease; at most one active at a time.
+// - `ReadOnly` — runs concurrently with other read-only jobs.
 type TaskLane = variant { ReadOnly; Mutating };
+// Per-task scheduling configuration stored in `TASK_CONFIG_MAP`.
 type TaskScheduleConfig = record {
   max_backoff_secs : nat64;
   kind : TaskKind;
   interval_secs : nat64;
   enabled : bool;
+  // Essential tasks are preserved in low-cycles mode; non-essential are skipped.
   essential : bool;
   priority : nat8;
 };
+// Mutable runtime state for a task kind, stored in `TASK_RUNTIME_MAP`.
 type TaskScheduleRuntime = record {
   backoff_until_ns : opt nat64;
   last_error : opt text;
   next_due_ns : nat64;
   kind : TaskKind;
   last_started_ns : opt nat64;
+  // The job ID of the most recently enqueued job for this task, if still active.
   pending_job_id : opt text;
   consecutive_failures : nat32;
   last_finished_ns : opt nat64;
 };
+// Records whether a strategy template is enabled for execution.
 type TemplateActivationState = record {
   key : StrategyTemplateKey;
   updated_at_ns : nat64;
   enabled : bool;
   reason : opt text;
 };
+// Records whether a strategy template has been permanently revoked.
 type TemplateRevocationState = record {
   key : StrategyTemplateKey;
   revoked : bool;
   updated_at_ns : nat64;
   reason : opt text;
 };
-type TemplateStatus = variant { Active; Draft; Deprecated; Revoked };
+// Lifecycle state of a strategy template.
+type TemplateStatus = variant {
+  Active;
+  // Not yet approved for execution.
+  Draft;
+  Deprecated;
+  // Permanently disabled; cannot be re-activated.
+  Revoked;
+};
+// A single tool invocation produced by the LLM during an inference round.
 type ToolCall = record {
   args_json : text;
   tool : text;
   tool_call_id : opt text;
 };
+// Classification of a persisted tool-call record.
 type ToolCallOutcome = variant {
+  // Call skipped because an identical autonomous call recently succeeded.
   SuppressedDedupe;
+  // Call blocked by tool sequence policy.
   BlockedSequence;
+  // Call skipped due to repeated-failure cooldown.
   SuppressedFailureCooldown;
+  // Tool implementation actually ran and produced either success or failure.
   Executed;
 };
+// Persisted record of a completed tool call, stored under `tools:{turn_id}`.
 type ToolCallRecord = record {
   output : text;
   args_json : text;
@@ -934,11 +1308,16 @@ type ToolCallRecord = record {
   outcome : ToolCallOutcome;
   failure_kind : opt ToolFailureKind;
 };
+// Coarse classification of executed tool failures for autonomy handling.
 type ToolFailureKind = variant {
+  // Tool call arguments or local validation failed before a real execution.
   MalformedInput;
+  // External dependency or outcall failed after a valid invocation.
   OutcallFailure;
+  // Non-malformed local/runtime failures.
   InternalFailure;
 };
+// Durable log entry for every FSM state transition, stored in `TRANSITION_MAP`.
 type TransitionLogRecord = record {
   id : text;
   occurred_at_ns : nat64;
@@ -948,6 +1327,7 @@ type TransitionLogRecord = record {
   turn_id : text;
   from_state : AgentState;
 };
+// Durable record of a completed agent turn, stored in `TURN_MAP`.
 type TurnRecord = record {
   id : text;
   inference_round_count : nat32;
@@ -963,6 +1343,8 @@ type TurnRecord = record {
   duration_ms : opt nat64;
   tool_call_count : nat32;
 };
+// Aggregated turn and tool-call statistics over a 24-hour window,
+// produced during retention maintenance and stored in `TURN_WINDOW_SUMMARY_MAP`.
 type TurnWindowSummary = record {
   tool_success_count : nat32;
   source_count : nat32;
@@ -978,7 +1360,18 @@ type TurnWindowSummary = record {
   tool_call_count : nat32;
 };
 type Vec = vec record { kind : text; name : text; components : Vec };
-type WalletBalanceStatus = variant { Error; Stale; Fresh; Unknown };
+// Coarse classification of a wallet balance reading.
+type WalletBalanceStatus = variant {
+  // The last sync attempt returned an error.
+  Error;
+  // The most recent reading is older than the freshness window.
+  Stale;
+  // The most recent reading is within the configured freshness window.
+  Fresh;
+  // No balance has ever been fetched.
+  Unknown;
+};
+// Candid-serialisable projection of [`WalletBalanceSyncConfig`] for query responses.
 type WalletBalanceSyncConfigView = record {
   normal_interval_secs : nat64;
   max_response_bytes : nat64;
@@ -987,6 +1380,8 @@ type WalletBalanceSyncConfigView = record {
   freshness_window_secs : nat64;
   low_cycles_interval_secs : nat64;
 };
+// Read-only telemetry view of the wallet balance, returned by the
+// `wallet_balance_telemetry_view` canister query.
 type WalletBalanceTelemetryView = record {
   last_error : opt text;
   status : WalletBalanceStatus;
@@ -994,6 +1389,7 @@ type WalletBalanceTelemetryView = record {
   eth_balance_wei_hex : opt text;
   usdc_balance_raw_hex : opt text;
   last_synced_at_ns : opt nat64;
+  // `true` while the first successful balance sync has not yet completed.
   bootstrap_pending : bool;
   usdc_decimals : nat8;
   is_stale : bool;
@@ -1050,7 +1446,7 @@ service : (InitArgs) -> {
   get_observability_snapshot : (nat32) -> (ObservabilitySnapshot) query;
   // Returns aggregate outbox statistics (total messages, delivered count, …).
   get_outbox_stats : () -> (OutboxStats) query;
-  // Returns all prompt layers ordered by layer ID.
+  // Returns the legacy 0-9 prompt view with explicit ownership-document aliases.
   get_prompt_layers : () -> (vec PromptLayerView) query;
   // Returns the most-recent autonomous decisions, bounded by the durable FIFO cap.
   get_recent_decisions : () -> (vec DecisionRecord) query;
@@ -1065,7 +1461,7 @@ service : (InitArgs) -> {
   get_scheduler_base_tick_secs : () -> (nat64) query;
   // Returns the scheduler's current runtime state (enabled flag, last tick, …).
   get_scheduler_view : () -> (SchedulerRuntime) query;
-  // Returns the agent's "soul" — the core identity/persona prompt layer.
+  // Returns the agent's "soul" — the temporary self-label rendered in Genesis.
   get_soul : () -> (text) query;
   // Returns the persisted launchpad/factory bootstrap metadata, if any.
   get_spawn_bootstrap_view : () -> (SpawnBootstrapView) query;
@@ -1109,7 +1505,7 @@ service : (InitArgs) -> {
   // Returns up to `limit` inbox messages ordered by arrival time (newest last).
   list_inbox_messages : (nat32) -> (vec InboxMessage) query;
   // Returns memory facts filtered by key prefix, sorted by `sort`, and bounded by `limit`.
-  // 
+  //
   // Pass an empty prefix (`""`) to list across all memory facts.
   list_memory_facts : (text, MemoryFactListSort, nat32) -> (
       vec MemoryFact,
@@ -1155,13 +1551,13 @@ service : (InitArgs) -> {
       PromoteDiscoveryProtocolArtifactsArgs,
     ) -> (Result_4);
   // Controller-only remediation endpoint to prune memory facts by prefix and/or age.
-  // 
+  //
   // - `prefix`: optional key namespace filter (e.g. `"signal."`).
   // - `updated_before_ns`: optional inclusive timestamp cutoff.
   // - `limit`: max number of facts to remove in this call.
   prune_memory_facts_admin : (opt text, opt nat64, nat32) -> (Result_5);
   // Register a strategy from a compact recipe (controller only).
-  // 
+  //
   // Replaces the previous multi-step workflow (`ingest_strategy_template_admin` +
   // `ingest_strategy_abi_artifact_admin` + `activate_strategy_template_admin`) with
   // a single call.  Accepts the same JSON recipe format as the agent's
@@ -1254,12 +1650,12 @@ service : (InitArgs) -> {
     );
   // Replaces the active autonomy policy (controller only).
   update_autonomy_policy : (AutonomyPolicy) -> (Result_14);
-  // Replaces the content of a prompt layer identified by `layer_id` (controller only).
+  // Replaces Doctrine through a legacy mutable alias 6-9 (controller only).
   update_prompt_layer_admin : (nat8, text) -> (Result_15);
   // Replaces the agent's soul prompt.  Rejects empty strings (controller only).
   update_soul : (text) -> (Result_1);
   // Inserts or updates a skill record.
-  // 
+  //
   // Only callable by a canister controller.  This is the runtime management
   // endpoint for adding new inter-canister call skills or modifying existing ones.
   upsert_skill : (SkillRecord) -> (Result_16);

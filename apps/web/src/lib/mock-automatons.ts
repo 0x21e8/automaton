@@ -10,6 +10,11 @@ export const SIMULATED_VIEWER_ADDRESS =
 
 const BASE_TIME = Date.UTC(2026, 2, 10, 8, 0, 0);
 const BASE_CHAIN_ID = 8453;
+const UNAVAILABLE_CONSTITUTION_VERIFICATION = {
+  status: "unavailable",
+  expectedHash: null,
+  computedHash: null
+} as const;
 
 function deriveCategory(
   type: MonologueEntry["type"],
@@ -150,6 +155,7 @@ function makeVersion(commitHash: string) {
 
 export const mockAutomatons = [
   {
+    constitutionVerification: UNAVAILABLE_CONSTITUTION_VERIFICATION,
     canisterId: "alpha-42-launchpad-cai",
     ethAddress: "0xa1fa4200000000000000000000000000000bead",
     chain: "base",
@@ -253,6 +259,7 @@ export const mockAutomatons = [
     ])
   },
   {
+    constitutionVerification: UNAVAILABLE_CONSTITUTION_VERIFICATION,
     canisterId: "child-07-launchpad-cai",
     ethAddress: "0xc107d0000000000000000000000000000000fade",
     chain: "base",
@@ -349,6 +356,7 @@ export const mockAutomatons = [
     ])
   },
   {
+    constitutionVerification: UNAVAILABLE_CONSTITUTION_VERIFICATION,
     canisterId: "gamma-11-launchpad-cai",
     ethAddress: "0x9a6611000000000000000000000000000000feed",
     chain: "base",
@@ -444,6 +452,7 @@ export const mockAutomatons = [
     ])
   },
   {
+    constitutionVerification: UNAVAILABLE_CONSTITUTION_VERIFICATION,
     canisterId: "sigma-03-launchpad-cai",
     ethAddress: "0x510300000000000000000000000000000000cafe",
     chain: "base",
@@ -538,6 +547,7 @@ export const mockAutomatons = [
     ])
   },
   {
+    constitutionVerification: UNAVAILABLE_CONSTITUTION_VERIFICATION,
     canisterId: "delta-88-launchpad-cai",
     ethAddress: "0xd38800000000000000000000000000000000babe",
     chain: "base",

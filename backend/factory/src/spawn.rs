@@ -33,6 +33,27 @@ use crate::types::{
     SessionAuditActor, SpawnExecutionReceipt, SpawnSession, SpawnSessionState,
     SpawnedAutomatonRecord, CONTROLLER_FIELD,
 };
+use sha2::{Digest, Sha256};
+
+fn constitution_hash(constitution: &str) -> String {
+    format!("{:x}", Sha256::digest(constitution.as_bytes()))
+}
+
+fn redact_released_constitution(
+    session: &mut SpawnSession,
+    runtime: &mut AutomatonRuntimeState,
+) -> (String, String) {
+    let (name, constitution) = session.resolved_genesis();
+    let hash = constitution_hash(&constitution);
+    session.constitution = None;
+
+    if let Some(verification) = runtime.bootstrap_verification.as_mut() {
+        verification.evidence.bootstrap_constitution = None;
+        verification.evidence.bootstrap_constitution_hash = Some(hash.clone());
+    }
+
+    (name, hash)
+}
 
 #[cfg(target_arch = "wasm32")]
 use crate::now_ms as current_time_ms;
@@ -68,12 +89,24 @@ fn build_bootstrap_verification(
     expected_chain_id: u64,
     expected_version_commit: &str,
     expected_evm_address: &str,
-    evidence: AutomatonBootstrapEvidence,
+    mut evidence: AutomatonBootstrapEvidence,
     checked_at: u64,
 ) -> AutomatonBootstrapVerification {
     let expected_strategies = normalize_bootstrap_list(&session.config.strategies);
     let expected_skills = normalize_bootstrap_list(&session.config.skills);
+    let (expected_name, expected_constitution) = session.resolved_genesis();
+    evidence.bootstrap_constitution_hash = Some(constitution_hash(expected_constitution.as_str()));
     let mut failures = Vec::new();
+
+    if evidence.bootstrap_contract_version != Some(crate::types::SPAWN_CONTRACT_VERSION) {
+        failures.push("spawn contract version mismatch".to_string());
+    }
+    if evidence.bootstrap_name.as_deref() != Some(expected_name.as_str()) {
+        failures.push("genesis name mismatch".to_string());
+    }
+    if evidence.bootstrap_constitution.as_deref() != Some(expected_constitution.as_str()) {
+        failures.push("genesis constitution mismatch".to_string());
+    }
 
     if evidence.bootstrap_session_id.as_deref() != Some(session.session_id.as_str()) {
         failures.push(format!(
@@ -196,6 +229,10 @@ fn verify_spawned_automaton_bootstrap_sync(
         expected_version_commit,
         &runtime.evm_address,
         AutomatonBootstrapEvidence {
+            bootstrap_contract_version: Some(crate::types::SPAWN_CONTRACT_VERSION),
+            bootstrap_name: Some(session.resolved_genesis().0),
+            bootstrap_constitution_hash: None,
+            bootstrap_constitution: Some(session.resolved_genesis().1),
             bootstrap_session_id: Some(runtime.session_id.clone()),
             bootstrap_parent_id: session.parent_id.clone(),
             bootstrap_factory_principal: Some(*expected_factory_principal),
@@ -215,6 +252,9 @@ fn verify_spawned_automaton_bootstrap_sync(
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Debug, candid::CandidType, serde::Deserialize)]
 struct ChildSpawnBootstrapView {
+    contract_version: Option<u16>,
+    name: Option<String>,
+    constitution: Option<String>,
     session_id: Option<String>,
     parent_id: Option<String>,
     factory_principal: Option<candid::Principal>,
@@ -584,6 +624,10 @@ async fn load_spawned_automaton_bootstrap_evidence(
     }
 
     Ok(AutomatonBootstrapEvidence {
+        bootstrap_contract_version: bootstrap_view.contract_version,
+        bootstrap_name: bootstrap_view.name,
+        bootstrap_constitution_hash: None,
+        bootstrap_constitution: bootstrap_view.constitution,
         bootstrap_session_id: bootstrap_view.session_id,
         bootstrap_parent_id: bootstrap_view.parent_id,
         bootstrap_factory_principal: bootstrap_view.factory_principal,
@@ -938,8 +982,11 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             session.release_tx_hash = Some(release_tx_hash.clone());
             session.release_broadcast_at = Some(release_broadcast_at);
             session.release_broadcast = Some(release_record.clone());
+            let (name, constitution_hash) = redact_released_constitution(session, &mut runtime);
 
             SpawnedAutomatonRecord {
+                name: Some(name),
+                constitution_hash: Some(constitution_hash),
                 canister_id: runtime.canister_id.clone(),
                 steward_address: session.steward_address.clone(),
                 evm_address: runtime.evm_address.clone(),
@@ -1544,8 +1591,11 @@ pub async fn execute_spawn(
         session.release_tx_hash = Some(release_tx_hash.clone());
         session.release_broadcast_at = Some(release_broadcast_at);
         session.release_broadcast = Some(release_record.clone());
+        let (name, constitution_hash) = redact_released_constitution(session, &mut runtime);
 
         let record = SpawnedAutomatonRecord {
+            name: Some(name),
+            constitution_hash: Some(constitution_hash),
             canister_id: canister_id.clone(),
             steward_address: session.steward_address.clone(),
             evm_address: runtime.evm_address.clone(),
@@ -1593,6 +1643,8 @@ mod tests {
 
     fn sample_session() -> SpawnSession {
         SpawnSession {
+            name: Some("Meridian".to_string()),
+            constitution: Some("I am Meridian. ".repeat(30)),
             session_id: "session-1".to_string(),
             claim_id: "claim-1".to_string(),
             steward_address: "0xsteward".to_string(),
@@ -1645,6 +1697,10 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567",
             "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
             AutomatonBootstrapEvidence {
+                bootstrap_contract_version: Some(crate::types::SPAWN_CONTRACT_VERSION),
+                bootstrap_name: Some(session.resolved_genesis().0),
+                bootstrap_constitution_hash: None,
+                bootstrap_constitution: Some(session.resolved_genesis().1),
                 bootstrap_session_id: Some(session.session_id.clone()),
                 bootstrap_parent_id: session.parent_id.clone(),
                 bootstrap_factory_principal: Some(
@@ -1680,6 +1736,10 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567",
             "0xautomaton",
             AutomatonBootstrapEvidence {
+                bootstrap_contract_version: None,
+                bootstrap_name: None,
+                bootstrap_constitution_hash: None,
+                bootstrap_constitution: None,
                 bootstrap_session_id: Some("wrong-session".to_string()),
                 bootstrap_parent_id: None,
                 bootstrap_factory_principal: None,

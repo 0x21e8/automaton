@@ -21,6 +21,11 @@ export function createAutomatonDetailFixture(
     chain: "base",
     chainId: 8453,
     name: "ALPHA-42",
+    constitutionVerification: {
+      status: "unavailable",
+      expectedHash: null,
+      computedHash: null
+    },
     model: "openrouter/auto",
     tier: "normal",
     agentState: "Idle",

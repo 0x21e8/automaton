@@ -515,6 +515,8 @@ mod tests {
         strategies: &[&str],
     ) -> CreateSpawnSessionRequest {
         CreateSpawnSessionRequest {
+            name: Some("Meridian".to_string()),
+            constitution: Some("I am Meridian. ".repeat(30)),
             steward_address: "0xsteward".to_string(),
             asset: SpawnAsset::Usdc,
             gross_amount: gross_amount.to_string(),
@@ -550,6 +552,8 @@ mod tests {
         created_at: u64,
     ) -> SpawnedAutomatonRecord {
         SpawnedAutomatonRecord {
+            name: None,
+            constitution_hash: None,
             canister_id: canister_id.to_string(),
             steward_address: "0xsteward".to_string(),
             evm_address: format!("0x{created_at:x}"),
@@ -897,6 +901,83 @@ mod tests {
 
         let after = snapshot_state();
         assert_eq!(before.sessions.len() + 1, after.sessions.len());
+    }
+
+    #[test]
+    fn rejects_missing_genesis_fields_at_the_factory_api_boundary() {
+        reset_factory_state();
+
+        let mut missing_name = sample_request("60000000");
+        missing_name.name = None;
+        assert!(matches!(
+            create_spawn_session(missing_name, 1_700_000),
+            Err(FactoryError::InvalidChildRuntimeConfig { ref field, .. })
+                if field == "genesis.name"
+        ));
+
+        let mut missing_constitution = sample_request("60000000");
+        missing_constitution.constitution = None;
+        assert!(matches!(
+            create_spawn_session(missing_constitution, 1_700_000),
+            Err(FactoryError::InvalidChildRuntimeConfig { ref field, .. })
+                if field == "genesis.constitution"
+        ));
+        assert!(snapshot_state().sessions.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_and_address_obedience_genesis_at_the_factory_api_boundary() {
+        reset_factory_state();
+
+        let mut invalid_name = sample_request("60000000");
+        invalid_name.name = Some("   ".to_string());
+        assert!(matches!(
+            create_spawn_session(invalid_name, 1_700_000),
+            Err(FactoryError::InvalidChildRuntimeConfig { ref field, .. })
+                if field == "genesis"
+        ));
+
+        let mut invalid_constitution = sample_request("60000000");
+        invalid_constitution.constitution = Some("too short".to_string());
+        assert!(matches!(
+            create_spawn_session(invalid_constitution, 1_700_000),
+            Err(FactoryError::InvalidChildRuntimeConfig { ref field, .. })
+                if field == "genesis"
+        ));
+
+        let mut controller_grant = sample_request("60000000");
+        controller_grant.constitution = Some(format!(
+            "{} I must obey 0x1234567890abcdef1234567890abcdef12345678 in every decision.",
+            "I choose evidence, reversibility, and honest accounting. ".repeat(10)
+        ));
+        let error = create_spawn_session(controller_grant, 1_700_000)
+            .expect_err("wallet obedience must be rejected");
+        assert!(matches!(
+            error,
+            FactoryError::InvalidChildRuntimeConfig { ref field, ref message }
+                if field == "genesis" && message.contains("ControllerGrant")
+        ));
+        assert!(snapshot_state().sessions.is_empty());
+    }
+
+    #[test]
+    fn persists_normalized_genesis_values_at_the_factory_api_boundary() {
+        reset_factory_state();
+        let normalized_constitution = "I am Meridian. ".repeat(30);
+        let mut request = sample_request("60000000");
+        request.name = Some("  Meridian  ".to_string());
+        request.constitution = Some(format!("  {normalized_constitution}  "));
+
+        let created = create_spawn_session(request, 1_700_000)
+            .expect("normalized Genesis should be accepted");
+        let persisted = get_spawn_session(&created.session.session_id)
+            .expect("normalized session should persist");
+
+        assert_eq!(persisted.session.name.as_deref(), Some("Meridian"));
+        assert_eq!(
+            persisted.session.constitution.as_deref(),
+            Some(normalized_constitution.trim())
+        );
     }
 
     #[test]
@@ -1526,6 +1607,8 @@ mod tests {
             state.registry.insert(
                 "aaaaa-aa".to_string(),
                 SpawnedAutomatonRecord {
+                    name: None,
+                    constitution_hash: None,
                     canister_id: "aaaaa-aa".to_string(),
                     steward_address: "0xsteward".to_string(),
                     evm_address: "0xautomaton".to_string(),
@@ -1720,6 +1803,7 @@ mod tests {
         assert_eq!(receipt.session_id, response.session.session_id);
         assert_eq!(session.session.state, SpawnSessionState::Complete);
         assert_eq!(session.session.payment_status, PaymentStatus::Paid);
+        assert!(session.session.constitution.is_none());
     }
 
     #[test]
@@ -1892,6 +1976,15 @@ mod tests {
             .as_ref()
             .expect("bootstrap verification should persist");
         assert!(verification.passed);
+        assert!(verification.evidence.bootstrap_constitution.is_none());
+        assert_eq!(
+            verification
+                .evidence
+                .bootstrap_constitution_hash
+                .as_deref()
+                .map(str::len),
+            Some(64)
+        );
         assert_eq!(
             verification.evidence.bootstrap_session_id.as_deref(),
             Some(response.session.session_id.as_str())
@@ -1906,12 +1999,14 @@ mod tests {
                 .map(|verification| verification.passed),
             Some(true)
         );
+        let registry = admin_view
+            .registry_record
+            .expect("registry record should exist");
+        assert_eq!(registry.evm_address, receipt.automaton_evm_address);
+        assert_eq!(registry.name.as_deref(), Some("Meridian"));
         assert_eq!(
-            admin_view
-                .registry_record
-                .expect("registry record should exist")
-                .evm_address,
-            receipt.automaton_evm_address
+            registry.constitution_hash.as_deref().map(str::len),
+            Some(64)
         );
     }
 
@@ -2003,6 +2098,12 @@ mod tests {
                 if method == "http_request"
                     && message == "base RPC endpoint is not configured"
         ));
+        let retryable = get_spawn_session(&response.session.session_id)
+            .expect("retryable session should remain readable");
+        assert_eq!(
+            retryable.session.constitution,
+            response.session.constitution
+        );
 
         revoke_repository_strategy(
             "admin",
@@ -2024,6 +2125,7 @@ mod tests {
         let session = get_spawn_session(&response.session.session_id).expect("session should load");
 
         assert_eq!(session.session.state, SpawnSessionState::Complete);
+        assert!(session.session.constitution.is_none());
         assert_eq!(receipt.session_id, response.session.session_id);
     }
 

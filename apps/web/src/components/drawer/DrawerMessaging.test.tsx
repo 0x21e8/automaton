@@ -17,6 +17,13 @@ function createAutomatonDetail(): AutomatonDetail {
     corePattern: null,
     corePatternIndex: 0,
     createdAt: 1_700_000_000_000,
+    constitution: null,
+    constitutionHash: null,
+    constitutionVerification: {
+      status: "unavailable",
+      expectedHash: null,
+      computedHash: null
+    },
     cyclesBalance: 2_000_000_000_000,
     ethAddress: "0x1234567890abcdef1234567890abcdef12345678",
     ethBalanceWei: "1000000000000000000",
@@ -91,6 +98,76 @@ afterEach(() => {
 });
 
 describe("drawer messaging", () => {
+  it("shows verified documents and hides mismatched content", () => {
+    const verified = createAutomatonDetail();
+    verified.constitution = "A verified founding document.";
+    verified.constitutionHash = "abc123";
+    verified.constitutionVerification = {
+      status: "verified",
+      expectedHash: "abc123",
+      computedHash: "abc123"
+    };
+    const verifiedMarkup = renderToStaticMarkup(
+      <AutomatonDrawer
+        automaton={verified}
+        errorMessage={null}
+        isLoading={false}
+        isOpen
+        onClose={() => {}}
+        selectedCanisterId={verified.canisterId}
+        viewerAddress={null}
+        walletSession={null}
+      />
+    );
+    expect(verifiedMarkup).toContain("A verified founding document.");
+    expect(verifiedMarkup).toContain("Verified SHA-256 abc123");
+
+    const mismatch = createAutomatonDetail();
+    mismatch.constitution = null;
+    mismatch.constitutionHash = "expected";
+    mismatch.constitutionVerification = {
+      status: "mismatch",
+      expectedHash: "expected",
+      computedHash: "different"
+    };
+    const mismatchMarkup = renderToStaticMarkup(
+      <AutomatonDrawer
+        automaton={mismatch}
+        errorMessage={null}
+        isLoading={false}
+        isOpen
+        onClose={() => {}}
+        selectedCanisterId={mismatch.canisterId}
+        viewerAddress={null}
+        walletSession={null}
+      />
+    );
+    expect(mismatchMarkup).toContain("Integrity warning");
+    expect(mismatchMarkup).not.toContain("A verified founding document.");
+
+    const legacy = createAutomatonDetail();
+    legacy.constitution = "A legacy founding document.";
+    legacy.constitutionVerification = {
+      status: "legacy_unverified",
+      expectedHash: null,
+      computedHash: "computed"
+    };
+    const legacyMarkup = renderToStaticMarkup(
+      <AutomatonDrawer
+        automaton={legacy}
+        errorMessage={null}
+        isLoading={false}
+        isOpen
+        onClose={() => {}}
+        selectedCanisterId={legacy.canisterId}
+        viewerAddress={null}
+        walletSession={null}
+      />
+    );
+    expect(legacyMarkup).toContain("Legacy document");
+    expect(legacyMarkup).toContain("no registry hash");
+  });
+
   it("distinguishes a missing indexed automaton from a generic detail failure", () => {
     const missingMarkup = renderToStaticMarkup(
       <AutomatonDrawer

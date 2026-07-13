@@ -17,6 +17,11 @@ function createAutomatonDetail(): AutomatonDetail {
     canisterUrl: "http://txyno-ch777-77776-aaaaq-cai.localhost:8000/",
     chain: "base",
     chainId: 8453,
+    constitutionVerification: {
+      status: "unavailable",
+      expectedHash: null,
+      computedHash: null
+    },
     childIds: [],
     corePattern: null,
     corePatternIndex: 0,

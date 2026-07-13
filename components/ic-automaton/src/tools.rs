@@ -4452,6 +4452,9 @@ mod tests {
 
     fn configure_factory_room_access() {
         stable::set_spawn_bootstrap_metadata(SpawnBootstrapView {
+            contract_version: None,
+            name: None,
+            constitution: None,
             session_id: None,
             parent_id: None,
             factory_principal: Some(test_factory_principal()),

@@ -25,6 +25,9 @@ struct SpawnProviderBootstrapArgs {
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize)]
 struct SpawnBootstrapArgs {
+    contract_version: Option<u16>,
+    name: Option<String>,
+    constitution: Option<String>,
     steward_address: String,
     session_id: String,
     parent_id: Option<String>,
@@ -150,6 +153,9 @@ struct InferenceProxyStatusView {
 
 #[derive(CandidType, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct SpawnBootstrapView {
+    contract_version: Option<u16>,
+    name: Option<String>,
+    constitution: Option<String>,
     session_id: Option<String>,
     parent_id: Option<String>,
     factory_principal: Option<Principal>,
@@ -216,6 +222,9 @@ fn sample_spawn_provider_args(
 
 fn sample_spawn_bootstrap_args(provider: SpawnProviderBootstrapArgs) -> SpawnBootstrapArgs {
     SpawnBootstrapArgs {
+        contract_version: Some(2),
+        name: Some("Meridian".to_string()),
+        constitution: Some("I am Meridian. ".repeat(30).trim().to_string()),
         steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),
         session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
         parent_id: Some("parent-automaton".to_string()),
@@ -331,6 +340,9 @@ fn pocketic_spawn_bootstrap_sets_direct_openrouter_runtime_and_http_config() {
     assert_eq!(
         bootstrap_view,
         SpawnBootstrapView {
+            contract_version: Some(2),
+            name: Some("Meridian".to_string()),
+            constitution: Some("I am Meridian. ".repeat(30).trim().to_string()),
             session_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             parent_id: Some("parent-automaton".to_string()),
             factory_principal: Some(

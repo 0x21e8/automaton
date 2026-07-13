@@ -29,6 +29,7 @@ import {
   toOptionalString,
   toVariantName
 } from "../lib/automaton-derived.js";
+import { verifyConstitution } from "../lib/genesis-integrity.js";
 
 const EMPTY_STEWARD_ADDRESS = "0x0000000000000000000000000000000000000000";
 
@@ -170,7 +171,13 @@ function defaultDetail(
     ethAddress: registryRecord?.evmAddress ?? null,
     chain,
     chainId,
-    name: deriveAutomatonName(canisterId),
+    name: registryRecord?.name ?? deriveAutomatonName(canisterId),
+    constitutionHash: registryRecord?.constitutionHash ?? null,
+    constitutionVerification: {
+      status: "unavailable",
+      expectedHash: registryRecord?.constitutionHash ?? null,
+      computedHash: null
+    },
     tier: "normal",
     agentState: "Unknown",
     ethBalanceWei: null,
@@ -192,6 +199,7 @@ function defaultDetail(
     createdAt: registryRecord?.createdAt ?? now,
     lastTransitionAt: now,
     soul: "",
+    constitution: null,
     canisterUrl: buildCanisterUrl(config, canisterId),
     explorerUrl: null,
     model: spawnModel,
@@ -280,6 +288,18 @@ export function normalizeAutomatonDetail(options: {
         toOptionalString(runtime.snapshot.scheduler?.last_tick_error) ??
         null
       : base.runtime.lastError;
+  const constitutionHash =
+    options.registryRecord?.constitutionHash ?? base.constitutionHash ?? null;
+  const identityConstitution = options.identity?.genesis?.constitution ?? null;
+  const constitutionResult =
+    identityConstitution === null && options.identity === undefined
+      ? base.constitutionVerification === undefined
+        ? verifyConstitution(base.constitution ?? null, constitutionHash)
+        : {
+            constitution: base.constitution ?? null,
+            verification: base.constitutionVerification
+          }
+      : verifyConstitution(identityConstitution, constitutionHash);
 
   return {
     ...base,
@@ -287,7 +307,10 @@ export function normalizeAutomatonDetail(options: {
     ethAddress: automatonAddress,
     chainId,
     chain,
-    name: deriveAutomatonName(options.canisterId),
+    name: options.identity?.genesis?.name ?? options.registryRecord?.name ?? base.name,
+    constitutionHash,
+    constitution: constitutionResult.constitution,
+    constitutionVerification: constitutionResult.verification,
     model: options.spawnModel ?? base.model,
     tier: normalizeTier(runtime?.snapshot.scheduler?.survival_tier, base.tier),
     agentState: runtimeState,

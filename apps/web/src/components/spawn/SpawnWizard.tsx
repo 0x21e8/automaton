@@ -48,6 +48,7 @@ import {
   getRiskProfile,
   listSelectableRepositoryStrategies,
   normalizeSelectedRepositoryStrategyIds,
+  validateGenesis,
   TOTAL_SPAWN_STEPS,
   toggleSelection,
   type SpawnWizardState
@@ -57,6 +58,7 @@ import { FundStep } from "./steps/FundStep";
 import { ProviderConfigStep } from "./steps/ProviderConfigStep";
 import { RiskStep } from "./steps/RiskStep";
 import { StrategiesStep } from "./steps/StrategiesStep";
+import { GenesisStep } from "./steps/GenesisStep";
 
 interface SpawnWizardProps {
   isOpen: boolean;
@@ -94,9 +96,10 @@ interface SpawnJourneyProgress {
 }
 
 const stepTitles = [
+  "Genesis constitution",
   "Risk appetite",
   "Strategies",
-  "Provider config",
+  "Inference provider",
   "Fund"
 ] as const;
 const USDC_DECIMALS = 6;
@@ -226,8 +229,8 @@ function createSpawnJourneySteps(): SpawnJourneyStep[] {
   return [
     {
       key: "session",
-      label: "Create session",
-      detail: "Factory prepares the quoted escrow session and payment instructions.",
+      label: "Open birth session",
+      detail: "The factory prepares the quoted escrow session and payment instructions.",
       status: "pending"
     },
     {
@@ -245,7 +248,7 @@ function createSpawnJourneySteps(): SpawnJourneyStep[] {
     {
       key: "provision",
       label: "Provision automaton",
-      detail: "The factory creates the automaton canister and applies its initial configuration.",
+      detail: "The factory creates the automaton canister and provisions its founding state.",
       status: "pending"
     },
     {
@@ -337,7 +340,7 @@ export function deriveSpawnJourneyProgress(
     return finalizeSpawnJourneyProgress(
       steps,
       "Creating factory session",
-      "Factory is preparing the live payment session for this spawn attempt."
+      "The factory is preparing the live payment session for this birth attempt."
     );
   }
 
@@ -437,13 +440,13 @@ export function deriveSpawnJourneyProgress(
         steps,
         "provision",
         "current",
-        "Funding is confirmed. The factory is preparing the spawn pipeline."
+        "Funding is confirmed. The factory is preparing the birth pipeline."
       );
 
       return finalizeSpawnJourneyProgress(
         steps,
         "Provisioning automaton",
-        "Escrow payment is locked in and the factory has started the spawn pipeline."
+        "Escrow payment is locked in and the factory has started the birth pipeline."
       );
 
     case "spawning":
@@ -463,13 +466,13 @@ export function deriveSpawnJourneyProgress(
         steps,
         "provision",
         "current",
-        "The factory is creating the automaton canister and applying its initial configuration."
+        "The factory is creating the automaton canister and provisioning its founding state."
       );
 
       return finalizeSpawnJourneyProgress(
         steps,
         "Provisioning automaton",
-        "The automaton is being created and configured now."
+        "The automaton is being created and provisioned now."
       );
 
     case "broadcasting_release":
@@ -521,13 +524,13 @@ export function deriveSpawnJourneyProgress(
         steps,
         "complete",
         "complete",
-        "Spawn completed and the new automaton should now appear on the grid."
+        "Birth completed and the new automaton should now appear on the grid."
       );
 
       return finalizeSpawnJourneyProgress(
         steps,
-        "Spawn complete",
-        "The spawn finished successfully. The new automaton should now be visible on the grid."
+        "Birth complete",
+        "The birth finished successfully. The new automaton should now be visible on the grid."
       );
 
     case "failed":
@@ -565,7 +568,7 @@ export function deriveSpawnJourneyProgress(
 
       return finalizeSpawnJourneyProgress(
         steps,
-        "Spawn failed",
+        "Birth failed",
         describeSpawnSessionProgress(session as SpawnSession)
       );
 
@@ -599,7 +602,7 @@ export function deriveSpawnJourneyProgress(
           steps,
           "provision",
           "error",
-          "The session expired before the spawn could finish."
+          "The session expired before the birth could finish."
         );
       } else if (session.paymentStatus === "partial") {
         setSpawnJourneyStep(
@@ -868,6 +871,7 @@ export function SpawnWizard({
     !spawnSession.isCreating &&
     !playgroundMetadata?.maintenance &&
     !hasKnownFundingShortfall;
+  const genesisValidation = validateGenesis(state.name, state.constitution);
 
   useEffect(() => {
     const compatibleStrategies = listSelectableRepositoryStrategies(
@@ -1081,6 +1085,8 @@ export function SpawnWizard({
     }
 
     return {
+      name: state.name.trim(),
+      constitution: state.constitution.trim(),
       stewardAddress: viewerAddress,
       asset: state.asset,
       grossAmount,
@@ -1327,7 +1333,7 @@ export function SpawnWizard({
   const walletStatusMessage = !walletSession.hasProvider
     ? "No injected wallet detected. Install or enable MetaMask, Rabby, or another EIP-6963 wallet."
     : viewerAddress === null
-      ? "Choose the wallet you want to fund, then connect it here before spawning."
+      ? "Choose the wallet that will fund this birth, then connect it here."
       : walletSession.selectedProviderName !== null
         ? `${walletSession.selectedProviderName} is connected for playground funding and payment.`
         : "Wallet is connected for playground funding and payment.";
@@ -1421,15 +1427,15 @@ export function SpawnWizard({
       }}
     >
       <section
-        aria-label="Spawn automaton wizard"
+        aria-label="Automaton genesis rite"
         aria-modal="true"
         className="spawn-wizard"
         role="dialog"
       >
         <header className="spawn-header">
           <div>
-            <p className="section-label">Spawn wizard</p>
-            <h2 className="spawn-heading">Spawn Automaton</h2>
+            <p className="section-label">Genesis rite</p>
+            <h2 className="spawn-heading">Bring forth an Automaton</h2>
           </div>
           <div className="spawn-header-actions">
             <div className="spawn-header-meta">
@@ -1437,7 +1443,7 @@ export function SpawnWizard({
               <strong>{headerMetaTitle}</strong>
             </div>
             <button
-              aria-label="Close spawn wizard"
+              aria-label="Close genesis rite"
               className="spawn-close"
               onClick={closeWizard}
               type="button"
@@ -1458,6 +1464,15 @@ export function SpawnWizard({
 
         <div className="spawn-body">
           {stepIndex === 0 ? (
+            <GenesisStep
+              name={state.name}
+              constitution={state.constitution}
+              onNameChange={(name) => setState((current) => ({ ...current, name }))}
+              onConstitutionChange={(constitution) => setState((current) => ({ ...current, constitution }))}
+            />
+          ) : null}
+
+          {stepIndex === 1 ? (
             <RiskStep
               onChange={(risk) => {
                 setState((current) => ({
@@ -1469,7 +1484,7 @@ export function SpawnWizard({
             />
           ) : null}
 
-          {stepIndex === 1 ? (
+          {stepIndex === 2 ? (
             <StrategiesStep
               chainLabel={getActiveChainLabel(state.chain)}
               errorMessage={repositoryError}
@@ -1485,7 +1500,7 @@ export function SpawnWizard({
             />
           ) : null}
 
-          {stepIndex === 2 ? (
+          {stepIndex === 3 ? (
             <ProviderConfigStep
               braveSearchApiKey={state.braveSearchApiKey}
               modelOptions={modelOptions}
@@ -1512,7 +1527,7 @@ export function SpawnWizard({
             />
           ) : null}
 
-          {stepIndex === 3 ? (
+          {stepIndex === 4 ? (
             <FundStep
               asset={state.asset}
               balances={{
@@ -1614,7 +1629,7 @@ export function SpawnWizard({
             >
               <div className="spawn-session-header">
                 <div>
-                  <p className="section-label">Live spawn progress</p>
+                  <p className="section-label">Live birth progress</p>
                   <h3 className="spawn-step-title">Funding and Provisioning</h3>
                 </div>
                 <span className="spawn-session-pill">
@@ -1680,7 +1695,7 @@ export function SpawnWizard({
                           }}
                           type="button"
                         >
-                          Retry spawn
+                          Retry birth
                         </button>
                       ) : null}
                       {showRefundAction ? (
@@ -1734,7 +1749,6 @@ export function SpawnWizard({
                       until the reset completes.
                     </p>
                   ) : null}
-
                 </>
               ) : (
                 <p className="spawn-session-meta">
@@ -1770,7 +1784,7 @@ export function SpawnWizard({
                 onClick={resetTrackedSession}
                 type="button"
               >
-                New session
+                New genesis
               </button>
             </>
           ) : (
@@ -1788,7 +1802,9 @@ export function SpawnWizard({
                 disabled={
                   stepIndex === TOTAL_SPAWN_STEPS - 1
                     ? !canSubmit
-                    : stepIndex === 1
+                    : stepIndex === 0
+                      ? genesisValidation !== null
+                    : stepIndex === 2
                       ? isLoadingRepositoryStrategies ||
                         repositoryError !== null ||
                         selectedStrategyRecords.length === 0
@@ -1803,7 +1819,7 @@ export function SpawnWizard({
                 }
                 type="button"
               >
-                {stepIndex === TOTAL_SPAWN_STEPS - 1 ? "Spawn" : "Next"}
+                {stepIndex === TOTAL_SPAWN_STEPS - 1 ? "Begin genesis" : "Next"}
               </button>
             </>
           )}

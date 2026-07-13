@@ -115,6 +115,8 @@ export interface SpawnQuote {
 }
 
 export interface SpawnSession {
+  name?: string | null;
+  constitution?: string | null;
   // UUID v4 string. Production generation changes in LP-04.
   sessionId: string;
   claimId: string;
@@ -144,6 +146,8 @@ export interface SpawnSession {
 }
 
 export interface CreateSpawnSessionRequest {
+  name: string;
+  constitution: string;
   stewardAddress: string;
   asset: SpawnAsset;
   grossAmount: string;
@@ -208,6 +212,8 @@ export interface EscrowPaymentRecord {
 }
 
 export interface SpawnedAutomatonRecord {
+  name?: string | null;
+  constitutionHash?: string | null;
   canisterId: string;
   stewardAddress: string;
   evmAddress: string;

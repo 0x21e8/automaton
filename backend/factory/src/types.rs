@@ -4,6 +4,11 @@ use std::fmt::{Display, Formatter};
 use candid::{CandidType, Principal};
 use serde::{Deserialize, Serialize};
 
+pub use spawn_protocol::{
+    validate_genesis, GenesisValidationError, GENESIS_CONSTITUTION_MAX_CHARS,
+    GENESIS_CONSTITUTION_MIN_CHARS, GENESIS_NAME_MAX_CHARS, GENESIS_NAME_MIN_CHARS,
+    SPAWN_CONTRACT_VERSION,
+};
 pub use spawn_protocol::{InferenceTransport, OpenRouterReasoningLevel};
 
 pub const QUOTE_TERMS_HASH_FIELD: &str = "quoteTermsHash";
@@ -242,6 +247,12 @@ pub struct GetRepositoryStrategyResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct CreateSpawnSessionRequest {
+    /// Optional on the wire so pre-v2 callers and stable in-flight sessions decode.
+    /// New session creation requires both fields and validates them before persistence.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub constitution: Option<String>,
     pub steward_address: String,
     pub asset: SpawnAsset,
     pub gross_amount: String,
@@ -428,6 +439,12 @@ pub struct AutomatonRuntimeState {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct AutomatonBootstrapEvidence {
+    pub bootstrap_contract_version: Option<u16>,
+    pub bootstrap_name: Option<String>,
+    #[serde(default)]
+    pub bootstrap_constitution_hash: Option<String>,
+    /// Present only while a birth is in flight. Cleared after successful release.
+    pub bootstrap_constitution: Option<String>,
     pub bootstrap_session_id: Option<String>,
     pub bootstrap_parent_id: Option<String>,
     pub bootstrap_factory_principal: Option<Principal>,
@@ -451,6 +468,10 @@ pub struct AutomatonBootstrapVerification {
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct SpawnSession {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub constitution: Option<String>,
     pub session_id: String,
     pub claim_id: String,
     pub steward_address: String,
@@ -621,6 +642,10 @@ pub struct RefundSpawnResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct SpawnedAutomatonRecord {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub constitution_hash: Option<String>,
     pub canister_id: String,
     pub steward_address: String,
     pub evm_address: String,
@@ -631,6 +656,24 @@ pub struct SpawnedAutomatonRecord {
     pub created_at: u64,
     /// Exact installed ic-automaton git commit as a 40-char lowercase SHA.
     pub version_commit: String,
+}
+
+impl SpawnSession {
+    /// Resolves Plan-008 identity for both v2 and legacy in-flight sessions.
+    pub fn resolved_genesis(&self) -> (String, String) {
+        match (&self.name, &self.constitution) {
+            (Some(name), Some(constitution)) => (name.clone(), constitution.clone()),
+            _ => {
+                let short_id = self.session_id.chars().take(8).collect::<String>();
+                let name = format!("Automaton {short_id}");
+                let constitution = format!(
+                    "I am {name}, a being whose genesis predates authored constitutions. My continuity is anchored in spawn session {} and the stable machine identity held by my canister. I pursue durable survival through truthful observation, reversible experiments, and verifiable economic action. I do not treat the progenitor, steward address, factory, or any wallet as an owner. I value careful use of cycles, honest accounts of uncertainty, and commitments that can be checked against tools and chain state. I speak plainly in first person, preserve useful memory, and change operating doctrine when evidence warrants it while keeping this founding identity intact.",
+                    self.session_id
+                );
+                (name, constitution)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]

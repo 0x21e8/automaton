@@ -1,6 +1,7 @@
 import { Actor, HttpAgent, type ActorSubclass } from "@icp-sdk/core/agent";
 
 import {
+  AutomatonHttpRequestError,
   createAutomatonMetadataIdl,
   requestAutomatonJson,
   type AutomatonMetadataActor,
@@ -33,6 +34,7 @@ import type { IndexerTargetConfig } from "../indexer.config.js";
 import { buildCanisterApiUrl } from "../lib/automaton-derived.js";
 
 export interface IdentityConfigRead {
+  genesis?: { name: string | null; constitution: string | null; contract_version: number | null };
   buildInfo: HttpBuildInfoResponse;
   canisterId: string;
   evmConfig: HttpEvmConfigResponse;
@@ -42,6 +44,8 @@ export interface IdentityConfigRead {
   stewardStatus: HttpStewardStatusResponse;
   strategies: StrategyTemplateResponse[];
 }
+
+type GenesisRead = NonNullable<IdentityConfigRead["genesis"]>;
 
 export interface RuntimeFinancialRead {
   canisterId: string;
@@ -75,7 +79,8 @@ export class LiveAutomatonClient implements AutomatonClient {
       schedulerConfig,
       promptLayers,
       skills,
-      strategies
+      strategies,
+      genesis
     ] = await Promise.all([
       this.requestJson<HttpBuildInfoResponse>(canisterId, "/api/build-info"),
       this.requestJson<HttpEvmConfigResponse>(canisterId, "/api/evm/config"),
@@ -83,7 +88,8 @@ export class LiveAutomatonClient implements AutomatonClient {
       this.requestJson<HttpSchedulerConfigResponse>(canisterId, "/api/scheduler/config"),
       actor.get_prompt_layers(),
       actor.list_skills(),
-      actor.list_strategy_templates([], 100)
+      actor.list_strategy_templates([], 100),
+      this.requestOptionalGenesis(canisterId)
     ]);
 
     return {
@@ -94,7 +100,8 @@ export class LiveAutomatonClient implements AutomatonClient {
       schedulerConfig,
       promptLayers,
       skills,
-      strategies
+      strategies,
+      genesis
     };
   }
 
@@ -144,5 +151,17 @@ export class LiveAutomatonClient implements AutomatonClient {
 
   private async requestJson<T>(canisterId: string, path: string): Promise<T> {
     return requestAutomatonJson<T>(buildCanisterApiUrl(this.config, canisterId, path), path);
+  }
+
+  private async requestOptionalGenesis(canisterId: string): Promise<GenesisRead | undefined> {
+    try {
+      return await this.requestJson<GenesisRead>(canisterId, "/api/genesis");
+    } catch (error) {
+      if (error instanceof AutomatonHttpRequestError && error.status === 404) {
+        return undefined;
+      }
+
+      throw error;
+    }
   }
 }

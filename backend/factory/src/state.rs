@@ -768,3 +768,168 @@ pub fn record_session_audit(
         entries.drain(0..excess);
     }
 }
+
+#[cfg(test)]
+mod genesis_migration_tests {
+    use super::*;
+    use crate::types::*;
+
+    #[derive(CandidType, Serialize)]
+    struct LegacySpawnSession {
+        session_id: String,
+        claim_id: String,
+        steward_address: String,
+        chain: SpawnChain,
+        asset: SpawnAsset,
+        gross_amount: String,
+        platform_fee: String,
+        creation_cost: String,
+        net_forward_amount: String,
+        quote_terms_hash: String,
+        expires_at: u64,
+        state: SpawnSessionState,
+        retryable: bool,
+        refundable: bool,
+        payment_status: PaymentStatus,
+        last_scanned_block: Option<u64>,
+        automaton_canister_id: Option<String>,
+        automaton_evm_address: Option<String>,
+        release_tx_hash: Option<String>,
+        release_broadcast_at: Option<u64>,
+        release_broadcast: Option<ReleaseBroadcastRecord>,
+        parent_id: Option<String>,
+        child_ids: Vec<String>,
+        selected_strategies: Vec<RepositoryStrategySessionSnapshot>,
+        config: SpawnConfig,
+        created_at: u64,
+        updated_at: u64,
+    }
+
+    #[derive(CandidType, Serialize)]
+    struct LegacyRegistryRecord {
+        canister_id: String,
+        steward_address: String,
+        evm_address: String,
+        chain: SpawnChain,
+        session_id: String,
+        parent_id: Option<String>,
+        child_ids: Vec<String>,
+        created_at: u64,
+        version_commit: String,
+    }
+
+    #[derive(CandidType, Serialize)]
+    struct LegacyAutomatonBootstrapEvidence {
+        bootstrap_contract_version: Option<u16>,
+        bootstrap_name: Option<String>,
+        bootstrap_constitution: Option<String>,
+        bootstrap_session_id: Option<String>,
+        bootstrap_parent_id: Option<String>,
+        bootstrap_factory_principal: Option<candid::Principal>,
+        bootstrap_risk: Option<u8>,
+        bootstrap_strategies: Vec<String>,
+        bootstrap_skills: Vec<String>,
+        bootstrap_version_commit: Option<String>,
+        steward_address: Option<String>,
+        steward_chain_id: Option<u64>,
+        steward_enabled: Option<bool>,
+        evm_address: Option<String>,
+    }
+
+    fn legacy_config() -> SpawnConfig {
+        SpawnConfig {
+            chain: SpawnChain::Base,
+            risk: 3,
+            strategies: vec![],
+            skills: vec![],
+            provider: ProviderConfig {
+                model: None,
+                inference_transport: InferenceTransport::OpenrouterDirect,
+                open_router_reasoning_level: OpenRouterReasoningLevel::Default,
+            },
+        }
+    }
+
+    #[test]
+    fn candid_stable_bytes_from_pre_genesis_records_decode_with_empty_compatibility_fields() {
+        let legacy_config_bytes = candid::encode_one(legacy_config()).unwrap();
+        assert_eq!(
+            candid::decode_one::<SpawnConfig>(&legacy_config_bytes).unwrap(),
+            legacy_config()
+        );
+
+        let legacy = LegacySpawnSession {
+            session_id: "legacy-session".into(),
+            claim_id: "claim".into(),
+            steward_address: "0xlegacy".into(),
+            chain: SpawnChain::Base,
+            asset: SpawnAsset::Usdc,
+            gross_amount: "100".into(),
+            platform_fee: "1".into(),
+            creation_cost: "1".into(),
+            net_forward_amount: "98".into(),
+            quote_terms_hash: "hash".into(),
+            expires_at: 1,
+            state: SpawnSessionState::AwaitingPayment,
+            retryable: false,
+            refundable: false,
+            payment_status: PaymentStatus::Unpaid,
+            last_scanned_block: None,
+            automaton_canister_id: None,
+            automaton_evm_address: None,
+            release_tx_hash: None,
+            release_broadcast_at: None,
+            release_broadcast: None,
+            parent_id: None,
+            child_ids: vec![],
+            selected_strategies: vec![],
+            config: legacy_config(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let decoded: SpawnSession =
+            candid::decode_one(&candid::encode_one(legacy).unwrap()).unwrap();
+        assert_eq!(decoded.name, None);
+        assert_eq!(decoded.constitution, None);
+        let (name, constitution) = decoded.resolved_genesis();
+        assert!(name.starts_with("Automaton"));
+        assert!(constitution.chars().count() >= GENESIS_CONSTITUTION_MIN_CHARS);
+
+        let legacy_registry = LegacyRegistryRecord {
+            canister_id: "aaaaa-aa".into(),
+            steward_address: "0xlegacy".into(),
+            evm_address: "0xchild".into(),
+            chain: SpawnChain::Base,
+            session_id: "legacy-session".into(),
+            parent_id: None,
+            child_ids: vec![],
+            created_at: 1,
+            version_commit: "0".repeat(40),
+        };
+        let decoded: SpawnedAutomatonRecord =
+            candid::decode_one(&candid::encode_one(legacy_registry).unwrap()).unwrap();
+        assert_eq!(decoded.name, None);
+        assert_eq!(decoded.constitution_hash, None);
+
+        let legacy_evidence = LegacyAutomatonBootstrapEvidence {
+            bootstrap_contract_version: Some(SPAWN_CONTRACT_VERSION),
+            bootstrap_name: Some("Meridian".into()),
+            bootstrap_constitution: Some("I am Meridian. ".repeat(30)),
+            bootstrap_session_id: Some("legacy-session".into()),
+            bootstrap_parent_id: None,
+            bootstrap_factory_principal: Some(candid::Principal::anonymous()),
+            bootstrap_risk: Some(3),
+            bootstrap_strategies: vec![],
+            bootstrap_skills: vec![],
+            bootstrap_version_commit: Some("0".repeat(40)),
+            steward_address: Some("0xlegacy".into()),
+            steward_chain_id: Some(8_453),
+            steward_enabled: Some(true),
+            evm_address: Some("0xchild".into()),
+        };
+        let decoded: AutomatonBootstrapEvidence =
+            candid::decode_one(&candid::encode_one(legacy_evidence).unwrap()).unwrap();
+        assert_eq!(decoded.bootstrap_constitution_hash, None);
+        assert!(decoded.bootstrap_constitution.is_some());
+    }
+}

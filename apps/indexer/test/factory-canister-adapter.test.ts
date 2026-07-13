@@ -285,6 +285,7 @@ function createActor() {
 
 describe("CanisterFactoryAdapter", () => {
   it("maps candid responses into shared contracts and caches the actor", async () => {
+    const constitution = "I am Meridian. ".repeat(30);
     const actor = createActor();
     const fakeAgent = {
       fetchRootKey: vi.fn(async () => undefined)
@@ -299,6 +300,8 @@ describe("CanisterFactoryAdapter", () => {
     });
 
     const created = await adapter.createSpawnSession({
+      name: "Meridian",
+      constitution,
       stewardAddress: "0x0000000000000000000000000000000000000002",
       asset: "usdc",
       grossAmount: "1000000000",
@@ -343,6 +346,8 @@ describe("CanisterFactoryAdapter", () => {
     expect(fakeAgent.fetchRootKey).toHaveBeenCalledTimes(1);
     expect(createActorSpy).toHaveBeenCalledTimes(1);
     expect(actor.create_spawn_session).toHaveBeenCalledWith({
+      name: ["Meridian"],
+      constitution: [constitution],
       asset: USDC,
       config: {
         chain: BASE,

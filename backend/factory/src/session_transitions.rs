@@ -245,6 +245,8 @@ mod tests {
 
     fn sample_session(state: SpawnSessionState) -> SpawnSession {
         SpawnSession {
+            name: None,
+            constitution: None,
             session_id: "session-1".to_string(),
             claim_id: "claim-1".to_string(),
             steward_address: "0xsteward".to_string(),

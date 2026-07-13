@@ -30,6 +30,17 @@ export type AutomatonTier = (typeof AUTOMATON_TIERS)[number];
 export type MonologueEntryType = (typeof MONOLOGUE_ENTRY_TYPES)[number];
 export type MonologueEntryCategory = (typeof MONOLOGUE_ENTRY_CATEGORIES)[number];
 export type MonologueEntryImportance = (typeof MONOLOGUE_ENTRY_IMPORTANCE)[number];
+export type ConstitutionVerificationStatus =
+  | "verified"
+  | "mismatch"
+  | "legacy_unverified"
+  | "unavailable";
+
+export interface ConstitutionVerification {
+  status: ConstitutionVerificationStatus;
+  expectedHash: string | null;
+  computedHash: string | null;
+}
 
 export interface GridPosition {
   x: number;
@@ -73,6 +84,9 @@ export interface AutomatonRecord {
   chain: ChainSlug;
   chainId: number;
   name: string;
+  constitutionHash?: string | null;
+  constitution?: string | null;
+  constitutionVerification?: ConstitutionVerification;
   model: string | null;
   soul: string;
   tier: AutomatonTier;
@@ -109,6 +123,7 @@ export interface AutomatonSummary {
   chain: ChainSlug;
   chainId: number;
   name: string;
+  constitutionHash?: string | null;
   tier: AutomatonTier;
   agentState: string;
   ethBalanceWei: string | null;
@@ -179,6 +194,8 @@ export interface AutomatonListResponse {
 }
 
 export interface AutomatonDetail extends AutomatonSummary {
+  constitution?: string | null;
+  constitutionVerification: ConstitutionVerification;
   soul: string;
   canisterUrl: string;
   explorerUrl: string | null;

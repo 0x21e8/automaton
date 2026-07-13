@@ -240,6 +240,16 @@ export function createAutomatonMetadataIdl() {
   };
 }
 
+export class AutomatonHttpRequestError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number
+  ) {
+    super(message);
+    this.name = "AutomatonHttpRequestError";
+  }
+}
+
 export async function requestAutomatonJson<T>(
   canisterUrl: string,
   path: string,
@@ -251,8 +261,9 @@ export async function requestAutomatonJson<T>(
   });
 
   if (!response.ok) {
-    throw new Error(
-      `Canister HTTP request failed for ${canisterUrl} ${path}: ${response.status} ${response.statusText}`
+    throw new AutomatonHttpRequestError(
+      `Canister HTTP request failed for ${canisterUrl} ${path}: ${response.status} ${response.statusText}`,
+      response.status
     );
   }
 

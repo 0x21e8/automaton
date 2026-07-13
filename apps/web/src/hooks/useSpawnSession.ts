@@ -50,23 +50,23 @@ export function describeSpawnSessionProgress(session: SpawnSession): string {
     case "awaiting_payment":
       return "Waiting for the quoted escrow payment to arrive before the factory can proceed.";
     case "payment_detected":
-      return "Escrow payment was detected. The factory is preparing the spawn pipeline.";
+      return "Escrow payment was detected. The factory is preparing the birth pipeline.";
     case "spawning":
-      return "The factory is creating the automaton canister and applying its initial configuration.";
+      return "The factory is creating the automaton canister and provisioning its founding state.";
     case "broadcasting_release":
       return "Canister install succeeded. The factory is broadcasting the escrow release transaction.";
     case "complete":
-      return "Spawn completed and the new automaton should now appear on the grid.";
+      return "Birth completed and the new automaton should now appear on the grid.";
     case "failed":
       return session.retryable
-        ? "Spawn failed but can still be retried before expiration."
-        : "Spawn failed and is waiting for expiration before any refund path opens.";
+        ? "Birth failed but can still be retried before expiration."
+        : "Birth failed and is waiting for expiration before any refund path opens.";
     case "expired":
       return session.refundable
         ? "Funds can now be reclaimed through refund. This session expired unresolved because the quote TTL may have elapsed or the playground may have reset."
         : "This session expired. The quote TTL may have elapsed or the playground may have reset before completion.";
     default:
-      return "Spawn status unavailable.";
+      return "Birth status unavailable.";
   }
 }
 
@@ -127,7 +127,7 @@ export function useSpawnSession() {
       setError(null);
       return nextDetail;
     } catch (nextError: unknown) {
-      setError(getErrorMessage(nextError, "Unknown spawn session error."));
+      setError(getErrorMessage(nextError, "Unknown birth session error."));
       return null;
     } finally {
       setIsRefreshing(false);
@@ -222,7 +222,7 @@ export function useSpawnSession() {
         setRefreshToken((current) => current + 1);
         return response;
       } catch (nextError: unknown) {
-        setError(getErrorMessage(nextError, "Unknown spawn session error."));
+        setError(getErrorMessage(nextError, "Unknown birth session error."));
         return null;
       } finally {
         setIsCreating(false);
@@ -241,7 +241,7 @@ export function useSpawnSession() {
         setRefreshToken((current) => current + 1);
         return await refresh(sessionId);
       } catch (nextError: unknown) {
-        setError(getErrorMessage(nextError, "Unknown spawn session error."));
+        setError(getErrorMessage(nextError, "Unknown birth session error."));
         return null;
       } finally {
         setIsMutating(false);
@@ -260,7 +260,7 @@ export function useSpawnSession() {
         setRefreshToken((current) => current + 1);
         return await refresh(sessionId);
       } catch (nextError: unknown) {
-        setError(getErrorMessage(nextError, "Unknown spawn session error."));
+        setError(getErrorMessage(nextError, "Unknown birth session error."));
         return null;
       } finally {
         setIsMutating(false);

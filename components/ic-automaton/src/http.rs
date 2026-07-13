@@ -810,6 +810,12 @@ fn build_certification_state() -> HttpCertificationState {
     let scheduler_config = scheduler_config_view();
     let welcome = welcome_view();
     let build_info = build_info_view();
+    let bootstrap = stable::spawn_bootstrap_view();
+    let genesis = serde_json::json!({
+        "name": bootstrap.name,
+        "constitution": bootstrap.constitution,
+        "contract_version": bootstrap.contract_version,
+    });
 
     let mut tree = HttpCertificationTree::default();
     let routes = vec![
@@ -873,6 +879,7 @@ fn build_certification_state() -> HttpCertificationState {
         json_route(Method::GET, "/api/scheduler/config", &scheduler_config),
         json_route(Method::GET, "/api/welcome", &welcome),
         json_route(Method::GET, "/api/build-info", &build_info),
+        json_route(Method::GET, "/api/genesis", &genesis),
         upgrade_route(Method::POST, "/api/conversation"),
         upgrade_route(Method::POST, "/api/steward/direct-message/prepare"),
         upgrade_route(Method::POST, "/api/steward/direct-message/execute"),
@@ -1316,7 +1323,8 @@ mod tests {
         );
 
         let body = std::str::from_utf8(response.body()).expect("app.js body should be utf8");
-        let metadata_response = handle_http_request(HttpRequest::get("/ui_terminal_commands.js").build());
+        let metadata_response =
+            handle_http_request(HttpRequest::get("/ui_terminal_commands.js").build());
         let metadata = std::str::from_utf8(metadata_response.body())
             .expect("terminal metadata body should be utf8");
         assert!(
@@ -1423,6 +1431,24 @@ mod tests {
         let body = serde_json::from_slice::<Value>(response.body())
             .expect("snapshot body should decode as json");
         assert!(body.get("runtime").is_some());
+    }
+
+    #[test]
+    fn genesis_query_path_is_certified_and_contains_only_public_identity() {
+        let _ = stable::set_spawn_bootstrap_metadata(crate::domain::types::SpawnBootstrapView {
+            contract_version: Some(spawn_protocol::SPAWN_CONTRACT_VERSION),
+            name: Some("Meridian".to_string()),
+            constitution: Some("I am Meridian. ".repeat(30)),
+            ..Default::default()
+        });
+        init_certification();
+        let response = handle_http_request(HttpRequest::get("/api/genesis").build());
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), None);
+        let body = serde_json::from_slice::<Value>(response.body()).unwrap();
+        assert_eq!(body.get("name").and_then(Value::as_str), Some("Meridian"));
+        assert!(body.get("constitution").is_some());
+        assert!(body.get("open_router_api_key").is_none());
     }
 
     #[test]
@@ -1732,6 +1758,9 @@ mod tests {
     fn get_build_info_route_prefers_installed_version_commit() {
         stable::init_storage();
         let _ = stable::set_spawn_bootstrap_metadata(crate::domain::types::SpawnBootstrapView {
+            contract_version: None,
+            name: None,
+            constitution: None,
             session_id: None,
             parent_id: None,
             factory_principal: None,

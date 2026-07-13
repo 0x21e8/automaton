@@ -5,7 +5,10 @@ import {
   type SpawnChain
 } from "../../../../../packages/shared/src/spawn.js";
 
-export const TOTAL_SPAWN_STEPS = 4;
+export const TOTAL_SPAWN_STEPS = 5;
+export const GENESIS_NAME_MAX_CHARS = 64;
+export const GENESIS_CONSTITUTION_MIN_CHARS = 400;
+export const GENESIS_CONSTITUTION_MAX_CHARS = 8000;
 export const MOCK_ETH_USD_RATE = 3200;
 export const MOCK_PLATFORM_FEE_USD = 4.5;
 export const MOCK_CREATION_COST_USD = 8;
@@ -24,6 +27,8 @@ export interface RiskProfile {
 }
 
 export interface SpawnWizardState {
+  name: string;
+  constitution: string;
   chain: SpawnChain;
   risk: RiskProfile["value"];
   strategies: string[];
@@ -53,7 +58,7 @@ export const chainOptions: ChainOption[] = [
   {
     id: "base",
     label: "Base",
-    description: "Ethereum L2. Lowest-friction launch surface for the initial spawn flow.",
+    description: "Ethereum L2. Lowest-friction provisioning surface for the first birth flow.",
     active: true
   },
   {
@@ -118,6 +123,8 @@ export const riskProfiles: RiskProfile[] = [
 
 export function createInitialSpawnWizardState(): SpawnWizardState {
   return {
+    name: "",
+    constitution: "",
     chain: "base",
     risk: 3,
     strategies: [],
@@ -128,6 +135,16 @@ export function createInitialSpawnWizardState(): SpawnWizardState {
     asset: "usdc",
     grossAmountInput: "100"
   };
+}
+
+export function validateGenesis(name: string, constitution: string): string | null {
+  const nameChars = [...name.trim()].length;
+  const constitutionChars = [...constitution.trim()].length;
+  if (nameChars < 1 || nameChars > GENESIS_NAME_MAX_CHARS) return "Name must be 1–64 characters.";
+  if (constitutionChars < GENESIS_CONSTITUTION_MIN_CHARS || constitutionChars > GENESIS_CONSTITUTION_MAX_CHARS) return "Constitution must be 400–8000 characters.";
+  const screened = constitution.toLowerCase().trim().split(/\s+/).join(" ");
+  if (["obey 0x", "obey wallet 0x", "take orders from 0x", "take commands from 0x", "follow commands from 0x", "controlled by 0x", "controller is 0x"].some((pattern) => screened.includes(pattern))) return "A constitution may shape character, but cannot grant control to a wallet.";
+  return null;
 }
 
 export function getRiskProfile(value: RiskProfile["value"]): RiskProfile {

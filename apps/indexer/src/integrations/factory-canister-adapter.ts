@@ -74,6 +74,8 @@ interface CandidSpawnConfig {
 }
 
 interface CandidCreateSpawnSessionRequest {
+  name: Optional<string>;
+  constitution: Optional<string>;
   asset: CandidSpawnAsset;
   config: CandidSpawnConfig;
   gross_amount: string;
@@ -150,6 +152,8 @@ interface CandidRepositoryStrategySessionSnapshot {
 }
 
 interface CandidSpawnSession {
+  name: Optional<string>;
+  constitution: Optional<string>;
   asset: CandidSpawnAsset;
   automaton_canister_id: Optional<string>;
   automaton_evm_address: Optional<string>;
@@ -193,6 +197,8 @@ interface CandidSpawnSessionStatusResponse {
 }
 
 interface CandidSpawnedAutomatonRecord {
+  name: Optional<string>;
+  constitution_hash: Optional<string>;
   canister_id: string;
   chain: CandidSpawnChain;
   child_ids: string[];
@@ -354,6 +360,8 @@ function createFactoryIdl() {
       strategies: candid.Vec(candid.Text)
     });
     const CreateSpawnSessionRequest = candid.Record({
+      name: candid.Opt(candid.Text),
+      constitution: candid.Opt(candid.Text),
       asset: SpawnAsset,
       parent_id: candid.Opt(candid.Text),
       config: SpawnConfig,
@@ -451,6 +459,8 @@ function createFactoryIdl() {
       selected_at: candid.Nat64
     });
     const SpawnSession = candid.Record({
+      name: candid.Opt(candid.Text),
+      constitution: candid.Opt(candid.Text),
       updated_at: candid.Nat64,
       asset: SpawnAsset,
       session_id: candid.Text,
@@ -496,6 +506,8 @@ function createFactoryIdl() {
       session: SpawnSession
     });
     const SpawnedAutomatonRecord = candid.Record({
+      name: candid.Opt(candid.Text),
+      constitution_hash: candid.Opt(candid.Text),
       evm_address: candid.Text,
       session_id: candid.Text,
       chain: SpawnChain,
@@ -671,8 +683,8 @@ function createFactoryIdl() {
   };
 }
 
-function unwrapOptional<T>(value: Optional<T>): T | null {
-  return value.length === 0 ? null : value[0];
+function unwrapOptional<T>(value: Optional<T> | undefined): T | null {
+  return value === undefined || value.length === 0 ? null : value[0];
 }
 
 function expectOk<T>(result: CandidResult<T>): T {
@@ -957,6 +969,8 @@ function mapSelectedStrategy(
 
 function mapSpawnSession(session: CandidSpawnSession): SpawnSessionStatusResponse["session"] {
   return {
+    name: unwrapOptional(session.name),
+    constitution: unwrapOptional(session.constitution),
     asset: mapAsset(session.asset),
     automatonCanisterId: unwrapOptional(session.automaton_canister_id),
     automatonEvmAddress: unwrapOptional(session.automaton_evm_address),
@@ -1010,6 +1024,8 @@ function mapSessionStatus(
 
 function mapRegistryRecord(record: CandidSpawnedAutomatonRecord): SpawnedAutomatonRecord {
   return {
+    name: unwrapOptional(record.name),
+    constitutionHash: unwrapOptional(record.constitution_hash),
     canisterId: record.canister_id,
     chain: mapChain(record.chain),
     childIds: [...record.child_ids],
@@ -1068,6 +1084,8 @@ function mapCreateRequest(
   request: CreateSpawnSessionRequest
 ): CandidCreateSpawnSessionRequest {
   return {
+    name: [request.name],
+    constitution: [request.constitution],
     asset: {
       Usdc: null
     },

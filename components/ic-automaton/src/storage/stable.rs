@@ -1817,6 +1817,11 @@ pub fn steward_status_view() -> StewardStatusView {
 
 pub fn set_spawn_bootstrap_metadata(view: SpawnBootstrapView) -> SpawnBootstrapView {
     let mut snapshot = runtime_snapshot();
+    if snapshot.genesis_constitution.is_none() {
+        snapshot.spawn_contract_version = view.contract_version;
+        snapshot.genesis_name = view.name.clone();
+        snapshot.genesis_constitution = view.constitution.clone();
+    }
     snapshot.spawn_session_id = view.session_id.clone();
     snapshot.spawn_parent_id = view.parent_id.clone();
     snapshot.factory_principal = view.factory_principal.map(|value| value.to_text());
@@ -1831,6 +1836,11 @@ pub fn set_spawn_bootstrap_metadata(view: SpawnBootstrapView) -> SpawnBootstrapV
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
     view
+}
+
+pub fn genesis_identity() -> (Option<String>, Option<String>) {
+    let snapshot = runtime_snapshot();
+    (snapshot.genesis_name, snapshot.genesis_constitution)
 }
 
 pub fn spawn_bootstrap_view() -> SpawnBootstrapView {
@@ -6036,6 +6046,9 @@ mod tests {
         init_storage();
 
         let view = set_spawn_bootstrap_metadata(SpawnBootstrapView {
+            contract_version: None,
+            name: None,
+            constitution: None,
             session_id: None,
             parent_id: None,
             factory_principal: Some(

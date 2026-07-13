@@ -7,7 +7,10 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { AutomatonClientLike } from "../src/lib/automaton-client.js";
 import { ArtifactStore } from "../src/lib/files.js";
-import { RunController } from "../src/runtime/run-controller.js";
+import {
+  buildEvaluationGenesis,
+  RunController
+} from "../src/runtime/run-controller.js";
 import type { EvaluatorRuntimeEnv } from "../src/types.js";
 import { EvaluationEventHub } from "../src/ws/events.js";
 
@@ -353,6 +356,25 @@ function createController(options: {
 }
 
 describe("run controller", () => {
+  it("authors deterministic, principal-specific Genesis documents for evaluator births", () => {
+    const config = {
+      id: "alpha-principal",
+      label: "Alpha",
+      model: "model-alpha",
+      transport: "openrouter_direct" as const,
+      reasoningLevel: "default" as const,
+      strategies: []
+    };
+
+    const first = buildEvaluationGenesis(config);
+    const second = buildEvaluationGenesis(config);
+
+    expect(second).toEqual(first);
+    expect(first.name).toContain("alpha-principal");
+    expect(first.constitution).toContain("principal identified as alpha-principal");
+    expect([...first.constitution].length).toBeGreaterThanOrEqual(400);
+  });
+
   it("aborts and writes artifacts when the spawn threshold becomes unreachable", async () => {
     const repoRoot = await createTempDirectory("evaluator-controller-repo-");
     const artifactsRoot = await createTempDirectory("evaluator-controller-artifacts-");
