@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   assert,
   claimPlaygroundFaucet,
-  createDefaultSpawnConfig,
+  createDefaultSpawnSessionRequest,
   createEphemeralWallet,
   createSpawnSession,
   ensurePlaygroundSmokePrecondition,
@@ -26,13 +26,14 @@ const faucetClaim = await claimPlaygroundFaucet(runtime.indexerBaseUrl, wallet.a
 
 assert(faucetClaim?.ok === true, "faucet claim did not succeed", faucetClaim);
 
-const createSessionResponse = await createSpawnSession(runtime.indexerBaseUrl, {
-  stewardAddress: wallet.address,
-  asset: "usdc",
-  grossAmount: runtime.spawnGrossAmount,
-  config: createDefaultSpawnConfig(),
-  parentId: null
-});
+const createSessionResponse = await createSpawnSession(
+  runtime.indexerBaseUrl,
+  createDefaultSpawnSessionRequest({
+    stewardAddress: wallet.address,
+    grossAmount: runtime.spawnGrossAmount,
+    parentId: null
+  })
+);
 
 const payment = createSessionResponse?.quote?.payment;
 assert(

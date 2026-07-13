@@ -25,7 +25,7 @@ to the operator. Do not discard, overwrite, or silently absorb them.
 | 004 | Canonicalize spawn contracts and strategy assets, then add a two-canister gate | P1 | L | 003 | DONE |
 | 005 | Build and deploy one atomic release from one revision | P1 | L | 004 | DONE |
 | 006 | Converge the public, direct-console, and evaluator appearance | P2 | L | 002, 003 | DONE |
-| 007 | Restructure the prompt stack into ownership-based documents | P0 | L | — | TODO |
+| 007 | Restructure the prompt stack into ownership-based documents | P0 | L | — | DONE |
 | 008 | Genesis constitution end-to-end | P0 | L | 007 | TODO |
 | 009 | Voice: journal channel, de-chatted runtime, deference metric | P1 | L | 007 (008 soft) | TODO |
 | 010 | Metabolism and patronage surfaces | P1 | L | — (parallel-safe) | TODO |

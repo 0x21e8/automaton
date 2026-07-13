@@ -1444,13 +1444,10 @@ pub struct PlanRecord {
     pub outcome: Option<String>,
 }
 
-// ── Prompt layer types ───────────────────────────────────────────────────────
+// ── Prompt document compatibility types ─────────────────────────────────────
 
-/// A versioned, mutable segment of the system prompt, stored in `PROMPT_LAYER_MAP`.
-///
-/// Immutable layers are defined at compile time in `src/prompt.rs`; mutable
-/// layers (layer IDs in `MUTABLE_LAYER_MIN_ID..=MUTABLE_LAYER_MAX_ID`) can be
-/// updated at runtime by a controller or by the agent itself.
+/// The versioned Doctrine document exposed through the legacy layer-ID API.
+/// IDs 6-9 are aliases; storage canonicalizes every write to ID 6.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PromptLayer {
     pub layer_id: u8,
@@ -1460,7 +1457,7 @@ pub struct PromptLayer {
     pub version: u32,
 }
 
-/// Read-only view of a prompt layer, returned by `list_prompt_layers`.
+/// Read-only legacy-ID view returned by `get_prompt_layers`.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PromptLayerView {
     pub layer_id: u8,

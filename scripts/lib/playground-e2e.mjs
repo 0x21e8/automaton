@@ -210,10 +210,32 @@ export function createDefaultSpawnConfig() {
     strategies: [],
     skills: [],
     provider: {
-      openRouterApiKey: null,
       model: null,
-      braveSearchApiKey: null
+      inferenceTransport: "openrouter_direct",
+      openRouterReasoningLevel: "default"
     }
+  };
+}
+
+export function createDefaultProviderSecrets() {
+  return {
+    openRouterApiKey: null,
+    braveSearchApiKey: null
+  };
+}
+
+export function createDefaultSpawnSessionRequest({
+  stewardAddress,
+  grossAmount,
+  parentId = null
+}) {
+  return {
+    stewardAddress,
+    asset: "usdc",
+    grossAmount,
+    config: createDefaultSpawnConfig(),
+    providerSecrets: createDefaultProviderSecrets(),
+    parentId
   };
 }
 

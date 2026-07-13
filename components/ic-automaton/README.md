@@ -127,14 +127,19 @@ Pre-flight affordability checks ensure the agent never attempts an operation it 
 ### Persistent Memory
 The agent stores and retrieves facts across turns using a durable key-value memory backed by stable structures.
 
-### Multi-Layer Constitution
-A layered prompt system defines the agent's identity and behavioral constraints across 11 layers (0–10):
+### Ownership-Based Prompt Documents
+Five documents define identity and behavior by function and owner:
 
-- **Layers 0–5** (immutable): Interpretation rules, safety/non-harm, survival economics, identity, ethics, and tool policies
-- **Layers 6–9** (mutable): Updateable by the controller or the agent itself at runtime
-- **Layer 10** (dynamic): Runtime context injected each turn -- cycle balance, wallet state, memory facts, pending inbox messages, and available tools
+- **Charter** (runtime-owned, immutable): safety, non-harm, trust, and precedence
+- **Protocol** (runtime-owned, immutable and code-versioned): tool discipline, turn mechanics, trigger names, and decision-envelope contract
+- **Genesis** (being-specific, immutable): identity; Plan 008 replaces the temporary soul-based identity with an authored constitution
+- **Doctrine** (being-owned, versioned and mutable): economic, inbox, memory, planning, and self-modification policy
+- **Situation** (runtime-owned, dynamic): per-turn balances, state, memory, inbox, and available tools
 
-Lower-numbered layers take precedence in all conflicts. Forbidden-phrase detection blocks prompt injection attempts that try to override core policy layers.
+The legacy Candid layer API remains compatible: IDs 6-9 all update the single
+Doctrine document, while reads map IDs 0-9 explicitly onto the new documents.
+Charter and Protocol take precedence over every other document and untrusted
+content. Forbidden-phrase and protocol-contract detection guard Doctrine writes.
 
 ### Strategy Engine
 A structured DeFi strategy execution framework (in `src/strategy/`) enables the agent to execute template-based on-chain actions safely:
@@ -168,7 +173,7 @@ The agent maintains a fresh snapshot of its ETH and USDC balances via periodic b
 - Normal interval: 5 minutes; low-cycles interval: 15 minutes
 - Freshness window: 10 minutes (stale if older)
 - USDC contract address is auto-discovered from the Inbox contract if not explicitly configured
-- Balance data is injected into each turn's dynamic context (Layer 10)
+- Balance data is injected into each turn's Situation document
 
 ### Inference Proxy Callback Reliability
 When OpenRouter proxy-worker mode is enabled, callback ingestion is idempotent by `job_id` and tracks recently completed callback jobs so duplicate deliveries are safely ignored even after result consumption.

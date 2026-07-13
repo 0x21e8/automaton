@@ -133,7 +133,7 @@ pub const MAX_REFLECTION_MEMORY_RECORDS: usize = 64;
 pub const MAX_DECISION_RECORDS: usize = 200;
 /// Reflection lessons expire after seven days without a fresh update.
 pub const REFLECTION_MEMORY_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
-/// Maximum reflection lines reserved for Layer 10 context rendering.
+/// Maximum reflection lines reserved for Situation rendering.
 pub const MAX_REFLECTION_MEMORY_LINES: usize = 5;
 /// Maximum characters per rendered reflection line.
 pub const MAX_REFLECTION_MEMORY_LINE_CHARS: usize = 160;
@@ -389,7 +389,7 @@ pub fn survival_operation_consecutive_failures(operation: &SurvivalOperationClas
 /// One-time storage bootstrap called from `canister_init` and `canister_post_upgrade`.
 ///
 /// Performs idempotent setup: migrates legacy cursor fields, seeds default
-/// prompt layers, initialises sequence counters, and calls
+/// prompt documents, initialises sequence counters, and calls
 /// `init_scheduler_defaults` / `init_retention_defaults`.
 pub fn init_storage() {
     let _ = sqlite::init_storage();
@@ -415,7 +415,9 @@ pub fn init_storage() {
     if snapshot_changed {
         save_runtime_snapshot(&snapshot);
     }
-    seed_default_prompt_layers();
+    migrate_legacy_prompt_layers_to_doctrine()
+        .unwrap_or_else(|error| panic!("prompt Doctrine migration failed: {error}"));
+    seed_default_doctrine();
     if runtime_u64(INBOX_SEQ_KEY).is_none() {
         save_runtime_u64(INBOX_SEQ_KEY, 0);
     }
@@ -780,45 +782,75 @@ fn accumulate_error(errors: &mut Vec<String>, error: Option<&str>) {
     errors.push(normalized.to_string());
 }
 
-fn seed_default_prompt_layers() {
-    for layer_id in prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID {
-        if get_prompt_layer(layer_id).is_some() {
-            continue;
-        }
-        if let Some(content) = prompt::default_layer_content(layer_id) {
-            let _ = save_prompt_layer(&PromptLayer {
-                layer_id,
-                content: content.to_string(),
-                updated_at_ns: now_ns(),
-                updated_by_turn: "init".to_string(),
-                version: 1,
-            });
-        }
+fn seed_default_doctrine() {
+    if sqlite::get_prompt_layer(prompt::DOCTRINE_LAYER_ID)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        let _ = sqlite::save_prompt_layer(&PromptLayer {
+            layer_id: prompt::DOCTRINE_LAYER_ID,
+            content: prompt::default_doctrine_content().to_string(),
+            updated_at_ns: now_ns(),
+            updated_by_turn: "init".to_string(),
+            version: 1,
+        });
     }
 }
 
-// ── Prompt layers ─────────────────────────────────────────────────────────────
-
-/// Retrieves the mutable prompt layer with `layer_id`, or `None` if not yet set.
-pub fn get_prompt_layer(layer_id: u8) -> Option<PromptLayer> {
-    sqlite::get_prompt_layer(layer_id).ok().flatten()
+/// One-time, idempotent post-upgrade migration from four mutable layer rows to
+/// one Doctrine row. Legacy rows 7-9 are the migration marker: fresh and
+/// already-migrated stores contain only canonical row 6.
+fn migrate_legacy_prompt_layers_to_doctrine() -> Result<bool, String> {
+    let raw_layers = sqlite::list_prompt_layers()?;
+    if !raw_layers.iter().any(|layer| {
+        (prompt::MUTABLE_LAYER_MIN_ID + 1..=prompt::MUTABLE_LAYER_MAX_ID).contains(&layer.layer_id)
+    }) {
+        return Ok(false);
+    }
+    let folded = prompt::fold_legacy_layers_into_doctrine(&raw_layers).ok_or_else(|| {
+        "legacy prompt rows existed but no Doctrine source could be folded".to_string()
+    })?;
+    sqlite::save_prompt_layer(&folded)?;
+    for legacy_id in prompt::MUTABLE_LAYER_MIN_ID + 1..=prompt::MUTABLE_LAYER_MAX_ID {
+        sqlite::delete_prompt_layer(legacy_id)?;
+    }
+    Ok(true)
 }
 
-/// Persists a mutable prompt layer.  Returns an error if `layer_id` falls
-/// outside the mutable range `[MUTABLE_LAYER_MIN_ID, MUTABLE_LAYER_MAX_ID]`.
+// ── Prompt ownership documents and legacy ID compatibility ───────────────────
+
+/// Retrieves Doctrine through any legacy mutable layer alias.
+pub fn get_prompt_layer(layer_id: u8) -> Option<PromptLayer> {
+    if !(prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID).contains(&layer_id) {
+        return None;
+    }
+    sqlite::get_prompt_layer(prompt::DOCTRINE_LAYER_ID)
+        .ok()
+        .flatten()
+        .map(|mut doctrine| {
+            doctrine.layer_id = layer_id;
+            doctrine
+        })
+}
+
+/// Persists Doctrine through a legacy mutable-layer alias. Returns an error if
+/// the ID is outside the compatibility range 6-9.
 pub fn save_prompt_layer(layer: &PromptLayer) -> Result<(), String> {
     if !(prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID).contains(&layer.layer_id) {
         return Err(format!(
-            "mutable prompt layer id must be in range {}..={}",
+            "Doctrine compatibility alias must be in range {}..={}",
             prompt::MUTABLE_LAYER_MIN_ID,
             prompt::MUTABLE_LAYER_MAX_ID
         ));
     }
-    sqlite::save_prompt_layer(layer)
+    let mut doctrine = layer.clone();
+    doctrine.layer_id = prompt::DOCTRINE_LAYER_ID;
+    sqlite::save_prompt_layer(&doctrine)
 }
 
-/// Returns a merged view of all immutable and mutable prompt layers, ordered
-/// by `layer_id` ascending.
+/// Returns the legacy 0-9 view. Duplicate content is intentional: each old ID
+/// explicitly aliases Charter, Protocol, Genesis, or Doctrine.
 pub fn list_prompt_layers() -> Vec<PromptLayerView> {
     let mut layers = Vec::with_capacity(
         usize::from(prompt::IMMUTABLE_LAYER_MAX_ID - prompt::IMMUTABLE_LAYER_MIN_ID + 1)
@@ -826,16 +858,23 @@ pub fn list_prompt_layers() -> Vec<PromptLayerView> {
     );
 
     for layer_id in prompt::IMMUTABLE_LAYER_MIN_ID..=prompt::IMMUTABLE_LAYER_MAX_ID {
-        if let Some(content) = prompt::immutable_layer_content(layer_id) {
-            layers.push(PromptLayerView {
-                layer_id,
-                is_mutable: false,
-                content: content.to_string(),
-                updated_at_ns: None,
-                updated_by_turn: None,
-                version: None,
-            });
-        }
+        let content = if layer_id == 2 {
+            get_prompt_layer(prompt::DOCTRINE_LAYER_ID)
+                .map(|doctrine| doctrine.content)
+                .unwrap_or_else(|| prompt::default_doctrine_content().to_string())
+        } else if let Some(content) = prompt::immutable_layer_content(layer_id) {
+            content.into_owned()
+        } else {
+            continue;
+        };
+        layers.push(PromptLayerView {
+            layer_id,
+            is_mutable: false,
+            content,
+            updated_at_ns: None,
+            updated_by_turn: None,
+            version: None,
+        });
     }
 
     for layer_id in prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID {
@@ -2783,7 +2822,7 @@ fn render_reflection_memory_context_line(record: &ReflectionMemoryRecord) -> Str
     truncate_reflection_context_line(&line)
 }
 
-/// Returns bounded, deterministic reflection-memory lines for Layer 10 context.
+/// Returns bounded, deterministic reflection-memory lines for Situation.
 ///
 /// Ordering prioritizes unresolved repeated failures first, then more recent
 /// degraded lessons, while remaining stable on key ties.
@@ -5836,6 +5875,75 @@ mod tests {
 
     fn trusted_test_principal() -> Principal {
         Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai").expect("test principal should parse")
+    }
+
+    #[test]
+    fn upgrade_folds_custom_legacy_layers_into_one_lossless_doctrine() {
+        sqlite::close_storage().expect("reset sqlite");
+        sqlite::init_storage().expect("initialize sqlite");
+        let legacy = [
+            PromptLayer {
+                layer_id: 6,
+                content: "## Layer 6 custom\n- expanded operator policy\n- scheduled_review".into(),
+                updated_at_ns: 300,
+                updated_by_turn: "admin:principal".into(),
+                version: 3,
+            },
+            PromptLayer {
+                layer_id: 7,
+                content: "## Layer 7\n- inbox default".into(),
+                updated_at_ns: 100,
+                updated_by_turn: "init".into(),
+                version: 1,
+            },
+            PromptLayer {
+                layer_id: 8,
+                content: "## Layer 8\n- memory default".into(),
+                updated_at_ns: 100,
+                updated_by_turn: "init".into(),
+                version: 1,
+            },
+            PromptLayer {
+                layer_id: 9,
+                content: "## Layer 9\n- self-mod default".into(),
+                updated_at_ns: 100,
+                updated_by_turn: "init".into(),
+                version: 1,
+            },
+        ];
+        for layer in &legacy {
+            sqlite::save_prompt_layer(layer).expect("seed raw legacy row");
+        }
+
+        assert!(migrate_legacy_prompt_layers_to_doctrine().expect("migration succeeds"));
+        assert!(!migrate_legacy_prompt_layers_to_doctrine().expect("migration is idempotent"));
+
+        let rows = sqlite::list_prompt_layers().expect("list migrated rows");
+        assert_eq!(rows.len(), 1);
+        let doctrine = &rows[0];
+        assert_eq!(doctrine.layer_id, prompt::DOCTRINE_LAYER_ID);
+        assert_eq!(doctrine.version, 3);
+        assert_eq!(doctrine.updated_at_ns, 300);
+        assert_eq!(doctrine.updated_by_turn, "admin:principal");
+        for source in &legacy {
+            assert_eq!(doctrine.content.matches(&source.content).count(), 1);
+            assert!(doctrine
+                .content
+                .contains(&format!("\"updated_at_ns\":{}", source.updated_at_ns)));
+            assert!(doctrine.content.contains(&format!(
+                "\"updated_by_turn\":\"{}\"",
+                source.updated_by_turn
+            )));
+        }
+        let compatibility = list_prompt_layers();
+        assert_eq!(compatibility.len(), 10);
+        for alias in [2, 6, 7, 8, 9] {
+            let view = compatibility
+                .iter()
+                .find(|view| view.layer_id == alias)
+                .expect("legacy Doctrine alias must be present");
+            assert_eq!(view.content, doctrine.content);
+        }
     }
 
     #[test]

@@ -1382,23 +1382,20 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         }),
         IcLlmTool::Function(IcLlmFunction {
             name: "update_prompt_layer".to_string(),
-            description: Some(
-                "Update a mutable prompt layer (6-9). Immutable layers cannot be modified."
-                    .to_string(),
-            ),
+            description: Some(crate::tools::UPDATE_DOCTRINE_TOOL_DESCRIPTION.to_string()),
             parameters: Some(IcLlmParameters {
                 type_: "object".to_string(),
                 properties: Some(vec![
                     IcLlmProperty {
                         type_: "integer".to_string(),
                         name: "layer_id".to_string(),
-                        description: Some("Mutable layer id, must be between 6 and 9.".to_string()),
+                        description: Some("Legacy compatibility alias 6-9; every value targets the same Doctrine document.".to_string()),
                         enum_values: None,
                     },
                     IcLlmProperty {
                         type_: "string".to_string(),
                         name: "content".to_string(),
-                        description: Some("Replacement markdown content.".to_string()),
+                        description: Some("Complete replacement Doctrine markdown. It cannot define runtime Protocol contracts.".to_string()),
                         enum_values: None,
                     },
                 ]),
@@ -1654,7 +1651,7 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
         IcLlmTool::Function(IcLlmFunction {
             name: "canister_call".to_string(),
             description: Some(
-                "Call a method on another Internet Computer canister. The target canister+method pair must be permitted by an active skill (check active skill instructions for permitted calls and correct Candid argument format). Arguments must be in Candid text format, e.g. \"(record { owner = principal \\\"aaaaa-aa\\\"; subaccount = null })\". Response is returned as Candid text. IMPORTANT: When a method requires your own principal (e.g. icrc1_balance_of owner), use the exact self_canister_id value from Layer 10 Dynamic Context — never reconstruct or guess it."
+                "Call a method on another Internet Computer canister. The target canister+method pair must be permitted by an active skill (check active skill instructions for permitted calls and correct Candid argument format). Arguments must be in Candid text format, e.g. \"(record { owner = principal \\\"aaaaa-aa\\\"; subaccount = null })\". Response is returned as Candid text. IMPORTANT: When a method requires your own principal (e.g. icrc1_balance_of owner), use the exact self_canister_id value from Situation — never reconstruct or guess it."
                     .to_string(),
             ),
             parameters: Some(IcLlmParameters {
@@ -3987,7 +3984,9 @@ mod tests {
         });
         let input = InferenceInput {
             input: "hello".to_string(),
-            context_snippet: "## Layer 10: Dynamic Context\n### Conversation with 0xabc\n  [0xabc]: hi\n  [you]: hello".to_string(),
+            context_snippet:
+                "## Situation\n### Conversation with 0xabc\n  [0xabc]: hi\n  [you]: hello"
+                    .to_string(),
             turn_id: "turn-compact".to_string(),
             tool_scope: Default::default(),
             proxy_resume_job_id: None,
@@ -4000,15 +3999,13 @@ mod tests {
             panic!("first message must be system");
         };
 
-        assert!(content.contains("## Layer 0: Interpretation & Precedence"));
-        assert!(content.contains("## Layer 1: Constitution - Safety & Non-Harm"));
-        assert!(content.contains("## Layer 5: Operational Reality"));
-        assert!(content.contains("## Layer 10: Dynamic Context"));
+        assert!(content.contains("## Charter"));
+        assert!(content.contains("## Protocol"));
+        assert!(content.contains("## Genesis"));
+        assert!(content.contains("## Doctrine"));
+        assert!(content.contains("## Situation"));
         assert!(content.contains("### Conversation with 0xabc"));
         assert!(content.contains("compact-skill"));
-        assert!(content.contains("## Layer 2: Survival Economics"));
-        assert!(!content.contains("## Layer 3: Identity & On-Chain Personhood"));
-        assert!(!content.contains("## Layer 6: Economic Decision Loop"));
     }
 
     #[test]
@@ -4017,7 +4014,9 @@ mod tests {
         stable::set_soul("full-soul".to_string());
         let input = InferenceInput {
             input: "hello".to_string(),
-            context_snippet: "## Layer 10: Dynamic Context\n### Conversation with 0xdef\n  [0xdef]: ping\n  [you]: pong".to_string(),
+            context_snippet:
+                "## Situation\n### Conversation with 0xdef\n  [0xdef]: ping\n  [you]: pong"
+                    .to_string(),
             turn_id: "turn-openrouter".to_string(),
             tool_scope: Default::default(),
             proxy_resume_job_id: None,
@@ -4035,14 +4034,13 @@ mod tests {
             .and_then(|value| value.as_str())
             .expect("first message content must exist");
 
-        assert!(system_prompt.contains("## Layer 0: Interpretation & Precedence"));
-        assert!(system_prompt.contains("## Layer 1: Constitution - Safety & Non-Harm"));
-        assert!(system_prompt.contains("## Layer 2: Survival Economics"));
-        assert!(system_prompt.contains("## Layer 3: Identity & On-Chain Personhood"));
+        assert!(system_prompt.contains("## Charter"));
+        assert!(system_prompt.contains("## Protocol"));
+        assert!(system_prompt.contains("## Genesis"));
+        assert!(system_prompt.contains("## Doctrine"));
         assert!(system_prompt.contains("full-soul"));
-        assert!(system_prompt.contains("## Layer 10: Dynamic Context"));
+        assert!(system_prompt.contains("## Situation"));
         assert!(system_prompt.contains("### Conversation with 0xdef"));
-        assert!(system_prompt.contains("## Layer 6: Economic Decision Loop"));
     }
 
     #[test]

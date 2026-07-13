@@ -135,7 +135,7 @@ icp canister call $CANISTER prune_memory_facts_admin '(opt "signal.", opt (17300
 icp canister call $CANISTER list_reflection_memory '(20 : nat32)' -n ic
 ```
 
-Shows the bounded degraded-turn lessons the automaton now carries forward in Layer 10:
+Shows the bounded degraded-turn lessons the automaton now carries forward in Situation:
 - `tool` / `subject` / `error_class` identify the repeated failure bucket.
 - `what_failed` is the compact deterministic failure lesson.
 - `what_worked` appears only after a later successful matching call.

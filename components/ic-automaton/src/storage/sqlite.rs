@@ -2136,6 +2136,18 @@ pub fn save_prompt_layer(layer: &crate::domain::types::PromptLayer) -> Result<()
     })
 }
 
+pub fn delete_prompt_layer(layer_id: u8) -> Result<bool, String> {
+    backend::with_connection(|conn| {
+        let deleted = conn
+            .execute(
+                "DELETE FROM prompt_layers WHERE layer_id = ?1",
+                [i64::from(layer_id)],
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(deleted > 0)
+    })
+}
+
 pub fn list_prompt_layers() -> Result<Vec<crate::domain::types::PromptLayer>, String> {
     backend::with_connection(|conn| {
         let mut stmt = conn

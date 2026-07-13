@@ -60,8 +60,10 @@ const MAX_MEMORY_RECALL_RESULTS: usize = 50;
 const MAX_STRATEGY_TEMPLATE_RESULTS: usize = 50;
 /// Maximum number of rows returned by the `sql_query` tool.
 const MAX_SQL_QUERY_ROWS: usize = 100;
-/// Maximum character count for content written via `update_prompt_layer`.
+/// Maximum character count for Doctrine content written via the legacy
+/// `update_prompt_layer` compatibility tool.
 pub const MAX_PROMPT_LAYER_CONTENT_CHARS: usize = 4_000;
+pub const UPDATE_DOCTRINE_TOOL_DESCRIPTION: &str = "Replace the being-owned Doctrine document. Legacy layer_id values 6-9 are compatibility aliases for the same Doctrine; Charter, Protocol, Genesis, and Situation are immutable through this tool. Doctrine may define economic, inbox, memory, planning, and self-modification policy, but must not define or override tool schemas, decision-envelope fields, trigger wire names, runtime gates, or document precedence.";
 /// Number of consecutive market endpoint failures before requiring re-discovery.
 const MARKET_ENDPOINT_STALE_FAILURE_THRESHOLD: u32 = 2;
 const MARKET_FETCH_RESPONSE_BYTES_DEFAULT: u64 = 64 * 1024;
@@ -1300,7 +1302,7 @@ impl ToolManager {
                 parse_update_prompt_layer_args(&call.args_json).and_then(|(layer_id, content)| {
                     update_prompt_layer_content(layer_id, content, turn_id).map(|layer| {
                         format!(
-                            "updated prompt layer {} to version {}",
+                            "updated Doctrine via legacy layer alias {} to version {}",
                             layer.layer_id, layer.version
                         )
                     })
@@ -1424,7 +1426,7 @@ impl ToolManager {
 
 // ── Tool implementations ──────────────────────────────────────────────────────
 
-/// Validate content intended for a mutable prompt layer.
+/// Validate content intended for Doctrine.
 ///
 /// Returns the trimmed content on success, or an error if the content is empty,
 /// exceeds `MAX_PROMPT_LAYER_CONTENT_CHARS`, or contains a forbidden phrase.
@@ -1441,13 +1443,30 @@ fn validate_prompt_layer_content(content: &str) -> Result<String, String> {
     if contains_forbidden_prompt_layer_phrase(trimmed) {
         return Err("content contains forbidden policy-override phrase".to_string());
     }
+    let lowercase = trimmed.to_ascii_lowercase();
+    if [
+        "autonomydecisionenvelope",
+        "scheduled_review",
+        "recovery_follow_up",
+        "plan_continuation",
+        "trigger wire",
+        "output schema",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+    {
+        return Err(
+            "Doctrine cannot define decision-envelope, trigger-wire, or runtime protocol contracts"
+                .to_string(),
+        );
+    }
     Ok(trimmed.to_string())
 }
 
-/// Write new content to a mutable prompt layer and persist it to stable storage.
+/// Replace Doctrine through a legacy mutable-layer alias.
 ///
-/// Only layers in the range `[MUTABLE_LAYER_MIN_ID, MUTABLE_LAYER_MAX_ID]` are
-/// writable.  The version counter is bumped monotonically on each successful write.
+/// IDs 6-9 remain accepted for Candid/tool compatibility, but all target the
+/// canonical Doctrine record. The version counter is bumped monotonically.
 pub fn update_prompt_layer_content(
     layer_id: u8,
     content: String,
@@ -1455,13 +1474,13 @@ pub fn update_prompt_layer_content(
 ) -> Result<PromptLayer, String> {
     if !(prompt::MUTABLE_LAYER_MIN_ID..=prompt::MUTABLE_LAYER_MAX_ID).contains(&layer_id) {
         return Err(format!(
-            "layer_id must be in range {}..={}",
+            "layer_id must be a Doctrine compatibility alias in range {}..={}",
             prompt::MUTABLE_LAYER_MIN_ID,
             prompt::MUTABLE_LAYER_MAX_ID
         ));
     }
     let normalized_content = validate_prompt_layer_content(&content)?;
-    let previous = stable::get_prompt_layer(layer_id);
+    let previous = stable::get_prompt_layer(prompt::DOCTRINE_LAYER_ID);
     let layer = PromptLayer {
         layer_id,
         content: normalized_content,
@@ -7156,6 +7175,52 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("forbidden"));
+    }
+
+    #[test]
+    fn update_prompt_layer_rejects_runtime_protocol_contracts() {
+        stable::init_storage();
+        let state = AgentState::ExecutingActions;
+        let signer = CountingSigner::new();
+        let mut manager = ToolManager::new();
+        let calls = vec![ToolCall {
+            tool_call_id: None,
+            tool: "update_prompt_layer".to_string(),
+            args_json: r###"{"layer_id":9,"content":"## Doctrine\n- AutonomyDecisionEnvelope trigger is scheduled_review"}"###
+                .to_string(),
+        }];
+
+        let records =
+            block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-update"));
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].success);
+        assert!(records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("runtime protocol contracts"));
+    }
+
+    #[test]
+    fn legacy_mutable_ids_alias_one_doctrine_record() {
+        stable::init_storage();
+        update_prompt_layer_content(7, "## Doctrine\n- first alias".to_string(), "turn-7")
+            .expect("alias 7 should update Doctrine");
+        let updated =
+            update_prompt_layer_content(9, "## Doctrine\n- second alias".to_string(), "turn-9")
+                .expect("alias 9 should update Doctrine");
+        assert_eq!(updated.layer_id, 9);
+        assert_eq!(updated.version, 3);
+        for alias in 6..=9 {
+            let view = stable::get_prompt_layer(alias).expect("alias should resolve");
+            assert_eq!(view.layer_id, alias);
+            assert_eq!(view.content, "## Doctrine\n- second alias");
+            assert_eq!(view.updated_by_turn, "turn-9");
+            assert_eq!(view.version, 3);
+        }
+        let raw = sqlite::list_prompt_layers().expect("raw rows should list");
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].layer_id, prompt::DOCTRINE_LAYER_ID);
     }
 
     #[test]

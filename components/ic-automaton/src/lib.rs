@@ -1598,13 +1598,13 @@ fn list_inbox_messages(limit: u32) -> Vec<InboxMessage> {
         .unwrap_or_else(|_| stable::list_inbox_messages(limit as usize))
 }
 
-/// Returns all prompt layers ordered by layer ID.
+/// Returns the legacy 0-9 prompt view with explicit ownership-document aliases.
 #[ic_cdk::query]
 fn get_prompt_layers() -> Vec<PromptLayerView> {
     stable::list_prompt_layers()
 }
 
-/// Replaces the content of a prompt layer identified by `layer_id` (controller only).
+/// Replaces Doctrine through a legacy mutable alias 6-9 (controller only).
 #[ic_cdk::update]
 fn update_prompt_layer_admin(layer_id: u8, content: String) -> Result<PromptLayer, String> {
     ensure_controller()?;
@@ -2002,7 +2002,7 @@ fn list_strategy_discovery_results(
     stable::list_strategy_discovery_results(bounded_limit)
 }
 
-/// Returns the agent's "soul" — the core identity/persona prompt layer.
+/// Returns the agent's "soul" — the temporary self-label rendered in Genesis.
 #[ic_cdk::query]
 fn get_soul() -> String {
     stable::get_soul()

@@ -55,7 +55,8 @@
     "test:terminal-parity": "node --test ./scripts/verify-terminal-parity.test.mjs",
     "test:release-actions": "node --test ./scripts/release-actions.test.mjs",
     "test:release-manifest": "node --test ./scripts/release-manifest.test.mjs",
-    "test": "npm run test:ui-tokens && npm run test:terminal-parity && npm run test --workspace @ic-automaton/shared && npm run test --workspace @ic-automaton/canister-clients && npm run test --workspace @ic-automaton/indexer && npm run test --workspace @ic-automaton/rpc-gateway && npm run test --workspace @ic-automaton/web && npm run test --workspace @ic-automaton/evaluator && npm run test --workspace @ic-automaton/evaluator-web && npm run test:release-actions && npm run test:release-manifest && npm run test:workers",
+    "test:playground-e2e": "node --test ./scripts/playground-e2e.test.mjs",
+    "test": "npm run test:ui-tokens && npm run test:terminal-parity && npm run test --workspace @ic-automaton/shared && npm run test --workspace @ic-automaton/canister-clients && npm run test --workspace @ic-automaton/indexer && npm run test --workspace @ic-automaton/rpc-gateway && npm run test --workspace @ic-automaton/web && npm run test --workspace @ic-automaton/evaluator && npm run test --workspace @ic-automaton/evaluator-web && npm run test:release-actions && npm run test:release-manifest && npm run test:playground-e2e && npm run test:workers",
     "test:factory": "cargo test -p factory"
   },
   "devDependencies": {
