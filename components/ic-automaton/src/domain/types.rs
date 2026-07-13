@@ -1114,6 +1114,19 @@ pub struct TurnRecord {
     pub error: Option<String>,
 }
 
+/// A public, first-person record authored by the being through the `journal` tool.
+/// This expressive channel is intentionally separate from `TurnRecord::inner_dialogue`,
+/// which remains operator-facing runtime diagnostics.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct JournalEntry {
+    pub id: u64,
+    pub turn_id: String,
+    pub timestamp_ns: u64,
+    pub text: String,
+    #[serde(default)]
+    pub genesis: bool,
+}
+
 /// Durable exposure record used for protocol concentration and reconciliation.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ActiveExposure {
@@ -2074,6 +2087,8 @@ pub struct ObservabilitySnapshot {
     pub memory_rollups: Vec<MemoryRollup>,
     #[serde(default)]
     pub cycles: CycleTelemetry,
+    #[serde(default)]
+    pub recent_decisions: Vec<DecisionRecord>,
     pub recent_turns: Vec<TurnRecord>,
     pub recent_transitions: Vec<TransitionLogRecord>,
     pub recent_jobs: Vec<ScheduledJob>,

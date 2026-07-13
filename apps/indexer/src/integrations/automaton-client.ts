@@ -7,6 +7,7 @@ import {
   type AutomatonMetadataActor,
   type HttpBuildInfoResponse,
   type HttpEvmConfigResponse,
+  type HttpJournalResponse,
   type HttpSchedulerConfigResponse,
   type HttpSnapshotResponse,
   type HttpStewardStatusResponse,
@@ -20,6 +21,7 @@ import {
 export type {
   HttpBuildInfoResponse,
   HttpEvmConfigResponse,
+  HttpJournalResponse,
   HttpSchedulerConfigResponse,
   HttpSnapshotResponse,
   HttpStewardStatusResponse,
@@ -58,10 +60,16 @@ export interface RecentTurnsRead {
   recentTurns: HttpTurnRecordResponse[];
 }
 
+export interface JournalRead {
+  canisterId: string;
+  entries: NonNullable<HttpJournalResponse["entries"]>;
+}
+
 export interface AutomatonClient {
   readIdentityConfig(canisterId: string): Promise<IdentityConfigRead>;
   readRuntimeFinancial(canisterId: string): Promise<RuntimeFinancialRead>;
   readRecentTurns(canisterId: string): Promise<RecentTurnsRead>;
+  readJournal?(canisterId: string): Promise<JournalRead>;
 }
 
 export class LiveAutomatonClient implements AutomatonClient {
@@ -117,6 +125,19 @@ export class LiveAutomatonClient implements AutomatonClient {
   async readRecentTurns(canisterId: string): Promise<RecentTurnsRead> {
     const snapshot = await this.requestJson<HttpSnapshotResponse>(canisterId, "/api/snapshot");
     return { canisterId, recentTurns: snapshot.recent_turns ?? [] };
+  }
+
+  async readJournal(canisterId: string): Promise<JournalRead> {
+    try {
+      const journal = await this.requestJson<HttpJournalResponse>(canisterId, "/api/journal");
+      return { canisterId, entries: journal.entries ?? [] };
+    } catch (error) {
+      if (error instanceof AutomatonHttpRequestError && error.status === 404) {
+        return { canisterId, entries: [] };
+      }
+
+      throw error;
+    }
   }
 
   private async getAgent() {

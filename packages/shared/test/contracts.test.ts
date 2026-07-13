@@ -93,6 +93,7 @@ describe("shared contracts", () => {
       "action",
       "message",
       "monologue",
+      "journal",
       "offline"
     ]);
     expect(SPAWN_EVENT_TYPES).toEqual([

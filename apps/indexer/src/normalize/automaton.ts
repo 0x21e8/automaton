@@ -228,6 +228,7 @@ function defaultDetail(
     skills: [],
     promptLayers: [],
     monologue: [],
+    journal: [],
     spawnSelection: null,
     childIds: registryRecord?.childIds ?? [],
     lastPolledAt: now
@@ -385,6 +386,7 @@ export function normalizeAutomatonDetail(options: {
       identity?.promptLayers.map((layer) => layer.content) ??
       base.promptLayers,
     monologue: options.monologue ?? base.monologue,
+    journal: base.journal ?? [],
     lastPolledAt: options.now
   };
 }

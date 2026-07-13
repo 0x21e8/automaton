@@ -17,6 +17,7 @@
 /// | GET    | `/app.js`                     | query       |
 /// | GET    | `/ui_terminal_commands.js`     | query       |
 /// | GET    | `/api/snapshot`               | query       |
+/// | GET    | `/api/journal`                | query       |
 /// | GET    | `/api/steward/status`         | query       |
 /// | GET    | `/api/wallet/balance`         | query       |
 /// | GET    | `/api/wallet/balance/sync-config` | query   |
@@ -602,6 +603,10 @@ pub async fn handle_http_request_update(
             let snapshot = stable::observability_snapshot(DEFAULT_SNAPSHOT_LIMIT);
             json_update_response(StatusCode::OK, &snapshot)
         }
+        (&Method::GET, "/api/journal") => {
+            let journal = stable::list_recent_journal_entries(100);
+            json_update_response(StatusCode::OK, &serde_json::json!({ "entries": journal }))
+        }
         (&Method::GET, "/api/steward/status") => {
             let status = stable::steward_status_view();
             json_update_response(StatusCode::OK, &status)
@@ -816,6 +821,9 @@ fn build_certification_state() -> HttpCertificationState {
         "constitution": bootstrap.constitution,
         "contract_version": bootstrap.contract_version,
     });
+    let journal = serde_json::json!({
+        "entries": stable::list_recent_journal_entries(100),
+    });
 
     let mut tree = HttpCertificationTree::default();
     let routes = vec![
@@ -880,6 +888,7 @@ fn build_certification_state() -> HttpCertificationState {
         json_route(Method::GET, "/api/welcome", &welcome),
         json_route(Method::GET, "/api/build-info", &build_info),
         json_route(Method::GET, "/api/genesis", &genesis),
+        json_route(Method::GET, "/api/journal", &journal),
         upgrade_route(Method::POST, "/api/conversation"),
         upgrade_route(Method::POST, "/api/steward/direct-message/prepare"),
         upgrade_route(Method::POST, "/api/steward/direct-message/execute"),
@@ -1431,6 +1440,7 @@ mod tests {
         let body = serde_json::from_slice::<Value>(response.body())
             .expect("snapshot body should decode as json");
         assert!(body.get("runtime").is_some());
+        assert!(body.get("recent_decisions").is_some());
     }
 
     #[test]
@@ -1449,6 +1459,23 @@ mod tests {
         assert_eq!(body.get("name").and_then(Value::as_str), Some("Meridian"));
         assert!(body.get("constitution").is_some());
         assert!(body.get("open_router_api_key").is_none());
+    }
+
+    #[test]
+    fn journal_query_path_is_certified_and_excludes_debug_turns() {
+        stable::append_journal_entry("turn-public", "I chose to wait and watch.", false)
+            .expect("journal entry");
+        init_certification();
+
+        let response = handle_http_request(HttpRequest::get("/api/journal").build());
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(response.upgrade(), None);
+        let body = serde_json::from_slice::<Value>(response.body()).unwrap();
+        let entries = body.get("entries").and_then(Value::as_array).unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| { entry.get("turn_id").and_then(Value::as_str) == Some("turn-public") }));
+        assert!(body.get("inner_dialogue").is_none());
     }
 
     #[test]

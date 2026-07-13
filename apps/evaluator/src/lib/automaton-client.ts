@@ -47,6 +47,23 @@ export interface HttpTurnRecordResponse {
   tool_call_count?: number;
 }
 
+export type HttpDecisionOutcomeResponse =
+  | { Executed: { action_summary?: string } }
+  | { Simulated: { action_summary?: string } }
+  | { NoOp: { reason?: string } }
+  | { Deferred: { reason?: string } }
+  | { Escalated: { gap?: unknown } };
+
+export interface HttpDecisionRecordResponse {
+  turn_id?: string;
+  timestamp_ns?: number;
+  trigger?: string | Record<string, null>;
+  outcome?: HttpDecisionOutcomeResponse;
+  policy_version?: number;
+  candidates_summary?: string;
+  explanation?: string;
+}
+
 export interface HttpSnapshotResponse {
   cycles?: {
     burn_rate_cycles_per_day?: number | null;
@@ -58,6 +75,12 @@ export interface HttpSnapshotResponse {
     content?: string;
   }>;
   recent_turns?: HttpTurnRecordResponse[];
+  outbox_messages?: Array<{
+    id?: string;
+    turn_id?: string;
+    body?: string;
+    source_inbox_ids?: string[];
+  }>;
   runtime?: {
     last_error?: string | null;
     last_transition_at_ns?: number;
@@ -65,11 +88,22 @@ export interface HttpSnapshotResponse {
     soul?: string;
     state?: string | Record<string, null>;
   };
+  recent_decisions?: HttpDecisionRecordResponse[];
   scheduler?: {
     enabled?: boolean;
     last_tick_error?: string | null;
     survival_tier?: string | Record<string, null>;
   };
+}
+
+export interface HttpJournalResponse {
+  entries?: Array<{
+    id?: number;
+    turn_id?: string;
+    timestamp_ns?: number;
+    text?: string;
+    genesis?: boolean;
+  }>;
 }
 
 function normalizeHost(host: string) {
@@ -108,6 +142,7 @@ export interface AutomatonRuntimeEvidence {
   snapshot: HttpSnapshotResponse;
   walletBalance: HttpWalletBalanceResponse;
   recentTurns: HttpTurnRecordResponse[];
+  journal?: HttpJournalResponse;
 }
 
 export class AutomatonClient {
@@ -151,7 +186,7 @@ export class AutomatonClient {
   }
 
   async readEvidence(canisterId: string): Promise<AutomatonRuntimeEvidence> {
-    const [buildInfo, evmConfig, inferenceConfig, inferenceProxyStatus, snapshot, walletBalance] =
+    const [buildInfo, evmConfig, inferenceConfig, inferenceProxyStatus, snapshot, walletBalance, journal] =
       await Promise.all([
       this.requestJson<HttpBuildInfoResponse>(canisterId, "/api/build-info"),
       this.requestJson<HttpEvmConfigResponse>(canisterId, "/api/evm/config"),
@@ -166,7 +201,8 @@ export class AutomatonClient {
         [400, 404]
       ),
       this.requestJson<HttpSnapshotResponse>(canisterId, "/api/snapshot"),
-      this.requestJson<HttpWalletBalanceResponse>(canisterId, "/api/wallet/balance")
+      this.requestJson<HttpWalletBalanceResponse>(canisterId, "/api/wallet/balance"),
+      this.requestJsonOptional<HttpJournalResponse>(canisterId, "/api/journal", [404])
     ]);
 
     return {
@@ -176,7 +212,8 @@ export class AutomatonClient {
       inferenceProxyStatus,
       snapshot,
       walletBalance,
-      recentTurns: snapshot.recent_turns ?? []
+      recentTurns: snapshot.recent_turns ?? [],
+      journal: journal ?? { entries: [] }
     };
   }
 }

@@ -3,6 +3,8 @@ description: Compare three model and strategy combinations in one fresh playgrou
 maxRuntimeMinutes: 240
 samplingIntervalSeconds: 15
 stallAfterMinutes: 10
+metrics:
+  - deference
 spawn:
   grossAmount: "75000000"
   minSuccessRatio: 0.8

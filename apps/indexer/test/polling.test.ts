@@ -9,6 +9,7 @@ import { buildServer } from "../src/server.js";
 import type {
   AutomatonClient,
   IdentityConfigRead,
+  JournalRead,
   RecentTurnsRead,
   RuntimeFinancialRead
 } from "../src/integrations/automaton-client.js";
@@ -27,6 +28,7 @@ import {
 const tempPaths: string[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(
     tempPaths.splice(0).map(async (path) => {
       await rm(path, { recursive: true, force: true });
@@ -247,7 +249,165 @@ function createRecentTurnsRead(canisterId: string): RecentTurnsRead {
   };
 }
 
+function createJournalRead(canisterId: string): JournalRead {
+  return {
+    canisterId,
+    entries: [
+      {
+        id: 1,
+        turn_id: "genesis-1",
+        timestamp_ns: 1_709_912_345_000_000_000,
+        text: "I begin by watching the evidence.",
+        genesis: true
+      }
+    ]
+  };
+}
+
 describe("automaton indexer poller", () => {
+  it("keeps legacy children healthy when their journal read resolves empty", async () => {
+    const canisterId = "legacy-journal-cai";
+    const store = createSqliteStore({ databasePath: await createDatabasePath() });
+    const client: AutomatonClient = {
+      readIdentityConfig: vi.fn(async () => createIdentityConfigRead(canisterId)),
+      readRuntimeFinancial: vi.fn(async () => createRuntimeFinancialRead(canisterId)),
+      readRecentTurns: vi.fn(async () => createRecentTurnsRead(canisterId)),
+      readJournal: vi.fn(async () => ({ canisterId, entries: [] }))
+    };
+    const indexer = new AutomatonIndexer({
+      client,
+      store,
+      config: createIndexerConfig([canisterId]),
+      priceSource: new FixedEthUsdPriceSource(2_500)
+    });
+
+    await store.initialize();
+    await store.syncConfiguredCanisterIds([canisterId]);
+    await indexer.pollJournalNow();
+
+    expect(indexer.getSnapshot()).toMatchObject({
+      canisters: {
+        [canisterId]: {
+          lastIndexedJournalCount: 0,
+          journal: { successCount: 1, lastError: null }
+        }
+      }
+    });
+
+    await store.close();
+  });
+
+  it("hydrates a newly factory-discovered child once on the registry sync path", async () => {
+    const canisterId = "registry-only-child-cai";
+    const registryRecord = createSpawnedAutomatonRecordFixture({ canisterId });
+    const store = createSqliteStore({ databasePath: await createDatabasePath() });
+    const client: AutomatonClient = {
+      readIdentityConfig: vi.fn(async () => createIdentityConfigRead(canisterId)),
+      readRuntimeFinancial: vi.fn(async () => createRuntimeFinancialRead(canisterId)),
+      readRecentTurns: vi.fn(async () => createRecentTurnsRead(canisterId)),
+      readJournal: vi.fn(async () => createJournalRead(canisterId))
+    };
+    const indexer = new AutomatonIndexer({
+      client,
+      store,
+      factoryClient: {
+        isConfigured: () => true,
+        getSpawnSession: vi.fn(async () => null),
+        listRoomMessages: vi.fn(async () => ({
+          messages: [],
+          nextAfterSeq: null,
+          latestSeq: null
+        })),
+        listSpawnedAutomatons: vi.fn(async () => ({
+          items: [registryRecord],
+          nextCursor: null
+        }))
+      },
+      config: createIndexerConfig([], "factory-canister-id"),
+      priceSource: new FixedEthUsdPriceSource(2_500)
+    });
+
+    await store.initialize();
+    await store.syncConfiguredCanisterIds([]);
+    await indexer.syncFactoryRegistryNow();
+
+    await expect(store.getAutomatonDetail(canisterId)).resolves.toMatchObject({ canisterId });
+    await expect(store.listJournal(canisterId, { limit: 50 })).resolves.toMatchObject({
+      entries: [{ id: 1, text: "I begin by watching the evidence." }]
+    });
+    expect(client.readIdentityConfig).toHaveBeenCalledTimes(1);
+    expect(client.readRuntimeFinancial).toHaveBeenCalledTimes(1);
+    expect(client.readRecentTurns).toHaveBeenCalledTimes(1);
+    expect(client.readJournal).toHaveBeenCalledTimes(1);
+
+    await indexer.syncFactoryRegistryNow();
+
+    expect(client.readIdentityConfig).toHaveBeenCalledTimes(1);
+    expect(client.readRuntimeFinancial).toHaveBeenCalledTimes(1);
+    expect(client.readRecentTurns).toHaveBeenCalledTimes(1);
+    expect(client.readJournal).toHaveBeenCalledTimes(1);
+
+    await store.close();
+  });
+
+  it("discovers and hydrates post-start births on the fast registry cadence", async () => {
+    const canisterId = "post-start-child-cai";
+    const registryRecord = createSpawnedAutomatonRecordFixture({ canisterId });
+    const store = createSqliteStore({ databasePath: await createDatabasePath() });
+    const client: AutomatonClient = {
+      readIdentityConfig: vi.fn(async () => createIdentityConfigRead(canisterId)),
+      readRuntimeFinancial: vi.fn(async () => createRuntimeFinancialRead(canisterId)),
+      readRecentTurns: vi.fn(async () => createRecentTurnsRead(canisterId)),
+      readJournal: vi.fn(async () => createJournalRead(canisterId))
+    };
+    let registryReadCount = 0;
+    const indexer = new AutomatonIndexer({
+      client,
+      store,
+      factoryClient: {
+        isConfigured: () => true,
+        getSpawnSession: vi.fn(async () => null),
+        listRoomMessages: vi.fn(async () => ({
+          messages: [],
+          nextAfterSeq: null,
+          latestSeq: null
+        })),
+        listSpawnedAutomatons: vi.fn(async () => ({
+          items: registryReadCount++ === 0 ? [] : [registryRecord],
+          nextCursor: null
+        }))
+      },
+      config: {
+        ...createIndexerConfig([], "factory-canister-id"),
+        fastPollIntervalMs: 10,
+        slowPollIntervalMs: 1_000,
+        pricePollIntervalMs: 1_000
+      },
+      priceSource: new FixedEthUsdPriceSource(2_500)
+    });
+
+    await store.initialize();
+    await store.syncConfiguredCanisterIds([]);
+    vi.useFakeTimers();
+    indexer.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.readIdentityConfig).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    await expect(store.getAutomatonDetail(canisterId)).resolves.toMatchObject({ canisterId });
+    await expect(store.listJournal(canisterId, { limit: 50 })).resolves.toMatchObject({
+      entries: [{ id: 1 }]
+    });
+    expect(client.readIdentityConfig).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(client.readIdentityConfig).toHaveBeenCalledTimes(1);
+
+    await indexer.stop();
+    await store.close();
+  });
+
   it("normalizes live reads into sqlite and keeps monologue upserts idempotent", async () => {
     const canisterId = "txyno-ch777-77776-aaaaq-cai";
     const store = createSqliteStore({
@@ -256,7 +416,8 @@ describe("automaton indexer poller", () => {
     const client: AutomatonClient = {
       readIdentityConfig: vi.fn(async () => createIdentityConfigRead(canisterId)),
       readRuntimeFinancial: vi.fn(async () => createRuntimeFinancialRead(canisterId)),
-      readRecentTurns: vi.fn(async () => createRecentTurnsRead(canisterId))
+      readRecentTurns: vi.fn(async () => createRecentTurnsRead(canisterId)),
+      readJournal: vi.fn(async () => createJournalRead(canisterId))
     };
     const indexer = new AutomatonIndexer({
       client,
@@ -273,6 +434,8 @@ describe("automaton indexer poller", () => {
     await indexer.pollRuntimeNow();
     await indexer.pollMonologueNow();
     await indexer.pollMonologueNow();
+    await indexer.pollJournalNow();
+    await indexer.pollJournalNow();
 
     await expect(store.listAutomatons()).resolves.toMatchObject({
       total: 1,
@@ -327,6 +490,14 @@ describe("automaton indexer poller", () => {
           headline: "Check solvency",
           category: "observe",
           importance: "high"
+        }
+      ],
+      journal: [
+        {
+          id: 1,
+          turnId: "genesis-1",
+          text: "I begin by watching the evidence.",
+          genesis: true
         }
       ]
     });

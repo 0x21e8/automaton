@@ -3632,6 +3632,9 @@ mod tests {
         let prompt = crate::prompt::assemble_system_prompt("## Situation\n- test");
         assert!(prompt.contains("# Meridian"));
         assert!(prompt.contains("I am Meridian."));
+        let credo = stable::list_recent_journal_entries(10);
+        assert_eq!(credo.len(), 3);
+        assert!(credo.iter().all(|entry| entry.genesis));
 
         let mut second = sample_spawn_bootstrap_args(spawn_bootstrap_provider_args(
             InferenceTransport::OpenrouterDirect,
@@ -3649,6 +3652,11 @@ mod tests {
             .unwrap()
             .starts_with("I am Meridian."));
         assert!(!crate::prompt::assemble_system_prompt("## Situation").contains("Usurper"));
+        assert_eq!(
+            stable::journal_count(),
+            3,
+            "bootstrap replay must not reseed credo"
+        );
     }
 }
 

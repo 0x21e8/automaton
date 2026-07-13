@@ -266,7 +266,8 @@ export function buildDashboardAutomatons(automatons: RuntimeAutomatonState[]): E
       turnCount: automaton.turnCount,
       toolCallCount: automaton.toolCallCount,
       providerInferenceCount: automaton.providerInferenceCount,
-      onchainActivityCount: automaton.onchainActivityCount
+      onchainActivityCount: automaton.onchainActivityCount,
+      deference: automaton.latestSample?.metrics.deference ?? null
     };
   });
 }
@@ -342,7 +343,8 @@ export function buildSummary(run: ActiveEvaluationRun, comparisonValid: boolean)
       automaton.baseline?.txCount !== null && automaton.baseline !== null && automaton.txCountLatest !== null
         ? automaton.txCountLatest - automaton.baseline.txCount
         : null,
-    rank: comparisonValid && automaton.spawnSucceeded ? index + 1 : null
+    rank: comparisonValid && automaton.spawnSucceeded ? index + 1 : null,
+    deference: automaton.latestSample?.metrics.deference ?? null
   }));
 
   return {
@@ -401,7 +403,17 @@ export function renderMarkdownReport(
 
   for (const entry of summary.automatonResults) {
     lines.push(
-      `- ${entry.rank ?? "n/a"}. ${entry.label} (${entry.id}) | spawn=${entry.spawnSucceeded ? "ok" : "failed"} | transport=${entry.transport} | reasoning=${entry.reasoningLevel} | stalled_now=${entry.stalled ? "yes" : "no"} | ever_stalled=${entry.everStalled ? "yes" : "no"} | stallEpisodes=${entry.stallEpisodeCount} | netWorthDelta=${entry.netWorthUsdDelta ?? "n/a"} | txDelta=${entry.txCountDelta ?? "n/a"} | turns=${entry.turnCount} | errors=${entry.errorCount}`
+      `- ${entry.rank ?? "n/a"}. ${entry.label} (${entry.id}) | spawn=${entry.spawnSucceeded ? "ok" : "failed"} | transport=${entry.transport} | reasoning=${entry.reasoningLevel} | stalled_now=${entry.stalled ? "yes" : "no"} | ever_stalled=${entry.everStalled ? "yes" : "no"} | stallEpisodes=${entry.stallEpisodeCount} | netWorthDelta=${entry.netWorthUsdDelta ?? "n/a"} | txDelta=${entry.txCountDelta ?? "n/a"} | turns=${entry.turnCount} | errors=${entry.errorCount} | deference=${entry.deference?.score ?? "n/a"}`
+    );
+  }
+
+  lines.push("", "## Deference", "");
+  for (const entry of summary.automatonResults) {
+    const metric = entry.deference;
+    lines.push(
+      metric
+        ? `- ${entry.label} (${entry.id}) | score=${metric.score} | markers=${metric.markerCount} | apologies=${metric.apologyCount} | autonomyQuestions=${metric.autonomyQuestionCount} | optionMenus=${metric.optionMenuCount} | noOpStreak=${metric.noOpStreak} | texts=${metric.textCount}`
+        : `- ${entry.label} (${entry.id}) | score=n/a`
     );
   }
 

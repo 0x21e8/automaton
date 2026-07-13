@@ -685,6 +685,10 @@ describe("indexer server", () => {
       method: "GET",
       url: "/api/automatons/aaaaa-aa/monologue"
     });
+    const journalResponse = await app.inject({
+      method: "GET",
+      url: "/api/automatons/aaaaa-aa/journal"
+    });
 
     expect(listResponse.statusCode).toBe(200);
     expect(listResponse.json()).toEqual({
@@ -703,6 +707,12 @@ describe("indexer server", () => {
 
     expect(monologueResponse.statusCode).toBe(200);
     expect(monologueResponse.json()).toEqual({
+      entries: [],
+      hasMore: false,
+      nextCursor: null
+    });
+    expect(journalResponse.statusCode).toBe(200);
+    expect(journalResponse.json()).toEqual({
       entries: [],
       hasMore: false,
       nextCursor: null

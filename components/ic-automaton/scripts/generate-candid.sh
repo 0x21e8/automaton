@@ -46,6 +46,6 @@ if [[ -z "${wasm_path}" ]]; then
 fi
 
 mkdir -p "$(dirname "${output_path}")"
-candid-extractor "${wasm_path}" > "${output_path}"
+candid-extractor "${wasm_path}" | sed 's/[[:space:]]*$//' > "${output_path}"
 
 echo "Generated Candid: ${output_path}"

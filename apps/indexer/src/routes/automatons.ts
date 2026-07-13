@@ -145,4 +145,13 @@ export const automatonRoutes: FastifyPluginAsync = async (fastify) => {
       limit: normalizeLimit(query.limit)
     });
   });
+
+  fastify.get("/api/automatons/:canisterId/journal", async (request) => {
+    const params = request.params as { canisterId: string };
+    const query = request.query as { before?: string; limit?: string };
+    return fastify.indexerStore.listJournal(params.canisterId, {
+      before: normalizeCursor(query.before),
+      limit: normalizeLimit(query.limit)
+    });
+  });
 };

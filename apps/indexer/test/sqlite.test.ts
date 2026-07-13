@@ -54,6 +54,7 @@ describe("sqlite store", () => {
         trackedCanisters: 0,
         automatons: 0,
         monologueEntries: 0,
+        journalEntries: 0,
         spawnSessions: 0,
         spawnedAutomatonRegistryRecords: 0
       }
@@ -111,16 +112,24 @@ describe("sqlite store", () => {
     await store.close();
   });
 
-  it("persists automaton details, monologue entries, and prices", async () => {
+  it("persists automaton details, public journal, debug monologue, and prices", async () => {
     const store = createSqliteStore({
       databasePath: await createDatabasePath()
     });
     const automaton = createAutomatonDetailFixture();
     const entry = createMonologueEntryFixture();
+    const journalEntry = {
+      id: 1,
+      turnId: "turn-journal",
+      timestamp: 1_709_912_345_000,
+      text: "I begin by watching the evidence.",
+      genesis: true
+    };
 
     await store.initialize();
     await store.upsertAutomaton(automaton);
     await store.appendMonologue(automaton.canisterId, [entry]);
+    await store.appendJournal(automaton.canisterId, [journalEntry]);
     await store.setPrice("ethUsd", 2_450.5);
 
     await expect(
@@ -147,6 +156,12 @@ describe("sqlite store", () => {
       })
     ).resolves.toEqual({
       entries: [entry],
+      hasMore: false,
+      nextCursor: null
+    });
+
+    await expect(store.listJournal(automaton.canisterId, { limit: 50 })).resolves.toEqual({
+      entries: [journalEntry],
       hasMore: false,
       nextCursor: null
     });

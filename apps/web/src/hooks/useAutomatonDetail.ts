@@ -26,6 +26,15 @@ function mergeMonologueEntries(
   });
 }
 
+function mergeJournalEntries(
+  existingEntries: NonNullable<AutomatonDetail["journal"]>,
+  nextEntry: NonNullable<AutomatonDetail["journal"]>[number]
+) {
+  const byId = new Map(existingEntries.map((entry) => [entry.id, entry]));
+  byId.set(nextEntry.id, nextEntry);
+  return [...byId.values()].sort((left, right) => right.id - left.id);
+}
+
 export function useAutomatonDetail(canisterId: string | null) {
   const [automaton, setAutomaton] = useState<AutomatonDetail | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -88,6 +97,17 @@ export function useAutomatonDetail(canisterId: string | null) {
               return {
                 ...current,
                 monologue: mergeMonologueEntries(current.monologue, event.entry)
+              };
+            });
+            return;
+          }
+
+          if (event.type === "journal") {
+            setAutomaton((current) => {
+              if (current === null || current.canisterId !== event.canisterId) return current;
+              return {
+                ...current,
+                journal: mergeJournalEntries(current.journal ?? [], event.entry)
               };
             });
             return;

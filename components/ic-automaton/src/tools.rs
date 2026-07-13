@@ -448,7 +448,6 @@ fn is_parallel_read_only_tool(tool: &str) -> bool {
     matches!(
         tool,
         "think"
-            | "record_signal"
             | "recall"
             | "memory_stats"
             | "sql_query"
@@ -601,7 +600,7 @@ pub fn tool_allowed_in_scope(tool: &str, scope: InferenceToolScope) -> bool {
         InferenceToolScope::CoordinationOnly => matches!(
             normalized.as_str(),
             "think"
-                | "record_signal"
+                | "journal"
                 | "remember"
                 | "recall"
                 | "memory_stats"
@@ -650,7 +649,7 @@ impl ToolManager {
             },
         );
         policies.insert(
-            "record_signal".to_string(),
+            "journal".to_string(),
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
@@ -1193,7 +1192,7 @@ impl ToolManager {
             "set_goal" => set_goal_tool(&call.args_json, turn_id),
             "list_goals" => list_goals_tool(&call.args_json),
             "update_goal" => update_goal_tool(&call.args_json, turn_id),
-            "record_signal" => Ok("recorded".to_string()),
+            "journal" => journal_tool(&call.args_json, turn_id),
             "remember" => remember_fact_tool(&call.args_json, turn_id),
             "recall" => recall_facts_tool(&call.args_json),
             "memory_stats" => memory_stats_tool(),
@@ -2576,6 +2575,20 @@ impl RecallSortBy {
             Self::Key => stable::MemoryFactSort::KeyAsc,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct JournalArgs {
+    text: String,
+}
+
+fn journal_tool(args_json: &str, turn_id: &str) -> Result<String, String> {
+    let args: JournalArgs = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid journal args json: {error}"))?;
+    let entry = stable::append_journal_entry(turn_id, &args.text, false)?;
+    // Journal is a certified public view; refresh the tree after each append.
+    crate::http::init_certification();
+    Ok(format!("journal entry {} recorded", entry.id))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -4715,16 +4728,16 @@ mod tests {
         let mut manager = ToolManager::new();
         let calls = vec![ToolCall {
             tool_call_id: None,
-            tool: "  ReCord_Signal  ".to_string(),
-            args_json: "{}".to_string(),
+            tool: "  Journal  ".to_string(),
+            args_json: r#"{"text":"I observed a canonicalized tool name."}"#.to_string(),
         }];
 
         let records =
             block_on_with_spin(manager.execute_actions(&state, &calls, &signer, "turn-0"));
         assert_eq!(records.len(), 1);
         assert!(records[0].success);
-        assert_eq!(records[0].tool, "record_signal");
-        assert_eq!(records[0].output, "recorded");
+        assert_eq!(records[0].tool, "journal");
+        assert!(records[0].output.contains("journal entry"));
     }
 
     #[test]
@@ -7376,7 +7389,7 @@ mod tests {
     #[test]
     fn coordination_only_tool_scope_retains_room_and_memory_tools() {
         for tool in [
-            "record_signal",
+            "journal",
             "remember",
             "recall",
             "memory_stats",

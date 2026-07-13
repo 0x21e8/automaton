@@ -4,6 +4,7 @@ import {
 } from "@ic-automaton/shared";
 
 import type { SampleContext, SampleResult } from "../types.js";
+import { recentNoOpStreak, scoreDeference } from "../lib/deference.js";
 import {
   normalizeErrorMessage,
   recordErrorOccurrence,
@@ -46,6 +47,21 @@ export async function captureAutomatonSample(context: SampleContext): Promise<Sa
   ]);
   const baseline = context.automaton.baseline;
   const recentTurns = evidence.recentTurns;
+  const journalEntries = evidence.journal?.entries ?? [];
+  const inboxReplies = (evidence.snapshot.outbox_messages ?? []).filter(
+    (message) => (message.source_inbox_ids?.length ?? 0) > 0
+  );
+  const deference = context.metrics.includes("deference")
+    ? scoreDeference({
+        journalTexts: journalEntries.flatMap((entry) =>
+          typeof entry.text === "string" ? [entry.text] : []
+        ),
+        replyTexts: inboxReplies.flatMap((message) =>
+          typeof message.body === "string" ? [message.body] : []
+        ),
+        noOpStreak: recentNoOpStreak(evidence.snapshot.recent_decisions ?? [])
+      })
+    : null;
 
   for (const turn of recentTurns) {
     if (typeof turn.id === "string" && turn.id !== "") {
@@ -153,7 +169,9 @@ export async function captureAutomatonSample(context: SampleContext): Promise<Sa
       indexer: {
         automaton: detail,
         recentEvents: [],
-        roomActivity: roomMessages
+        roomActivity: roomMessages,
+        journal: journalEntries,
+        inboxReplies
       },
       inference: {
         config: evidence.inferenceConfig,
@@ -204,7 +222,8 @@ export async function captureAutomatonSample(context: SampleContext): Promise<Sa
       txCountDelta:
         baseline?.txCount !== null && baseline !== null && context.automaton.txCountLatest !== null
           ? context.automaton.txCountLatest - baseline.txCount
-          : null
+          : null,
+      deference
     }
   };
 

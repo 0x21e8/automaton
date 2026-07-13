@@ -77,7 +77,8 @@ export function createAutomatonDetailFixture(
     strategies: [],
     skills: [],
     promptLayers: ["constitution"],
-    monologue: [],
+  monologue: [],
+  journal: [],
     spawnSelection: null,
     childIds: [],
     lastPolledAt: 1_709_912_347_000

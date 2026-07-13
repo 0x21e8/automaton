@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import type { MonologueEntry } from "@ic-automaton/shared";
+import type { JournalEntry, MonologueEntry } from "@ic-automaton/shared";
 
 function formatTime(timestamp: number): string {
   return new Intl.DateTimeFormat("en-GB", {
@@ -28,6 +28,7 @@ type FeedItem =
 
 interface MonologuePanelProps {
   entries: readonly MonologueEntry[];
+  journalEntries?: readonly JournalEntry[];
   errorMessage: string | null;
   isLoading: boolean;
   selectedCanisterId: string | null;
@@ -146,11 +147,13 @@ function formatGroupRange(entries: readonly MonologueEntry[]) {
 
 export function MonologuePanel({
   entries,
+  journalEntries = [],
   errorMessage,
   isLoading,
   selectedCanisterId
 }: MonologuePanelProps) {
   const [filter, setFilter] = useState<ActivityFilter>("important");
+  const [showOperatorDebug, setShowOperatorDebug] = useState(false);
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const feedItems = buildFeedItems(entries, filter);
   const emptyCopy = isLoading
@@ -176,10 +179,27 @@ export function MonologuePanel({
     <section className="log-section" aria-labelledby="monologue-heading">
       <div className="panel-heading">
         <div>
-          <h3 id="monologue-heading">Live Activity</h3>
-          <span className="panel-note">Condensed from indexed turns</span>
+          <h3 id="monologue-heading">{showOperatorDebug ? "Operator Debug" : "Public Journal"}</h3>
+          <span className="panel-note">
+            {showOperatorDebug ? "Runtime diagnostics from indexed turns" : "The being's own public voice"}
+          </span>
         </div>
-        <div className="activity-filter" role="tablist" aria-label="Activity density">
+        <div className="activity-filter" role="tablist" aria-label="Journal view">
+          <button
+            className={`activity-filter-btn${!showOperatorDebug ? " is-active" : ""}`}
+            onClick={() => setShowOperatorDebug(false)}
+            type="button"
+          >
+            Journal
+          </button>
+          <button
+            className={`activity-filter-btn${showOperatorDebug ? " is-active" : ""}`}
+            onClick={() => setShowOperatorDebug(true)}
+            type="button"
+          >
+            Operator debug
+          </button>
+          {showOperatorDebug ? <>
           <button
             className={`activity-filter-btn${filter === "important" ? " is-active" : ""}`}
             onClick={() => {
@@ -198,11 +218,32 @@ export function MonologuePanel({
           >
             All
           </button>
+          </> : null}
         </div>
       </div>
 
       <div className="log-feed">
-        {feedItems.length > 0 ? (
+        {!showOperatorDebug ? (
+          journalEntries.length > 0 ? (
+            [...journalEntries]
+              .sort((left, right) => right.id - left.id)
+              .map((entry) => (
+                <article className="activity-card is-medium" key={entry.id}>
+                  <div className="activity-topline">
+                    <span className="log-time">{formatTime(entry.timestamp)}</span>
+                    <span className="activity-kind is-message">
+                      {entry.genesis ? "credo" : "journal"}
+                    </span>
+                  </div>
+                  <p className="activity-detail">{entry.text}</p>
+                </article>
+              ))
+          ) : (
+            <p className="empty-copy">
+              {isLoading ? "Loading the public journal." : "No public journal entries yet."}
+            </p>
+          )
+        ) : feedItems.length > 0 ? (
           feedItems.map((item) => {
             const isExpanded = expandedIds[item.id] ?? false;
 

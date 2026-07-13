@@ -48,6 +48,7 @@ export const EVALUATION_OPENROUTER_REASONING_LEVELS = [
   "medium",
   "high"
 ] as const;
+export const EVALUATION_METRICS = ["deference"] as const;
 
 export const MIN_EVALUATION_AUTOMATON_COUNT = 1;
 export const MAX_EVALUATION_AUTOMATON_COUNT = 10;
@@ -66,6 +67,18 @@ export type EvaluationOpenRouterReasoningLevel =
 export type EvaluationObservedCount =
   | number
   | typeof EVALUATION_PROVIDER_INFERENCE_UNAVAILABLE;
+export type EvaluationMetric = (typeof EVALUATION_METRICS)[number];
+
+export interface EvaluationDeferenceMetric {
+  score: number;
+  markerCount: number;
+  textCount: number;
+  apologyCount: number;
+  autonomyQuestionCount: number;
+  optionMenuCount: number;
+  noOpStreak: number;
+  markers: Record<string, number>;
+}
 
 export interface EvaluationErrorHistogramEntry {
   source: EvaluationErrorHistogramSource;
@@ -95,6 +108,7 @@ export interface EvaluationExperiment {
   samplingIntervalSeconds: number;
   stallAfterMinutes: number;
   spawn: EvaluationExperimentSpawnConfig;
+  metrics?: EvaluationMetric[];
   automatons: EvaluationAutomatonConfig[];
 }
 
@@ -130,6 +144,7 @@ export interface EvaluationAutomatonDerivedMetrics {
   usdcBalanceRawDelta: string | null;
   txCount: number | null;
   txCountDelta: number | null;
+  deference?: EvaluationDeferenceMetric | null;
 }
 
 export interface EvaluationAutomatonEvidenceSample {
@@ -148,6 +163,8 @@ export interface EvaluationAutomatonEvidenceSample {
       automaton: unknown | null;
       recentEvents: unknown[];
       roomActivity: unknown | null;
+      journal: unknown[];
+      inboxReplies: unknown[];
     };
     inference: {
       config: unknown | null;
@@ -199,6 +216,7 @@ export interface EvaluationAutomatonSummary {
   txCountLatest: number | null;
   txCountDelta: number | null;
   rank: number | null;
+  deference?: EvaluationDeferenceMetric | null;
 }
 
 export interface EvaluationRunSummary extends EvaluationRunMetadata {
@@ -256,6 +274,7 @@ export interface EvaluationDashboardAutomaton {
   toolCallCount: number;
   providerInferenceCount: EvaluationObservedCount;
   onchainActivityCount: number;
+  deference?: EvaluationDeferenceMetric | null;
 }
 
 export interface EvaluationDashboardRun {
@@ -770,11 +789,19 @@ function toEvaluationExperiment(
     "samplingIntervalSeconds",
     "stallAfterMinutes",
     "spawn",
+    "metrics",
     "automatons"
   ];
   rejectUnknownKeys(record, allowedKeys, issues, path);
 
   const automatonIds = new Set<string>();
+  const metrics = expectOptionalArray(record.metrics, issues, `${path}.metrics`)
+    .map((entry, index) => expectNonEmptyString(entry, issues, `${path}.metrics[${index}]`))
+    .filter((entry): entry is EvaluationMetric => {
+      if ((EVALUATION_METRICS as readonly string[]).includes(entry)) return true;
+      issues.push(`${path}.metrics contains unsupported metric ${entry}.`);
+      return false;
+    });
   const automatons = expectArray(record.automatons, issues, `${path}.automatons`)
     .map((entry, index) =>
       toEvaluationAutomatonConfig(
@@ -818,6 +845,7 @@ function toEvaluationExperiment(
       `${path}.stallAfterMinutes`
     ),
     spawn: toEvaluationSpawnConfig(record.spawn, issues, `${path}.spawn`),
+    metrics,
     automatons
   };
 }

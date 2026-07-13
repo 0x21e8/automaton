@@ -125,6 +125,35 @@ export interface HttpTurnRecordResponse {
   tool_call_count?: number;
 }
 
+export type HttpDecisionOutcomeResponse =
+  | { Executed: { action_summary?: string } }
+  | { Simulated: { action_summary?: string } }
+  | { NoOp: { reason?: string } }
+  | { Deferred: { reason?: string } }
+  | { Escalated: { gap?: unknown } };
+
+export interface HttpDecisionRecordResponse {
+  turn_id?: string;
+  timestamp_ns?: number;
+  trigger?: string | Record<string, null>;
+  outcome?: HttpDecisionOutcomeResponse;
+  policy_version?: number;
+  candidates_summary?: string;
+  explanation?: string;
+}
+
+export interface HttpJournalEntryResponse {
+  id: number;
+  turn_id: string;
+  timestamp_ns: number;
+  text: string;
+  genesis?: boolean;
+}
+
+export interface HttpJournalResponse {
+  entries?: HttpJournalEntryResponse[];
+}
+
 export interface HttpSnapshotResponse {
   cycles?: {
     burn_rate_cycles_per_day?: number | null;
@@ -132,6 +161,7 @@ export interface HttpSnapshotResponse {
     liquid_cycles?: number;
     total_cycles?: number;
   };
+  recent_decisions?: HttpDecisionRecordResponse[];
   prompt_layers?: Array<{
     content?: string;
   }>;
@@ -255,7 +285,14 @@ export async function requestAutomatonJson<T>(
   path: string,
   options?: { fetch?: typeof fetch; signal?: AbortSignal }
 ): Promise<T> {
-  const response = await (options?.fetch ?? fetch)(new URL(path, canisterUrl), {
+  const baseUrl = new URL(canisterUrl);
+  const requestUrl = new URL(path, baseUrl);
+  for (const [name, value] of baseUrl.searchParams) {
+    if (!requestUrl.searchParams.has(name)) {
+      requestUrl.searchParams.append(name, value);
+    }
+  }
+  const response = await (options?.fetch ?? fetch)(requestUrl, {
     headers: { accept: "application/json" },
     signal: options?.signal
   });

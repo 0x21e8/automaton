@@ -15,10 +15,10 @@ use crate::domain::types::{
     CycleTelemetry, DecisionRecord, EvmPollCursor, EvmRouteStateView, ExposureReconciliationStatus,
     GoalRecord, InboxMessage, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState,
     InboxStats, InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
-    InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, MemoryFact, MemoryRollup,
-    ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel, OutboxMessage,
-    OutboxStats, PendingInferenceProxyJob, PendingStrategyDiscoveryJob, PlanRecord, PromptLayer,
-    PromptLayerView, ProtocolWatchlistEntry, ReflectionMemoryRecord, ReflectionOrigin,
+    InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, JournalEntry, MemoryFact,
+    MemoryRollup, ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel,
+    OutboxMessage, OutboxStats, PendingInferenceProxyJob, PendingStrategyDiscoveryJob, PlanRecord,
+    PromptLayer, PromptLayerView, ProtocolWatchlistEntry, ReflectionMemoryRecord, ReflectionOrigin,
     RetentionConfig, RetentionMaintenanceRuntime, RoomMessage, RoomPollingState, RuntimeSnapshot,
     RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord,
     SpawnBootstrapView, StewardNonceState, StewardState, StewardStatusView, StorageGrowthMetrics,
@@ -131,6 +131,12 @@ pub const MAX_MEMORY_FACTS: usize = 500;
 pub const MAX_REFLECTION_MEMORY_RECORDS: usize = 64;
 /// Hard cap on the number of recent autonomy decision records retained.
 pub const MAX_DECISION_RECORDS: usize = 200;
+/// Public journal retention and prompt budgets are deliberately independent
+/// from operator debug-turn retention.
+pub const MAX_JOURNAL_ENTRIES: usize = 200;
+pub const MAX_JOURNAL_ENTRY_CHARS: usize = 2_000;
+pub const MAX_JOURNAL_CONTEXT_ENTRIES: usize = 5;
+pub const MAX_JOURNAL_CONTEXT_CHARS: usize = 4_000;
 /// Reflection lessons expire after seven days without a fresh update.
 pub const REFLECTION_MEMORY_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 /// Maximum reflection lines reserved for Situation rendering.
@@ -1582,6 +1588,65 @@ pub fn list_strategy_quarantines() -> Vec<StrategyQuarantine> {
     sqlite::list_strategy_quarantines(1_000).unwrap_or_default()
 }
 
+pub fn append_journal_entry(
+    turn_id: &str,
+    text: &str,
+    genesis: bool,
+) -> Result<JournalEntry, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("journal text cannot be empty".to_string());
+    }
+    if text.chars().count() > MAX_JOURNAL_ENTRY_CHARS {
+        return Err(format!(
+            "journal text exceeds {MAX_JOURNAL_ENTRY_CHARS} characters"
+        ));
+    }
+    if serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|object| object.contains_key("trigger") && object.contains_key("outcome"))
+    {
+        return Err("journal text cannot contain a decision envelope".to_string());
+    }
+    let turn_id = turn_id.trim();
+    if turn_id.is_empty() {
+        return Err("journal turn_id cannot be empty".to_string());
+    }
+    sqlite::append_journal_entry(turn_id, now_ns(), text, genesis, MAX_JOURNAL_ENTRIES)
+}
+
+pub fn list_recent_journal_entries(limit: usize) -> Vec<JournalEntry> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    sqlite::list_recent_journal_entries(limit.min(MAX_JOURNAL_ENTRIES)).unwrap_or_default()
+}
+
+pub fn journal_count() -> usize {
+    sqlite::count_journal_entries().unwrap_or(0)
+}
+
+/// Renders newest public entries in chronological reading order under a hard
+/// character ceiling so the being's own voice remains a bounded few-shot.
+pub fn journal_brief_for_context() -> Vec<String> {
+    let mut entries = list_recent_journal_entries(MAX_JOURNAL_CONTEXT_ENTRIES);
+    entries.reverse();
+    let mut used = 0usize;
+    let mut lines = Vec::new();
+    for entry in entries {
+        let remaining = MAX_JOURNAL_CONTEXT_CHARS.saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        let rendered = format!("- [{}] {}", entry.turn_id, entry.text);
+        let bounded = truncate_to_chars(&rendered, remaining);
+        used = used.saturating_add(bounded.chars().count());
+        lines.push(bounded);
+    }
+    lines
+}
+
 pub fn append_decision_record(record: DecisionRecord) -> Result<DecisionRecord, String> {
     validate_decision_record(&record)?;
     sqlite::append_decision_record(&record, MAX_DECISION_RECORDS)?;
@@ -1817,7 +1882,8 @@ pub fn steward_status_view() -> StewardStatusView {
 
 pub fn set_spawn_bootstrap_metadata(view: SpawnBootstrapView) -> SpawnBootstrapView {
     let mut snapshot = runtime_snapshot();
-    if snapshot.genesis_constitution.is_none() {
+    let is_first_genesis = snapshot.genesis_constitution.is_none();
+    if is_first_genesis {
         snapshot.spawn_contract_version = view.contract_version;
         snapshot.genesis_name = view.name.clone();
         snapshot.genesis_constitution = view.constitution.clone();
@@ -1835,7 +1901,54 @@ pub fn set_spawn_bootstrap_metadata(view: SpawnBootstrapView) -> SpawnBootstrapV
     snapshot.installed_version_commit = view.version_commit.clone();
     snapshot.last_transition_at_ns = now_ns();
     save_runtime_snapshot(&snapshot);
+    if is_first_genesis && journal_count() == 0 {
+        if let (Some(name), Some(constitution)) =
+            (view.name.as_deref(), view.constitution.as_deref())
+        {
+            seed_genesis_journal(name, constitution);
+        }
+    }
     view
+}
+
+fn seed_genesis_journal(name: &str, constitution: &str) {
+    // The constitution is already progenitor-authored and public. Reusing its
+    // opening passages seeds voice without adding a paid inference call or a
+    // new provider failure mode to genesis.
+    let passages = genesis_journal_passages(constitution);
+    let prefixes = [
+        format!("I arrive as {}. ", name.trim()),
+        "I carry this conviction: ".to_string(),
+        "I begin with this boundary: ".to_string(),
+    ];
+    for (index, passage) in passages.iter().enumerate() {
+        let text = truncate_to_chars(
+            &format!("{}{}.", prefixes[index], passage),
+            MAX_JOURNAL_ENTRY_CHARS,
+        );
+        let _ = append_journal_entry(&format!("genesis-{}", index + 1), &text, true);
+    }
+}
+
+fn genesis_journal_passages(constitution: &str) -> Vec<String> {
+    let mut passages = constitution
+        .split_terminator(['.', '!', '?'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .take(3)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if passages.len() < 2 {
+        let characters = constitution.trim().chars().collect::<Vec<_>>();
+        let chunk_size = characters.len().div_ceil(3).max(1);
+        passages = characters
+            .chunks(chunk_size)
+            .take(3)
+            .map(|chunk| chunk.iter().collect::<String>().trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+    }
+    passages
 }
 
 pub fn genesis_identity() -> (Option<String>, Option<String>) {
@@ -5846,6 +5959,7 @@ pub fn observability_snapshot(limit: usize) -> ObservabilitySnapshot {
         turn_window_summaries,
         memory_rollups,
         cycles,
+        recent_decisions: list_recent_decisions(bounded_limit),
         recent_turns: list_turns(bounded_limit),
         recent_transitions: list_recent_transitions(bounded_limit),
         recent_jobs: list_recent_jobs(bounded_limit),
@@ -7087,5 +7201,58 @@ mod tests {
                 .is_none(),
             "task runtime should clear pending job reference"
         );
+    }
+
+    #[test]
+    fn journal_is_bounded_append_only_and_context_is_capped() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+
+        for index in 0..(MAX_JOURNAL_ENTRIES + 3) {
+            append_journal_entry(
+                &format!("turn-{index}"),
+                &format!("I observed bounded event {index}."),
+                false,
+            )
+            .expect("journal append");
+        }
+
+        let entries = list_recent_journal_entries(MAX_JOURNAL_ENTRIES + 10);
+        assert_eq!(entries.len(), MAX_JOURNAL_ENTRIES);
+        assert_eq!(
+            entries.first().map(|entry| entry.turn_id.as_str()),
+            Some("turn-202")
+        );
+        assert_eq!(
+            entries.last().map(|entry| entry.turn_id.as_str()),
+            Some("turn-3")
+        );
+        assert!(journal_brief_for_context().len() <= MAX_JOURNAL_CONTEXT_ENTRIES);
+        assert!(
+            journal_brief_for_context().join("\n").chars().count() <= MAX_JOURNAL_CONTEXT_CHARS
+        );
+    }
+
+    #[test]
+    fn journal_rejects_empty_and_oversized_text() {
+        sqlite::close_storage().expect("reset sqlite");
+        init_storage();
+        assert!(append_journal_entry("turn-empty", "  ", false).is_err());
+        let oversized = "x".repeat(MAX_JOURNAL_ENTRY_CHARS + 1);
+        assert!(append_journal_entry("turn-large", &oversized, false).is_err());
+        assert!(append_journal_entry(
+            "turn-envelope",
+            r#"{"trigger":"scheduled_review","outcome":{"NoOp":{"reason":"none"}}}"#,
+            false,
+        )
+        .is_err());
+        assert_eq!(journal_count(), 0);
+    }
+
+    #[test]
+    fn genesis_journal_splits_constitution_without_sentence_punctuation() {
+        let entries = genesis_journal_passages(&"conviction ".repeat(50));
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|entry| !entry.trim().is_empty()));
     }
 }

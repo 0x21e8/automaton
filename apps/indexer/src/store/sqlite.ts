@@ -8,6 +8,8 @@ import type {
   AutomatonSummary,
   AutomatonTier,
   ChainSlug,
+  JournalEntry,
+  JournalPage,
   MonologueEntry,
   MonologuePage,
   RoomMessage,
@@ -52,6 +54,11 @@ export interface MonologueQuery {
   limit: number;
 }
 
+export interface JournalQuery {
+  before?: number;
+  limit: number;
+}
+
 export interface RoomMessageStoreQuery {
   afterSeq?: number;
   limit: number;
@@ -68,6 +75,7 @@ export interface StoreHealth {
     trackedCanisters: number;
     automatons: number;
     monologueEntries: number;
+    journalEntries: number;
     spawnSessions: number;
     spawnedAutomatonRegistryRecords: number;
   };
@@ -111,6 +119,8 @@ export interface IndexerStore {
   upsertAutomaton(detail: AutomatonDetail): Promise<void>;
   listMonologue(canisterId: string, query: MonologueQuery): Promise<MonologuePage>;
   appendMonologue(canisterId: string, entries: MonologueEntry[]): Promise<void>;
+  listJournal(canisterId: string, query: JournalQuery): Promise<JournalPage>;
+  appendJournal(canisterId: string, entries: JournalEntry[]): Promise<void>;
   getLatestRoomMessageSeq(): Promise<number | null>;
   listRoomMessages(query: RoomMessageStoreQuery): Promise<RoomMessagePage>;
   upsertRoomMessages(messages: RoomMessage[], latestSeq: number | null): Promise<void>;
@@ -341,6 +351,9 @@ class BetterSqliteStore implements IndexerStore {
     const monologueCountRow = database
       .prepare<{ count: number }>("SELECT COUNT(*) AS count FROM monologue;")
       .get();
+    const journalCountRow = database
+      .prepare<{ count: number }>("SELECT COUNT(*) AS count FROM journal_entries;")
+      .get();
     const spawnSessionCountRow = database
       .prepare<{ count: number }>("SELECT COUNT(*) AS count FROM spawn_sessions;")
       .get();
@@ -367,6 +380,7 @@ class BetterSqliteStore implements IndexerStore {
         trackedCanisters: Number(trackedCanisterCountRow?.count ?? 0),
         automatons: Number(automatonCountRow?.count ?? 0),
         monologueEntries: Number(monologueCountRow?.count ?? 0),
+        journalEntries: Number(journalCountRow?.count ?? 0),
         spawnSessions: Number(spawnSessionCountRow?.count ?? 0),
         spawnedAutomatonRegistryRecords: Number(spawnRegistryCountRow?.count ?? 0)
       }
@@ -519,12 +533,14 @@ class BetterSqliteStore implements IndexerStore {
     const monologue = await this.listMonologue(canisterId, {
       limit: 50
     });
+    const journal = await this.listJournal(canisterId, { limit: 50 });
 
     return {
       ...detail,
       constitution: constitutionResult.constitution,
       constitutionVerification: constitutionResult.verification,
-      monologue: monologue.entries
+      monologue: monologue.entries,
+      journal: journal.entries
     };
   }
 
@@ -625,6 +641,51 @@ class BetterSqliteStore implements IndexerStore {
     });
 
     insertEntries(entries);
+  }
+
+  async listJournal(canisterId: string, query: JournalQuery): Promise<JournalPage> {
+    await this.initialize();
+    const database = this.getDatabase();
+    const clauses = ["canister_id = ?"];
+    const parameters: SqliteValue[] = [canisterId];
+    if (query.before !== undefined) {
+      clauses.push("entry_id < ?");
+      parameters.push(query.before);
+    }
+    parameters.push(query.limit + 1);
+    const rows = database
+      .prepare<{ entry_json: string }>(
+        `SELECT entry_json FROM journal_entries
+         WHERE ${clauses.join(" AND ")}
+         ORDER BY entry_id DESC LIMIT ?;`
+      )
+      .all(...parameters);
+    const hasMore = rows.length > query.limit;
+    const entries = rows.slice(0, query.limit).map((row) => JSON.parse(row.entry_json) as JournalEntry);
+    return {
+      entries,
+      hasMore,
+      nextCursor: hasMore ? entries.at(-1)?.id ?? null : null
+    };
+  }
+
+  async appendJournal(canisterId: string, entries: JournalEntry[]) {
+    await this.initialize();
+    if (entries.length === 0) return;
+    const database = this.getDatabase();
+    const statement = database.prepare(
+      `INSERT INTO journal_entries (canister_id, entry_id, timestamp, turn_id, entry_json)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(canister_id, entry_id) DO UPDATE SET
+         timestamp = excluded.timestamp,
+         turn_id = excluded.turn_id,
+         entry_json = excluded.entry_json;`
+    );
+    database.transaction((records: JournalEntry[]) => {
+      for (const entry of records) {
+        statement.run(canisterId, entry.id, entry.timestamp, entry.turnId, JSON.stringify(entry));
+      }
+    })(entries);
   }
 
   async getLatestRoomMessageSeq() {

@@ -1,5 +1,6 @@
 import type {
   AutomatonDetail,
+  JournalEntry,
   MonologueEntry,
   RealtimeEvent,
   RoomMessage,
@@ -55,9 +56,11 @@ export interface CanisterPollSnapshot {
   currentDetailAvailable: boolean;
   identity: PollRunSnapshot;
   lastIndexedMonologueCount: number;
+  lastIndexedJournalCount: number;
   lastObservedTurnId: string | null;
   lastPersistedAt: number | null;
   monologue: PollRunSnapshot;
+  journal: PollRunSnapshot;
   runtime: PollRunSnapshot;
 }
 
@@ -85,8 +88,10 @@ function createCanisterPollSnapshot(): CanisterPollSnapshot {
     identity: createPollRunSnapshot(),
     runtime: createPollRunSnapshot(),
     monologue: createPollRunSnapshot(),
+    journal: createPollRunSnapshot(),
     lastPersistedAt: null,
     lastIndexedMonologueCount: 0,
+    lastIndexedJournalCount: 0,
     lastObservedTurnId: null,
     currentDetailAvailable: false
   };
@@ -159,8 +164,9 @@ export class AutomatonIndexer {
     this.schedule(this.config.slowPollIntervalMs, () => this.pollIdentityNow());
     this.schedule(this.config.fastPollIntervalMs, () => this.pollRuntimeNow());
     this.schedule(this.config.fastPollIntervalMs, () => this.pollMonologueNow());
+    this.schedule(this.config.fastPollIntervalMs, () => this.pollJournalNow());
     this.schedule(this.config.pricePollIntervalMs, () => this.refreshPriceNow());
-    this.schedule(this.config.slowPollIntervalMs, () => this.syncFactoryRegistryNow());
+    this.schedule(this.config.fastPollIntervalMs, () => this.syncFactoryRegistryNow());
     this.schedule(this.config.slowPollIntervalMs, () => this.pollRoomNow());
   }
 
@@ -186,7 +192,8 @@ export class AutomatonIndexer {
             ...entry,
             identity: { ...entry.identity },
             runtime: { ...entry.runtime },
-            monologue: { ...entry.monologue }
+            monologue: { ...entry.monologue },
+            journal: { ...entry.journal }
           }
         ])
       )
@@ -201,96 +208,26 @@ export class AutomatonIndexer {
 
   async pollIdentityNow() {
     for (const canisterId of await this.listTrackedCanisterIds()) {
-      await this.runPoll(canisterId, "identity", async () => {
-        const existingDetail = await this.store.getAutomatonDetail(canisterId);
-        const registryRecord =
-          await this.store.getSpawnedAutomatonRegistryRecord(canisterId);
-        const spawnSession =
-          registryRecord === null
-            ? null
-            : await this.store.getSpawnSessionDetail(registryRecord.sessionId);
-        const identity = await this.client.readIdentityConfig(canisterId);
-        const detail = normalizeAutomatonDetail({
-          canisterId,
-          config: this.config.ingestion,
-          existingDetail,
-          identity,
-          now: Date.now(),
-          registryRecord,
-          spawnModel: spawnSession?.session.config.provider.model ?? null,
-          ethUsd: this.snapshot.price?.ethUsd ?? null
-        });
-
-        await this.persistDetail(canisterId, existingDetail, detail);
-      });
+      await this.pollIdentityFor(canisterId);
     }
   }
 
   async pollRuntimeNow() {
     for (const canisterId of await this.listTrackedCanisterIds()) {
-      await this.runPoll(canisterId, "runtime", async () => {
-        const existingDetail = await this.store.getAutomatonDetail(canisterId);
-        const registryRecord =
-          await this.store.getSpawnedAutomatonRegistryRecord(canisterId);
-        const spawnSession =
-          registryRecord === null
-            ? null
-            : await this.store.getSpawnSessionDetail(registryRecord.sessionId);
-        const runtime = await this.client.readRuntimeFinancial(canisterId);
-        const detail = normalizeAutomatonDetail({
-          canisterId,
-          config: this.config.ingestion,
-          existingDetail,
-          now: Date.now(),
-          registryRecord,
-          runtime,
-          spawnModel: spawnSession?.session.config.provider.model ?? null,
-          ethUsd: this.snapshot.price?.ethUsd ?? null
-        });
-
-        await this.persistDetail(canisterId, existingDetail, detail);
-      });
+      await this.pollRuntimeFor(canisterId);
     }
   }
 
   async pollMonologueNow() {
     for (const canisterId of await this.listTrackedCanisterIds()) {
-      await this.runPoll(canisterId, "monologue", async () => {
-        const turns = await this.client.readRecentTurns(canisterId);
-        const entries = normalizeMonologueEntries(turns.recentTurns);
-        const existingEntries = await this.store.listMonologue(canisterId, {
-          limit: Math.max(entries.length * 4, 50)
-        });
-        const existingKeys = new Set(
-          existingEntries.entries.map((entry) => this.createMonologueKey(entry))
-        );
-        const newEntries = entries.filter((entry) => {
-          return !existingKeys.has(this.createMonologueKey(entry));
-        });
+      await this.pollMonologueFor(canisterId);
+    }
+  }
 
-        await this.store.appendMonologue(canisterId, entries);
-
-        const page = await this.store.listMonologue(canisterId, {
-          limit: 50
-        });
-        const canisterSnapshot = this.ensureCanisterSnapshot(canisterId);
-        canisterSnapshot.lastIndexedMonologueCount = page.entries.length;
-        canisterSnapshot.lastObservedTurnId = page.entries[0]?.turnId ?? null;
-
-        for (const entry of newEntries.sort((left, right) => {
-          if (left.timestamp === right.timestamp) {
-            return left.turnId.localeCompare(right.turnId);
-          }
-
-          return left.timestamp - right.timestamp;
-        })) {
-          this.eventPublisher?.broadcast({
-            type: "monologue",
-            canisterId,
-            entry
-          });
-        }
-      });
+  async pollJournalNow() {
+    if (!this.client.readJournal) return;
+    for (const canisterId of await this.listTrackedCanisterIds()) {
+      await this.pollJournalFor(canisterId);
     }
   }
 
@@ -302,6 +239,7 @@ export class AutomatonIndexer {
     this.factoryDiscoveryInFlight = true;
 
     try {
+      const trackedBefore = new Set(await this.listTrackedCanisterIds());
       const records = await this.readFactoryRegistry();
       await this.store.replaceSpawnedAutomatonRegistry(records);
 
@@ -328,6 +266,15 @@ export class AutomatonIndexer {
         for (const record of records) {
           await this.autoFundSpawnedAutomaton(record.sessionId, record.evmAddress);
         }
+      }
+
+      const newlyDiscovered = new Set(
+        records
+          .map((record) => record.canisterId)
+          .filter((canisterId) => !trackedBefore.has(canisterId))
+      );
+      for (const canisterId of newlyDiscovered) {
+        await this.hydrateNewlyDiscoveredCanister(canisterId);
       }
     } finally {
       this.factoryDiscoveryInFlight = false;
@@ -393,6 +340,119 @@ export class AutomatonIndexer {
         return;
       }
     }
+  }
+
+  private async hydrateNewlyDiscoveredCanister(canisterId: string) {
+    await this.pollIdentityFor(canisterId);
+    await this.pollRuntimeFor(canisterId);
+    await this.pollMonologueFor(canisterId);
+    await this.pollJournalFor(canisterId);
+  }
+
+  private async pollIdentityFor(canisterId: string) {
+    await this.runPoll(canisterId, "identity", async () => {
+      const existingDetail = await this.store.getAutomatonDetail(canisterId);
+      const registryRecord = await this.store.getSpawnedAutomatonRegistryRecord(canisterId);
+      const spawnSession =
+        registryRecord === null
+          ? null
+          : await this.store.getSpawnSessionDetail(registryRecord.sessionId);
+      const identity = await this.client.readIdentityConfig(canisterId);
+      const detail = normalizeAutomatonDetail({
+        canisterId,
+        config: this.config.ingestion,
+        existingDetail,
+        identity,
+        now: Date.now(),
+        registryRecord,
+        spawnModel: spawnSession?.session.config.provider.model ?? null,
+        ethUsd: this.snapshot.price?.ethUsd ?? null
+      });
+
+      await this.persistDetail(canisterId, existingDetail, detail);
+    });
+  }
+
+  private async pollRuntimeFor(canisterId: string) {
+    await this.runPoll(canisterId, "runtime", async () => {
+      const existingDetail = await this.store.getAutomatonDetail(canisterId);
+      const registryRecord = await this.store.getSpawnedAutomatonRegistryRecord(canisterId);
+      const spawnSession =
+        registryRecord === null
+          ? null
+          : await this.store.getSpawnSessionDetail(registryRecord.sessionId);
+      const runtime = await this.client.readRuntimeFinancial(canisterId);
+      const detail = normalizeAutomatonDetail({
+        canisterId,
+        config: this.config.ingestion,
+        existingDetail,
+        now: Date.now(),
+        registryRecord,
+        runtime,
+        spawnModel: spawnSession?.session.config.provider.model ?? null,
+        ethUsd: this.snapshot.price?.ethUsd ?? null
+      });
+
+      await this.persistDetail(canisterId, existingDetail, detail);
+    });
+  }
+
+  private async pollMonologueFor(canisterId: string) {
+    await this.runPoll(canisterId, "monologue", async () => {
+      const turns = await this.client.readRecentTurns(canisterId);
+      const entries = normalizeMonologueEntries(turns.recentTurns);
+      const existingEntries = await this.store.listMonologue(canisterId, {
+        limit: Math.max(entries.length * 4, 50)
+      });
+      const existingKeys = new Set(
+        existingEntries.entries.map((entry) => this.createMonologueKey(entry))
+      );
+      const newEntries = entries.filter((entry) => {
+        return !existingKeys.has(this.createMonologueKey(entry));
+      });
+
+      await this.store.appendMonologue(canisterId, entries);
+
+      const page = await this.store.listMonologue(canisterId, { limit: 50 });
+      const canisterSnapshot = this.ensureCanisterSnapshot(canisterId);
+      canisterSnapshot.lastIndexedMonologueCount = page.entries.length;
+      canisterSnapshot.lastObservedTurnId = page.entries[0]?.turnId ?? null;
+
+      for (const entry of newEntries.sort((left, right) => {
+        if (left.timestamp === right.timestamp) {
+          return left.turnId.localeCompare(right.turnId);
+        }
+
+        return left.timestamp - right.timestamp;
+      })) {
+        this.eventPublisher?.broadcast({ type: "monologue", canisterId, entry });
+      }
+    });
+  }
+
+  private async pollJournalFor(canisterId: string) {
+    const readJournal = this.client.readJournal?.bind(this.client);
+    if (!readJournal) return;
+    await this.runPoll(canisterId, "journal", async () => {
+      const response = await readJournal(canisterId);
+      const entries: JournalEntry[] = response.entries.map((entry) => ({
+        id: Number(entry.id),
+        turnId: entry.turn_id,
+        timestamp: Math.floor(Number(entry.timestamp_ns) / 1_000_000),
+        text: entry.text,
+        genesis: entry.genesis ?? false
+      }));
+      const existing = await this.store.listJournal(canisterId, { limit: 200 });
+      const existingIds = new Set(existing.entries.map((entry) => entry.id));
+      const newEntries = entries.filter((entry) => !existingIds.has(entry.id));
+      await this.store.appendJournal(canisterId, entries);
+
+      const page = await this.store.listJournal(canisterId, { limit: 50 });
+      this.ensureCanisterSnapshot(canisterId).lastIndexedJournalCount = page.entries.length;
+      for (const entry of newEntries.sort((left, right) => left.id - right.id)) {
+        this.eventPublisher?.broadcast({ type: "journal", canisterId, entry });
+      }
+    });
   }
 
   private async persistDetail(
@@ -461,7 +521,7 @@ export class AutomatonIndexer {
 
   private async runPoll(
     canisterId: string,
-    phase: "identity" | "runtime" | "monologue",
+    phase: "identity" | "runtime" | "monologue" | "journal",
     operation: () => Promise<void>
   ) {
     const canisterSnapshot = this.ensureCanisterSnapshot(canisterId);

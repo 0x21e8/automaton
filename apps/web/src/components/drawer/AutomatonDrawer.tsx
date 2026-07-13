@@ -385,6 +385,7 @@ export function AutomatonDrawer({
           {activeSection === "activity" ? (
             <MonologuePanel
               entries={automaton?.monologue ?? []}
+              journalEntries={automaton?.journal ?? []}
               errorMessage={errorMessage}
               isLoading={isLoading}
               selectedCanisterId={selectedCanisterId}

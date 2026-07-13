@@ -6,10 +6,11 @@
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, ActiveExposure, AutonomyPolicy, ConversationEntry,
     ConversationLog, DecisionRecord, ExposureReconciliationStatus, GoalRecord, InboxMessage,
-    MemoryFact, OutboxMessage, PendingStrategyDiscoveryJob, PlanRecord, ReflectionMemoryRecord,
-    RuntimeSnapshot, ScheduledJob, SchedulerRuntime, SkillRecord, StrategyDiscoveryCallbackRecord,
-    StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass, TaskKind,
-    TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord, TransitionLogRecord, TurnRecord,
+    JournalEntry, MemoryFact, OutboxMessage, PendingStrategyDiscoveryJob, PlanRecord,
+    ReflectionMemoryRecord, RuntimeSnapshot, ScheduledJob, SchedulerRuntime, SkillRecord,
+    StrategyDiscoveryCallbackRecord, StrategyQuarantine, StrategyTemplate, StrategyTemplateKey,
+    SurvivalOperationClass, TaskKind, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
+    TransitionLogRecord, TurnRecord,
 };
 use crate::features::cycle_topup::TopUpStage;
 #[cfg(target_arch = "wasm32")]
@@ -21,7 +22,7 @@ use serde_json::{Map as JsonMap, Number as JsonNumber};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 const MIGRATION_001_BASE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -47,6 +48,15 @@ CREATE TABLE IF NOT EXISTS turns (
     payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_turns_created_at ON turns(created_at_ns);
+
+CREATE TABLE IF NOT EXISTS journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id TEXT NOT NULL,
+    timestamp_ns INTEGER NOT NULL,
+    genesis INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_journal_timestamp ON journal(timestamp_ns DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS tool_calls (
     turn_id TEXT NOT NULL,
@@ -353,6 +363,17 @@ CREATE INDEX IF NOT EXISTS idx_strategy_discovery_completed_callback_jobs_accept
     ON strategy_discovery_completed_callback_jobs(accepted_at_ns);
 "#;
 
+const MIGRATION_009_JOURNAL_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id TEXT NOT NULL,
+    timestamp_ns INTEGER NOT NULL,
+    genesis INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_journal_timestamp ON journal(timestamp_ns DESC, id DESC);
+"#;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
     use super::{
@@ -360,6 +381,7 @@ mod backend {
         MIGRATION_003_REMAINING_SCHEMA, MIGRATION_004_REFLECTION_MEMORY_SCHEMA,
         MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA, MIGRATION_006_GOALS_SCHEMA,
         MIGRATION_007_PLANS_SCHEMA, MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA,
+        MIGRATION_009_JOURNAL_SCHEMA,
     };
     use rusqlite::{params, Connection};
     use std::cell::RefCell;
@@ -420,6 +442,8 @@ mod backend {
             .map_err(|err| err.to_string())?;
         conn.execute_batch(MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA)
             .map_err(|err| err.to_string())?;
+        conn.execute_batch(MIGRATION_009_JOURNAL_SCHEMA)
+            .map_err(|err| err.to_string())?;
         let version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -446,6 +470,7 @@ mod backend {
         MIGRATION_003_REMAINING_SCHEMA, MIGRATION_004_REFLECTION_MEMORY_SCHEMA,
         MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA, MIGRATION_006_GOALS_SCHEMA,
         MIGRATION_007_PLANS_SCHEMA, MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA,
+        MIGRATION_009_JOURNAL_SCHEMA,
     };
 
     pub type SqlResult<T> = Result<T, String>;
@@ -467,6 +492,8 @@ mod backend {
             conn.execute_batch(MIGRATION_007_PLANS_SCHEMA)
                 .map_err(|err| err.to_string())?;
             conn.execute_batch(MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA)
+                .map_err(|err| err.to_string())?;
+            conn.execute_batch(MIGRATION_009_JOURNAL_SCHEMA)
                 .map_err(|err| err.to_string())?;
             let version: i64 = conn
                 .query_row(
@@ -2020,6 +2047,7 @@ pub fn table_count(table: &str) -> Result<u64, String> {
     let table_name = match table {
         "transitions"
         | "turns"
+        | "journal"
         | "tool_calls"
         | "inbox"
         | "outbox"
@@ -3079,6 +3107,62 @@ pub fn count_strategy_quarantines() -> Result<usize, String> {
     table_count_extended("strategy_quarantines").map(|count| count as usize)
 }
 
+pub fn append_journal_entry(
+    turn_id: &str,
+    timestamp_ns: u64,
+    text: &str,
+    genesis: bool,
+    keep_max: usize,
+) -> Result<JournalEntry, String> {
+    backend::with_connection(|conn| {
+        let next_id: i64 = conn
+            .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM journal", [], |row| {
+                row.get(0)
+            })
+            .map_err(|err| err.to_string())?;
+        let entry = JournalEntry {
+            id: next_id as u64,
+            turn_id: turn_id.to_string(),
+            timestamp_ns,
+            text: text.to_string(),
+            genesis,
+        };
+        let payload_json = row_payload(&entry)?;
+        conn.execute(
+            "INSERT INTO journal(id, turn_id, timestamp_ns, genesis, payload_json) VALUES(?1, ?2, ?3, ?4, ?5)",
+            (next_id, turn_id, timestamp_ns as i64, i64::from(genesis), payload_json),
+        )
+        .map_err(|err| err.to_string())?;
+        conn.execute(
+            "DELETE FROM journal WHERE id NOT IN (SELECT id FROM journal ORDER BY id DESC LIMIT ?1)",
+            [keep_max.min(i64::MAX as usize) as i64],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(entry)
+    })
+}
+
+pub fn list_recent_journal_entries(limit: usize) -> Result<Vec<JournalEntry>, String> {
+    let keep = bounded_limit(limit, 25, 200);
+    backend::with_connection(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT payload_json FROM journal ORDER BY id DESC LIMIT ?1")
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map([keep as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(from_payload_json(row.map_err(|err| err.to_string())?)?);
+        }
+        Ok(entries)
+    })
+}
+
+pub fn count_journal_entries() -> Result<usize, String> {
+    table_count_extended("journal").map(|count| count as usize)
+}
+
 pub fn append_decision_record(record: &DecisionRecord, keep_max: usize) -> Result<(), String> {
     let payload_json = row_payload(record)?;
     backend::with_connection(|conn| {
@@ -3586,6 +3670,7 @@ pub fn table_count_extended(table: &str) -> Result<u64, String> {
     let table_name = match table {
         "transitions"
         | "turns"
+        | "journal"
         | "tool_calls"
         | "inbox"
         | "outbox"

@@ -33,6 +33,18 @@ CREATE TABLE IF NOT EXISTS monologue (
 CREATE INDEX IF NOT EXISTS monologue_canister_ts_idx
   ON monologue (canister_id, timestamp DESC);
 
+CREATE TABLE IF NOT EXISTS journal_entries (
+  canister_id TEXT NOT NULL,
+  entry_id INTEGER NOT NULL,
+  timestamp INTEGER NOT NULL,
+  turn_id TEXT NOT NULL,
+  entry_json TEXT NOT NULL,
+  PRIMARY KEY (canister_id, entry_id)
+);
+
+CREATE INDEX IF NOT EXISTS journal_entries_canister_id_idx
+  ON journal_entries (canister_id, entry_id DESC);
+
 CREATE TABLE IF NOT EXISTS ens_cache (
   address TEXT PRIMARY KEY,
   ens_name TEXT,

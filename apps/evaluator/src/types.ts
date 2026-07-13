@@ -8,6 +8,7 @@ import type {
   EvaluationDashboardCyclesPoint,
   EvaluationDashboardRun,
   EvaluationExperiment,
+  EvaluationMetric,
   EvaluationReportMetadata,
   EvaluationRunEvent,
   EvaluationRunMetadata,
@@ -188,6 +189,7 @@ export interface SampleContext {
   automatonClient: AutomatonClientLike;
   evmClient: EvmClientLike;
   config: EvaluatorConfig;
+  metrics: readonly EvaluationMetric[];
 }
 
 export interface SampleResult {

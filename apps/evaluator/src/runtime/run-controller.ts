@@ -539,7 +539,8 @@ export class RunController {
           indexerClient: this.deps.indexerClient,
           automatonClient: this.deps.automatonClient,
           evmClient: this.deps.evmClient,
-          config: this.deps.config
+          config: this.deps.config,
+          metrics: this.requireRun().experiment.parsed.metrics ?? []
         });
 
         if (!baselineSampleIsReady(sampleResult.sample)) {
@@ -607,7 +608,8 @@ export class RunController {
           indexerClient: this.deps.indexerClient,
           automatonClient: this.deps.automatonClient,
           evmClient: this.deps.evmClient,
-          config: this.deps.config
+          config: this.deps.config,
+          metrics: run.experiment.parsed.metrics ?? []
         });
 
         automaton.childCommit ??= evidence.buildInfo.commit ?? null;

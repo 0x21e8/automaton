@@ -185,6 +185,20 @@ export interface MonologuePage {
   nextCursor: number | null;
 }
 
+export interface JournalEntry {
+  id: number;
+  turnId: string;
+  timestamp: number;
+  text: string;
+  genesis: boolean;
+}
+
+export interface JournalPage {
+  entries: JournalEntry[];
+  hasMore: boolean;
+  nextCursor: number | null;
+}
+
 export interface AutomatonListResponse {
   automatons: AutomatonSummary[];
   total: number;
@@ -207,6 +221,7 @@ export interface AutomatonDetail extends AutomatonSummary {
   skills: SkillSelection[];
   promptLayers: string[];
   monologue: MonologueEntry[];
+  journal?: JournalEntry[];
   spawnSelection?: AutomatonSpawnSelection | null;
   childIds: string[];
   lastPolledAt: number;

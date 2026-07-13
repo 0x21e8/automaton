@@ -567,6 +567,7 @@ type ObservabilitySnapshot = record {
   captured_at_ns : nat64;
   turn_window_summaries : vec TurnWindowSummary;
   storage_growth : StorageGrowthMetrics;
+  recent_decisions : vec DecisionRecord;
   outbox_messages : vec OutboxMessage;
   runtime : RuntimeView;
   session_summaries : vec SessionSummary;

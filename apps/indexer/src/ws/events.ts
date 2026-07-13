@@ -34,6 +34,7 @@ function extractEventCanisterIds(event: RealtimeEvent) {
     case "update":
     case "action":
     case "monologue":
+    case "journal":
     case "offline":
       return [event.canisterId];
     case "message":

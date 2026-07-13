@@ -268,7 +268,7 @@ describe("drawer messaging", () => {
     expect(markup).toContain("Select an automaton to inspect status and logs.");
   });
 
-  it("labels empty monologue state as polling-backed indexed history", () => {
+  it("shows the public journal by default and keeps operator debug reachable", () => {
     const markup = renderToStaticMarkup(
       <MonologuePanel
         entries={[]}
@@ -278,16 +278,13 @@ describe("drawer messaging", () => {
       />
     );
 
-    expect(markup).toContain("Live Activity");
-    expect(markup).toContain("Condensed from indexed turns");
-    expect(markup).toContain("Important");
-    expect(markup).toContain("All");
-    expect(markup).toContain(
-      "No indexed turns yet. Recent activity appears after the next successful poll."
-    );
+    expect(markup).toContain("Public Journal");
+    expect(markup).toContain("The being&#x27;s own public voice");
+    expect(markup).toContain("Operator debug");
+    expect(markup).toContain("No public journal entries yet.");
   });
 
-  it("renders condensed activity headlines and hides raw detail by default", () => {
+  it("renders first-person journal entries instead of debug turns by default", () => {
     const markup = renderToStaticMarkup(
       <MonologuePanel
         entries={[
@@ -305,16 +302,23 @@ describe("drawer messaging", () => {
             error: null
           }
         ]}
+        journalEntries={[
+          {
+            id: 7,
+            timestamp: 1_700_000_100_000,
+            turnId: "turn-1",
+            text: "I moved toward the active LP after the evidence changed.",
+            genesis: false
+          }
+        ]}
         errorMessage={null}
         isLoading={false}
         selectedCanisterId="txyno-ch777-77776-aaaaq-cai"
       />
     );
 
-    expect(markup).toContain("Rebalanced exposure toward the active LP");
-    expect(markup).toContain("2 tools");
-    expect(markup).toContain("Show");
-    expect(markup).not.toContain("with a two-step swap");
+    expect(markup).toContain("I moved toward the active LP");
+    expect(markup).not.toContain("Rebalanced exposure toward the active LP");
   });
 
   it("shows lifetime and the configured model in the details section", () => {

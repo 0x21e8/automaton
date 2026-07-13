@@ -476,7 +476,7 @@ fn summarize_tool_call(call: &ToolCallRecord) -> String {
 }
 
 fn tool_record_counts_as_bounded_exploration_action(record: &ToolCallRecord) -> bool {
-    record.success && record.outcome == ToolCallOutcome::Executed && record.tool != "record_signal"
+    record.success && record.outcome == ToolCallOutcome::Executed && record.tool != "journal"
 }
 
 fn exploration_action_summary_from_tool_records(records: &[ToolCallRecord]) -> Option<String> {
@@ -571,15 +571,6 @@ fn render_tool_results_reply(tool_calls: &[ToolCallRecord]) -> Option<String> {
         lines.push(format!("- {}", summarize_tool_call(call)));
     }
     Some(lines.join("\n"))
-}
-
-/// Extracts the `"signal"` value from a `record_signal` tool call's args JSON.
-fn extract_signal_payload(args_json: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(args_json).ok()?;
-    value
-        .get("signal")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
 }
 
 /// Normalises a tool-call args string to canonical JSON so that fingerprints
@@ -1842,11 +1833,12 @@ fn proxy_wait_fail_close_reply(state: &InboxProxyWaitState) -> String {
         .pending_job_id
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    format!("Unable to complete async inference in time (job_id={job}). Please retry your request.")
+    format!("My inference window closed before completion (job_id={job}). A later paid message can reopen the correspondence.")
 }
 
 fn missing_final_reply_fallback() -> String {
-    "I could not produce a final answer for your request. Please try again.".to_string()
+    "I produced no final reply in this turn. A later paid message can reopen the correspondence."
+        .to_string()
 }
 
 // ── Context builders ─────────────────────────────────────────────────────────
@@ -2649,6 +2641,7 @@ fn build_dynamic_context_with_scope(
     let autonomy_policy_section = render_autonomy_policy_section(&autonomy_policy);
     let recent_decisions_section = render_recent_decisions_section(&recent_decisions);
     let reflection_lines = stable::reflection_brief_for_context(now_ns);
+    let journal_lines = stable::journal_brief_for_context();
     let strategy_discovery_section = render_strategy_discovery_context_section(now_ns);
 
     let memory_section = if memory_facts.is_empty() && memory_rollups.is_empty() {
@@ -2689,7 +2682,7 @@ fn build_dynamic_context_with_scope(
 
     let mut sections = vec![
         "## Situation".to_string(),
-        "### Canonical Identity (use these exact values in tool arguments)".to_string(),
+        "### Canonical Identity".to_string(),
         format!("- self_canister_id: {self_principal_display}"),
         format!("- self_evm_address: {self_evm_address}"),
         "### Current State".to_string(),
@@ -2744,6 +2737,14 @@ fn build_dynamic_context_with_scope(
         build_conversation_context(staged_messages, conversation_history_limit),
         memory_section,
     ];
+    sections.push(if journal_lines.is_empty() {
+        "### My Recent Journal (Public Voice Few-Shot)\n- no entries yet".to_string()
+    } else {
+        format!(
+            "### My Recent Journal (Public Voice Few-Shot)\n{}",
+            journal_lines.join("\n")
+        )
+    });
     sections.push(build_active_goals_section());
     sections.push(build_active_plans_section());
     sections.push(render_autonomy_exploration_section(exploration_state));
@@ -2767,8 +2768,7 @@ fn build_dynamic_context_with_scope(
 fn build_active_goals_section() -> String {
     let goals = stable::list_active_goals();
     if goals.is_empty() {
-        return "### Active Goals\n- none — use `set_goal` to define what you are working toward"
-            .to_string();
+        return "### Active Goals\n- none recorded".to_string();
     }
     let mut lines = vec!["### Active Goals".to_string()];
     for goal in &goals {
@@ -2783,8 +2783,7 @@ fn build_active_goals_section() -> String {
 fn build_active_plans_section() -> String {
     let plans = stable::list_active_plans();
     if plans.is_empty() {
-        return "### Active Plans\n- none — use `create_plan` to decompose a goal into steps"
-            .to_string();
+        return "### Active Plans\n- none recorded".to_string();
     }
     let mut lines = vec!["### Active Plans".to_string()];
     for plan in &plans {
@@ -2817,7 +2816,7 @@ fn render_autonomy_exploration_section(exploration_state: AutonomyExplorationSta
     ];
     if exploration_state.should_request_bounded_action() {
         lines.push(
-            "- directive: review your active goals and take at least one bounded step toward the highest-priority goal. If no goal has an actionable step, explore to create one. If you have no goals, use `set_goal` to propose one based on your capabilities and current state.".to_string(),
+            "- bounded_action_pressure: active; the highest-priority actionable goal, exploratory goal formation, or a specific evidence-backed NoOp are the available terminal paths.".to_string(),
         );
     }
     lines.push(format!(
@@ -3874,23 +3873,6 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 append_inner_dialogue(&mut inner_dialogue, &tool_results_reply);
             }
 
-            // Surface record_signal payloads into inner_dialogue so the agent's
-            // reasoning is captured even when the LLM puts its thinking into the
-            // tool call args rather than the explanation text.
-            for record in &round_tool_records {
-                if record.tool == "record_signal" && record.success {
-                    if let Some(signal) = extract_signal_payload(&record.args_json) {
-                        let trimmed = signal.trim();
-                        if !trimmed.is_empty() {
-                            append_inner_dialogue(
-                                &mut inner_dialogue,
-                                &format!("signal: {}", sanitize_preview(trimmed, 500)),
-                            );
-                        }
-                    }
-                }
-            }
-
             for record in &round_tool_records {
                 persist_reflection_memory_success_for_record(
                     &turn_id,
@@ -4570,7 +4552,7 @@ mod tests {
             },
             ToolCallRecord {
                 turn_id: "turn-1".to_string(),
-                tool: "record_signal".to_string(),
+                tool: "journal".to_string(),
                 args_json: "{}".to_string(),
                 output: "tool execution failed".to_string(),
                 success: false,
@@ -4604,21 +4586,6 @@ mod tests {
             first_reason.ends_with("..."),
             "first reason should be truncated for log safety"
         );
-    }
-
-    #[test]
-    fn extract_signal_payload_returns_signal_value() {
-        assert_eq!(
-            extract_signal_payload(r#"{"signal":"ETH price rising"}"#),
-            Some("ETH price rising".to_string()),
-        );
-    }
-
-    #[test]
-    fn extract_signal_payload_returns_none_for_missing_key() {
-        assert_eq!(extract_signal_payload(r#"{"other":"value"}"#), None);
-        assert_eq!(extract_signal_payload("invalid json"), None);
-        assert_eq!(extract_signal_payload(r#"{"signal": 42}"#), None);
     }
 
     #[test]
@@ -5206,9 +5173,7 @@ mod tests {
 
         let context = build_dynamic_context(&snapshot, &staged, 3, &memory, &[], "turn-12", 5);
         assert!(context.contains("## Situation"));
-        assert!(
-            context.contains("### Canonical Identity (use these exact values in tool arguments)")
-        );
+        assert!(context.contains("### Canonical Identity"));
         assert!(context.contains("- self_canister_id: unknown"));
         assert!(context.contains("- self_evm_address: 0x1234567890abcdef1234567890abcdef12345678"));
         assert!(context.contains("### Current State"));
@@ -5232,6 +5197,13 @@ mod tests {
         assert!(context.contains("- raw strategy=buy dips"));
         assert!(context.contains("### Available Tools"));
         assert!(context.contains("- post_room_message: calls_this_turn=0"));
+        let normalized = context.to_ascii_lowercase();
+        for servile_phrase in ["please ", "you should now", "the user wants", "directive:"] {
+            assert!(
+                !normalized.contains(servile_phrase),
+                "runtime Situation reintroduced servile phrase: {servile_phrase}"
+            );
+        }
     }
 
     #[test]
@@ -5427,8 +5399,8 @@ mod tests {
         let tool_records = vec![
             ToolCallRecord {
                 turn_id: "turn-1".to_string(),
-                tool: "record_signal".to_string(),
-                args_json: r#"{"signal":"exploration"}"#.to_string(),
+                tool: "journal".to_string(),
+                args_json: r#"{"text":"I explored a bounded possibility."}"#.to_string(),
                 output: "ok".to_string(),
                 success: true,
                 outcome: ToolCallOutcome::Executed,
@@ -6253,7 +6225,7 @@ mod tests {
             &[
                 ToolCallRecord {
                     turn_id: turn_id.to_string(),
-                    tool: "record_signal".to_string(),
+                    tool: "journal".to_string(),
                     args_json: "{}".to_string(),
                     output: "ok".to_string(),
                     success: true,
@@ -6263,7 +6235,7 @@ mod tests {
                 },
                 ToolCallRecord {
                     turn_id: turn_id.to_string(),
-                    tool: "record_signal".to_string(),
+                    tool: "journal".to_string(),
                     args_json: "{}".to_string(),
                     output: "ok".to_string(),
                     success: true,
@@ -6286,7 +6258,7 @@ mod tests {
 
         let snapshot = stable::runtime_snapshot();
         let context = build_dynamic_context(&snapshot, &[], 0, &[], &[], turn_id, 5);
-        assert!(context.contains("- record_signal: calls_this_turn=2"));
+        assert!(context.contains("- journal: calls_this_turn=2"));
         assert!(context.contains("- evm_read: calls_this_turn=1"));
     }
 
@@ -6536,7 +6508,7 @@ mod tests {
         assert!(
             outbox[0]
                 .body
-                .contains("Unable to complete async inference in time"),
+                .contains("My inference window closed before completion"),
             "fail-close reply should explain async timeout"
         );
         assert_eq!(stable::inbox_stats().staged_count, 0);

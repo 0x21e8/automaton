@@ -1,5 +1,6 @@
 import type {
   AutomatonRecord,
+  JournalEntry,
   MonologueEntry
 } from "./automaton.js";
 import type { RoomMessage } from "./room.js";
@@ -14,6 +15,7 @@ export const AUTOMATON_EVENT_TYPES = [
   "action",
   "message",
   "monologue",
+  "journal",
   "offline"
 ] as const;
 
@@ -58,6 +60,12 @@ export interface AutomatonMonologueEvent {
   entry: MonologueEntry;
 }
 
+export interface AutomatonJournalEvent {
+  type: "journal";
+  canisterId: string;
+  entry: JournalEntry;
+}
+
 export interface AutomatonOfflineEvent {
   type: "offline";
   canisterId: string;
@@ -94,6 +102,7 @@ export type RealtimeEvent =
   | AutomatonActionEvent
   | AutomatonMessageEvent
   | AutomatonMonologueEvent
+  | AutomatonJournalEvent
   | AutomatonOfflineEvent
   | SpawnSessionUpdatedEvent
   | SpawnSessionCompletedEvent

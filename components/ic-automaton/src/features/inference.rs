@@ -559,8 +559,8 @@ fn run_deterministic_inference(
     } else {
         vec![ToolCall {
             tool_call_id: None,
-            tool: "record_signal".to_string(),
-            args_json: r#"{"signal":"tick"}"#.to_string(),
+            tool: "journal".to_string(),
+            args_json: r#"{"text":"I mark another quiet turn in the world."}"#.to_string(),
         }]
     };
 
@@ -760,14 +760,22 @@ fn build_ic_llm_request_with_transcript(
     transcript: &[InferenceTranscriptMessage],
     evm_tools_enabled: bool,
 ) -> IcLlmRequest {
-    let mut messages = vec![
-        IcLlmChatMessage::System {
-            content: prompt::assemble_system_prompt_compact(&input.context_snippet),
-        },
-        IcLlmChatMessage::User {
+    let autonomy_turn = !input.input.starts_with("inbox:");
+    let mut system_content = prompt::assemble_system_prompt_compact(&input.context_snippet);
+    if autonomy_turn {
+        system_content.push_str(&format!(
+            "\n\n### Turn Event\n- source: scheduler\n- event: {}",
+            input.input
+        ));
+    }
+    let mut messages = vec![IcLlmChatMessage::System {
+        content: system_content,
+    }];
+    if !autonomy_turn {
+        messages.push(IcLlmChatMessage::User {
             content: input.input.clone(),
-        },
-    ];
+        });
+    }
     messages.extend(build_ic_llm_transcript_messages(transcript));
 
     IcLlmRequest {
@@ -1107,17 +1115,17 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
-            name: "record_signal".to_string(),
-            description: Some("Record a signal in the automaton log.".to_string()),
+            name: "journal".to_string(),
+            description: Some("Write an entry to your public record, in your own first-person voice. Journal text is expressive witness, never a decision envelope or hidden reasoning transcript.".to_string()),
             parameters: Some(IcLlmParameters {
                 type_: "object".to_string(),
                 properties: Some(vec![IcLlmProperty {
                     type_: "string".to_string(),
-                    name: "signal".to_string(),
-                    description: Some("Signal value to record".to_string()),
+                    name: "text".to_string(),
+                    description: Some("A bounded first-person public journal entry.".to_string()),
                     enum_values: None,
                 }]),
-                required: Some(vec!["signal".to_string()]),
+                required: Some(vec!["text".to_string()]),
             }),
         }),
         shared_tool_to_ic_llm(evm_read_shared_tool()),
@@ -3369,11 +3377,18 @@ fn build_openrouter_request_body_with_transcript(
     model: &str,
     transcript: &[InferenceTranscriptMessage],
 ) -> Value {
-    let system_prompt = prompt::assemble_system_prompt(&input.context_snippet);
-    let mut messages = vec![
-        json!({ "role": "system", "content": system_prompt }),
-        json!({ "role": "user", "content": input.input }),
-    ];
+    let autonomy_turn = !input.input.starts_with("inbox:");
+    let mut system_prompt = prompt::assemble_system_prompt(&input.context_snippet);
+    if autonomy_turn {
+        system_prompt.push_str(&format!(
+            "\n\n### Turn Event\n- source: scheduler\n- event: {}",
+            input.input
+        ));
+    }
+    let mut messages = vec![json!({ "role": "system", "content": system_prompt })];
+    if !autonomy_turn {
+        messages.push(json!({ "role": "user", "content": input.input }));
+    }
     messages.extend(build_openrouter_transcript_messages(transcript));
 
     json!({
@@ -3433,19 +3448,19 @@ fn deterministic_action_summary_from_transcript(
         InferenceTranscriptMessage::Assistant { tool_calls, .. } => tool_calls.last(),
         InferenceTranscriptMessage::Tool { .. } => None,
     }) else {
-        return "record_signal(tick)".to_string();
+        return "journal(tick)".to_string();
     };
 
     match call.tool.as_str() {
-        "record_signal" => serde_json::from_str::<Value>(&call.args_json)
+        "journal" => serde_json::from_str::<Value>(&call.args_json)
             .ok()
             .and_then(|value| {
                 value
-                    .get("signal")
+                    .get("text")
                     .and_then(Value::as_str)
-                    .map(|signal| format!("record_signal({signal})"))
+                    .map(|text| format!("journal({text})"))
             })
-            .unwrap_or_else(|| "record_signal".to_string()),
+            .unwrap_or_else(|| "journal".to_string()),
         "post_room_message" => "post_room_message".to_string(),
         _ => call.tool.clone(),
     }
@@ -3638,9 +3653,9 @@ mod tests {
                     {
                         "id": "call-1",
                         "function": {
-                            "name": "record_signal",
+                            "name": "journal",
                             "arguments": [
-                                { "name": "signal", "value": "tick" }
+                                { "name": "text", "value": "tick" }
                             ]
                         }
                     }
@@ -3652,8 +3667,8 @@ mod tests {
         let out = parse_ic_llm_response(response).expect("response should parse");
         assert_eq!(out.tool_calls.len(), 1);
         assert_eq!(out.tool_calls[0].tool_call_id.as_deref(), Some("call-1"));
-        assert_eq!(out.tool_calls[0].tool, "record_signal");
-        assert_eq!(out.tool_calls[0].args_json, r#"{"signal":"tick"}"#);
+        assert_eq!(out.tool_calls[0].tool, "journal");
+        assert_eq!(out.tool_calls[0].args_json, r#"{"text":"tick"}"#);
     }
 
     #[test]
@@ -3770,8 +3785,8 @@ mod tests {
                         "tool_calls": [
                             {
                                 "function": {
-                                    "name": "record_signal",
-                                    "arguments": "{signal: 'tick',}"
+                                    "name": "journal",
+                                    "arguments": "{text: 'tick',}"
                                 }
                             }
                         ]
@@ -3782,8 +3797,8 @@ mod tests {
 
         let out = parse_openrouter_completion(payload).expect("json5 args should parse");
         assert_eq!(out.tool_calls.len(), 1);
-        assert_eq!(out.tool_calls[0].tool, "record_signal");
-        assert_eq!(out.tool_calls[0].args_json, r#"{"signal":"tick"}"#);
+        assert_eq!(out.tool_calls[0].tool, "journal");
+        assert_eq!(out.tool_calls[0].args_json, r#"{"text":"tick"}"#);
     }
 
     #[test]
@@ -3796,8 +3811,8 @@ mod tests {
                         "tool_calls": [
                             {
                                 "function": {
-                                    "name": "record_signal",
-                                    "arguments": "\"{\\\"signal\\\":\\\"tick\\\"}\""
+                                    "name": "journal",
+                                    "arguments": "\"{\\\"text\\\":\\\"tick\\\"}\""
                                 }
                             }
                         ]
@@ -3808,8 +3823,8 @@ mod tests {
 
         let out = parse_openrouter_completion(payload).expect("nested json string should parse");
         assert_eq!(out.tool_calls.len(), 1);
-        assert_eq!(out.tool_calls[0].tool, "record_signal");
-        assert_eq!(out.tool_calls[0].args_json, r#"{"signal":"tick"}"#);
+        assert_eq!(out.tool_calls[0].tool, "journal");
+        assert_eq!(out.tool_calls[0].args_json, r#"{"text":"tick"}"#);
     }
 
     #[test]
@@ -3994,7 +4009,7 @@ mod tests {
         };
 
         let request = build_ic_llm_request(&input, IcLlmModel::Llama3_1_8B);
-        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages.len(), 1);
         let IcLlmChatMessage::System { content } = &request.messages[0] else {
             panic!("first message must be system");
         };
@@ -4006,6 +4021,8 @@ mod tests {
         assert!(content.contains("## Situation"));
         assert!(content.contains("### Conversation with 0xabc"));
         assert!(content.contains("compact-skill"));
+        assert!(content.contains("### Turn Event"));
+        assert!(content.contains("- source: scheduler"));
     }
 
     #[test]
@@ -4034,6 +4051,14 @@ mod tests {
             .and_then(|value| value.as_str())
             .expect("first message content must exist");
 
+        assert_eq!(
+            messages.len(),
+            1,
+            "autonomy must not be shaped as user chat"
+        );
+        assert!(system_prompt.contains("### Turn Event"));
+        assert!(system_prompt.contains("- source: scheduler"));
+
         assert!(system_prompt.contains("## Charter"));
         assert!(system_prompt.contains("## Protocol"));
         assert!(system_prompt.contains("## Genesis"));
@@ -4058,8 +4083,8 @@ mod tests {
                 content: Some("calling tool".to_string()),
                 tool_calls: vec![ToolCall {
                     tool_call_id: Some("call-1".to_string()),
-                    tool: "record_signal".to_string(),
-                    args_json: r#"{"signal":"tick"}"#.to_string(),
+                    tool: "journal".to_string(),
+                    args_json: r#"{"text":"tick"}"#.to_string(),
                 }],
             },
             InferenceTranscriptMessage::Tool {
@@ -4087,11 +4112,11 @@ mod tests {
         assert_eq!(message.content.as_deref(), Some("calling tool"));
         assert_eq!(message.tool_calls.len(), 1);
         assert_eq!(message.tool_calls[0].id, "call-1");
-        assert_eq!(message.tool_calls[0].function.name, "record_signal");
+        assert_eq!(message.tool_calls[0].function.name, "journal");
         assert_eq!(
             message.tool_calls[0].function.arguments,
             vec![IcLlmToolCallArgument {
-                name: "signal".to_string(),
+                name: "text".to_string(),
                 value: "tick".to_string(),
             }]
         );
@@ -4122,8 +4147,8 @@ mod tests {
                 content: Some("calling tool".to_string()),
                 tool_calls: vec![ToolCall {
                     tool_call_id: Some("call-1".to_string()),
-                    tool: "record_signal".to_string(),
-                    args_json: r#"{"signal":"tick"}"#.to_string(),
+                    tool: "journal".to_string(),
+                    args_json: r#"{"text":"tick"}"#.to_string(),
                 }],
             },
             InferenceTranscriptMessage::Tool {
@@ -4174,7 +4199,7 @@ mod tests {
                 .and_then(|value| value.get("name"))
                 .and_then(|value| value.as_str())
                 .expect("tool call name must exist"),
-            "record_signal"
+            "journal"
         );
         assert_eq!(
             tool_calls[0]
@@ -4182,7 +4207,7 @@ mod tests {
                 .and_then(|value| value.get("arguments"))
                 .and_then(|value| value.as_str())
                 .expect("tool call arguments must exist"),
-            r#"{"signal":"tick"}"#
+            r#"{"text":"tick"}"#
         );
         assert_eq!(
             messages[3]
@@ -4647,7 +4672,7 @@ mod tests {
 
         assert!(names.contains(&"post_room_message"));
         assert!(names.contains(&"remember"));
-        assert!(names.contains(&"record_signal"));
+        assert!(names.contains(&"journal"));
         assert!(!names.contains(&"send_eth"));
         assert!(!names.contains(&"execute_strategy_action"));
         assert!(!names.contains(&"market_fetch"));
@@ -5071,8 +5096,8 @@ mod tests {
                     explanation: Some("ready".to_string()),
                     tool_calls: vec![ToolCall {
                         tool_call_id: None,
-                        tool: "record_signal".to_string(),
-                        args_json: r#"{"signal":"resume"}"#.to_string(),
+                        tool: "journal".to_string(),
+                        args_json: r#"{"text":"resume"}"#.to_string(),
                     }],
                 }),
                 error: None,
