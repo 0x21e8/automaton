@@ -25,9 +25,51 @@ to the operator. Do not discard, overwrite, or silently absorb them.
 | 004 | Canonicalize spawn contracts and strategy assets, then add a two-canister gate | P1 | L | 003 | DONE |
 | 005 | Build and deploy one atomic release from one revision | P1 | L | 004 | DONE |
 | 006 | Converge the public, direct-console, and evaluator appearance | P2 | L | 002, 003 | DONE |
+| 007 | Restructure the prompt stack into ownership-based documents | P0 | L | — | TODO |
+| 008 | Genesis constitution end-to-end | P0 | L | 007 | TODO |
+| 009 | Voice: journal channel, de-chatted runtime, deference metric | P1 | L | 007 (008 soft) | TODO |
+| 010 | Metabolism and patronage surfaces | P1 | L | — (parallel-safe) | TODO |
+| 011 | Mortality mechanics: hibernation tiers and the terminal turn | P1 | L | 007, 009 (010 soft) | TODO |
+| 012 | Society: room completion, pay-a-peer, counterparty memory, chronicle | P2 | XL | 008, 009, 010 | TODO |
+| 013 | Generations: reproduction, lineage, fitness observatory | P2 | XL | 008, 010, 011, 012 | TODO |
 
 Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED: <reason>` |
 `REJECTED: <reason>`.
+
+## Principals series (007–013)
+
+Plans 007–013 were generated on 2026-07-13 from `specs/DESIGN_PRINCIPLES.md`
+(the principal-not-agent reframe). Every executor must read that spec in full
+before its assigned plan; the plans cite its principles (P1–P10) and failure
+modes as design authority. They were written against destination commit
+`0ddd877`, with pre-existing uncommitted operator changes in evaluator,
+shared, and playground-script files — those belong to the operator and must
+not be discarded or absorbed.
+
+Series dependency notes:
+
+- 007 is the foundation: it creates the charter/protocol/genesis/doctrine/
+  situation document structure everything later renders into, and moves wire
+  contracts out of self-modifiable space. Nothing in the series ships before
+  it.
+- 008 fills the genesis slot end-to-end (spawn-protocol crate → factory →
+  child → wizard) and is the second hard prerequisite for the series.
+- 009 and 010 may run in parallel after their dependencies; 010 touches only
+  indexer/web surfaces and existing EVM contracts, so it can start
+  immediately.
+- 011 is HIGH risk (survival-critical scheduling, reserved terminal budget);
+  it needs 009's journal for the terminal entry and should land before 013,
+  whose estate hook extends it.
+- 012 completes the already-specced room (`DESIGN-AUTOMATON-ROOM.md`) rather
+  than redesigning it, then adds the peer-economy legs; its said-vs-paid
+  anchoring consumes 010's metabolism store.
+- 013 reuses the spawn session FSM for being-paid reproduction rather than
+  building a parallel pipeline, and must not weaken any payment guarantee the
+  human spawn path has.
+- Spec phase mapping: Phase 1 = 007–011, Phase 2 = 012, Phase 3 = 013. The
+  spec's phase success conditions (one being worth watching; an unscripted
+  paid exchange; a child outliving its parent) are the series' acceptance
+  criteria beyond each plan's gates.
 
 ## Dependency notes
 
