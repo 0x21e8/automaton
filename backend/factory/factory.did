@@ -156,6 +156,7 @@ type FactoryError = variant {
   };
   ManagementCallFailed : record { method : text; message : text };
   InvalidChildRuntimeConfig : record { field : text; message : text };
+  InvalidDeathReport : record { reason : text };
   SessionNotFound : record { session_id : text };
   RepositoryStrategyAlreadyExists : record { strategy_id : text };
   ControllerInvariantViolation : record { canister_id : text };
@@ -292,6 +293,11 @@ type ProviderConfig = record {
   model : opt text;
   inference_transport : InferenceTransport;
 };
+type RecordInfrastructureDeathRequest = record {
+  canister_id : text;
+  estate_disposition : text;
+  incident_reference : text;
+};
 type RefundSpawnResponse = record {
   session_id : text;
   payment_status : PaymentStatus;
@@ -340,6 +346,11 @@ type ReleaseBroadcastStage = variant {
   PublicKeyLookup;
 };
 type ReleaseSignatureRecord = record { r : text; s : text; y_parity : bool };
+type ReportDeathRequest = record {
+  cause : text;
+  terminal_turn_id : text;
+  estate_disposition : text;
+};
 type RepositoryStrategyMetadata = record {
   protocol : text;
   canonical_chain : SpawnChain;
@@ -583,6 +594,9 @@ type SpawnedAutomatonRecord = record {
   // Controller principals attested by the factory after handoff.
   controllers : opt vec text;
   session_id : text;
+  // Permanent public mortality record. Starvation records may never be
+  // cleared or replaced by an infrastructure restore.
+  death_cause : opt text;
   chain : SpawnChain;
   name : opt text;
   canister_id : text;
@@ -591,8 +605,15 @@ type SpawnedAutomatonRecord = record {
   parent_id : opt text;
   // Exact installed ic-automaton git commit as a 40-char lowercase SHA.
   version_commit : text;
+  // Required public incident log reference for infrastructure deaths.
+  death_incident_reference : opt text;
+  died_at : opt nat64;
   // Millisecond timestamp at which the factory verified `controllers`.
   control_verified_at : opt nat64;
+  // Child canister ID for starvation, or authenticated admin principal for
+  // infrastructure incidents.
+  death_recorded_by : opt text;
+  estate_disposition : opt text;
   // Truthful public control label derived from the verified controller list.
   control_status : opt text;
   child_ids : vec text;
@@ -629,6 +650,10 @@ service : (opt FactoryInitArgs) -> {
   list_room_messages : (opt nat64, opt nat64) -> (Result_11) query;
   list_spawned_automatons : (opt text, nat64) -> (Result_12) query;
   post_room_message : (PostRoomMessageRequest) -> (Result_13);
+  record_infrastructure_death : (RecordInfrastructureDeathRequest) -> (
+      Result_10,
+    );
+  report_death : (ReportDeathRequest) -> (Result_10);
   retry_session_admin : (text) -> (Result_9);
   retry_spawn_session : (text) -> (Result_9);
   revoke_repository_strategy : (RevokeRepositoryStrategyRequest) -> (Result);

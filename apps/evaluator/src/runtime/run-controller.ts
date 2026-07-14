@@ -17,6 +17,7 @@ import type {
   RuntimeAutomatonState
 } from "../types.js";
 import { loadExperimentFile } from "../lib/experiment.js";
+import { evaluateDieWellAssertions, isDieWellExperiment } from "../lib/mortality-assertions.js";
 import {
   assessComparisonValidity,
   buildDashboardAutomatons,
@@ -349,12 +350,25 @@ export class RunController {
 
       const deadline = run.metadata.startedAt + run.experiment.parsed.maxRuntimeMinutes * 60_000;
       const samplingDelay = run.experiment.parsed.samplingIntervalSeconds * 1_000;
+      let dieWellUnmet: string[] = ["terminal evidence has not been sampled"];
 
       while (!run.stopRequested && this.now() < deadline) {
         await this.sampleFleet(runtime);
+        if (isDieWellExperiment(run.experiment.parsed.name)) {
+          const assertion = await this.evaluateDieWellRun();
+          dieWellUnmet = assertion.unmet;
+          if (assertion.passed) {
+            await this.finalizeRun("completed");
+            return;
+          }
+        }
         if (!run.stopRequested && this.now() < deadline) {
           await this.pause(samplingDelay);
         }
+      }
+
+      if (!run.stopRequested && isDieWellExperiment(run.experiment.parsed.name)) {
+        throw new Error(`Die-well assertions not satisfied: ${dieWellUnmet.join("; ")}`);
       }
 
       await this.finalizeRun(run.stopRequested ? "stopped_manually" : "timed_out");
@@ -640,6 +654,24 @@ export class RunController {
     }
 
     void runtime;
+  }
+
+  private async evaluateDieWellRun() {
+    const run = this.requireRun();
+    const unmet: string[] = [];
+    for (const automaton of run.automatons.values()) {
+      if (!automaton.spawnSucceeded || automaton.canisterId === null || automaton.sessionId === null) {
+        unmet.push(`${automaton.config.id}: spawn/session is incomplete`);
+        continue;
+      }
+      const [evidence, session] = await Promise.all([
+        this.deps.automatonClient.readEvidence(automaton.canisterId),
+        this.deps.indexerClient.fetchSpawnSession(automaton.sessionId)
+      ]);
+      const result = evaluateDieWellAssertions(evidence, session.registryRecord);
+      unmet.push(...result.unmet.map((entry) => `${automaton.config.id}: ${entry}`));
+    }
+    return { passed: unmet.length === 0, unmet };
   }
 
   private hasMetSpawnSuccessThreshold(run: ActiveEvaluationRun) {

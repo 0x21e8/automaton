@@ -31,6 +31,7 @@ use crate::domain::cycle_admission::{
     AffordabilityRequirements, OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES,
     DEFAULT_SAFETY_MARGIN_BPS,
 };
+use crate::domain::mortality::{canonical_runway_seconds, policy_for_tier};
 use crate::domain::recovery_policy::decide_recovery_action;
 use crate::domain::types::{
     EvmEvent, InboxMessageSource, JobStatus, OperationFailure, OperationFailureKind,
@@ -139,6 +140,14 @@ impl GetLogFilter for SchedulerLogPriority {
 pub async fn scheduler_tick() {
     let now_ns = current_time_ns();
     stable::record_scheduler_tick_start(now_ns);
+
+    // Death is durable and absolute. Even if an upgrade or stale timer leaves
+    // the scheduler flag enabled, no queue or recovery path may act again.
+    if stable::mortality_is_dead() {
+        stable::record_scheduler_tick_end(now_ns, None);
+        crate::http::init_certification();
+        return;
+    }
 
     log!(
         SchedulerLogPriority::Info,
@@ -266,7 +275,13 @@ async fn run_one_pending_mutating_job(now_ns: u64) -> Result<bool, String> {
     }
 
     if let Some(operation_class) = operation_class_for_task(&job.kind) {
-        if !stable::can_run_survival_operation(&operation_class, now_ns) {
+        let is_terminal_turn = job.kind == TaskKind::AgentTurn
+            && matches!(
+                stable::mortality_runtime().phase,
+                crate::domain::types::MortalityPhase::TerminalPending
+                    | crate::domain::types::MortalityPhase::TerminalInProgress
+            );
+        if !is_terminal_turn && !stable::can_run_survival_operation(&operation_class, now_ns) {
             let reason = format!(
                 "operation blocked by survival policy (operation={:?})",
                 operation_class
@@ -1179,6 +1194,7 @@ async fn run_check_cycles() -> Result<(), String> {
     let expected = classify_survival_tier(total_cycles, liquid_cycles)?;
     let requirements = check_cycles_requirements()?;
     let snapshot = stable::runtime_snapshot();
+    let telemetry = stable::cycle_telemetry();
     let cached_usdc_balance_raw =
         parse_hex_quantity_u64(snapshot.wallet_balance.usdc_balance_raw_hex.as_deref());
     let mut topup_state = stable::read_topup_state();
@@ -1187,6 +1203,18 @@ async fn run_check_cycles() -> Result<(), String> {
     stable::set_scheduler_survival_tier(expected.clone());
     let runtime_tier = stable::scheduler_survival_tier();
     let recovery_checks = stable::scheduler_survival_tier_recovery_checks();
+    let runway_seconds = canonical_runway_seconds(
+        liquid_cycles,
+        telemetry.burn_rate_cycles_per_day,
+        parse_hex_quantity_u64(snapshot.wallet_balance.usdc_balance_raw_hex.as_deref()),
+        snapshot.wallet_balance.usdc_decimals,
+        telemetry.usd_per_trillion_cycles,
+    );
+    let mortality = stable::observe_mortality_resources(liquid_cycles, runway_seconds, now_ns);
+    let mortality_policy = policy_for_tier(mortality.tier);
+    if mortality.phase == crate::domain::types::MortalityPhase::TerminalPending {
+        let _ = enqueue_immediate_agent_turn_job_if_absent("AgentTurn:terminal".to_string());
+    }
 
     if snapshot.cycle_topup.enabled
         && maybe_recover_failed_topup(&snapshot, topup_state.as_ref(), now_ns)
@@ -1227,7 +1255,7 @@ async fn run_check_cycles() -> Result<(), String> {
 
     log!(
         SchedulerLogPriority::Info,
-    "scheduler_checkcycles total_cycles={} liquid_cycles={} reserve_floor_cycles={} required_cycles={} low_tier_limit={} observed_tier={:?} runtime_tier={:?} recovery_checks={} cached_usdc_balance_raw={:?} topup_triggered={} topup_state={:?}",
+    "scheduler_checkcycles total_cycles={} liquid_cycles={} reserve_floor_cycles={} required_cycles={} low_tier_limit={} observed_tier={:?} runtime_tier={:?} recovery_checks={} mortality_tier={:?} runway_seconds={:?} cadence_multiplier={} reasoning={:?} cached_usdc_balance_raw={:?} topup_triggered={} topup_state={:?}",
         total_cycles,
         liquid_cycles,
         DEFAULT_RESERVE_FLOOR_CYCLES,
@@ -1236,6 +1264,10 @@ async fn run_check_cycles() -> Result<(), String> {
         expected,
         runtime_tier,
         recovery_checks,
+        mortality.tier,
+        mortality.runway_seconds,
+        mortality_policy.cadence_multiplier,
+        mortality_policy.reasoning_level,
         cached_usdc_balance_raw,
         topup_triggered,
         topup_state

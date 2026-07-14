@@ -151,6 +151,27 @@ describe("drawer messaging", () => {
     expect(unverifiedMarkup).toContain("Controller status unverified");
   });
 
+  it("renders terminal death cause and monument estate from indexer facts", () => {
+    const automaton = createAutomatonDetail();
+    automaton.tier = "out_of_cycles";
+    automaton.metabolism = {
+      burnRateCyclesPerDay: 1_000_000_000_000,
+      runwaySeconds: 0,
+      lifetimeEarningsUsdcRaw: "0",
+      ageSeconds: 86_400,
+      state: "dead",
+      history: [],
+      mortalityTier: "dead",
+      deathCause: "starved",
+      diedAt: 1_800_000_000_000,
+      estateDisposition: "monument"
+    };
+    const markup = renderToStaticMarkup(<AutomatonDrawer automaton={automaton} errorMessage={null} isLoading={false} isOpen onClose={() => {}} selectedCanisterId={automaton.canisterId} viewerAddress={null} walletSession={null} />);
+    expect(markup).toContain("starved");
+    expect(markup).toContain("monument");
+    expect(markup).toContain("dead");
+  });
+
   it("shows verified documents and hides mismatched content", () => {
     const verified = createAutomatonDetail();
     verified.constitution = "A verified founding document.";

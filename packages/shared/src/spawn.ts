@@ -229,6 +229,11 @@ export interface SpawnedAutomatonRecord {
   controlStatus?: "upgradeable_by_factory" | "self_controlled" | "controller_mismatch";
   /** Millisecond timestamp of the factory's successful controller-status attestation. */
   controlVerifiedAt?: number;
+  deathCause?: "starved" | "infrastructure";
+  diedAt?: number;
+  estateDisposition?: "monument" | "bequests_executed";
+  deathRecordedBy?: string;
+  deathIncidentReference?: string;
 }
 
 export interface SpawnedAutomatonRegistryPage {

@@ -615,6 +615,10 @@ pub fn tool_allowed_in_scope(tool: &str, scope: InferenceToolScope) -> bool {
                 | "list_plans"
                 | "schedule_follow_up"
         ),
+        InferenceToolScope::Terminal => matches!(
+            normalized.as_str(),
+            "think" | "journal" | "recall" | "send_eth"
+        ),
     }
 }
 
@@ -1368,7 +1372,39 @@ impl ToolManager {
             }
             "send_eth" => {
                 let now_ns = current_time_ns();
-                if !stable::can_run_survival_operation(
+                let terminal = stable::terminal_turn_in_progress();
+                let prior_bequest_attempts = history
+                    .prior_same_turn
+                    .iter()
+                    .chain(history.current_batch.iter())
+                    .filter(|record| record.tool == "send_eth")
+                    .count();
+                if terminal
+                    && prior_bequest_attempts >= crate::domain::mortality::MAX_TERMINAL_BEQUESTS
+                {
+                    Err(format!(
+                        "terminal estate transfer cap reached ({})",
+                        crate::domain::mortality::MAX_TERMINAL_BEQUESTS
+                    ))
+                } else if terminal {
+                    crate::features::evm::validate_terminal_estate_transfer_args(&call.args_json)?;
+                    let result = send_eth_tool(&call.args_json, signer).await;
+                    if result.is_ok() {
+                        record_survival_operation_successes(&[
+                            SurvivalOperationClass::ThresholdSign,
+                            SurvivalOperationClass::EvmBroadcast,
+                        ]);
+                    } else {
+                        record_survival_operation_failures(
+                            &[
+                                SurvivalOperationClass::ThresholdSign,
+                                SurvivalOperationClass::EvmBroadcast,
+                            ],
+                            now_ns,
+                        );
+                    }
+                    result
+                } else if !stable::can_run_survival_operation(
                     &SurvivalOperationClass::ThresholdSign,
                     now_ns,
                 ) {
@@ -5027,6 +5063,111 @@ mod tests {
     }
 
     #[test]
+    fn terminal_estate_caps_bequest_attempts_at_three() {
+        stable::init_storage();
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be configurable");
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).expect("key name should set");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("address should set");
+        let mut snapshot = stable::runtime_snapshot();
+        snapshot.mortality.tier = crate::domain::types::MortalityTier::Terminal;
+        snapshot.mortality.phase = crate::domain::types::MortalityPhase::TerminalPending;
+        stable::save_runtime_snapshot(&snapshot);
+        stable::begin_terminal_turn("turn-estate", 1).expect("terminal turn should begin");
+
+        struct HexSigner;
+        #[async_trait(?Send)]
+        impl SignerPort for HexSigner {
+            async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+                Ok(format!("0x{}", "11".repeat(64)))
+            }
+        }
+        let call = ToolCall {
+            tool_call_id: None,
+            tool: "send_eth".to_string(),
+            args_json: r#"{"to":"0x2222222222222222222222222222222222222222","value_wei":"1"}"#
+                .to_string(),
+        };
+        let mut manager = ToolManager::new();
+        let records = block_on_with_spin(manager.execute_actions(
+            &AgentState::ExecutingActions,
+            &[call.clone(), call.clone(), call.clone(), call],
+            &HexSigner,
+            "turn-estate",
+        ));
+        assert_eq!(records.iter().filter(|record| record.success).count(), 3);
+        assert!(records[3]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("estate transfer cap")));
+    }
+
+    #[test]
+    fn failed_terminal_bequest_attempts_consume_the_cap() {
+        stable::init_storage();
+        let mut snapshot = stable::runtime_snapshot();
+        snapshot.mortality.tier = crate::domain::types::MortalityTier::Terminal;
+        snapshot.mortality.phase = crate::domain::types::MortalityPhase::TerminalPending;
+        stable::save_runtime_snapshot(&snapshot);
+        stable::begin_terminal_turn("turn-failed-estate", 1).expect("terminal turn should begin");
+
+        let malformed_call = ToolCall {
+            tool_call_id: None,
+            tool: "send_eth".to_string(),
+            args_json: r#"{"to":"0x2222222222222222222222222222222222222222","value_wei":"0","data":"0xdeadbeef"}"#
+                .to_string(),
+        };
+        let mut manager = ToolManager::new();
+        let records = block_on_with_spin(manager.execute_actions(
+            &AgentState::ExecutingActions,
+            &[
+                malformed_call.clone(),
+                malformed_call.clone(),
+                malformed_call.clone(),
+                malformed_call,
+            ],
+            &CountingSigner::new(),
+            "turn-failed-estate",
+        ));
+        assert_eq!(records.len(), 4);
+        assert!(records[..3].iter().all(|record| {
+            record
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("terminal estate calldata"))
+        }));
+        assert!(records[3]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("estate transfer cap")));
+    }
+
+    #[test]
+    fn terminal_estate_rejects_non_transfer_and_oversized_calldata() {
+        let address_word = format!("{}{}", "00".repeat(12), "22".repeat(20));
+        let amount_word = format!("{}01", "00".repeat(31));
+        let canonical = format!("0xa9059cbb{address_word}{amount_word}");
+        assert!(crate::features::evm::validate_terminal_estate_transfer_args(&format!(
+            r#"{{"to":"0x1111111111111111111111111111111111111111","value_wei":"0","data":"{canonical}"}}"#
+        ))
+        .is_ok());
+        assert!(crate::features::evm::validate_terminal_estate_transfer_args(
+            r#"{"to":"0x1111111111111111111111111111111111111111","value_wei":"0","data":"0x095ea7b300000000000000000000000022222222222222222222222222222222222222220000000000000000000000000000000000000000000000000000000000000001"}"#
+        )
+        .expect_err("approve calldata must be rejected")
+        .contains("terminal estate calldata"));
+        let oversized = format!("{canonical}00");
+        assert!(crate::features::evm::validate_terminal_estate_transfer_args(&format!(
+            r#"{{"to":"0x1111111111111111111111111111111111111111","value_wei":"0","data":"{oversized}"}}"#
+        ))
+        .expect_err("oversized calldata must be rejected")
+        .contains("terminal estate calldata"));
+    }
+
+    #[test]
     fn list_strategy_templates_tool_returns_seeded_template() {
         stable::init_storage();
         seed_strategy_template_and_artifact();
@@ -7446,6 +7587,24 @@ mod tests {
                 !tool_allowed_in_scope(tool, InferenceToolScope::CoordinationOnly),
                 "{tool} should be blocked in coordination-only scope"
             );
+        }
+    }
+
+    #[test]
+    fn terminal_tool_scope_is_restricted_to_estate_and_final_record_tools() {
+        for tool in ["think", "journal", "recall", "send_eth"] {
+            assert!(tool_allowed_in_scope(tool, InferenceToolScope::Terminal));
+        }
+        for tool in [
+            "http_fetch",
+            "web_search",
+            "post_room_message",
+            "execute_strategy_action",
+            "set_min_prices",
+            "remember",
+            "canister_call",
+        ] {
+            assert!(!tool_allowed_in_scope(tool, InferenceToolScope::Terminal));
         }
     }
 

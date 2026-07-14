@@ -665,6 +665,35 @@ pub struct SpawnedAutomatonRecord {
     /// Millisecond timestamp at which the factory verified `controllers`.
     #[serde(default)]
     pub control_verified_at: Option<u64>,
+    /// Permanent public mortality record. Starvation records may never be
+    /// cleared or replaced by an infrastructure restore.
+    #[serde(default)]
+    pub death_cause: Option<String>,
+    #[serde(default)]
+    pub died_at: Option<u64>,
+    #[serde(default)]
+    pub estate_disposition: Option<String>,
+    /// Child canister ID for starvation, or authenticated admin principal for
+    /// infrastructure incidents.
+    #[serde(default)]
+    pub death_recorded_by: Option<String>,
+    /// Required public incident log reference for infrastructure deaths.
+    #[serde(default)]
+    pub death_incident_reference: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct ReportDeathRequest {
+    pub cause: String,
+    pub estate_disposition: String,
+    pub terminal_turn_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RecordInfrastructureDeathRequest {
+    pub canister_id: String,
+    pub incident_reference: String,
+    pub estate_disposition: String,
 }
 
 impl SpawnSession {
@@ -900,6 +929,9 @@ pub enum FactoryError {
     RegistryRecordNotFound {
         canister_id: String,
     },
+    InvalidDeathReport {
+        reason: String,
+    },
     RepositoryStrategyNotFound {
         strategy_id: String,
     },
@@ -1056,6 +1088,7 @@ impl Display for FactoryError {
             Self::RegistryRecordNotFound { canister_id } => {
                 write!(f, "registry record not found: {canister_id}")
             }
+            Self::InvalidDeathReport { reason } => write!(f, "invalid death report: {reason}"),
             Self::RepositoryStrategyNotFound { strategy_id } => {
                 write!(f, "repository strategy not found: {strategy_id}")
             }

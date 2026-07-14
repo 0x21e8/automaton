@@ -67,6 +67,12 @@ export function MetabolismPanel({ automaton }: { automaton: AutomatonDetail }) {
     <div className="metabolism-sparkline" aria-label="Runway history">
       {points ? <svg role="img" viewBox="0 0 100 32" preserveAspectRatio="none"><polyline points={points} /></svg> : <span>History begins after two indexed samples.</span>}
     </div>
+    {metabolism.mortalityTier ? <div className="mortality-facts" aria-label="Mortality state">
+      <div><span>Tier</span><strong>{metabolism.mortalityTier}</strong></div>
+      {metabolism.deathCause ? <div><span>Death</span><strong>{metabolism.deathCause}</strong></div> : null}
+      {metabolism.estateDisposition ? <div><span>Estate</span><strong>{metabolism.estateDisposition.replaceAll("_", " ")}</strong></div> : null}
+      {metabolism.diedAt ? <div><span>Died</span><strong>{new Date(metabolism.diedAt).toISOString()}</strong></div> : null}
+    </div> : null}
     <details className="control-status">
       <summary>{controlCopy}</summary>
       {controlStatus.controllers.length > 0

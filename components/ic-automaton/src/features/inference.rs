@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::domain::cycle_admission::DEFAULT_RESERVE_FLOOR_CYCLES;
 /// LLM inference abstraction supporting IC LLM and OpenRouter backends.
 ///
 /// Provides a unified `InferenceAdapter` trait with two concrete implementations:
@@ -14,8 +16,8 @@
 /// than an error, allowing the agent turn to degrade gracefully.
 // ── Imports ──────────────────────────────────────────────────────────────────
 use crate::domain::cycle_admission::{
-    affordability_requirements, can_afford, estimate_operation_cost, AffordabilityRequirements,
-    OperationClass, DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
+    affordability_requirements, can_afford, can_afford_with_reserve, estimate_operation_cost,
+    AffordabilityRequirements, OperationClass, DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
     AutonomyInferenceSuppressionClassification, DecisionTrigger, InferenceInput, InferenceProvider,
@@ -192,10 +194,28 @@ pub async fn infer_with_provider_transcript(
     transcript: &[InferenceTranscriptMessage],
 ) -> Result<InferenceOutput, String> {
     let now_ns = current_time_ns();
-    if !stable::can_run_survival_operation(&SurvivalOperationClass::Inference, now_ns) {
+    if !stable::terminal_turn_in_progress()
+        && !stable::can_run_survival_operation(&SurvivalOperationClass::Inference, now_ns)
+    {
         return Ok(InferenceOutput::deferred(
             InferenceDeferredReason::SurvivalPolicy,
             "inference skipped due to survival policy".to_string(),
+        ));
+    }
+    let (total_cycles, _) = current_cycle_balances();
+    if cfg!(target_arch = "wasm32")
+        && !can_afford_with_reserve(
+            total_cycles,
+            &OperationClass::WorkflowEnvelope {
+                envelope_cycles: 5_000_000_000,
+            },
+            DEFAULT_SAFETY_MARGIN_BPS,
+            stable::operation_reserve_floor_cycles(),
+        )?
+    {
+        return Ok(InferenceOutput::deferred(
+            InferenceDeferredReason::LowCycles,
+            "inference skipped to preserve the reserved terminal budget".to_string(),
         ));
     }
 
@@ -2569,7 +2589,9 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
         let request_size_bytes = Self::estimate_request_size_bytes(&payload);
         let requirements =
             Self::affordability_requirements(request_size_bytes, self.max_response_bytes)?;
-        let (total_cycles, liquid_cycles) = current_cycle_balances();
+        let (total_cycles, system_liquid_cycles) = current_cycle_balances();
+        let reserve_floor = stable::operation_reserve_floor_cycles();
+        let liquid_cycles = system_liquid_cycles.saturating_sub(reserve_floor);
 
         log!(
             InferenceLogPriority::Info,
@@ -2581,7 +2603,7 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
             requirements.required_cycles,
             liquid_cycles,
             total_cycles,
-            DEFAULT_RESERVE_FLOOR_CYCLES,
+            reserve_floor,
         );
 
         if !can_afford(liquid_cycles, &requirements) {
@@ -2597,7 +2619,7 @@ impl InferenceAdapter for OpenRouterInferenceAdapter {
                 requirements.estimated_cycles,
                 liquid_cycles,
                 total_cycles,
-                DEFAULT_RESERVE_FLOOR_CYCLES,
+                reserve_floor,
                 requirements.required_cycles
             );
             return Ok(InferenceOutput::deferred(

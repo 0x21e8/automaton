@@ -569,3 +569,43 @@ pub fn get_spawned_automaton(
         })
     })
 }
+
+pub fn report_death(
+    caller_canister_id: &str,
+    request: crate::types::ReportDeathRequest,
+    now_ms: u64,
+) -> Result<crate::types::SpawnedAutomatonRecord, FactoryError> {
+    let cause = request.cause.trim();
+    if cause != "starved" {
+        return Err(FactoryError::InvalidDeathReport {
+            reason: "child self-reports may only record starvation".to_string(),
+        });
+    }
+    let disposition = request.estate_disposition.trim();
+    if disposition != "monument" && disposition != "bequests_executed" {
+        return Err(FactoryError::InvalidDeathReport {
+            reason: "estate disposition must be monument or bequests_executed".to_string(),
+        });
+    }
+    if request.terminal_turn_id.trim().is_empty() {
+        return Err(FactoryError::InvalidDeathReport {
+            reason: "terminal_turn_id is required".to_string(),
+        });
+    }
+    crate::state::write_state(|state| {
+        let record = state.registry.get_mut(caller_canister_id).ok_or_else(|| {
+            FactoryError::RegistryRecordNotFound {
+                canister_id: caller_canister_id.to_string(),
+            }
+        })?;
+        if record.death_cause.as_deref() == Some("starved") {
+            return Ok(record.clone());
+        }
+        record.death_cause = Some(cause.to_string());
+        record.died_at = Some(now_ms);
+        record.estate_disposition = Some(disposition.to_string());
+        record.death_recorded_by = Some(caller_canister_id.to_string());
+        record.death_incident_reference = None;
+        Ok(record.clone())
+    })
+}

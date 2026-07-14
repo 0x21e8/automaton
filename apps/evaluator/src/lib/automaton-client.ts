@@ -87,6 +87,15 @@ export interface HttpSnapshotResponse {
     loop_enabled?: boolean;
     soul?: string;
     state?: string | Record<string, null>;
+    mortality?: {
+      tier?: string | Record<string, null>;
+      phase?: string | Record<string, null>;
+      runway_seconds?: number | null;
+      death_cause?: string | null;
+      estate_disposition?: string | null;
+      terminal_turn_id?: string | null;
+      died_at_ns?: number | null;
+    };
   };
   recent_decisions?: HttpDecisionRecordResponse[];
   scheduler?: {

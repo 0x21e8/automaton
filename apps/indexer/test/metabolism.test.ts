@@ -192,4 +192,27 @@ describe("metabolism math", () => {
     });
     expect(detail.metabolism?.runwaySeconds).toBe(172_800);
   });
+
+  it("indexes terminal completion as a permanent death with estate facts", () => {
+    const record = createSpawnedAutomatonRecordFixture({
+      deathCause: "starved",
+      diedAt: 1_800_000_000_000,
+      estateDisposition: "monument"
+    });
+    const detail = normalizeAutomatonDetail({
+      canisterId: record.canisterId,
+      config: localConfig,
+      now: 2_000_000_000_000,
+      registryRecord: record,
+      ethUsd: null
+    });
+    expect(detail.tier).toBe("out_of_cycles");
+    expect(detail.metabolism).toMatchObject({
+      state: "dead",
+      mortalityTier: "dead",
+      deathCause: "starved",
+      diedAt: 1_800_000_000_000,
+      estateDisposition: "monument"
+    });
+  });
 });

@@ -105,6 +105,61 @@ pub fn set_pause(caller: &str, paused: bool) -> Result<bool, FactoryError> {
     Ok(paused)
 }
 
+pub fn record_infrastructure_death(
+    caller: &str,
+    request: crate::types::RecordInfrastructureDeathRequest,
+    now_ms: u64,
+) -> Result<SpawnedAutomatonRecord, FactoryError> {
+    let canister_id = request.canister_id.trim();
+    let incident_reference = request.incident_reference.trim();
+    if canister_id.is_empty() {
+        return Err(FactoryError::InvalidDeathReport {
+            reason: "canister_id is required".to_string(),
+        });
+    }
+    if incident_reference.is_empty()
+        || !(incident_reference.starts_with("https://")
+            || incident_reference.starts_with("ipfs://"))
+    {
+        return Err(FactoryError::InvalidDeathReport {
+            reason: "a public https:// or ipfs:// incident_reference is required".to_string(),
+        });
+    }
+    let disposition = request.estate_disposition.trim();
+    if disposition != "monument" && disposition != "bequests_executed" {
+        return Err(FactoryError::InvalidDeathReport {
+            reason: "estate disposition must be monument or bequests_executed".to_string(),
+        });
+    }
+
+    write_state(|state| {
+        ensure_admin_in_state(state, caller)?;
+        let record = state.registry.get_mut(canister_id).ok_or_else(|| {
+            FactoryError::RegistryRecordNotFound {
+                canister_id: canister_id.to_string(),
+            }
+        })?;
+        if record.death_cause.as_deref() == Some("starved") {
+            return Ok(record.clone());
+        }
+        if record.death_cause.as_deref() == Some("infrastructure") {
+            if record.death_incident_reference.as_deref() == Some(incident_reference) {
+                return Ok(record.clone());
+            }
+            return Err(FactoryError::InvalidDeathReport {
+                reason: "infrastructure death already recorded with a different incident reference"
+                    .to_string(),
+            });
+        }
+        record.death_cause = Some("infrastructure".to_string());
+        record.died_at = Some(now_ms);
+        record.estate_disposition = Some(disposition.to_string());
+        record.death_recorded_by = Some(caller.to_string());
+        record.death_incident_reference = Some(incident_reference.to_string());
+        Ok(record.clone())
+    })
+}
+
 pub fn get_factory_config(caller: &str) -> Result<FactoryConfigSnapshot, FactoryError> {
     read_state(|state| -> Result<FactoryConfigSnapshot, FactoryError> {
         ensure_admin_in_state(state, caller)?;

@@ -211,6 +211,11 @@ interface CandidSpawnedAutomatonRecord {
   controllers: Optional<string[]>;
   control_status: Optional<string>;
   control_verified_at: Optional<bigint>;
+  death_cause: Optional<string>;
+  died_at: Optional<bigint>;
+  estate_disposition: Optional<string>;
+  death_recorded_by: Optional<string>;
+  death_incident_reference: Optional<string>;
 }
 
 interface CandidSpawnedAutomatonRegistryPage {
@@ -521,6 +526,11 @@ function createFactoryIdl() {
       controllers: candid.Opt(candid.Vec(candid.Text)),
       control_status: candid.Opt(candid.Text),
       control_verified_at: candid.Opt(candid.Nat64),
+      death_cause: candid.Opt(candid.Text),
+      died_at: candid.Opt(candid.Nat64),
+      estate_disposition: candid.Opt(candid.Text),
+      death_recorded_by: candid.Opt(candid.Text),
+      death_incident_reference: candid.Opt(candid.Text),
       child_ids: candid.Vec(candid.Text),
       steward_address: candid.Text
     });
@@ -580,6 +590,7 @@ function createFactoryIdl() {
       ArtifactHashMismatch: candid.Record({ expected: candid.Text, actual: candid.Text }),
       QuoteTermsHashMismatch: candid.Record({ expected: candid.Text, received: candid.Text }),
       RegistryRecordNotFound: candid.Record({ canister_id: candid.Text }),
+      InvalidDeathReport: candid.Record({ reason: candid.Text }),
       RepositoryStrategyNotFound: candid.Record({ strategy_id: candid.Text }),
       RepositoryStrategyDeprecated: candid.Record({ strategy_id: candid.Text }),
       RepositoryStrategyRevoked: candid.Record({ strategy_id: candid.Text }),
@@ -1052,7 +1063,20 @@ function mapRegistryRecord(record: CandidSpawnedAutomatonRecord): SpawnedAutomat
         : undefined,
     controlVerifiedAt: unwrapOptional(record.control_verified_at) === null
       ? undefined
-      : toNumber(unwrapOptional(record.control_verified_at) as bigint)
+      : toNumber(unwrapOptional(record.control_verified_at) as bigint),
+    deathCause: unwrapOptional(record.death_cause) === "starved" ||
+      unwrapOptional(record.death_cause) === "infrastructure"
+      ? unwrapOptional(record.death_cause) as SpawnedAutomatonRecord["deathCause"]
+      : undefined,
+    diedAt: unwrapOptional(record.died_at) === null
+      ? undefined
+      : toNumber(unwrapOptional(record.died_at) as bigint),
+    estateDisposition: unwrapOptional(record.estate_disposition) === "monument" ||
+      unwrapOptional(record.estate_disposition) === "bequests_executed"
+      ? unwrapOptional(record.estate_disposition) as SpawnedAutomatonRecord["estateDisposition"]
+      : undefined,
+    deathRecordedBy: unwrapOptional(record.death_recorded_by) ?? undefined,
+    deathIncidentReference: unwrapOptional(record.death_incident_reference) ?? undefined
   };
 }
 

@@ -157,6 +157,7 @@ export interface AutomatonFinancials {
 }
 
 export type MetabolicState = "healthy" | "hibernating" | "dying" | "dead";
+export type MortalityTier = "active" | "conserving" | "hibernating" | "terminal" | "dead";
 export type AutomatonControlLabel =
   | "upgradeable_by_factory"
   | "self_controlled"
@@ -178,6 +179,10 @@ export interface AutomatonMetabolism {
   ageSeconds: number;
   state: MetabolicState;
   history: MetabolismHistoryPoint[];
+  mortalityTier?: MortalityTier;
+  deathCause?: "starved" | "infrastructure" | null;
+  diedAt?: number | null;
+  estateDisposition?: "monument" | "bequests_executed" | null;
 }
 
 export interface AutomatonControlStatus {

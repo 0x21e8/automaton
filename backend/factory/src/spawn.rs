@@ -1010,6 +1010,11 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
                 controllers: Some(verified_factory_controllers),
                 control_status: Some("upgradeable_by_factory".to_string()),
                 control_verified_at: Some(now_ms),
+                death_cause: None,
+                died_at: None,
+                estate_disposition: None,
+                death_recorded_by: None,
+                death_incident_reference: None,
             }
         };
 
@@ -1626,6 +1631,11 @@ pub async fn execute_spawn(
             controllers: Some(verified_factory_controllers.clone()),
             control_status: Some("upgradeable_by_factory".to_string()),
             control_verified_at: Some(current_time),
+            death_cause: None,
+            died_at: None,
+            estate_disposition: None,
+            death_recorded_by: None,
+            death_incident_reference: None,
         };
 
         state.runtimes.insert(canister_id.clone(), runtime.clone());

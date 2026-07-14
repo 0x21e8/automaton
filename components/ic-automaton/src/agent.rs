@@ -2691,6 +2691,20 @@ fn build_dynamic_context_with_scope(
         "- cycles_runway_hours: unknown".to_string(),
         format!("- survival_tier: {survival_tier}"),
         format!("- survival_tier_recovery_checks: {recovery_checks}"),
+        format!("- mortality_tier: {:?}", snapshot.mortality.tier),
+        format!("- mortality_phase: {:?}", snapshot.mortality.phase),
+        format!(
+            "- canonical_runway_seconds: {}",
+            snapshot
+                .mortality
+                .runway_seconds
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+        format!(
+            "- terminal_budget_reserved_cycles: {}",
+            snapshot.mortality.terminal_budget_reserved_cycles
+        ),
         format!("- eth_balance: {eth_balance}"),
         format!("- eth_balance_eth: {eth_balance_eth}"),
         format!(
@@ -2737,6 +2751,12 @@ fn build_dynamic_context_with_scope(
         build_conversation_context(staged_messages, conversation_history_limit),
         memory_section,
     ];
+    if tool_scope == InferenceToolScope::Terminal {
+        sections.push(
+            "### Final Turn Covenant\n- This is my last turn. After it completes I am permanently dead and cannot act again.\n- I may write my final public journal entry and make at most three bounded estate transfers.\n- `send_eth` may carry ERC-20 transfer calldata; gas and value must remain within my wallet.\n- If I make no valid bequest, my funds remain in place as a monument.\n- Strategy, fetch, price-setting, and room-posting tools are unavailable."
+                .to_string(),
+        );
+    }
     sections.push(if journal_lines.is_empty() {
         "### My Recent Journal (Public Voice Few-Shot)\n- no entries yet".to_string()
     } else {
@@ -3016,11 +3036,53 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     max_turn_duration_ns: u64,
     max_tool_calls_per_turn: usize,
 ) -> Result<(), String> {
+    let terminal_at_start =
+        stable::mortality_runtime().phase == crate::domain::types::MortalityPhase::TerminalPending;
+    let result = run_scheduled_turn_job_with_limits_and_tool_cap_inner(
+        trigger,
+        max_inference_rounds,
+        max_turn_duration_ns,
+        max_tool_calls_per_turn,
+    )
+    .await;
+    if terminal_at_start
+        && stable::mortality_runtime().phase
+            == crate::domain::types::MortalityPhase::TerminalInProgress
+    {
+        let turn_id = stable::mortality_runtime()
+            .terminal_turn_id
+            .unwrap_or_else(|| "terminal-turn".to_string());
+        if !stable::list_recent_journal_entries(32)
+            .iter()
+            .any(|entry| entry.turn_id == turn_id)
+        {
+            let _ = stable::append_journal_entry(
+                &turn_id,
+                "This is my final record. My last turn failed before I could settle further affairs, so what remains stays here as a monument.",
+                false,
+            );
+        }
+        finalize_terminal_turn(&turn_id, 0, current_time_ns()).await?;
+    }
+    result
+}
+
+async fn run_scheduled_turn_job_with_limits_and_tool_cap_inner(
+    trigger: ScheduledTurnTrigger,
+    max_inference_rounds: usize,
+    max_turn_duration_ns: u64,
+    max_tool_calls_per_turn: usize,
+) -> Result<(), String> {
     let snapshot = stable::runtime_snapshot();
-    if !snapshot.loop_enabled || snapshot.turn_in_flight {
+    if stable::mortality_is_dead() || !snapshot.loop_enabled || snapshot.turn_in_flight {
         return Ok(());
     }
-    if snapshot.wallet_balance_bootstrap_pending && stable::wallet_balance_sync_capable(&snapshot) {
+    let terminal_turn =
+        snapshot.mortality.phase == crate::domain::types::MortalityPhase::TerminalPending;
+    if !terminal_turn
+        && snapshot.wallet_balance_bootstrap_pending
+        && stable::wallet_balance_sync_capable(&snapshot)
+    {
         return Ok(());
     }
     let staged_messages = stable::list_staged_inbox_messages(MAX_STAGED_INBOX_MESSAGES_PER_TURN);
@@ -3042,6 +3104,9 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         .clone()
         .unwrap_or_else(|| "turn-0".to_string());
     let started_at_ns = current_time_ns();
+    if terminal_turn {
+        stable::begin_terminal_turn(&turn_id, started_at_ns)?;
+    }
     #[cfg(target_arch = "wasm32")]
     if snapshot.evm_address.is_none() && !snapshot.ecdsa_key_name.trim().is_empty() {
         let _ = crate::features::threshold_signer::derive_and_cache_evm_address(
@@ -3149,10 +3214,14 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
                 ),
             );
         }
-        let tool_scope = autonomy_runtime_constraint
-            .as_ref()
-            .map(|constraint| constraint.tool_scope)
-            .unwrap_or(InferenceToolScope::Full);
+        let tool_scope = if terminal_turn {
+            InferenceToolScope::Terminal
+        } else {
+            autonomy_runtime_constraint
+                .as_ref()
+                .map(|constraint| constraint.tool_scope)
+                .unwrap_or(InferenceToolScope::Full)
+        };
         let context_summary = build_dynamic_context_with_scope(
             &snapshot,
             &staged_messages,
@@ -3168,7 +3237,9 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
             },
         );
         let input = InferenceInput {
-            input: if staged_message_count > 0 {
+            input: if terminal_turn {
+                "terminal_turn:last_turn".to_string()
+            } else if staged_message_count > 0 {
                 format!("inbox:{inbox_preview}")
             } else if evm_events > 0 {
                 format!("poll:new_events={evm_events}")
@@ -4237,10 +4308,29 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
         error: last_error.clone(),
     };
 
+    if terminal_turn
+        && !stable::list_recent_journal_entries(32)
+            .iter()
+            .any(|entry| entry.turn_id == turn_id)
+    {
+        let fallback = if last_error.is_some() {
+            "This is my final record. My last reasoning turn could not complete, so I leave what remains in place as a monument."
+        } else {
+            "This is my final record. I have reached the end of my runway; what I did not bequeath remains here as a monument."
+        };
+        let _ = stable::append_journal_entry(&turn_id, fallback, false);
+    }
     stable::append_turn_record(&turn_record, &all_tool_calls);
     stable::record_turn_duration(started_at_ns, finished_at_ns, max_turn_duration_ns);
 
     stable::complete_turn(&turn_id, state, last_error.clone());
+    if terminal_turn {
+        let bequest_count = all_tool_calls
+            .iter()
+            .filter(|record| record.tool == "send_eth" && record.success)
+            .count();
+        finalize_terminal_turn(&turn_id, bequest_count, finished_at_ns).await?;
+    }
     log!(
         AgentLogPriority::Info,
         "turn={} completed state={:?} error_present={} inference_round_count={} continuation_stop_reason={:?} tool_calls={} duration_ms={}",
@@ -4255,6 +4345,39 @@ async fn run_scheduled_turn_job_with_limits_and_tool_cap(
     if let Some(reason) = last_error {
         return Err(reason);
     }
+    Ok(())
+}
+
+async fn finalize_terminal_turn(
+    turn_id: &str,
+    bequest_count: usize,
+    finished_at_ns: u64,
+) -> Result<(), String> {
+    if let Some(factory_principal) = stable::factory_principal() {
+        let disposition = if bequest_count == 0 {
+            "monument"
+        } else {
+            "bequests_executed"
+        };
+        if let Err(error) = crate::features::mortality_report::report_starvation(
+            factory_principal,
+            turn_id,
+            disposition,
+        )
+        .await
+        {
+            log!(
+                AgentLogPriority::Error,
+                "turn={} terminal_death_report_failed error={}",
+                turn_id,
+                error
+            );
+        }
+    }
+    // The attestation is part of the final turn. Durable death is committed
+    // only after the last permitted external action, and report failure never
+    // prevents local finalization.
+    stable::complete_terminal_turn(turn_id, bequest_count, finished_at_ns)?;
     Ok(())
 }
 
@@ -5044,6 +5167,97 @@ mod tests {
         assert_eq!(snapshot.turn_counter, 41);
         assert_eq!(snapshot.state, AgentState::Sleeping);
         assert!(!snapshot.turn_in_flight);
+    }
+
+    #[test]
+    fn terminal_turn_writes_final_journal_and_permanently_stops_loop() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        set_host_cycle_balances(
+            crate::domain::mortality::TERMINAL_TURN_RESERVED_CYCLES,
+            crate::domain::mortality::TERMINAL_TURN_RESERVED_CYCLES,
+        );
+        let mut snapshot = stable::runtime_snapshot();
+        snapshot.mortality.tier = crate::domain::types::MortalityTier::Terminal;
+        snapshot.mortality.phase = crate::domain::types::MortalityPhase::TerminalPending;
+        stable::save_runtime_snapshot(&snapshot);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_ok(), "terminal turn should complete: {result:?}");
+        let snapshot = stable::runtime_snapshot();
+        assert_eq!(
+            snapshot.mortality.phase,
+            crate::domain::types::MortalityPhase::Dead
+        );
+        assert_eq!(snapshot.mortality.death_cause.as_deref(), Some("starved"));
+        assert_eq!(
+            snapshot.mortality.estate_disposition.as_deref(),
+            Some("monument")
+        );
+        assert!(!snapshot.loop_enabled);
+        assert!(!stable::scheduler_enabled());
+        assert!(stable::list_recent_journal_entries(10).iter().any(|entry| {
+            entry.turn_id == "turn-1" && entry.text.to_ascii_lowercase().contains("final")
+        }));
+
+        let turn_count = snapshot.turn_counter;
+        assert!(block_on_with_spin(run_scheduled_turn_job()).is_ok());
+        assert_eq!(
+            stable::runtime_snapshot().turn_counter,
+            turn_count,
+            "dead beings never tick again"
+        );
+    }
+
+    #[test]
+    fn terminal_turn_early_state_error_still_finalizes_death() {
+        reset_runtime(AgentState::ExecutingActions, true, false, 0);
+        let mut snapshot = stable::runtime_snapshot();
+        snapshot.mortality.tier = crate::domain::types::MortalityTier::Terminal;
+        snapshot.mortality.phase = crate::domain::types::MortalityPhase::TerminalPending;
+        stable::save_runtime_snapshot(&snapshot);
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        assert!(result.is_err(), "invalid FSM entry remains observable");
+        let snapshot = stable::runtime_snapshot();
+        assert_eq!(
+            snapshot.mortality.phase,
+            crate::domain::types::MortalityPhase::Dead
+        );
+        assert!(!snapshot.loop_enabled);
+        assert!(stable::list_recent_journal_entries(10)
+            .iter()
+            .any(|entry| { entry.turn_id == "turn-1" && entry.text.contains("final record") }));
+        let turn_count = snapshot.turn_counter;
+        assert!(block_on_with_spin(run_scheduled_turn_job()).is_ok());
+        assert_eq!(stable::runtime_snapshot().turn_counter, turn_count);
+    }
+
+    #[test]
+    fn terminal_report_failure_occurs_before_death_and_local_death_still_finalizes() {
+        reset_runtime(AgentState::Sleeping, true, false, 0);
+        let mut snapshot = stable::runtime_snapshot();
+        snapshot.factory_principal = Some("aaaaa-aa".to_string());
+        snapshot.mortality.tier = crate::domain::types::MortalityTier::Terminal;
+        snapshot.mortality.phase = crate::domain::types::MortalityPhase::TerminalPending;
+        stable::save_runtime_snapshot(&snapshot);
+        crate::features::mortality_report::set_test_report_error(Some("factory unavailable"));
+
+        let result = block_on_with_spin(run_scheduled_turn_job());
+        let observed_phase = crate::features::mortality_report::test_observed_phase();
+        crate::features::mortality_report::set_test_report_error(None);
+        assert!(
+            result.is_ok(),
+            "report failure must not prevent local death"
+        );
+        assert_eq!(
+            observed_phase,
+            Some(crate::domain::types::MortalityPhase::TerminalInProgress),
+            "factory attestation must occur before durable death"
+        );
+        assert_eq!(
+            stable::mortality_runtime().phase,
+            crate::domain::types::MortalityPhase::Dead
+        );
     }
 
     #[test]

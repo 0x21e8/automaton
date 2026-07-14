@@ -304,6 +304,26 @@ export function normalizeAutomatonDetail(options: {
     toOptionalInteger(identity?.schedulerConfig.default_turn_interval_secs) ??
     base.runtime.heartbeatIntervalSeconds;
   const runtimeState = toVariantName(runtime?.snapshot.runtime?.state, base.runtime.agentState);
+  const mortalityTierVariant = toVariantName(
+    runtime?.snapshot.runtime?.mortality?.tier,
+    options.registryRecord?.deathCause ? "dead" : "active"
+  ).toLowerCase();
+  const mortalityTier = (
+    ["active", "conserving", "hibernating", "terminal", "dead"] as const
+  ).find((candidate) => candidate === mortalityTierVariant) ?? "active";
+  const runtimeDeathCause = toOptionalString(runtime?.snapshot.runtime?.mortality?.death_cause);
+  const deathCause = runtimeDeathCause === "starved" || runtimeDeathCause === "infrastructure"
+    ? runtimeDeathCause
+    : options.registryRecord?.deathCause ?? null;
+  const runtimeDisposition = toOptionalString(
+    runtime?.snapshot.runtime?.mortality?.estate_disposition
+  );
+  const estateDisposition = runtimeDisposition === "monument" ||
+    runtimeDisposition === "bequests_executed"
+    ? runtimeDisposition
+    : options.registryRecord?.estateDisposition ?? null;
+  const diedAt = nsToMs(runtime?.snapshot.runtime?.mortality?.died_at_ns) ??
+    options.registryRecord?.diedAt ?? null;
   const commitHash = toOptionalString(identity?.buildInfo.commit) ?? base.version.commitHash;
   const runtimeLastError =
     runtime !== undefined
@@ -365,7 +385,9 @@ export function normalizeAutomatonDetail(options: {
       ).toString();
   const cyclesBalance =
     toOptionalNumber(runtime?.snapshot.cycles?.total_cycles) ?? base.financials.cyclesBalance;
-  const tier = normalizeTier(runtime?.snapshot.scheduler?.survival_tier, base.tier);
+  const tier = mortalityTier === "dead"
+    ? "out_of_cycles"
+    : normalizeTier(runtime?.snapshot.scheduler?.survival_tier, base.tier);
   const nextHistory = !shouldAppendRuntimeSample ? priorHistory : [...priorHistory, {
     capturedAt,
     liquidCycles,
@@ -421,7 +443,11 @@ export function normalizeAutomatonDetail(options: {
       lifetimeEarningsUsdcRaw,
       ageSeconds: Math.max(0, Math.floor((capturedAt - (options.registryRecord?.createdAt ?? base.createdAt)) / 1_000)),
       state: deriveMetabolicState({ runwaySeconds, tier, cyclesBalance }),
-      history
+      history,
+      mortalityTier,
+      deathCause,
+      diedAt,
+      estateDisposition
     },
     controlStatus: {
       label: controlLabel,

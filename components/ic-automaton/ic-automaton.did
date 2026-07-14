@@ -547,6 +547,33 @@ type MemoryRollup = record {
   source_keys : vec text;
   namespace : text;
 };
+type MortalityPhase = variant {
+  Dead;
+  TerminalPending;
+  Alive;
+  TerminalInProgress;
+};
+type MortalityRuntime = record {
+  recovery_checks : nat32;
+  recovery_candidate : opt MortalityTier;
+  terminal_bequest_count : nat8;
+  death_cause : opt text;
+  tier : MortalityTier;
+  terminal_turn_id : opt text;
+  died_at_ns : opt nat64;
+  estate_disposition : opt text;
+  phase : MortalityPhase;
+  terminal_started_at_ns : opt nat64;
+  terminal_budget_reserved_cycles : nat;
+  runway_seconds : opt nat64;
+};
+type MortalityTier = variant {
+  Hibernating;
+  Dead;
+  Active;
+  Conserving;
+  Terminal;
+};
 // A point-in-time snapshot of the entire observable state of the canister,
 // returned by the `observability_snapshot` query.
 //
@@ -794,6 +821,7 @@ type RuntimeView = record {
   timing_telemetry : RuntimeTimingTelemetry;
   state : AgentState;
   inference_provider : InferenceProvider;
+  mortality : MortalityRuntime;
   evm_next_log_index : nat64;
   turn_in_flight : bool;
   inference_model : text;

@@ -20,6 +20,7 @@ pub mod evm;
 pub mod factory_room;
 pub mod http_fetch;
 pub mod inference;
+pub mod mortality_report;
 pub mod signer;
 pub mod skills;
 pub mod strategy_discovery;

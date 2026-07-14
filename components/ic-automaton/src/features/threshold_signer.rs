@@ -20,7 +20,7 @@ use sha3::{Digest, Keccak256};
 #[cfg(target_arch = "wasm32")]
 use crate::domain::cycle_admission::{
     affordability_requirements, can_afford, estimate_operation_cost, OperationClass,
-    DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
+    DEFAULT_SAFETY_MARGIN_BPS,
 };
 #[cfg(target_arch = "wasm32")]
 use ic_cdk::management_canister::{
@@ -87,7 +87,7 @@ impl SignerPort for ThresholdSignerAdapter {
             let requirements = affordability_requirements(
                 estimated,
                 DEFAULT_SAFETY_MARGIN_BPS,
-                DEFAULT_RESERVE_FLOOR_CYCLES,
+                stable::operation_reserve_floor_cycles(),
             );
             let liquid = ic_cdk::api::canister_liquid_cycle_balance();
             if !can_afford(liquid, &requirements) {

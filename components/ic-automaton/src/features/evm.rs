@@ -12,7 +12,7 @@
 // ── Imports ──────────────────────────────────────────────────────────────────
 use crate::domain::cycle_admission::{
     affordability_requirements, can_afford, estimate_operation_cost, OperationClass,
-    DEFAULT_RESERVE_FLOOR_CYCLES, DEFAULT_SAFETY_MARGIN_BPS,
+    DEFAULT_SAFETY_MARGIN_BPS,
 };
 use crate::domain::types::{
     EvmEvent, EvmPollCursor, EvmStewardProof, ExecutionPlan, OperationFailure,
@@ -866,7 +866,7 @@ fn ensure_http_affordable(request_size_bytes: u64, max_response_bytes: u64) -> R
     let requirements = affordability_requirements(
         estimated,
         DEFAULT_SAFETY_MARGIN_BPS,
-        DEFAULT_RESERVE_FLOOR_CYCLES,
+        stable::operation_reserve_floor_cycles(),
     );
     let liquid = liquid_cycle_balance();
     if !can_afford(liquid, &requirements) {
@@ -2320,6 +2320,27 @@ fn parse_send_eth_args(args_json: &str) -> Result<ParsedSendEthArgs, String> {
     })
 }
 
+/// Terminal estate transfers deliberately support only bounded, auditable
+/// shapes: a native transfer with no calldata, or the canonical ERC-20
+/// `transfer(address,uint256)` ABI payload. This validation runs before any
+/// gas estimate, signature, or broadcast is attempted.
+pub(crate) fn validate_terminal_estate_transfer_args(args_json: &str) -> Result<(), String> {
+    let args = parse_send_eth_args(args_json)?;
+    if args.data.is_empty() {
+        return Ok(());
+    }
+    if args.data.len() != 68 || args.data.as_ref().get(..4) != Some(&[0xa9, 0x05, 0x9c, 0xbb]) {
+        return Err(
+            "terminal estate calldata must be empty or exact ERC-20 transfer(address,uint256) calldata (selector 0xa9059cbb, 68 bytes)"
+                .to_string(),
+        );
+    }
+    if !args.value_wei.is_zero() {
+        return Err("terminal ERC-20 transfers must set value_wei to 0".to_string());
+    }
+    Ok(())
+}
+
 fn parse_decimal_u256(raw: &str, field: &str) -> Result<U256, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -2446,7 +2467,7 @@ fn ensure_send_eth_affordable(key_name: &str) -> Result<(), String> {
     let requirements = affordability_requirements(
         estimated,
         DEFAULT_SAFETY_MARGIN_BPS,
-        DEFAULT_RESERVE_FLOOR_CYCLES,
+        stable::operation_reserve_floor_cycles(),
     );
     let liquid = liquid_cycle_balance();
     if !can_afford(liquid, &requirements) {

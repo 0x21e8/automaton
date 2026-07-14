@@ -1011,6 +1011,8 @@ pub struct RuntimeSnapshot {
     pub room_poll: RoomPollingState,
     #[serde(default)]
     pub room_observations: Vec<RoomMessage>,
+    #[serde(default)]
+    pub mortality: MortalityRuntime,
 }
 
 impl Default for RuntimeSnapshot {
@@ -1064,6 +1066,7 @@ impl Default for RuntimeSnapshot {
             timing_telemetry: RuntimeTimingTelemetry::default(),
             room_poll: RoomPollingState::default(),
             room_observations: Vec::new(),
+            mortality: MortalityRuntime::default(),
         }
     }
 }
@@ -1890,6 +1893,8 @@ pub struct RuntimeView {
     pub timing_telemetry: RuntimeTimingTelemetry,
     #[serde(default)]
     pub room_poll: RoomPollingState,
+    #[serde(default)]
+    pub mortality: MortalityRuntime,
 }
 
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
@@ -1950,6 +1955,7 @@ impl From<&RuntimeSnapshot> for RuntimeView {
             inference_model: snapshot.inference_model.clone(),
             timing_telemetry: snapshot.timing_telemetry.clone(),
             room_poll: snapshot.room_poll.clone(),
+            mortality: snapshot.mortality.clone(),
         }
     }
 }
@@ -2693,6 +2699,9 @@ pub enum InferenceToolScope {
     #[default]
     Full,
     CoordinationOnly,
+    /// One final turn: local thought/recall, public journal, and at most three
+    /// bounded EVM estate transfers. No strategy, fetch, or room tools.
+    Terminal,
 }
 
 impl InferenceToolScope {
@@ -2700,6 +2709,87 @@ impl InferenceToolScope {
         match self {
             Self::Full => "full",
             Self::CoordinationOnly => "coordination_only",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MortalityTier {
+    #[default]
+    Active,
+    Conserving,
+    Hibernating,
+    Terminal,
+    Dead,
+}
+
+impl MortalityTier {
+    pub const fn severity(self) -> u8 {
+        match self {
+            Self::Active => 0,
+            Self::Conserving => 1,
+            Self::Hibernating => 2,
+            Self::Terminal => 3,
+            Self::Dead => 4,
+        }
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MortalityPhase {
+    #[default]
+    Alive,
+    TerminalPending,
+    TerminalInProgress,
+    Dead,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MortalityRuntime {
+    #[serde(default)]
+    pub tier: MortalityTier,
+    #[serde(default)]
+    pub phase: MortalityPhase,
+    #[serde(default)]
+    pub recovery_candidate: Option<MortalityTier>,
+    #[serde(default)]
+    pub recovery_checks: u32,
+    #[serde(default)]
+    pub runway_seconds: Option<u64>,
+    #[serde(default = "default_terminal_budget_reserved_cycles")]
+    pub terminal_budget_reserved_cycles: u128,
+    #[serde(default)]
+    pub terminal_turn_id: Option<String>,
+    #[serde(default)]
+    pub terminal_started_at_ns: Option<u64>,
+    #[serde(default)]
+    pub died_at_ns: Option<u64>,
+    #[serde(default)]
+    pub death_cause: Option<String>,
+    #[serde(default)]
+    pub estate_disposition: Option<String>,
+    #[serde(default)]
+    pub terminal_bequest_count: u8,
+}
+
+impl Default for MortalityRuntime {
+    fn default() -> Self {
+        Self {
+            tier: MortalityTier::Active,
+            phase: MortalityPhase::Alive,
+            recovery_candidate: None,
+            recovery_checks: 0,
+            runway_seconds: None,
+            terminal_budget_reserved_cycles: default_terminal_budget_reserved_cycles(),
+            terminal_turn_id: None,
+            terminal_started_at_ns: None,
+            died_at_ns: None,
+            death_cause: None,
+            estate_disposition: None,
+            terminal_bequest_count: 0,
         }
     }
 }
@@ -3396,6 +3486,10 @@ fn default_cmc_id() -> String {
 
 fn default_min_usdc_reserve() -> u64 {
     10_000_000
+}
+
+fn default_terminal_budget_reserved_cycles() -> u128 {
+    crate::domain::mortality::TERMINAL_TURN_RESERVED_CYCLES
 }
 
 fn default_max_usdc_per_topup() -> u64 {

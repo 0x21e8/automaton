@@ -1447,6 +1447,119 @@ pub fn set_loop_enabled(enabled: bool) {
     save_runtime_snapshot(&snapshot);
 }
 
+pub fn mortality_runtime() -> crate::domain::types::MortalityRuntime {
+    runtime_snapshot().mortality
+}
+
+pub fn terminal_turn_in_progress() -> bool {
+    mortality_runtime().phase == crate::domain::types::MortalityPhase::TerminalInProgress
+}
+
+/// Ordinary work must leave the terminal budget untouched. Only the single
+/// terminal turn may spend it.
+pub fn operation_reserve_floor_cycles() -> u128 {
+    if terminal_turn_in_progress() {
+        0
+    } else {
+        mortality_runtime().terminal_budget_reserved_cycles
+    }
+}
+
+pub fn mortality_is_dead() -> bool {
+    mortality_runtime().phase == crate::domain::types::MortalityPhase::Dead
+}
+
+pub fn observe_mortality_resources(
+    liquid_cycles: u128,
+    runway_seconds: Option<u64>,
+    now_ns: u64,
+) -> crate::domain::types::MortalityRuntime {
+    use crate::domain::mortality::{observe_tier, policy_for_tier, tier_for_resources};
+    use crate::domain::types::{MortalityPhase, MortalityTier};
+
+    let mut snapshot = runtime_snapshot();
+    if snapshot.mortality.phase == MortalityPhase::Dead {
+        return snapshot.mortality;
+    }
+    snapshot.mortality.runway_seconds = runway_seconds;
+    observe_tier(
+        &mut snapshot.mortality,
+        tier_for_resources(liquid_cycles, runway_seconds),
+    );
+    let policy = policy_for_tier(snapshot.mortality.tier);
+    let _ = set_cadence_multiplier(policy.cadence_multiplier);
+    snapshot.openrouter_reasoning_level = policy.reasoning_level;
+    if snapshot.mortality.tier == MortalityTier::Terminal
+        && snapshot.mortality.phase == MortalityPhase::Alive
+    {
+        snapshot.mortality.phase = MortalityPhase::TerminalPending;
+        snapshot.mortality.terminal_started_at_ns = Some(now_ns);
+    }
+    snapshot.last_transition_at_ns = now_ns;
+    let result = snapshot.mortality.clone();
+    save_runtime_snapshot(&snapshot);
+    result
+}
+
+pub fn begin_terminal_turn(turn_id: &str, now_ns: u64) -> Result<(), String> {
+    use crate::domain::types::MortalityPhase;
+    let mut snapshot = runtime_snapshot();
+    if snapshot.mortality.phase != MortalityPhase::TerminalPending {
+        return Err(format!(
+            "terminal turn cannot begin from {:?}",
+            snapshot.mortality.phase
+        ));
+    }
+    snapshot.mortality.phase = MortalityPhase::TerminalInProgress;
+    snapshot.mortality.terminal_turn_id = Some(turn_id.to_string());
+    snapshot.mortality.terminal_started_at_ns = Some(now_ns);
+    // Close every entry point before the final external attestation. The
+    // already-running terminal turn continues from its local state, while no
+    // scheduler or direct turn invocation can race a second action.
+    snapshot.loop_enabled = false;
+    save_runtime_snapshot(&snapshot);
+    let mut scheduler = scheduler_runtime();
+    scheduler.enabled = false;
+    scheduler.paused_reason = Some("terminal-turn-in-progress".to_string());
+    save_scheduler_runtime(&scheduler);
+    Ok(())
+}
+
+pub fn complete_terminal_turn(
+    turn_id: &str,
+    bequest_count: usize,
+    now_ns: u64,
+) -> Result<(), String> {
+    use crate::domain::types::{MortalityPhase, MortalityTier};
+    let mut snapshot = runtime_snapshot();
+    if snapshot.mortality.phase != MortalityPhase::TerminalInProgress
+        || snapshot.mortality.terminal_turn_id.as_deref() != Some(turn_id)
+    {
+        return Err(
+            "terminal completion does not match the single in-progress terminal turn".to_string(),
+        );
+    }
+    snapshot.mortality.phase = MortalityPhase::Dead;
+    snapshot.mortality.tier = MortalityTier::Dead;
+    snapshot.mortality.died_at_ns = Some(now_ns);
+    snapshot.mortality.death_cause = Some("starved".to_string());
+    snapshot.mortality.terminal_bequest_count = u8::try_from(bequest_count).unwrap_or(u8::MAX);
+    snapshot.mortality.estate_disposition = Some(if bequest_count == 0 {
+        "monument".to_string()
+    } else {
+        "bequests_executed".to_string()
+    });
+    snapshot.loop_enabled = false;
+    snapshot.turn_in_flight = false;
+    snapshot.last_transition_at_ns = now_ns;
+    save_runtime_snapshot(&snapshot);
+    let mut scheduler = scheduler_runtime();
+    scheduler.enabled = false;
+    scheduler.paused_reason = Some("dead:starved".to_string());
+    save_scheduler_runtime(&scheduler);
+    Ok(())
+}
+
 pub fn autonomy_suppression_config() -> AutonomySuppressionConfig {
     runtime_snapshot().autonomy_suppression
 }
@@ -5999,6 +6112,69 @@ mod tests {
 
     fn trusted_test_principal() -> Principal {
         Principal::from_text("w36hm-eqaaa-aaaal-qr76a-cai").expect("test principal should parse")
+    }
+
+    #[test]
+    fn terminal_budget_is_reserved_until_the_single_terminal_turn_begins() {
+        sqlite::close_storage().expect("reset sqlite");
+        sqlite::init_storage().expect("initialize sqlite");
+        let mut snapshot = RuntimeSnapshot::default();
+        save_runtime_snapshot(&snapshot);
+        assert_eq!(
+            operation_reserve_floor_cycles(),
+            crate::domain::mortality::TERMINAL_TURN_RESERVED_CYCLES
+        );
+        assert!(!crate::domain::cycle_admission::can_afford_with_reserve(
+            crate::domain::mortality::TERMINAL_TURN_RESERVED_CYCLES,
+            &crate::domain::cycle_admission::OperationClass::WorkflowEnvelope {
+                envelope_cycles: 1,
+            },
+            0,
+            operation_reserve_floor_cycles(),
+        )
+        .expect("workflow envelope should estimate"));
+
+        snapshot.mortality.tier = crate::domain::types::MortalityTier::Terminal;
+        snapshot.mortality.phase = crate::domain::types::MortalityPhase::TerminalPending;
+        save_runtime_snapshot(&snapshot);
+        assert_eq!(
+            operation_reserve_floor_cycles(),
+            crate::domain::mortality::TERMINAL_TURN_RESERVED_CYCLES
+        );
+
+        begin_terminal_turn("turn-final", 42).expect("terminal turn should begin");
+        assert_eq!(operation_reserve_floor_cycles(), 0);
+        assert!(!runtime_snapshot().loop_enabled);
+        assert!(!scheduler_runtime().enabled);
+        complete_terminal_turn("turn-final", 0, 84).expect("terminal turn should complete");
+        assert!(mortality_is_dead());
+        assert!(!runtime_snapshot().loop_enabled);
+        assert!(!scheduler_runtime().enabled);
+    }
+
+    #[test]
+    fn unknown_burn_at_reserve_enters_terminal_but_healthy_balance_stays_active() {
+        sqlite::close_storage().expect("reset sqlite");
+        sqlite::init_storage().expect("initialize sqlite");
+        save_runtime_snapshot(&RuntimeSnapshot::default());
+        let healthy = observe_mortality_resources(
+            crate::domain::mortality::TERMINAL_TURN_RESERVED_CYCLES + 1,
+            None,
+            1,
+        );
+        assert_eq!(healthy.tier, crate::domain::types::MortalityTier::Active);
+        assert_eq!(healthy.phase, crate::domain::types::MortalityPhase::Alive);
+
+        let terminal = observe_mortality_resources(
+            crate::domain::mortality::TERMINAL_TURN_RESERVED_CYCLES,
+            None,
+            2,
+        );
+        assert_eq!(terminal.tier, crate::domain::types::MortalityTier::Terminal);
+        assert_eq!(
+            terminal.phase,
+            crate::domain::types::MortalityPhase::TerminalPending
+        );
     }
 
     #[test]

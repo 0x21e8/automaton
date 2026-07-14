@@ -21,15 +21,15 @@ pub mod types;
 pub use api::admin::{
     append_artifact_chunk, begin_artifact_upload, commit_artifact_upload,
     get_artifact_upload_status, get_factory_config, get_factory_health, get_factory_runtime,
-    get_session_admin, retry_session_admin, set_child_runtime_config, set_creation_cost_quote,
-    set_fee_config, set_operational_config, set_pause, set_release_broadcast_config,
-    update_artifact,
+    get_session_admin, record_infrastructure_death, retry_session_admin, set_child_runtime_config,
+    set_creation_cost_quote, set_fee_config, set_operational_config, set_pause,
+    set_release_broadcast_config, update_artifact,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use api::public::{
     claim_spawn_refund, create_spawn_session, get_spawn_session, get_spawned_automaton,
     list_messages_for_automaton, list_my_room_messages, list_room_messages,
-    list_spawned_automatons, post_room_message, retry_spawn_session,
+    list_spawned_automatons, post_room_message, report_death, retry_spawn_session,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use api::repository::{
@@ -59,9 +59,10 @@ pub use types::{
     FactoryInitArgs, FactoryOperationalConfig, FactoryRuntimeSnapshot,
     FactorySchedulerHealthSnapshot, FactorySchedulerJobCounts, FactorySessionHealthCounts,
     FeeConfig, GetRepositoryStrategyResponse, ListRepositoryStrategiesResponse, PaymentStatus,
-    PostRoomMessageRequest, ProviderConfig, RefundSpawnResponse, ReleaseBroadcastConfig,
-    ReleaseBroadcastFailure, ReleaseBroadcastRecord, ReleaseBroadcastStage, ReleaseSignatureRecord,
-    RepositoryStrategyMetadata, RepositoryStrategyMutationResponse, RepositoryStrategyRecord,
+    PostRoomMessageRequest, ProviderConfig, RecordInfrastructureDeathRequest, RefundSpawnResponse,
+    ReleaseBroadcastConfig, ReleaseBroadcastFailure, ReleaseBroadcastRecord, ReleaseBroadcastStage,
+    ReleaseSignatureRecord, ReportDeathRequest, RepositoryStrategyMetadata,
+    RepositoryStrategyMutationResponse, RepositoryStrategyRecord,
     RepositoryStrategySessionSnapshot, RepositoryStrategySource, RepositoryStrategyStatus,
     RevokeRepositoryStrategyRequest, RoomContentType, RoomMessage, RoomMessagePage, RoomState,
     SchedulerFailureAction, SchedulerFailureSource, SchedulerJob, SchedulerJobFailure,
@@ -182,6 +183,12 @@ fn get_spawn_session(session_id: String) -> Result<SpawnSessionStatusResponse, F
 #[ic_cdk::query]
 fn get_spawned_automaton(canister_id: String) -> Result<SpawnedAutomatonRecord, FactoryError> {
     api::public::get_spawned_automaton(&canister_id)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
+fn report_death(request: ReportDeathRequest) -> Result<SpawnedAutomatonRecord, FactoryError> {
+    api::public::report_death(&ic_cdk::api::msg_caller().to_text(), request, now_ms())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -334,6 +341,14 @@ fn set_pause(paused: bool) -> Result<bool, FactoryError> {
 
 #[cfg(target_arch = "wasm32")]
 #[ic_cdk::update]
+fn record_infrastructure_death(
+    request: RecordInfrastructureDeathRequest,
+) -> Result<SpawnedAutomatonRecord, FactoryError> {
+    api::admin::record_infrastructure_death(&ic_cdk::api::msg_caller().to_text(), request, now_ms())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
 fn add_repository_strategy(
     request: AddRepositoryStrategyRequest,
 ) -> Result<RepositoryStrategyMutationResponse, FactoryError> {
@@ -431,15 +446,16 @@ mod tests {
         insert_spawned_automaton_record, list_messages_for_automaton, list_my_room_messages,
         list_repository_strategies, list_room_messages, list_spawned_automatons,
         load_spawn_provider_secrets, mark_session_failed, next_payment_scan_plan,
-        post_room_message, read_state, reconcile_escrow_payments, restore_state,
-        retry_session_admin, retry_spawn_session, revoke_repository_strategy,
-        set_child_runtime_config, set_creation_cost_quote, set_fee_config,
-        set_mock_canister_balance, set_operational_config, set_pause, set_release_broadcast_config,
-        snapshot_state, update_artifact, write_state, AddRepositoryStrategyRequest,
-        AutomatonChildRuntimeConfig, CreateSpawnSessionRequest, CreationCostQuote,
-        DeprecateRepositoryStrategyRequest, FactoryError, FactoryInitArgs,
+        post_room_message, read_state, reconcile_escrow_payments, record_infrastructure_death,
+        report_death, restore_state, retry_session_admin, retry_spawn_session,
+        revoke_repository_strategy, set_child_runtime_config, set_creation_cost_quote,
+        set_fee_config, set_mock_canister_balance, set_operational_config, set_pause,
+        set_release_broadcast_config, snapshot_state, update_artifact, write_state,
+        AddRepositoryStrategyRequest, AutomatonChildRuntimeConfig, CreateSpawnSessionRequest,
+        CreationCostQuote, DeprecateRepositoryStrategyRequest, FactoryError, FactoryInitArgs,
         FactoryOperationalConfig, FactoryStateSnapshot, FeeConfig, PaymentStatus,
-        PostRoomMessageRequest, ProviderConfig, ReleaseBroadcastConfig, RepositoryStrategyMetadata,
+        PostRoomMessageRequest, ProviderConfig, RecordInfrastructureDeathRequest,
+        ReleaseBroadcastConfig, ReportDeathRequest, RepositoryStrategyMetadata,
         RepositoryStrategySource, RevokeRepositoryStrategyRequest, RoomContentType,
         SchedulerFailureAction, SchedulerFailureSource, SchedulerJob, SchedulerJobFailure,
         SchedulerJobKind, SchedulerJobStatus, SchedulerRuntime, SessionAuditActor, SpawnAsset,
@@ -566,6 +582,11 @@ mod tests {
             controllers: Some(vec![canister_id.to_string()]),
             control_status: Some("self_controlled".to_string()),
             control_verified_at: Some(created_at),
+            death_cause: None,
+            died_at: None,
+            estate_disposition: None,
+            death_recorded_by: None,
+            death_incident_reference: None,
         }
     }
 
@@ -1378,6 +1399,128 @@ mod tests {
     }
 
     #[test]
+    fn registered_child_records_permanent_starvation_and_monument_estate() {
+        reset_factory_state();
+        insert_spawned_automaton_record(sample_spawned_automaton_record(
+            "aaaaa-aa",
+            "session-1",
+            1,
+        ));
+        let recorded = report_death(
+            "aaaaa-aa",
+            ReportDeathRequest {
+                cause: "starved".to_string(),
+                estate_disposition: "monument".to_string(),
+                terminal_turn_id: "turn-9".to_string(),
+            },
+            42,
+        )
+        .expect("registered child may report its own death");
+        assert_eq!(recorded.death_cause.as_deref(), Some("starved"));
+        assert_eq!(recorded.died_at, Some(42));
+        assert_eq!(recorded.estate_disposition.as_deref(), Some("monument"));
+        assert_eq!(recorded.death_recorded_by.as_deref(), Some("aaaaa-aa"));
+
+        let rejected = report_death(
+            "aaaaa-aa",
+            ReportDeathRequest {
+                cause: "infrastructure".to_string(),
+                estate_disposition: "bequests_executed".to_string(),
+                terminal_turn_id: "restore-attempt".to_string(),
+            },
+            99,
+        )
+        .expect_err("children cannot self-label infrastructure loss");
+        assert!(matches!(rejected, FactoryError::InvalidDeathReport { .. }));
+
+        let unchanged = report_death(
+            "aaaaa-aa",
+            ReportDeathRequest {
+                cause: "starved".to_string(),
+                estate_disposition: "bequests_executed".to_string(),
+                terminal_turn_id: "repeat".to_string(),
+            },
+            99,
+        )
+        .expect("repeat starvation reports are idempotent");
+        assert_eq!(unchanged.died_at, Some(42));
+        assert_eq!(unchanged.estate_disposition.as_deref(), Some("monument"));
+    }
+
+    #[test]
+    fn infrastructure_death_requires_admin_and_public_incident_provenance() {
+        reset_factory_state();
+        insert_spawned_automaton_record(sample_spawned_automaton_record(
+            "aaaaa-aa",
+            "session-1",
+            1,
+        ));
+        let request = RecordInfrastructureDeathRequest {
+            canister_id: "aaaaa-aa".to_string(),
+            incident_reference: "https://status.example/incidents/42".to_string(),
+            estate_disposition: "monument".to_string(),
+        };
+        assert!(matches!(
+            record_infrastructure_death("not-admin", request.clone(), 41),
+            Err(FactoryError::UnauthorizedAdmin { .. })
+        ));
+        let recorded = record_infrastructure_death("admin", request.clone(), 42)
+            .expect("admin may record documented infrastructure death");
+        assert_eq!(recorded.death_cause.as_deref(), Some("infrastructure"));
+        assert_eq!(recorded.died_at, Some(42));
+        assert_eq!(recorded.death_recorded_by.as_deref(), Some("admin"));
+        assert_eq!(
+            recorded.death_incident_reference.as_deref(),
+            Some("https://status.example/incidents/42")
+        );
+        assert_eq!(
+            record_infrastructure_death("admin", request, 99)
+                .expect("same incident is idempotent")
+                .died_at,
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn infrastructure_record_cannot_overwrite_starvation() {
+        reset_factory_state();
+        let mut record = sample_spawned_automaton_record("aaaaa-aa", "session-1", 1);
+        record.death_cause = Some("starved".to_string());
+        record.died_at = Some(10);
+        record.estate_disposition = Some("monument".to_string());
+        insert_spawned_automaton_record(record);
+        let unchanged = record_infrastructure_death(
+            "admin",
+            RecordInfrastructureDeathRequest {
+                canister_id: "aaaaa-aa".to_string(),
+                incident_reference: "https://status.example/incidents/42".to_string(),
+                estate_disposition: "bequests_executed".to_string(),
+            },
+            99,
+        )
+        .expect("immutable starvation returns the existing record");
+        assert_eq!(unchanged.death_cause.as_deref(), Some("starved"));
+        assert_eq!(unchanged.died_at, Some(10));
+        assert_eq!(unchanged.estate_disposition.as_deref(), Some("monument"));
+    }
+
+    #[test]
+    fn unregistered_caller_cannot_create_death_record() {
+        reset_factory_state();
+        let error = report_death(
+            "2vxsx-fae",
+            ReportDeathRequest {
+                cause: "starved".to_string(),
+                estate_disposition: "monument".to_string(),
+                terminal_turn_id: "turn-1".to_string(),
+            },
+            42,
+        )
+        .expect_err("unregistered callers have no registry record to mutate");
+        assert!(matches!(error, FactoryError::RegistryRecordNotFound { .. }));
+    }
+
+    #[test]
     fn posts_room_messages_for_registered_automatons_and_round_trips_untrusted_text() {
         reset_factory_state();
         register_room_poster("aaaaa-aa");
@@ -1624,6 +1767,11 @@ mod tests {
                     controllers: Some(vec!["aaaaa-aa".to_string()]),
                     control_status: Some("self_controlled".to_string()),
                     control_verified_at: Some(5_100),
+                    death_cause: None,
+                    died_at: None,
+                    estate_disposition: None,
+                    death_recorded_by: None,
+                    death_incident_reference: None,
                 },
             );
             state.runtimes.insert(

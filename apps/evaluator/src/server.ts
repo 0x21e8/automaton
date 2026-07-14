@@ -16,6 +16,7 @@ import { historyRoutes } from "./routes/history.js";
 import { runRoutes } from "./routes/run.js";
 import "./types.js";
 import { RunController } from "./runtime/run-controller.js";
+import { dieWellBootstrapEnv, isDieWellExperiment } from "./lib/mortality-assertions.js";
 import { EvaluationEventHub, evaluatorRealtimeRoutes } from "./ws/events.js";
 
 export interface BuildServerOptions {
@@ -55,6 +56,9 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     logger: options.logger ?? false
   });
   const config = resolveEvaluatorConfig(mergedEnv, options.config);
+  if (isDieWellExperiment(config.experimentPath)) {
+    Object.assign(mergedEnv, dieWellBootstrapEnv());
+  }
   const runtimeEnv = options.runtimeEnv ?? loadEvaluatorEnv(config.repoRoot, mergedEnv);
   const artifactStore = options.artifactStore ?? new ArtifactStore(config.artifactsRoot);
   const processManager =

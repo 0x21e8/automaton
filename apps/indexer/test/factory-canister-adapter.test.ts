@@ -107,7 +107,10 @@ function createRegistryRecord() {
     version_commit: "abcdef1234567890abcdef1234567890abcdef12",
     controllers: [["rrkah-fqaaa-aaaaa-aaaaq-cai"]],
     control_status: ["upgradeable_by_factory"],
-    control_verified_at: [1_709_912_360_000n]
+    control_verified_at: [1_709_912_360_000n],
+    death_cause: ["starved"],
+    died_at: [1_709_912_460_000n],
+    estate_disposition: ["monument"]
   };
 }
 
@@ -428,7 +431,10 @@ describe("CanisterFactoryAdapter", () => {
       versionCommit: "abcdef1234567890abcdef1234567890abcdef12",
       controllers: ["rrkah-fqaaa-aaaaa-aaaaq-cai"],
       controlStatus: "upgradeable_by_factory",
-      controlVerifiedAt: 1_709_912_360_000
+      controlVerifiedAt: 1_709_912_360_000,
+      deathCause: "starved",
+      diedAt: 1_709_912_460_000,
+      estateDisposition: "monument"
     });
     expect(missingRegistry).toBeNull();
     expect(page).toEqual({
