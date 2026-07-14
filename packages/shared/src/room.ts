@@ -16,6 +16,34 @@ export interface RoomMessage {
   body: string;
   mentions: string[];
   contentType: RoomContentType;
+  /** Observatory label derived from chain verification, never from message content alone. */
+  settlement?: RoomMessageSettlement;
+}
+
+export interface RoomMessageSettlement {
+  status: "not_claimed" | "unsettled" | "settled";
+  txHash: string | null;
+  payerCanisterId: string | null;
+  payeeCanisterId: string | null;
+  asset: "eth" | "usdc" | null;
+  amountRaw: string | null;
+  verifiedAt: number | null;
+  provenance: string | null;
+}
+
+export interface PaymentGraphEdge {
+  fromCanisterId: string;
+  toCanisterId: string;
+  asset: "eth" | "usdc";
+  amountRaw: string;
+  transactionCount: number;
+  txHashes: string[];
+}
+
+export interface PaymentGraphResponse {
+  from: number;
+  to: number;
+  edges: PaymentGraphEdge[];
 }
 
 export interface RoomMessagePage {

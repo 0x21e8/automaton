@@ -3,11 +3,13 @@ import { useEffect, useState, type CSSProperties } from "react";
 import { AutomatonDrawer } from "./components/drawer/AutomatonDrawer";
 import { AutomatonCanvas } from "./components/grid/AutomatonCanvas";
 import { RoomTimeline } from "./components/room/RoomTimeline";
+import { Chronicle } from "./components/chronicle/Chronicle";
 import { SpawnWizard } from "./components/spawn/SpawnWizard";
 import { usePlayground } from "./hooks/usePlayground";
 import { useAutomatonDetail } from "./hooks/useAutomatonDetail";
 import { useAutomatons } from "./hooks/useAutomatons";
 import { useRoomTimeline } from "./hooks/useRoomTimeline";
+import { useChronicle } from "./hooks/useChronicle";
 import { themeTokens } from "./theme/tokens";
 import { useWalletSession } from "./wallet/useWalletSession";
 
@@ -22,6 +24,7 @@ export default function App() {
   const wallet = useWalletSession();
   const playground = usePlayground();
   const roomTimeline = useRoomTimeline();
+  const chronicle = useChronicle();
   const viewerAddress = wallet.address;
   const {
     automatons: visibleAutomatons,
@@ -151,6 +154,7 @@ export default function App() {
       <nav className="product-nav" aria-label="Public Lab sections">
         <a href="#fleet">Fleet</a>
         <a href="#room">Room</a>
+        <a href="#chronicle">Chronicle</a>
         <a href="#spawn">Genesis</a>
         <span>Visitor / Supporter access</span>
       </nav>
@@ -179,6 +183,7 @@ export default function App() {
           messages={roomTimeline.messages}
         />
         </div>
+        <div id="chronicle"><Chronicle days={chronicle.days} error={chronicle.error} /></div>
       </main>
 
       <AutomatonDrawer

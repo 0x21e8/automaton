@@ -15,17 +15,18 @@ use crate::domain::types::{
     CycleTelemetry, DecisionRecord, EvmPollCursor, EvmRouteStateView, ExposureReconciliationStatus,
     GoalRecord, InboxMessage, InboxMessageSource, InboxMessageStatus, InboxProxyWaitState,
     InboxStats, InferenceConfigView, InferenceProvider, InferenceProxyCallbackApply,
-    InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, JournalEntry, MemoryFact,
-    MemoryRollup, ObservabilitySnapshot, OpenRouterProxyWorkerConfig, OpenRouterReasoningLevel,
-    OutboxMessage, OutboxStats, PendingInferenceProxyJob, PendingStrategyDiscoveryJob, PlanRecord,
-    PromptLayer, PromptLayerView, ProtocolWatchlistEntry, ReflectionMemoryRecord, ReflectionOrigin,
-    RetentionConfig, RetentionMaintenanceRuntime, RoomMessage, RoomPollingState, RuntimeSnapshot,
-    RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord,
-    SpawnBootstrapView, StewardNonceState, StewardState, StewardStatusView, StorageGrowthMetrics,
-    StoragePressureLevel, StrategyDiscoveryCallbackRecord, StrategyDiscoveryResultPayload,
-    StrategyDiscoveryResultStatus, StrategyDiscoveryStatusView, StrategyDiscoveryWorkerConfig,
-    StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats,
-    StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
+    InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, JournalDealClaim,
+    JournalEntry, MemoryFact, MemoryRollup, ObservabilitySnapshot, OpenRouterProxyWorkerConfig,
+    OpenRouterReasoningLevel, OutboxMessage, OutboxStats, PendingInferenceProxyJob,
+    PendingStrategyDiscoveryJob, PlanRecord, PromptLayer, PromptLayerView, ProtocolWatchlistEntry,
+    ReflectionMemoryRecord, ReflectionOrigin, RetentionConfig, RetentionMaintenanceRuntime,
+    RoomMessage, RoomPollingState, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease,
+    SchedulerRuntime, SessionSummary, SkillRecord, SpawnBootstrapView, StewardNonceState,
+    StewardState, StewardStatusView, StorageGrowthMetrics, StoragePressureLevel,
+    StrategyDiscoveryCallbackRecord, StrategyDiscoveryResultPayload, StrategyDiscoveryResultStatus,
+    StrategyDiscoveryStatusView, StrategyDiscoveryWorkerConfig, StrategyKillSwitchState,
+    StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats, StrategyQuarantine,
+    StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
     SubmitStrategyDiscoveryResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
     TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState,
     ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
@@ -1706,6 +1707,23 @@ pub fn append_journal_entry(
     text: &str,
     genesis: bool,
 ) -> Result<JournalEntry, String> {
+    append_journal_entry_with_claim(turn_id, text, genesis, None)
+}
+
+pub fn append_journal_deal_claim(
+    turn_id: &str,
+    text: &str,
+    claim: JournalDealClaim,
+) -> Result<JournalEntry, String> {
+    append_journal_entry_with_claim(turn_id, text, false, Some(claim))
+}
+
+fn append_journal_entry_with_claim(
+    turn_id: &str,
+    text: &str,
+    genesis: bool,
+    deal_claim: Option<JournalDealClaim>,
+) -> Result<JournalEntry, String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("journal text cannot be empty".to_string());
@@ -1726,7 +1744,14 @@ pub fn append_journal_entry(
     if turn_id.is_empty() {
         return Err("journal turn_id cannot be empty".to_string());
     }
-    sqlite::append_journal_entry(turn_id, now_ns(), text, genesis, MAX_JOURNAL_ENTRIES)
+    sqlite::append_journal_entry(
+        turn_id,
+        now_ns(),
+        text,
+        genesis,
+        deal_claim,
+        MAX_JOURNAL_ENTRIES,
+    )
 }
 
 pub fn list_recent_journal_entries(limit: usize) -> Vec<JournalEntry> {

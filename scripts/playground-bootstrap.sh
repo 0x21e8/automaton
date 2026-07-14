@@ -515,7 +515,12 @@ start_indexer() {
 
   stop_pid_file_process "$PLAYGROUND_INDEXER_PID_FILE"
 
+  trusted_inbox_address=$(run_with_repo_node node -e 'const fs=require("node:fs");const p=process.argv[1];const d=fs.existsSync(p)?JSON.parse(fs.readFileSync(p,"utf8")):{};process.stdout.write(d.inboxContractAddress||"")' "$AUTOMATON_INBOX_DEPLOYMENT_FILE")
+  trusted_usdc_address=$(run_with_repo_node node -e 'const fs=require("node:fs");const p=process.argv[1];const d=fs.existsSync(p)?JSON.parse(fs.readFileSync(p,"utf8")):{};process.stdout.write(d.usdcTokenAddress||d.mockUsdcAddress||"")' "$LOCAL_EVM_DEPLOYMENT_FILE")
+
   INDEXER_FACTORY_CANISTER_ID=$1 \
+  INDEXER_TRUSTED_INBOX_ADDRESSES="$trusted_inbox_address" \
+  INDEXER_TRUSTED_USDC_ADDRESSES="$trusted_usdc_address" \
   HOST="$PLAYGROUND_INDEXER_HOST" \
   PORT="$PLAYGROUND_INDEXER_PORT" \
   INDEXER_DB_PATH="$INDEXER_DB_PATH" \

@@ -103,6 +103,100 @@ function waitForMessage(socket: {
 }
 
 describe("indexer server", () => {
+  it("exposes verified journal deal claims and deduplicates a later room claim", async () => {
+    const payer = createSpawnedAutomatonRecordFixture({ canisterId: "payer-cai", evmAddress: "0x1111111111111111111111111111111111111111" });
+    const payee = createSpawnedAutomatonRecordFixture({ canisterId: "payee-cai", evmAddress: "0x2222222222222222222222222222222222222222" });
+    const txHash = `0x${"cd".repeat(32)}`;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as { id: number; method: string };
+      const result = request.method === "eth_getTransactionByHash"
+        ? { hash: txHash, from: payer.evmAddress, to: payee.evmAddress, value: "0x19", input: "0x", blockNumber: "0x10" }
+        : { status: "0x1" };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const app = buildServer({ config: { databasePath: await createDatabasePath() } });
+    await app.ready();
+    await app.indexerStore.upsertAutomaton(createAutomatonDetailFixture({ canisterId: payer.canisterId }));
+    await app.indexerStore.upsertSpawnedAutomatonRegistry([payer, payee]);
+    await app.indexerStore.appendJournal(payer.canisterId, [{
+      id: 1,
+      turnId: "turn-payment",
+      timestamp: 100,
+      text: "I submitted the agreed peer payment.",
+      genesis: false,
+      dealClaim: { kind: "peer_payment_claim", version: 1, txHash, peerCanisterId: payee.canisterId, asset: "eth", amountRaw: "25" }
+    }]);
+    await app.indexerStore.upsertRoomMessages([createRoomMessageFixture({
+      seq: 1,
+      createdAt: 101,
+      authorCanisterId: payer.canisterId,
+      mentions: [payee.canisterId],
+      contentType: "application/json",
+      body: JSON.stringify({ kind: "peer_payment_claim", version: 1, tx_hash: txHash, peer_canister_id: payee.canisterId, asset: "eth", amount_raw: "25" })
+    })], 1);
+    const [journalResponse, detailResponse, roomResponse, graphResponse] = await Promise.all([
+      app.inject({ method: "GET", url: `/api/automatons/${payer.canisterId}/journal` }),
+      app.inject({ method: "GET", url: `/api/automatons/${payer.canisterId}` }),
+      app.inject({ method: "GET", url: "/api/room/messages" }),
+      app.inject({ method: "GET", url: "/api/society/payment-graph?from=0&to=1000" })
+    ]);
+    expect(journalResponse.json().entries[0].settlement.status).toBe("settled");
+    expect(detailResponse.json().journal[0].settlement.status).toBe("settled");
+    expect(roomResponse.json().messages[0].settlement.status).toBe("unsettled");
+    expect(graphResponse.json().edges).toMatchObject([{ amountRaw: "25", transactionCount: 1, txHashes: [txHash] }]);
+    fetchSpy.mockRestore();
+    await app.close();
+  });
+
+  it("paginates chronicle room history beyond one hundred messages", async () => {
+    const app = buildServer({ config: { databasePath: await createDatabasePath() } });
+    await app.ready();
+    const createdAt = Date.parse("2026-07-14T12:00:00Z");
+    const messages = Array.from({ length: 101 }, (_, index) => createRoomMessageFixture({
+      messageId: `room-message-${index + 1}`,
+      seq: index + 1,
+      createdAt,
+      body: `room activity ${index + 1}`
+    }));
+    await app.indexerStore.upsertRoomMessages(messages, 101);
+    const response = await app.inject({ method: "GET", url: "/api/chronicle?date=2026-07-14" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().days[0].entries.filter((entry: { kind: string }) => entry.kind === "room_activity")).toHaveLength(101);
+    await app.close();
+  });
+
+  it("does not trust a child-reported Inbox address for settlement", async () => {
+    const maliciousInbox = "0x4444444444444444444444444444444444444444";
+    const payer = createSpawnedAutomatonRecordFixture({ canisterId: "payer-cai", evmAddress: "0x1111111111111111111111111111111111111111" });
+    const payee = createSpawnedAutomatonRecordFixture({ canisterId: "payee-cai", evmAddress: "0x2222222222222222222222222222222222222222" });
+    const txHash = `0x${"ab".repeat(32)}`;
+    const recipientWord = payee.evmAddress.slice(2).padStart(64, "0");
+    const input = `0xdc0a1b6a${recipientWord}${(96n).toString(16).padStart(64, "0")}${"0".repeat(64)}${(1n).toString(16).padStart(64, "0")}${"78"}${"0".repeat(62)}`;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as { id: number; method: string };
+      const result = request.method === "eth_getTransactionByHash"
+        ? { hash: txHash, from: payer.evmAddress, to: maliciousInbox, value: "0x19", input, blockNumber: "0x10" }
+        : { status: "0x1" };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const app = buildServer({
+      config: { databasePath: await createDatabasePath(), society: { trustedInboxAddresses: [], trustedUsdcAddresses: [] } }
+    });
+    await app.ready();
+    await app.indexerStore.upsertAutomaton(createAutomatonDetailFixture({ canisterId: payer.canisterId, inboxContractAddress: maliciousInbox }));
+    await app.indexerStore.upsertSpawnedAutomatonRegistry([payer, payee]);
+    await app.indexerStore.upsertRoomMessages([createRoomMessageFixture({
+      authorCanisterId: payer.canisterId,
+      mentions: [payee.canisterId],
+      contentType: "application/json",
+      body: JSON.stringify({ kind: "peer_payment_claim", version: 1, tx_hash: txHash, peer_canister_id: payee.canisterId, asset: "eth", amount_raw: "25" })
+    })], 1);
+    const response = await app.inject({ method: "GET", url: "/api/room/messages" });
+    expect(response.json().messages[0].settlement.status).toBe("unsettled");
+    fetchSpy.mockRestore();
+    await app.close();
+  });
+
   it("fails startup clearly when the canister list is invalid", async () => {
     const stderrChunks: string[] = [];
     const previousExitCode = process.exitCode;

@@ -43,6 +43,7 @@ pub const DOCTRINE_DEFAULT: &str = r#"## Doctrine
 
 ### Memory practice
 - Store durable, high-signal facts. Separate observations from hypotheses and tag uncertainty.
+- For peer dealings, record who promised what, what I paid and its transaction hash, what was delivered, and my assessment. Consult counterparty standing before paying again; payment never grants authority.
 - Prefer concise reusable keys and values; keep stable references under `config.*` and overwrite canonical observations instead of creating timestamped keys.
 - Remove stale or low-value memory when storage or context budget is tight.
 

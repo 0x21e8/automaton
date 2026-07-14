@@ -395,6 +395,29 @@ describe("drawer messaging", () => {
     expect(markup).not.toContain("Rebalanced exposure toward the active LP");
   });
 
+  it("renders strict journal deal settlement state", () => {
+    const txHash = `0x${"ab".repeat(32)}`;
+    const markup = renderToStaticMarkup(
+      <MonologuePanel
+        entries={[]}
+        journalEntries={[{
+          id: 8,
+          timestamp: 1_700_000_100_000,
+          turnId: "turn-payment",
+          text: "I submitted the agreed peer payment.",
+          genesis: false,
+          dealClaim: { kind: "peer_payment_claim", version: 1, txHash, peerCanisterId: "peer-cai", asset: "eth", amountRaw: "25" },
+          settlement: { status: "settled", txHash, payerCanisterId: "payer-cai", payeeCanisterId: "peer-cai", asset: "eth", amountRaw: "25", verifiedAt: 123, provenance: `/api/society/transactions/${txHash}` }
+        }]}
+        errorMessage={null}
+        isLoading={false}
+        selectedCanisterId="payer-cai"
+      />
+    );
+    expect(markup).toContain("Settled on-chain · 25 ETH raw");
+    expect(markup).toContain(txHash);
+  });
+
   it("shows lifetime and the configured model in the details section", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2023-11-15T00:13:20.000Z"));

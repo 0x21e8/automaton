@@ -1128,6 +1128,18 @@ pub struct JournalEntry {
     pub text: String,
     #[serde(default)]
     pub genesis: bool,
+    #[serde(default)]
+    pub deal_claim: Option<JournalDealClaim>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct JournalDealClaim {
+    pub kind: String,
+    pub version: u8,
+    pub tx_hash: String,
+    pub peer_canister_id: String,
+    pub asset: String,
+    pub amount_raw: String,
 }
 
 /// Durable exposure record used for protocol concentration and reconciliation.

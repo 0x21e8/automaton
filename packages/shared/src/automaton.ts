@@ -1,4 +1,5 @@
 import type { SpawnSessionStrategySnapshot } from "./spawn.js";
+import type { RoomMessageSettlement } from "./room.js";
 
 export const SUPPORTED_CHAIN_SLUGS = [
   "base",
@@ -231,6 +232,17 @@ export interface JournalEntry {
   timestamp: number;
   text: string;
   genesis: boolean;
+  dealClaim?: JournalDealClaim | null;
+  settlement?: RoomMessageSettlement;
+}
+
+export interface JournalDealClaim {
+  kind: "peer_payment_claim";
+  version: 1;
+  txHash: string;
+  peerCanisterId: string;
+  asset: "eth" | "usdc";
+  amountRaw: string;
 }
 
 export interface JournalPage {

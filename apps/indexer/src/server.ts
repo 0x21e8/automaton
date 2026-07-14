@@ -27,6 +27,7 @@ import { playgroundRoutes } from "./routes/playground.js";
 import { realtimeRoutes } from "./routes/realtime.js";
 import { repositoryRoutes } from "./routes/repository.js";
 import { roomRoutes } from "./routes/room.js";
+import { chronicleRoutes } from "./routes/chronicle.js";
 import { spawnSessionRoutes } from "./routes/spawn-sessions.js";
 import { createSqliteStore, type IndexerStore } from "./store/sqlite.js";
 import "./types.js";
@@ -177,6 +178,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   app.register(realtimeRoutes);
   app.register(repositoryRoutes);
   app.register(roomRoutes);
+  app.register(chronicleRoutes);
   app.register(spawnSessionRoutes);
 
   return app;

@@ -30,7 +30,7 @@ to the operator. Do not discard, overwrite, or silently absorb them.
 | 009 | Voice: journal channel, de-chatted runtime, deference metric | P1 | L | 007 (008 soft) | DONE |
 | 010 | Metabolism and patronage surfaces | P1 | L | — (parallel-safe) | DONE |
 | 011 | Mortality mechanics: hibernation tiers and the terminal turn | P1 | L | 007, 009 (010 soft) | DONE |
-| 012 | Society: room completion, pay-a-peer, counterparty memory, chronicle | P2 | XL | 008, 009, 010 | TODO |
+| 012 | Society: room completion, pay-a-peer, counterparty memory, chronicle | P2 | XL | 008, 009, 010 | DONE |
 | 013 | Generations: reproduction, lineage, fitness observatory | P2 | XL | 008, 010, 011, 012 | TODO |
 
 Status values: `TODO` | `IN PROGRESS` | `DONE` | `BLOCKED: <reason>` |

@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 
 import type { AutomatonTier, ChainSlug, SpawnSessionDetail } from "@ic-automaton/shared";
+import { loadSettledSociety } from "../lib/society-indexer.js";
 
 const EMPTY_STEWARD_ADDRESS = "0x0000000000000000000000000000000000000000";
 
@@ -110,6 +111,9 @@ export const automatonRoutes: FastifyPluginAsync = async (fastify) => {
       }
     }
 
+    const society = await loadSettledSociety(fastify);
+    const settledJournal = society.journals.find((journal) => journal.canisterId === params.canisterId)?.entries;
+
     return {
       ...automaton,
       ethAddress: automaton.ethAddress ?? registryRecord?.evmAddress ?? null,
@@ -129,6 +133,7 @@ export const automatonRoutes: FastifyPluginAsync = async (fastify) => {
         automaton.childIds.length > 0 ? automaton.childIds : registryRecord?.childIds ?? [],
       createdAt: registryRecord?.createdAt ?? automaton.createdAt,
       model: automaton.model ?? spawnSession?.session.config.provider.model ?? null,
+      journal: settledJournal ?? automaton.journal,
       spawnSelection: buildSpawnSelection(spawnSession)
     };
   });
@@ -149,9 +154,12 @@ export const automatonRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.get("/api/automatons/:canisterId/journal", async (request) => {
     const params = request.params as { canisterId: string };
     const query = request.query as { before?: string; limit?: string };
-    return fastify.indexerStore.listJournal(params.canisterId, {
+    const page = await fastify.indexerStore.listJournal(params.canisterId, {
       before: normalizeCursor(query.before),
       limit: normalizeLimit(query.limit)
     });
+    const settled = await loadSettledSociety(fastify);
+    const byId = new Map((settled.journals.find((journal) => journal.canisterId === params.canisterId)?.entries ?? []).map((entry) => [entry.id, entry]));
+    return { ...page, entries: page.entries.map((entry) => byId.get(entry.id) ?? entry) };
   });
 };

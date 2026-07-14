@@ -10,6 +10,17 @@ const defaultPlaygroundStatusFilePath = fileURLToPath(
 );
 
 describe("indexer config", () => {
+  it("loads only explicit normalized settlement trust anchors and otherwise fails closed", () => {
+    expect(resolveIndexerConfig({}).society).toEqual({ trustedInboxAddresses: [], trustedUsdcAddresses: [] });
+    expect(resolveIndexerConfig({
+      INDEXER_TRUSTED_INBOX_ADDRESSES: "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,invalid,0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      INDEXER_TRUSTED_USDC_ADDRESSES: "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    }).society).toEqual({
+      trustedInboxAddresses: ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      trustedUsdcAddresses: ["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+    });
+  });
+
   it("uses the dedicated target config file as the default ingestion source", () => {
     const config = resolveIndexerConfig({});
 

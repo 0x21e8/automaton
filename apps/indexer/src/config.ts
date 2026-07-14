@@ -26,6 +26,10 @@ export interface IndexerConfig {
   slowPollIntervalMs: number;
   pricePollIntervalMs: number;
   playground: IndexerPlaygroundConfig;
+  society: {
+    trustedInboxAddresses: string[];
+    trustedUsdcAddresses: string[];
+  };
 }
 
 export interface IndexerConfigOverrides {
@@ -40,6 +44,7 @@ export interface IndexerConfigOverrides {
   slowPollIntervalMs?: number;
   pricePollIntervalMs?: number;
   playground?: IndexerPlaygroundConfig;
+  society?: IndexerConfig["society"];
 }
 
 const DEFAULT_DATABASE_PATH = fileURLToPath(
@@ -140,6 +145,11 @@ function parseCanisterIdList(value: string | undefined) {
     .split(",")
     .map((canisterId) => canisterId.trim())
     .filter((canisterId) => canisterId.length > 0);
+}
+
+function parseEvmAddressList(value: string | undefined) {
+  if (!value) return [];
+  return [...new Set(value.split(",").map((entry) => entry.trim().toLowerCase()).filter((entry) => /^0x[0-9a-f]{40}$/.test(entry)))];
 }
 
 function buildCrc32Table() {
@@ -430,6 +440,10 @@ export function resolveIndexerConfig(
       overrides.slowPollIntervalMs ?? parseNumber(env.INDEXER_SLOW_POLL_INTERVAL_MS, 300_000),
     pricePollIntervalMs:
       overrides.pricePollIntervalMs ?? parseNumber(env.INDEXER_PRICE_POLL_INTERVAL_MS, 60_000),
-    playground: overrides.playground ?? resolvePlaygroundConfig(env)
+    playground: overrides.playground ?? resolvePlaygroundConfig(env),
+    society: overrides.society ?? {
+      trustedInboxAddresses: parseEvmAddressList(env.INDEXER_TRUSTED_INBOX_ADDRESSES),
+      trustedUsdcAddresses: parseEvmAddressList(env.INDEXER_TRUSTED_USDC_ADDRESSES)
+    }
   };
 }

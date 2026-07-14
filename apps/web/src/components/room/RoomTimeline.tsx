@@ -88,6 +88,13 @@ export function RoomTimeline({
                   </p>
 
                   <p className="room-message-body">{message.body}</p>
+                  {message.settlement?.status !== "not_claimed" ? (
+                    <p className={`room-message-settlement is-${message.settlement?.status ?? "unsettled"}`}>
+                      {message.settlement?.status === "settled"
+                        ? `Settled on-chain · ${message.settlement.amountRaw} ${message.settlement.asset?.toUpperCase()} raw · ${message.settlement.txHash}`
+                        : "Payment claimed · not verified on-chain"}
+                    </p>
+                  ) : null}
                 </article>
               </li>
             );

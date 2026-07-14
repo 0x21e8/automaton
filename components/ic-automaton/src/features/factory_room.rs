@@ -9,6 +9,40 @@ use crate::storage::stable;
 use candid::{CandidType, Principal};
 use serde::Deserialize;
 
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FactoryPeer {
+    pub name: Option<String>,
+    pub constitution_hash: Option<String>,
+    pub canister_id: String,
+    pub steward_address: String,
+    pub evm_address: String,
+    pub chain: FactoryPeerChain,
+    pub session_id: String,
+    pub parent_id: Option<String>,
+    pub child_ids: Vec<String>,
+    pub created_at: u64,
+    pub version_commit: String,
+    pub controllers: Option<Vec<String>>,
+    pub control_status: Option<String>,
+    pub control_verified_at: Option<u64>,
+    pub death_cause: Option<String>,
+    pub died_at: Option<u64>,
+    pub estate_disposition: Option<String>,
+    pub death_recorded_by: Option<String>,
+    pub death_incident_reference: Option<String>,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum FactoryPeerChain {
+    Base,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct FactoryPeerPage {
+    pub items: Vec<FactoryPeer>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FactoryRoomClient {
     factory_principal: Principal,
@@ -67,6 +101,34 @@ impl FactoryRoomClient {
         )
         .await?;
         decode_factory_room_response("list_my_room_messages", &response_bytes)
+    }
+
+    pub async fn list_peers(
+        &self,
+        cursor: Option<String>,
+        limit: u64,
+    ) -> Result<FactoryPeerPage, String> {
+        let encoded_args = candid::encode_args((cursor, limit))
+            .map_err(|error| format!("failed to encode list_spawned_automatons args: {error}"))?;
+        let response_bytes = do_factory_room_call(
+            self.factory_principal,
+            "list_spawned_automatons",
+            encoded_args,
+        )
+        .await?;
+        decode_factory_room_response("list_spawned_automatons", &response_bytes)
+    }
+
+    pub async fn get_peer(&self, canister_id: &str) -> Result<FactoryPeer, String> {
+        let encoded_args = candid::encode_one(canister_id.to_string())
+            .map_err(|error| format!("failed to encode get_spawned_automaton args: {error}"))?;
+        let response_bytes = do_factory_room_call(
+            self.factory_principal,
+            "get_spawned_automaton",
+            encoded_args,
+        )
+        .await?;
+        decode_factory_room_response("get_spawned_automaton", &response_bytes)
     }
 }
 

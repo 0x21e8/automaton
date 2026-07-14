@@ -68,6 +68,7 @@ const CONTROL_PLANE_MAX_RESPONSE_BYTES: u64 = 4 * 1024;
 const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str =
     "MessageQueued(address,uint64,address,string,uint256,uint256)";
 const INBOX_USDC_FUNCTION_SIGNATURE: &str = "usdc()";
+const INBOX_MIN_PRICES_FOR_FUNCTION_SIGNATURE: &str = "minPricesFor(address)";
 const ERC20_BALANCE_OF_FUNCTION_SIGNATURE: &str = "balanceOf(address)";
 const EIP1271_IS_VALID_SIGNATURE_FUNCTION_SIGNATURE: &str = "isValidSignature(bytes32,bytes)";
 const EIP1271_IS_VALID_SIGNATURE_MAGIC_VALUE: &str = "1626ba7e";
@@ -422,6 +423,20 @@ pub struct HttpEvmRpcClient {
     max_response_bytes: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerMinPrices {
+    pub usdc_min_raw: String,
+    pub eth_min_wei: String,
+    pub uses_default: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionReceiptStatus {
+    Pending,
+    Confirmed,
+    Reverted,
+}
+
 impl HttpEvmRpcClient {
     /// Construct from the current `RuntimeSnapshot`.  Returns an error if the
     /// primary RPC URL is not configured.
@@ -575,6 +590,31 @@ impl HttpEvmRpcClient {
             .and_then(Value::as_str)
             .ok_or_else(|| "eth_getTransactionCount result was missing".to_string())?;
         parse_hex_u64(raw, "eth_getTransactionCount")
+    }
+
+    pub async fn transaction_receipt_status(
+        &self,
+        tx_hash: &str,
+    ) -> Result<TransactionReceiptStatus, String> {
+        let response = self
+            .rpc_call(
+                "eth_getTransactionReceipt",
+                json!([tx_hash]),
+                self.control_plane_max_response_bytes(),
+            )
+            .await
+            .map_err(|error| format!("eth_getTransactionReceipt failed: {error}"))?;
+        let Some(receipt) = response.get("result") else {
+            return Err("eth_getTransactionReceipt result was missing".to_string());
+        };
+        if receipt.is_null() {
+            return Ok(TransactionReceiptStatus::Pending);
+        }
+        match receipt.get("status").and_then(Value::as_str) {
+            Some("0x1") => Ok(TransactionReceiptStatus::Confirmed),
+            Some("0x0") => Ok(TransactionReceiptStatus::Reverted),
+            _ => Err("eth_getTransactionReceipt status was invalid".to_string()),
+        }
     }
 
     /// Fetch the current base gas price in wei.
@@ -1125,6 +1165,10 @@ fn host_rpc_stub_eth_call_result(request: &Value) -> Value {
         "0x{}",
         function_selector_hex(ERC20_BALANCE_OF_FUNCTION_SIGNATURE)
     );
+    let min_prices_selector = format!(
+        "0x{}",
+        function_selector_hex(INBOX_MIN_PRICES_FOR_FUNCTION_SIGNATURE)
+    );
     let eip1271_selector = format!(
         "0x{}",
         function_selector_hex(EIP1271_IS_VALID_SIGNATURE_FUNCTION_SIGNATURE)
@@ -1150,6 +1194,13 @@ fn host_rpc_stub_eth_call_result(request: &Value) -> Value {
             "jsonrpc":"2.0",
             "id":1,
             "result":"0x000000000000000000000000000000000000000000000000000000000000002a"
+        });
+    }
+    if data.starts_with(&min_prices_selector) {
+        return json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "result":format!("0x{:064x}{:064x}{:064x}", 1_000_000u64, 500_000_000_000_000u64, 1u8)
         });
     }
 
@@ -2104,6 +2155,49 @@ pub async fn fetch_usdc_balance_raw_hex(
     decode_u256_word_hex_as_quantity(&raw, "usdc balanceOf result")
 }
 
+pub async fn fetch_peer_min_prices(
+    snapshot: &RuntimeSnapshot,
+    peer_address: &str,
+) -> Result<PeerMinPrices, String> {
+    let inbox = snapshot
+        .inbox_contract_address
+        .as_deref()
+        .ok_or_else(|| "inbox contract address is not configured".to_string())?;
+    let rpc = HttpEvmRpcClient::from_snapshot(snapshot)?;
+    let calldata =
+        encode_call_single_address_arg(INBOX_MIN_PRICES_FOR_FUNCTION_SIGNATURE, peer_address)?;
+    let raw = rpc.eth_call(inbox, &calldata).await?;
+    decode_peer_min_prices(&raw)
+}
+
+fn decode_peer_min_prices(raw: &str) -> Result<PeerMinPrices, String> {
+    let normalized = normalize_hex_blob(raw, "Inbox.minPricesFor result")?;
+    let payload = normalized.trim_start_matches("0x");
+    if payload.len() < 192 {
+        return Err("Inbox.minPricesFor result must contain three ABI words".to_string());
+    }
+    let usdc_min = parse_hex_u256(&format!("0x{}", &payload[..64]), "usdc minimum")?;
+    let eth_min = parse_hex_u256(&format!("0x{}", &payload[64..128]), "eth minimum")?;
+    let uses_default = parse_hex_u256(&format!("0x{}", &payload[128..192]), "uses-default flag")?;
+    if uses_default > U256::from(1u8) {
+        return Err("Inbox.minPricesFor returned an invalid bool".to_string());
+    }
+    Ok(PeerMinPrices {
+        usdc_min_raw: usdc_min.to_string(),
+        eth_min_wei: eth_min.to_string(),
+        uses_default: uses_default == U256::from(1u8),
+    })
+}
+
+pub async fn fetch_transaction_receipt_status(
+    snapshot: &RuntimeSnapshot,
+    tx_hash: &str,
+) -> Result<TransactionReceiptStatus, String> {
+    HttpEvmRpcClient::from_snapshot(snapshot)?
+        .transaction_receipt_status(tx_hash)
+        .await
+}
+
 #[allow(dead_code)]
 pub async fn discover_usdc_contract_address_via_inbox(
     rpc: &HttpEvmRpcClient,
@@ -2561,6 +2655,54 @@ pub async fn set_min_prices_tool(
         .ok_or_else(|| "inbox contract is not configured".to_string())?;
     let call = set_min_prices_send_eth_args_json(&inbox, usdc_min, eth_min);
     send_eth_tool(&call, signer).await
+}
+
+/// Canonical paid-Inbox call used by `pay_peer`. The recipient comes from the
+/// factory registry, never from room or inbox content.
+pub fn peer_inbox_send_eth_args_json(
+    inbox: &str,
+    recipient: &str,
+    message: &str,
+    eth_amount: U256,
+) -> Result<String, String> {
+    let inbox = normalize_evm_address(inbox)?;
+    let recipient = normalize_evm_address(recipient)?;
+    let recipient_word = format!("{:0>64}", recipient.trim_start_matches("0x"));
+    let message_hex = hex::encode(message.as_bytes());
+    let padding = "0".repeat((64 - (message_hex.len() % 64)) % 64);
+    let selector_hash = keccak256("queueMessage(address,string,uint256)".as_bytes());
+    let selector = &selector_hash.as_slice()[..4];
+    let data = format!(
+        "0x{}{}{:064x}{:064x}{:064x}{}{}",
+        hex::encode(selector),
+        recipient_word,
+        U256::from(96u64),
+        U256::ZERO,
+        U256::from(message.len()),
+        message_hex,
+        padding
+    );
+    Ok(
+        serde_json::json!({ "to": inbox, "value_wei": eth_amount.to_string(), "data": data })
+            .to_string(),
+    )
+}
+
+pub fn peer_erc20_transfer_send_eth_args_json(
+    token: &str,
+    recipient: &str,
+    amount: U256,
+) -> Result<String, String> {
+    let token = normalize_evm_address(token)?;
+    let recipient = normalize_evm_address(recipient)?;
+    let selector_hash = keccak256("transfer(address,uint256)".as_bytes());
+    let data = format!(
+        "0x{}{:0>64}{:064x}",
+        hex::encode(&selector_hash.as_slice()[..4]),
+        recipient.trim_start_matches("0x"),
+        amount
+    );
+    Ok(serde_json::json!({ "to": token, "value_wei": "0", "data": data }).to_string())
 }
 
 fn set_min_prices_send_eth_args_json(inbox: &str, usdc_min: U256, eth_min: U256) -> String {
@@ -4496,4 +4638,20 @@ mod tests {
             Err(payload) => std::panic::resume_unwind(payload),
         }
     }
+}
+#[test]
+fn decodes_verified_inbox_min_prices() {
+    let raw = format!(
+        "0x{:064x}{:064x}{:064x}",
+        1_000_000u64, 500_000_000_000_000u64, 1u8
+    );
+    assert_eq!(
+        decode_peer_min_prices(&raw).unwrap(),
+        PeerMinPrices {
+            usdc_min_raw: "1000000".to_string(),
+            eth_min_wei: "500000000000000".to_string(),
+            uses_default: true,
+        }
+    );
+    assert!(decode_peer_min_prices("0x01").is_err());
 }

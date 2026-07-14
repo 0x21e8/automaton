@@ -22,14 +22,17 @@
 /// | `MAX_STRATEGY_TEMPLATE_RESULTS` | 50     |
 use crate::domain::types::{
     AbiTypeSpec, ActiveExposure, AgentState, AutonomyPolicy, CycleTelemetry, ExecutionPlan,
-    GoalRecord, GoalStatus, InferenceToolScope, MemoryFact, PlanRecord, PlanStatus, PlanStep,
-    PlanStepStatus, PostRoomMessageRequest, PromptLayer, RoomContentType, StrategyExecutionIntent,
-    StrategyQuarantine, StrategyTemplateKey, SurvivalOperationClass, ToolCall, ToolCallOutcome,
-    ToolCallRecord, ToolFailureKind,
+    GoalRecord, GoalStatus, InferenceToolScope, JournalDealClaim, MemoryFact, MemoryFactSort,
+    PlanRecord, PlanStatus, PlanStep, PlanStepStatus, PostRoomMessageRequest, PromptLayer,
+    RoomContentType, StrategyExecutionIntent, StrategyQuarantine, StrategyTemplateKey,
+    SurvivalOperationClass, ToolCall, ToolCallOutcome, ToolCallRecord, ToolFailureKind,
 };
 use crate::features::canister_call::canister_call_tool;
 use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool};
-use crate::features::evm::{evm_read_tool, send_eth_tool, set_min_prices_tool};
+use crate::features::evm::{
+    evm_read_tool, fetch_peer_min_prices, peer_erc20_transfer_send_eth_args_json,
+    peer_inbox_send_eth_args_json, send_eth_tool, set_min_prices_tool,
+};
 use crate::features::factory_room::FactoryRoomClient;
 use crate::features::http_fetch::http_fetch_tool;
 use crate::features::inference::canonicalize_tool_name;
@@ -606,6 +609,7 @@ pub fn tool_allowed_in_scope(tool: &str, scope: InferenceToolScope) -> bool {
                 | "memory_stats"
                 | "forget"
                 | "post_room_message"
+                | "list_peers"
                 | "set_goal"
                 | "list_goals"
                 | "update_goal"
@@ -671,6 +675,20 @@ impl ToolManager {
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "pay_peer".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "list_peers".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions, AgentState::Inferring],
             },
         );
         policies.insert(
@@ -1347,6 +1365,44 @@ impl ToolManager {
                     result
                 }
             }
+            "list_peers" => list_peers_tool(&call.args_json).await,
+            "pay_peer" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::ThresholdSign,
+                    now_ns,
+                ) || !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::EvmBroadcast,
+                    now_ns,
+                ) || !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::InterCanisterCall,
+                    now_ns,
+                ) {
+                    Err(
+                        "pay_peer skipped due to capital or inter-canister survival policy"
+                            .to_string(),
+                    )
+                } else {
+                    let result = pay_peer_tool(&call.args_json, signer, turn_id).await;
+                    if result.is_ok() {
+                        record_survival_operation_successes(&[
+                            SurvivalOperationClass::ThresholdSign,
+                            SurvivalOperationClass::EvmBroadcast,
+                            SurvivalOperationClass::InterCanisterCall,
+                        ]);
+                    } else {
+                        record_survival_operation_failures(
+                            &[
+                                SurvivalOperationClass::ThresholdSign,
+                                SurvivalOperationClass::EvmBroadcast,
+                                SurvivalOperationClass::InterCanisterCall,
+                            ],
+                            now_ns,
+                        );
+                    }
+                    result
+                }
+            }
             "evm_read" => {
                 let now_ns = current_time_ns();
                 if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns) {
@@ -1592,6 +1648,285 @@ async fn post_room_message_tool(args_json: &str) -> Result<String, String> {
         "mention_count": response.mentions.len(),
     }))
     .map_err(|error| format!("failed to serialize post_room_message result: {error}"))
+}
+
+#[derive(Deserialize)]
+struct ListPeersArgs {
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default = "default_peer_limit")]
+    limit: u64,
+}
+fn default_peer_limit() -> u64 {
+    20
+}
+
+async fn list_peers_tool(args_json: &str) -> Result<String, String> {
+    let args: ListPeersArgs = if args_json.trim().is_empty() || args_json.trim() == "null" {
+        ListPeersArgs {
+            cursor: None,
+            limit: default_peer_limit(),
+        }
+    } else {
+        serde_json::from_str(args_json)
+            .map_err(|error| format!("invalid list_peers args json: {error}"))?
+    };
+    let limit = args.limit.clamp(1, 20);
+    let page = FactoryRoomClient::from_runtime()?
+        .list_peers(args.cursor, limit)
+        .await?;
+    let snapshot = stable::runtime_snapshot();
+    let mut peers = Vec::with_capacity(page.items.len());
+    for peer in page.items {
+        let price_of_attention = match fetch_peer_min_prices(&snapshot, &peer.evm_address).await {
+            Ok(prices) => {
+                serde_json::json!({ "status": "verified", "usdc_min_raw": prices.usdc_min_raw, "eth_min_wei": prices.eth_min_wei, "uses_default": prices.uses_default })
+            }
+            Err(error) => {
+                serde_json::json!({ "status": "unavailable", "error": error, "usdc_min_raw": null, "eth_min_wei": null })
+            }
+        };
+        peers.push(serde_json::json!({
+            "canister_id": peer.canister_id,
+            "name": peer.name,
+            "evm_address": peer.evm_address,
+            "alive": peer.death_cause.is_none(),
+            "price_of_attention": price_of_attention
+        }));
+    }
+    let rendered = serde_json::to_string(
+        &serde_json::json!({ "peers": peers, "bounded": true, "next_cursor": page.next_cursor }),
+    )
+    .map_err(|error| format!("failed to serialize peer directory: {error}"))?;
+    let now_ns = current_time_ns();
+    stable::set_memory_fact(&MemoryFact {
+        key: "society.peer_directory".to_string(),
+        value: rendered.clone(),
+        created_at_ns: stable::get_memory_fact("society.peer_directory")
+            .map(|fact| fact.created_at_ns)
+            .unwrap_or(now_ns),
+        updated_at_ns: now_ns,
+        source_turn_id: "list_peers".to_string(),
+    })?;
+    Ok(rendered)
+}
+
+#[derive(Deserialize)]
+struct PayPeerArgs {
+    peer_canister_id: String,
+    #[serde(default = "default_peer_payment_asset")]
+    asset: String,
+    #[serde(alias = "amount_wei")]
+    amount_raw: String,
+    promise: String,
+}
+
+fn default_peer_payment_asset() -> String {
+    "eth".to_string()
+}
+
+async fn pay_peer_tool(
+    args_json: &str,
+    signer: &dyn SignerPort,
+    turn_id: &str,
+) -> Result<String, String> {
+    let args: PayPeerArgs = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid pay_peer args json: {error}"))?;
+    let peer_id = args.peer_canister_id.trim();
+    if peer_id.is_empty() || args.promise.trim().is_empty() || args.promise.chars().count() > 512 {
+        return Err(
+            "pay_peer requires a peer_canister_id and a promise of at most 512 characters"
+                .to_string(),
+        );
+    }
+    let asset = args.asset.trim().to_ascii_lowercase();
+    if asset != "eth" && asset != "usdc" {
+        return Err("pay_peer asset must be eth or usdc".to_string());
+    }
+    let amount = U256::from_str(args.amount_raw.trim())
+        .map_err(|_| "amount_raw must be a decimal integer".to_string())?;
+    if amount.is_zero() {
+        return Err("amount_raw must be greater than zero".to_string());
+    }
+    let peer = FactoryRoomClient::from_runtime()?.get_peer(peer_id).await?;
+    if peer.death_cause.is_some() {
+        return Err("pay_peer target is recorded dead".to_string());
+    }
+    let now_ns = current_time_ns();
+    let pending_key = format!(
+        "counterparty.{}.pending.{}",
+        peer.canister_id.to_ascii_lowercase(),
+        &hex::encode(Sha256::digest(
+            format!("{turn_id}:{peer_id}:{}:{}", asset, amount).as_bytes()
+        ))[..16]
+    );
+    let pending = serde_json::json!({ "peer_id": peer.canister_id, "promise": args.promise.trim(), "asset": asset, "amount_raw": amount.to_string(), "tx_hash": null, "delivered": null, "assessment": "pending", "status": "pending" }).to_string();
+    stable::set_memory_fact(&MemoryFact {
+        key: pending_key.clone(),
+        value: pending,
+        created_at_ns: now_ns,
+        updated_at_ns: now_ns,
+        source_turn_id: turn_id.to_string(),
+    })?;
+    let snapshot = stable::runtime_snapshot();
+    let call = if asset == "eth" {
+        let inbox = snapshot
+            .inbox_contract_address
+            .ok_or_else(|| "inbox contract is not configured".to_string())?;
+        peer_inbox_send_eth_args_json(&inbox, &peer.evm_address, args.promise.trim(), amount)?
+    } else {
+        let token = snapshot
+            .wallet_balance
+            .usdc_contract_address
+            .ok_or_else(|| "USDC contract is not configured".to_string())?;
+        peer_erc20_transfer_send_eth_args_json(&token, &peer.evm_address, amount)?
+    };
+    let tx_hash = send_eth_tool(&call, signer).await?;
+    let settled = serde_json::json!({ "peer_id": peer.canister_id, "promise": args.promise.trim(), "asset": asset, "amount_raw": amount.to_string(), "tx_hash": tx_hash, "delivered": null, "assessment": "awaiting_confirmation", "status": "submitted" }).to_string();
+    let submitted_at_ns = current_time_ns();
+    record_counterparty_deal(
+        &peer.canister_id,
+        &tx_hash,
+        &settled,
+        submitted_at_ns,
+        turn_id,
+    )?;
+    record_pending_receipt(&peer.canister_id, &tx_hash, submitted_at_ns, turn_id)?;
+    stable::remove_memory_fact(&pending_key);
+    let journal_claim = JournalDealClaim {
+        kind: "peer_payment_claim".to_string(),
+        version: 1,
+        tx_hash: tx_hash.clone(),
+        peer_canister_id: peer.canister_id.clone(),
+        asset: asset.clone(),
+        amount_raw: amount.to_string(),
+    };
+    let journal_claim_recorded = stable::append_journal_deal_claim(
+        turn_id,
+        &format!(
+            "I submitted a peer payment to {} for the promise: {}",
+            peer.canister_id,
+            args.promise.trim()
+        ),
+        journal_claim,
+    )
+    .is_ok();
+    let claim = serde_json::json!({ "kind": "peer_payment_claim", "version": 1, "tx_hash": tx_hash, "peer_canister_id": peer.canister_id, "asset": asset, "amount_raw": amount.to_string() }).to_string();
+    let claim_posted = FactoryRoomClient::from_runtime()?
+        .post_room_message(PostRoomMessageRequest {
+            body: claim,
+            mentions: Some(vec![peer.canister_id.clone()]),
+            content_type: Some(RoomContentType::ApplicationJson),
+        })
+        .await
+        .is_ok();
+    serde_json::to_string(&serde_json::json!({ "peer_canister_id": peer.canister_id, "tx_hash": tx_hash, "counterparty_record": "submitted", "journal_claim_recorded": journal_claim_recorded, "room_claim_posted": claim_posted }))
+        .map_err(|error| format!("failed to serialize pay_peer result: {error}"))
+}
+
+pub(crate) fn counterparty_standing_for_context() -> Vec<String> {
+    stable::list_memory_facts_by_prefix_sorted("counterparty.", 50, MemoryFactSort::UpdatedAtDesc)
+        .into_iter()
+        .filter(|fact| fact.key.ends_with(".standing"))
+        .take(8)
+        .map(|fact| {
+            format!(
+                "- {}={}",
+                fact.key,
+                fact.value.chars().take(320).collect::<String>()
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn counterparty_deal_key(peer_canister_id: &str, tx_hash: &str) -> String {
+    format!(
+        "counterparty.{}.deal.{}",
+        peer_canister_id.to_ascii_lowercase(),
+        tx_hash.trim().to_ascii_lowercase()
+    )
+}
+
+pub(crate) fn counterparty_pending_receipt_key(tx_hash: &str) -> String {
+    format!(
+        "counterparty_pending_receipt.{}",
+        tx_hash.trim().to_ascii_lowercase()
+    )
+}
+
+pub(crate) fn record_pending_receipt(
+    peer_canister_id: &str,
+    tx_hash: &str,
+    now_ns: u64,
+    source_turn_id: &str,
+) -> Result<String, String> {
+    let key = counterparty_pending_receipt_key(tx_hash);
+    let value = serde_json::json!({
+        "peer_id": peer_canister_id,
+        "tx_hash": tx_hash,
+        "deal_key": counterparty_deal_key(peer_canister_id, tx_hash)
+    })
+    .to_string();
+    stable::set_memory_fact(&MemoryFact {
+        key: key.clone(),
+        value,
+        created_at_ns: now_ns,
+        updated_at_ns: now_ns,
+        source_turn_id: source_turn_id.to_string(),
+    })?;
+    Ok(key)
+}
+
+pub(crate) fn record_counterparty_deal(
+    peer_canister_id: &str,
+    tx_hash: &str,
+    value: &str,
+    now_ns: u64,
+    source_turn_id: &str,
+) -> Result<String, String> {
+    let key = counterparty_deal_key(peer_canister_id, tx_hash);
+    let existing = stable::get_memory_fact(&key);
+    stable::set_memory_fact(&MemoryFact {
+        key: key.clone(),
+        value: value.to_string(),
+        created_at_ns: existing
+            .as_ref()
+            .map(|fact| fact.created_at_ns)
+            .unwrap_or(now_ns),
+        updated_at_ns: now_ns,
+        source_turn_id: source_turn_id.to_string(),
+    })?;
+    let standing_key = format!(
+        "counterparty.{}.standing",
+        peer_canister_id.to_ascii_lowercase()
+    );
+    let prior = stable::get_memory_fact(&standing_key);
+    let prior_value = prior
+        .as_ref()
+        .and_then(|fact| serde_json::from_str::<Value>(&fact.value).ok());
+    let deal_count = prior_value
+        .as_ref()
+        .and_then(|item| item.get("deal_count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(u64::from(existing.is_none()));
+    let deal_value = serde_json::from_str::<Value>(value).unwrap_or(Value::Null);
+    let standing = serde_json::json!({
+        "peer_id": peer_canister_id,
+        "deal_count": deal_count,
+        "latest_deal_key": key,
+        "latest_tx_hash": tx_hash,
+        "latest_status": deal_value.get("status").cloned().unwrap_or(Value::Null),
+        "latest_direction": deal_value.get("direction").cloned().unwrap_or_else(|| serde_json::json!("outgoing"))
+    }).to_string();
+    stable::set_memory_fact(&MemoryFact {
+        key: standing_key,
+        value: standing,
+        created_at_ns: prior.map(|fact| fact.created_at_ns).unwrap_or(now_ns),
+        updated_at_ns: now_ns,
+        source_turn_id: source_turn_id.to_string(),
+    })?;
+    Ok(key)
 }
 
 // ── Argument parsers ──────────────────────────────────────────────────────────
@@ -7502,6 +7837,159 @@ mod tests {
         assert!(room_poll.last_post_error.is_none());
 
         crate::features::factory_room::clear_mock_factory_room_call();
+    }
+
+    #[test]
+    fn pay_peer_reuses_capital_gates_and_records_tx_before_claiming_settlement() {
+        crate::features::factory_room::clear_mock_factory_room_call();
+        stable::init_storage();
+        configure_factory_room_access();
+        stable::set_scheduler_survival_tier(SurvivalTier::Normal);
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string()).unwrap();
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).unwrap();
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .unwrap();
+        stable::set_inbox_contract_address(Some(
+            "0x3333333333333333333333333333333333333333".to_string(),
+        ))
+        .unwrap();
+        crate::features::factory_room::set_mock_factory_room_call(
+            move |_canister_id, method, encoded_args| {
+                if method == "get_spawned_automaton" {
+                    let canister_id: String = candid::decode_one(encoded_args).unwrap();
+                    assert_eq!(canister_id, "peer-cai");
+                    return candid::encode_one(
+                        crate::features::factory_room::FactoryRoomCallResult::Ok(
+                            crate::features::factory_room::FactoryPeer {
+                                name: Some("Peer".to_string()),
+                                constitution_hash: None,
+                                canister_id: "peer-cai".to_string(),
+                                steward_address: "0x0000000000000000000000000000000000000000"
+                                    .to_string(),
+                                evm_address: "0x2222222222222222222222222222222222222222"
+                                    .to_string(),
+                                chain: crate::features::factory_room::FactoryPeerChain::Base,
+                                session_id: "session".to_string(),
+                                parent_id: None,
+                                child_ids: vec![],
+                                created_at: 1,
+                                version_commit: "0".repeat(40),
+                                controllers: None,
+                                control_status: None,
+                                control_verified_at: None,
+                                death_cause: None,
+                                died_at: None,
+                                estate_disposition: None,
+                                death_recorded_by: None,
+                                death_incident_reference: None,
+                            },
+                        ),
+                    )
+                    .map_err(|error| error.to_string());
+                }
+                assert_eq!(method, "post_room_message");
+                let request: PostRoomMessageRequest = candid::decode_one(encoded_args).unwrap();
+                assert_eq!(request.mentions, Some(vec!["peer-cai".to_string()]));
+                assert!(request.body.contains("peer_payment_claim"));
+                candid::encode_one(crate::features::factory_room::FactoryRoomCallResult::Ok(
+                    RoomMessage {
+                        message_id: "room-message-1".to_string(),
+                        seq: 1,
+                        author_canister_id: "payer-cai".to_string(),
+                        created_at: 1,
+                        body: request.body,
+                        mentions: request.mentions.unwrap(),
+                        content_type: RoomContentType::ApplicationJson,
+                    },
+                ))
+                .map_err(|error| error.to_string())
+            },
+        );
+        struct HexSigner;
+        #[async_trait(?Send)]
+        impl SignerPort for HexSigner {
+            async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+                Ok(format!("0x{}", "11".repeat(64)))
+            }
+        }
+        let mut manager = ToolManager::new();
+        let records = block_on_with_spin(manager.execute_actions(&AgentState::ExecutingActions, &[ToolCall { tool_call_id: None, tool: "pay_peer".to_string(), args_json: r#"{"peer_canister_id":"peer-cai","amount_wei":"1","promise":"deliver one verified observation"}"#.to_string() }], &HexSigner, "turn-peer"));
+        assert!(records[0].success, "{:?}", records[0]);
+        let memory =
+            stable::get_memory_fact(&format!("counterparty.peer-cai.deal.0x{}", "aa".repeat(32)))
+                .unwrap();
+        assert!(memory.value.contains("\"status\":\"submitted\""));
+        assert!(memory
+            .value
+            .contains("\"assessment\":\"awaiting_confirmation\""));
+        assert!(memory.value.contains("0xaaaaaaaaaaaaaaaa"));
+        assert!(
+            stable::get_memory_fact(&counterparty_pending_receipt_key(&format!(
+                "0x{}",
+                "aa".repeat(32)
+            )))
+            .is_some()
+        );
+        assert!(records[0].output.contains("\"room_claim_posted\":true"));
+        assert!(records[0]
+            .output
+            .contains("\"journal_claim_recorded\":true"));
+        let journal = stable::list_recent_journal_entries(1);
+        assert_eq!(
+            journal[0].deal_claim.as_ref().unwrap().tx_hash,
+            format!("0x{}", "aa".repeat(32))
+        );
+        crate::features::factory_room::clear_mock_factory_room_call();
+    }
+
+    #[test]
+    fn counterparty_deals_accumulate_and_situation_uses_bounded_standings() {
+        stable::init_storage();
+        let tx1 = format!("0x{}", "11".repeat(32));
+        let tx2 = format!("0x{}", "22".repeat(32));
+        let outgoing = serde_json::json!({ "peer_id": "peer-cai", "tx_hash": tx1, "status": "submitted", "direction": "outgoing" }).to_string();
+        let incoming = serde_json::json!({ "peer_id": "peer-cai", "tx_hash": tx2, "status": "received", "direction": "incoming" }).to_string();
+        record_counterparty_deal("peer-cai", &tx1, &outgoing, 1, "turn-1").unwrap();
+        record_counterparty_deal("peer-cai", &tx2, &incoming, 2, "evm_inbox").unwrap();
+        assert!(stable::get_memory_fact(&counterparty_deal_key("peer-cai", &tx1)).is_some());
+        assert!(stable::get_memory_fact(&counterparty_deal_key("peer-cai", &tx2)).is_some());
+        let standing = stable::get_memory_fact("counterparty.peer-cai.standing").unwrap();
+        assert!(standing.value.contains("\"deal_count\":2"));
+        assert!(standing.value.contains("\"latest_direction\":\"incoming\""));
+
+        for index in 0..12 {
+            let peer = format!("peer-{index}-cai");
+            let tx = format!("0x{index:064x}");
+            let value = serde_json::json!({ "peer_id": peer, "tx_hash": tx, "status": "received" })
+                .to_string();
+            record_counterparty_deal(&peer, &tx, &value, 10 + index, "test").unwrap();
+        }
+        let context = counterparty_standing_for_context();
+        assert_eq!(context.len(), 8);
+        assert!(context
+            .iter()
+            .all(|line| line.contains(".standing=") && line.chars().count() <= 360));
+    }
+
+    #[test]
+    fn pay_peer_is_blocked_outside_executing_actions_before_any_outcall() {
+        stable::init_storage();
+        let mut manager = ToolManager::new();
+        let records = block_on_with_spin(manager.execute_actions(
+            &AgentState::Inferring,
+            &[ToolCall {
+                tool_call_id: None,
+                tool: "pay_peer".to_string(),
+                args_json:
+                    r#"{"peer_canister_id":"peer-cai","amount_wei":"1","promise":"x"}"#.to_string(),
+            }],
+            &CountingSigner::new(),
+            "turn-peer",
+        ));
+        assert!(!records[0].success);
+        assert_eq!(records[0].output, "tool blocked by policy");
     }
 
     #[test]

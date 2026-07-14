@@ -114,6 +114,7 @@ function createIndexerConfig(
     fastPollIntervalMs: 15_000,
     slowPollIntervalMs: 300_000,
     pricePollIntervalMs: 60_000,
+    society: { trustedInboxAddresses: [], trustedUsdcAddresses: [] },
     playground: createPlaygroundConfig()
   };
 }

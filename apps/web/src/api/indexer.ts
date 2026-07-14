@@ -200,3 +200,7 @@ export async function fetchRoomHistory(signal?: AbortSignal): Promise<RoomMessag
     afterSeq = page.nextAfterSeq;
   }
 }
+
+export async function fetchChronicle(signal?: AbortSignal) {
+  return requestIndexerJson<import("@ic-automaton/shared").ChronicleFeed>("/api/chronicle", { signal });
+}

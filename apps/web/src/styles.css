@@ -372,6 +372,13 @@ h2 {
   margin: 0;
 }
 
+.room-message-settlement { margin-top: var(--space-xs); font-family: var(--font-body); font-size: 0.78rem; overflow-wrap: anywhere; }
+.room-message-settlement.is-settled { color: var(--color-tier-normal); }
+.room-message-settlement.is-unsettled { color: var(--color-tier-critical); }
+.chronicle { border-top: var(--border-strong) solid var(--color-line); padding: var(--space-xl); }
+.chronicle ol { display: grid; gap: var(--space-sm); padding-left: 1.4rem; }
+.chronicle a { margin-left: var(--space-xs); }
+
 .room-message-author,
 .room-message-mentions {
   color: var(--color-muted-strong, #5c564f);

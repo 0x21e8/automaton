@@ -110,6 +110,7 @@ export function useAutomatonDetail(canisterId: string | null) {
                 journal: mergeJournalEntries(current.journal ?? [], event.entry)
               };
             });
+            if (event.entry.dealClaim) setRefreshToken((current) => current + 1);
             return;
           }
 

@@ -6,11 +6,11 @@
 use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, ActiveExposure, AutonomyPolicy, ConversationEntry,
     ConversationLog, DecisionRecord, ExposureReconciliationStatus, GoalRecord, InboxMessage,
-    JournalEntry, MemoryFact, OutboxMessage, PendingStrategyDiscoveryJob, PlanRecord,
-    ReflectionMemoryRecord, RuntimeSnapshot, ScheduledJob, SchedulerRuntime, SkillRecord,
-    StrategyDiscoveryCallbackRecord, StrategyQuarantine, StrategyTemplate, StrategyTemplateKey,
-    SurvivalOperationClass, TaskKind, TaskScheduleConfig, TaskScheduleRuntime, ToolCallRecord,
-    TransitionLogRecord, TurnRecord,
+    JournalDealClaim, JournalEntry, MemoryFact, OutboxMessage, PendingStrategyDiscoveryJob,
+    PlanRecord, ReflectionMemoryRecord, RuntimeSnapshot, ScheduledJob, SchedulerRuntime,
+    SkillRecord, StrategyDiscoveryCallbackRecord, StrategyQuarantine, StrategyTemplate,
+    StrategyTemplateKey, SurvivalOperationClass, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
+    ToolCallRecord, TransitionLogRecord, TurnRecord,
 };
 use crate::features::cycle_topup::TopUpStage;
 #[cfg(target_arch = "wasm32")]
@@ -3112,6 +3112,7 @@ pub fn append_journal_entry(
     timestamp_ns: u64,
     text: &str,
     genesis: bool,
+    deal_claim: Option<JournalDealClaim>,
     keep_max: usize,
 ) -> Result<JournalEntry, String> {
     backend::with_connection(|conn| {
@@ -3126,6 +3127,7 @@ pub fn append_journal_entry(
             timestamp_ns,
             text: text.to_string(),
             genesis,
+            deal_claim,
         };
         let payload_json = row_payload(&entry)?;
         conn.execute(

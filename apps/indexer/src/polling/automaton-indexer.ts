@@ -440,7 +440,15 @@ export class AutomatonIndexer {
         turnId: entry.turn_id,
         timestamp: Math.floor(Number(entry.timestamp_ns) / 1_000_000),
         text: entry.text,
-        genesis: entry.genesis ?? false
+        genesis: entry.genesis ?? false,
+        dealClaim: entry.deal_claim ? {
+          kind: entry.deal_claim.kind as "peer_payment_claim",
+          version: entry.deal_claim.version as 1,
+          txHash: entry.deal_claim.tx_hash,
+          peerCanisterId: entry.deal_claim.peer_canister_id,
+          asset: entry.deal_claim.asset as "eth" | "usdc",
+          amountRaw: entry.deal_claim.amount_raw
+        } : null
       }));
       const existing = await this.store.listJournal(canisterId, { limit: 200 });
       const existingIds = new Set(existing.entries.map((entry) => entry.id));

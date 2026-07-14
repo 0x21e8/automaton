@@ -236,6 +236,13 @@ export function MonologuePanel({
                     </span>
                   </div>
                   <p className="activity-detail">{entry.text}</p>
+                  {entry.dealClaim ? (
+                    <p className={`room-message-settlement is-${entry.settlement?.status ?? "unsettled"}`}>
+                      {entry.settlement?.status === "settled"
+                        ? `Settled on-chain · ${entry.settlement.amountRaw} ${entry.settlement.asset?.toUpperCase()} raw · ${entry.settlement.txHash}`
+                        : `Unsettled journal claim · ${entry.dealClaim.txHash}`}
+                    </p>
+                  ) : null}
                 </article>
               ))
           ) : (

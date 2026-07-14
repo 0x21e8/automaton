@@ -34,11 +34,11 @@ use crate::domain::cycle_admission::{
 use crate::domain::mortality::{canonical_runway_seconds, policy_for_tier};
 use crate::domain::recovery_policy::decide_recovery_action;
 use crate::domain::types::{
-    EvmEvent, InboxMessageSource, JobStatus, OperationFailure, OperationFailureKind,
-    RecoveryContext, RecoveryFailure, RecoveryOperation, RecoveryPolicyAction,
-    ResponseLimitAdjustment, ResponseLimitPolicy, RuntimeSnapshot, ScheduledJob,
-    SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane, TemplateActivationState,
-    TemplateStatus,
+    EvmEvent, InboxMessageSource, JobStatus, MemoryFact, MemoryFactSort, OperationFailure,
+    OperationFailureKind, RecoveryContext, RecoveryFailure, RecoveryOperation,
+    RecoveryPolicyAction, ResponseLimitAdjustment, ResponseLimitPolicy, RuntimeSnapshot,
+    ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
+    TemplateActivationState, TemplateStatus,
 };
 use crate::features::cycle_topup::{
     TopUpStage, TOPUP_MIN_OPERATIONAL_CYCLES, TOPUP_MIN_USDC_AVAILABLE_RAW,
@@ -47,13 +47,15 @@ use crate::features::cycle_topup_host::{
     build_cycle_topup, enqueue_topup_cycles_job, topup_cycles_dedupe_key,
 };
 use crate::features::evm::{
-    classify_evm_failure, decode_message_queued_payload, fetch_wallet_balance_sync_read,
+    classify_evm_failure, decode_message_queued_payload, fetch_peer_min_prices,
+    fetch_transaction_receipt_status, fetch_wallet_balance_sync_read, TransactionReceiptStatus,
 };
-use crate::features::factory_room::FactoryRoomClient;
+use crate::features::factory_room::{FactoryPeer, FactoryRoomClient};
 use crate::features::inference::classify_inference_failure;
 use crate::features::{EvmPoller, HttpEvmPoller};
 use crate::storage::stable;
 use crate::timing::{self, current_time_ns};
+use crate::tools::{counterparty_pending_receipt_key, record_counterparty_deal};
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde_json::json;
 
@@ -67,6 +69,9 @@ const ROOM_POLL_INTERVAL_SECS: u64 = timing::DEFAULT_TASK_INTERVAL_SECS * 5;
 
 /// Cap each room catch-up step so chat remains incremental and low-cost.
 const ROOM_POLL_PAGE_LIMIT: u64 = 20;
+const PEER_DIRECTORY_PAGE_LIMIT: u64 = 20;
+const PEER_LOOKUP_HARD_CAP: usize = 500;
+const PENDING_RECEIPT_SCAN_LIMIT: usize = 500;
 
 /// Reference workflow-envelope cost (cycles) used by `CheckCycles` to
 /// estimate the minimum operational floor.
@@ -780,6 +785,168 @@ fn room_poll_due(now_ns: u64, last_attempted_at_ns: Option<u64>) -> bool {
     now_ns >= last_attempted_at_ns.saturating_add(interval_ns)
 }
 
+async fn refresh_peer_directory(
+    now_ns: u64,
+    snapshot: &RuntimeSnapshot,
+    client: &FactoryRoomClient,
+) {
+    let Ok(page) = client.list_peers(None, PEER_DIRECTORY_PAGE_LIMIT).await else {
+        return;
+    };
+    let mut peers = Vec::with_capacity(page.items.len());
+    for peer in page.items {
+        let price = match fetch_peer_min_prices(snapshot, &peer.evm_address).await {
+            Ok(value) => {
+                json!({ "status": "verified", "usdc_min_raw": value.usdc_min_raw, "eth_min_wei": value.eth_min_wei, "uses_default": value.uses_default })
+            }
+            Err(error) => {
+                json!({ "status": "unavailable", "usdc_min_raw": null, "eth_min_wei": null, "error": error })
+            }
+        };
+        peers.push(json!({ "canister_id": peer.canister_id, "name": peer.name, "evm_address": peer.evm_address, "alive": peer.death_cause.is_none(), "price_of_attention": price }));
+    }
+    let value =
+        json!({ "peers": peers, "bounded": true, "next_cursor": page.next_cursor }).to_string();
+    let created_at_ns = stable::get_memory_fact("society.peer_directory")
+        .map(|fact| fact.created_at_ns)
+        .unwrap_or(now_ns);
+    let _ = stable::set_memory_fact(&MemoryFact {
+        key: "society.peer_directory".to_string(),
+        value,
+        created_at_ns,
+        updated_at_ns: now_ns,
+        source_turn_id: "room_poll".to_string(),
+    });
+}
+
+async fn reconcile_submitted_peer_payments(now_ns: u64, snapshot: &RuntimeSnapshot) {
+    for fact in stable::list_memory_facts_by_prefix_sorted(
+        "counterparty_pending_receipt.",
+        PENDING_RECEIPT_SCAN_LIMIT,
+        MemoryFactSort::UpdatedAtDesc,
+    ) {
+        let Ok(alias) = serde_json::from_str::<serde_json::Value>(&fact.value) else {
+            continue;
+        };
+        let Some(tx_hash) = alias
+            .get("tx_hash")
+            .and_then(|item| item.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if counterparty_pending_receipt_key(&tx_hash) != fact.key {
+            continue;
+        }
+        let Ok(status) = fetch_transaction_receipt_status(snapshot, &tx_hash).await else {
+            continue;
+        };
+        let _ = reconcile_pending_receipt_alias(&fact.key, status, now_ns);
+    }
+}
+
+fn reconcile_pending_receipt_alias(
+    alias_key: &str,
+    status: TransactionReceiptStatus,
+    now_ns: u64,
+) -> bool {
+    let Some(alias) = stable::get_memory_fact(alias_key) else {
+        return false;
+    };
+    let Ok(alias_value) = serde_json::from_str::<serde_json::Value>(&alias.value) else {
+        return false;
+    };
+    let Some(deal_key) = alias_value.get("deal_key").and_then(|item| item.as_str()) else {
+        return false;
+    };
+    let Some(deal) = stable::get_memory_fact(deal_key) else {
+        return false;
+    };
+    let Ok(mut deal_value) = serde_json::from_str::<serde_json::Value>(&deal.value) else {
+        return false;
+    };
+    if status == TransactionReceiptStatus::Pending {
+        return false;
+    }
+    if !persist_peer_payment_receipt_status(&mut deal_value, status, now_ns) {
+        return false;
+    }
+    stable::remove_memory_fact(alias_key)
+}
+
+fn persist_peer_payment_receipt_status(
+    value: &mut serde_json::Value,
+    status: TransactionReceiptStatus,
+    now_ns: u64,
+) -> bool {
+    if !apply_peer_payment_receipt_status(value, status) {
+        return false;
+    }
+    let peer_id = value
+        .get("peer_id")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let tx_hash = value
+        .get("tx_hash")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    !peer_id.is_empty()
+        && !tx_hash.is_empty()
+        && record_counterparty_deal(
+            peer_id,
+            tx_hash,
+            &value.to_string(),
+            now_ns,
+            "payment_reconcile",
+        )
+        .is_ok()
+}
+
+fn apply_peer_payment_receipt_status(
+    value: &mut serde_json::Value,
+    status: TransactionReceiptStatus,
+) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    if object.get("status").and_then(|item| item.as_str()) != Some("submitted") {
+        return false;
+    }
+    match status {
+        TransactionReceiptStatus::Pending => false,
+        TransactionReceiptStatus::Confirmed => {
+            object.insert("status".to_string(), json!("paid"));
+            object.insert("assessment".to_string(), json!("awaiting_delivery"));
+            true
+        }
+        TransactionReceiptStatus::Reverted => {
+            object.insert("status".to_string(), json!("failed"));
+            object.insert("assessment".to_string(), json!("transaction_reverted"));
+            true
+        }
+    }
+}
+
+async fn load_peers_for_incoming_events(client: &FactoryRoomClient) -> Vec<FactoryPeer> {
+    let mut peers = Vec::new();
+    let mut cursor = None;
+    while peers.len() < PEER_LOOKUP_HARD_CAP {
+        let Ok(page) = client.list_peers(cursor, 50).await else {
+            break;
+        };
+        peers.extend(
+            page.items
+                .into_iter()
+                .take(PEER_LOOKUP_HARD_CAP - peers.len()),
+        );
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    peers
+}
+
 async fn maybe_poll_factory_room(now_ns: u64, snapshot: &RuntimeSnapshot) {
     if snapshot
         .factory_principal
@@ -818,6 +985,11 @@ async fn maybe_poll_factory_room(now_ns: u64, snapshot: &RuntimeSnapshot) {
             return;
         }
     };
+
+    if snapshot.inbox_contract_address.is_some() && !snapshot.evm_rpc_url.trim().is_empty() {
+        refresh_peer_directory(now_ns, snapshot, &client).await;
+        reconcile_submitted_peer_payments(now_ns, snapshot).await;
+    }
 
     match client
         .list_my_room_messages(snapshot.room_poll.last_seen_seq, Some(ROOM_POLL_PAGE_LIMIT))
@@ -1143,6 +1315,15 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
             })?;
 
         fetched_events = poll.events.len();
+        let peer_directory = if !poll.events.is_empty() {
+            if let Ok(client) = FactoryRoomClient::from_runtime() {
+                load_peers_for_incoming_events(&client).await
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         for event in &poll.events {
             if !stable::try_mark_evm_event_ingested(&event.tx_hash, event.log_index) {
                 skipped_duplicate_events = skipped_duplicate_events.saturating_add(1);
@@ -1150,6 +1331,24 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
             }
             let (body, sender) = evm_event_to_inbox_message(event);
             ingest_inbox_message(body, sender, InboxMessageSource::EvmInbox)?;
+            if let Ok(payment) = crate::features::evm::decode_message_queued_payload(&event.payload)
+            {
+                if !payment.eth_amount.is_zero() || !payment.usdc_amount.is_zero() {
+                    if let Some(peer) = peer_directory
+                        .iter()
+                        .find(|peer| peer.evm_address.eq_ignore_ascii_case(&payment.sender))
+                    {
+                        let value = serde_json::json!({ "peer_id": peer.canister_id, "promise": payment.message, "asset": if payment.usdc_amount.is_zero() { "eth" } else { "usdc" }, "amount_raw": if payment.usdc_amount.is_zero() { payment.eth_amount.to_string() } else { payment.usdc_amount.to_string() }, "tx_hash": event.tx_hash, "delivered": null, "assessment": "commission_received", "status": "received", "direction": "incoming" }).to_string();
+                        record_counterparty_deal(
+                            &peer.canister_id,
+                            &event.tx_hash,
+                            &value,
+                            now_ns,
+                            "evm_inbox",
+                        )?;
+                    }
+                }
+            }
             ingested_events = ingested_events.saturating_add(1);
         }
 
@@ -1611,6 +1810,199 @@ mod tests {
 
     fn test_factory_principal() -> Principal {
         Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai").expect("test principal should parse")
+    }
+
+    fn sample_factory_peer(index: usize) -> FactoryPeer {
+        FactoryPeer {
+            name: Some(format!("Peer {index}")),
+            constitution_hash: None,
+            canister_id: format!("peer-{index}-cai"),
+            steward_address: "0x0000000000000000000000000000000000000000".to_string(),
+            evm_address: format!("0x{index:040x}"),
+            chain: crate::features::factory_room::FactoryPeerChain::Base,
+            session_id: format!("session-{index}"),
+            parent_id: None,
+            child_ids: vec![],
+            created_at: 1,
+            version_commit: "0".repeat(40),
+            controllers: None,
+            control_status: None,
+            control_verified_at: None,
+            death_cause: None,
+            died_at: None,
+            estate_disposition: None,
+            death_recorded_by: None,
+            death_incident_reference: None,
+        }
+    }
+
+    #[test]
+    fn receipt_reconciliation_keeps_pending_and_marks_confirmed_or_reverted() {
+        let original = json!({ "status": "submitted", "assessment": "awaiting_confirmation" });
+        let mut pending = original.clone();
+        assert!(!apply_peer_payment_receipt_status(
+            &mut pending,
+            TransactionReceiptStatus::Pending
+        ));
+        assert_eq!(pending, original);
+
+        let mut confirmed = original.clone();
+        assert!(apply_peer_payment_receipt_status(
+            &mut confirmed,
+            TransactionReceiptStatus::Confirmed
+        ));
+        assert_eq!(confirmed["status"], "paid");
+        assert_eq!(confirmed["assessment"], "awaiting_delivery");
+
+        let mut reverted = original;
+        assert!(apply_peer_payment_receipt_status(
+            &mut reverted,
+            TransactionReceiptStatus::Reverted
+        ));
+        assert_eq!(reverted["status"], "failed");
+        assert_eq!(reverted["assessment"], "transaction_reverted");
+
+        stable::init_storage();
+        let tx1 = format!("0x{}", "11".repeat(32));
+        let tx2 = format!("0x{}", "22".repeat(32));
+        let first = json!({ "peer_id": "peer-cai", "tx_hash": tx1, "status": "submitted", "assessment": "awaiting_confirmation" });
+        let second = json!({ "peer_id": "peer-cai", "tx_hash": tx2, "status": "submitted", "assessment": "awaiting_confirmation" });
+        record_counterparty_deal("peer-cai", &tx1, &first.to_string(), 1, "turn-1").unwrap();
+        record_counterparty_deal("peer-cai", &tx2, &second.to_string(), 2, "turn-2").unwrap();
+        let alias1 = crate::tools::record_pending_receipt("peer-cai", &tx1, 1, "turn-1").unwrap();
+        let alias2 = crate::tools::record_pending_receipt("peer-cai", &tx2, 2, "turn-2").unwrap();
+        for index in 0..12 {
+            let peer = format!("unrelated-{index}-cai");
+            let tx = format!("0x{index:064x}");
+            let value = json!({ "peer_id": peer, "tx_hash": tx, "status": "received" }).to_string();
+            record_counterparty_deal(&peer, &tx, &value, 10 + index, "unrelated").unwrap();
+        }
+        let pending_aliases = stable::list_memory_facts_by_prefix_sorted(
+            "counterparty_pending_receipt.",
+            PENDING_RECEIPT_SCAN_LIMIT,
+            MemoryFactSort::UpdatedAtDesc,
+        );
+        assert_eq!(pending_aliases.len(), 2);
+        assert!(pending_aliases.iter().any(|fact| fact.key == alias1));
+
+        assert!(!reconcile_pending_receipt_alias(
+            &alias1,
+            TransactionReceiptStatus::Pending,
+            30
+        ));
+        assert!(stable::get_memory_fact(&alias1).is_some());
+        assert!(reconcile_pending_receipt_alias(
+            &alias1,
+            TransactionReceiptStatus::Confirmed,
+            31
+        ));
+        assert!(stable::get_memory_fact(&alias1).is_none());
+        assert!(reconcile_pending_receipt_alias(
+            &alias2,
+            TransactionReceiptStatus::Reverted,
+            32
+        ));
+        assert!(stable::get_memory_fact(&alias2).is_none());
+        let first_saved =
+            stable::get_memory_fact(&crate::tools::counterparty_deal_key("peer-cai", &tx1))
+                .unwrap();
+        let second_saved =
+            stable::get_memory_fact(&crate::tools::counterparty_deal_key("peer-cai", &tx2))
+                .unwrap();
+        assert!(first_saved.value.contains("\"status\":\"paid\""));
+        assert!(second_saved.value.contains("\"status\":\"failed\""));
+        let standing = stable::get_memory_fact("counterparty.peer-cai.standing").unwrap();
+        assert!(standing.value.contains("\"latest_status\":\"failed\""));
+    }
+
+    #[test]
+    fn incoming_peer_lookup_paginates_beyond_first_fifty_with_hard_cap() {
+        crate::features::factory_room::clear_mock_factory_room_call();
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_for_mock = Rc::clone(&calls);
+        crate::features::factory_room::set_mock_factory_room_call(
+            move |_canister, method, args| {
+                assert_eq!(method, "list_spawned_automatons");
+                let (cursor, limit): (Option<String>, u64) = candid::decode_args(args).unwrap();
+                assert_eq!(limit, 50);
+                calls_for_mock.set(calls_for_mock.get() + 1);
+                let (items, next_cursor) = if cursor.is_none() {
+                    (
+                        (0..50).map(sample_factory_peer).collect(),
+                        Some("page-2".to_string()),
+                    )
+                } else {
+                    (vec![sample_factory_peer(50)], None)
+                };
+                candid::encode_one(crate::features::factory_room::FactoryRoomCallResult::Ok(
+                    crate::features::factory_room::FactoryPeerPage { items, next_cursor },
+                ))
+                .map_err(|error| error.to_string())
+            },
+        );
+        let peers = block_on_with_spin(load_peers_for_incoming_events(&FactoryRoomClient::new(
+            test_factory_principal(),
+        )));
+        assert_eq!(peers.len(), 51);
+        assert_eq!(peers.last().unwrap().canister_id, "peer-50-cai");
+        assert_eq!(calls.get(), 2);
+        crate::features::factory_room::clear_mock_factory_room_call();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn room_refresh_stores_registry_identity_and_verified_inbox_prices() {
+        with_clean_host_stub_env(|| {
+            stable::init_storage();
+            stable::set_evm_rpc_url("https://mainnet.base.org".to_string()).unwrap();
+            stable::set_inbox_contract_address(Some(
+                "0x3333333333333333333333333333333333333333".to_string(),
+            ))
+            .unwrap();
+            crate::features::factory_room::set_mock_factory_room_call(
+                move |_canister, method, args| {
+                    assert_eq!(method, "list_spawned_automatons");
+                    let (cursor, limit): (Option<String>, u64) = candid::decode_args(args).unwrap();
+                    assert!(cursor.is_none());
+                    assert_eq!(limit, PEER_DIRECTORY_PAGE_LIMIT);
+                    candid::encode_one(crate::features::factory_room::FactoryRoomCallResult::Ok(
+                        crate::features::factory_room::FactoryPeerPage {
+                            items: vec![sample_factory_peer(7)],
+                            next_cursor: None,
+                        },
+                    ))
+                    .map_err(|error| error.to_string())
+                },
+            );
+            let snapshot = stable::runtime_snapshot();
+            block_on_with_spin(refresh_peer_directory(
+                99,
+                &snapshot,
+                &FactoryRoomClient::new(test_factory_principal()),
+            ));
+            let value: serde_json::Value = serde_json::from_str(
+                &stable::get_memory_fact("society.peer_directory")
+                    .unwrap()
+                    .value,
+            )
+            .unwrap();
+            assert_eq!(value["peers"][0]["canister_id"], "peer-7-cai");
+            assert_eq!(value["peers"][0]["name"], "Peer 7");
+            assert_eq!(value["peers"][0]["alive"], true);
+            assert_eq!(
+                value["peers"][0]["price_of_attention"]["status"], "verified",
+                "{value}"
+            );
+            assert_eq!(
+                value["peers"][0]["price_of_attention"]["usdc_min_raw"],
+                "1000000"
+            );
+            assert_eq!(
+                value["peers"][0]["price_of_attention"]["eth_min_wei"],
+                "500000000000000"
+            );
+            crate::features::factory_room::clear_mock_factory_room_call();
+        });
     }
 
     fn configure_factory_room_access() {

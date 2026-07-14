@@ -2932,6 +2932,21 @@ fn build_room_integration_section(snapshot: &RuntimeSnapshot) -> String {
                 .map(render_room_observation_untrusted),
         );
     }
+    let standings = crate::tools::counterparty_standing_for_context();
+    lines.push("### Peer Directory (Factory registry; bounded discovery data)".to_string());
+    lines.push(
+        stable::get_memory_fact("society.peer_directory")
+            .map(|fact| format!("- {}", fact.value.chars().take(1_800).collect::<String>()))
+            .unwrap_or_else(|| {
+                "- not loaded; call list_peers for a bounded current registry view.".to_string()
+            }),
+    );
+    lines.push("### Counterparty Standing (Being-owned memory; bounded)".to_string());
+    if standings.is_empty() {
+        lines.push("- none recorded; record promises, payment, delivery, and assessment, and consult this standing before paying again.".to_string());
+    } else {
+        lines.extend(standings);
+    }
     lines.join("\n")
 }
 

@@ -149,6 +149,14 @@ export interface HttpJournalEntryResponse {
   timestamp_ns: number;
   text: string;
   genesis?: boolean;
+  deal_claim?: {
+    kind: string;
+    version: number;
+    tx_hash: string;
+    peer_canister_id: string;
+    asset: string;
+    amount_raw: string;
+  } | null;
 }
 
 export interface HttpJournalResponse {
