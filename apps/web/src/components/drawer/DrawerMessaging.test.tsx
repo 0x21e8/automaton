@@ -98,6 +98,59 @@ afterEach(() => {
 });
 
 describe("drawer messaging", () => {
+  it("renders indexer metabolism, truthful control, and both patronage flows", () => {
+    const automaton = createAutomatonDetail();
+    automaton.metabolism = {
+      burnRateCyclesPerDay: 1_000_000_000_000,
+      runwaySeconds: 172_800,
+      lifetimeEarningsUsdcRaw: "12500000",
+      ageSeconds: 259_200,
+      state: "healthy",
+      history: [
+        { capturedAt: 1, liquidCycles: 2_000, usdcBalanceRaw: "0", burnRateCyclesPerDay: 1_000, runwaySeconds: 172_800 },
+        { capturedAt: 2, liquidCycles: 1_000, usdcBalanceRaw: "0", burnRateCyclesPerDay: 1_000, runwaySeconds: 86_400 }
+      ]
+    };
+    automaton.controlStatus = {
+      label: "upgradeable_by_factory",
+      controllers: ["rrkah-fqaaa-aaaaa-aaaaq-cai"],
+      spawnerPresent: false,
+      verifiedAt: Date.now()
+    };
+    automaton.inboxContractAddress = "0x2222222222222222222222222222222222222222";
+    automaton.usdcContractAddress = "0x3333333333333333333333333333333333333333";
+    const markup = renderToStaticMarkup(<AutomatonDrawer automaton={automaton} errorMessage={null} isLoading={false} isOpen onClose={() => {}} selectedCanisterId={automaton.canisterId} viewerAddress={null} walletSession={null} />);
+    expect(markup).toContain("Metabolism");
+    expect(markup).toContain("Runway");
+    expect(markup).toContain("12.50 USDC");
+    expect(markup).toContain("Upgradeable by the factory");
+    expect(markup).toContain("Price of attention");
+    expect(markup).toContain("This is a gift the being can metabolize");
+    expect(markup).not.toContain("yield");
+  });
+
+  it("keeps historical self-controlled and unattested records truthful", () => {
+    const selfControlled = createAutomatonDetail();
+    selfControlled.controlStatus = {
+      label: "self_controlled",
+      controllers: [selfControlled.canisterId],
+      spawnerPresent: false,
+      verifiedAt: 1_700_000_000_000
+    };
+    const unverified = createAutomatonDetail();
+    unverified.controlStatus = {
+      label: "unverified",
+      controllers: [],
+      spawnerPresent: false,
+      verifiedAt: null
+    };
+
+    const selfMarkup = renderToStaticMarkup(<AutomatonDrawer automaton={selfControlled} errorMessage={null} isLoading={false} isOpen onClose={() => {}} selectedCanisterId={selfControlled.canisterId} viewerAddress={null} walletSession={null} />);
+    const unverifiedMarkup = renderToStaticMarkup(<AutomatonDrawer automaton={unverified} errorMessage={null} isLoading={false} isOpen onClose={() => {}} selectedCanisterId={unverified.canisterId} viewerAddress={null} walletSession={null} />);
+    expect(selfMarkup).toContain("Self-controlled; no factory upgrade path");
+    expect(unverifiedMarkup).toContain("Controller status unverified");
+  });
+
   it("shows verified documents and hides mismatched content", () => {
     const verified = createAutomatonDetail();
     verified.constitution = "A verified founding document.";

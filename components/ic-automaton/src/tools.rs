@@ -29,7 +29,7 @@ use crate::domain::types::{
 };
 use crate::features::canister_call::canister_call_tool;
 use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool};
-use crate::features::evm::{evm_read_tool, send_eth_tool};
+use crate::features::evm::{evm_read_tool, send_eth_tool, set_min_prices_tool};
 use crate::features::factory_room::FactoryRoomClient;
 use crate::features::http_fetch::http_fetch_tool;
 use crate::features::inference::canonicalize_tool_name;
@@ -664,6 +664,13 @@ impl ToolManager {
         );
         policies.insert(
             "send_eth".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "set_min_prices".to_string(),
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
@@ -1386,6 +1393,27 @@ impl ToolManager {
                             ],
                             now_ns,
                         );
+                    }
+                    result
+                }
+            }
+            "set_min_prices" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::ThresholdSign,
+                    now_ns,
+                ) || !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::EvmBroadcast,
+                    now_ns,
+                ) {
+                    Err("set_min_prices skipped due to EVM survival policy".to_string())
+                } else {
+                    let result = set_min_prices_tool(&call.args_json, signer).await;
+                    if result.is_ok() {
+                        record_survival_operation_successes(&[
+                            SurvivalOperationClass::ThresholdSign,
+                            SurvivalOperationClass::EvmBroadcast,
+                        ]);
                     }
                     result
                 }

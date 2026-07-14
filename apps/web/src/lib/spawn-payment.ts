@@ -103,7 +103,7 @@ function isProviderErrorWithCode(error: unknown, code: number) {
   );
 }
 
-async function requestJsonRpcResult<T>(
+export async function requestJsonRpcResult<T>(
   rpcUrl: string,
   method: string,
   params: unknown[]

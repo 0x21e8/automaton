@@ -2518,6 +2518,47 @@ pub async fn send_eth_tool(args_json: &str, signer: &dyn SignerPort) -> Result<S
     rpc.eth_send_raw_transaction(&signed).await
 }
 
+#[derive(Deserialize)]
+struct SetMinPricesArgs {
+    usdc_min_raw: String,
+    eth_min_wei: String,
+}
+
+/// Doctrine-level economic lever for the being's own price of attention.
+/// This deliberately wraps the generic signed EVM path so the model never has
+/// to construct ABI calldata or choose an Inbox address supplied by content.
+pub async fn set_min_prices_tool(
+    args_json: &str,
+    signer: &dyn SignerPort,
+) -> Result<String, String> {
+    let args: SetMinPricesArgs = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid set_min_prices args json: {error}"))?;
+    let usdc_min = parse_decimal_u256(&args.usdc_min_raw, "usdc_min_raw")?;
+    let eth_min = parse_decimal_u256(&args.eth_min_wei, "eth_min_wei")?;
+    let inbox = stable::runtime_snapshot()
+        .inbox_contract_address
+        .ok_or_else(|| "inbox contract is not configured".to_string())?;
+    let call = set_min_prices_send_eth_args_json(&inbox, usdc_min, eth_min);
+    send_eth_tool(&call, signer).await
+}
+
+fn set_min_prices_send_eth_args_json(inbox: &str, usdc_min: U256, eth_min: U256) -> String {
+    let selector_hash = keccak256("setMinPrices(uint256,uint256)".as_bytes());
+    let selector = &selector_hash.as_slice()[..4];
+    let data = format!(
+        "0x{}{:064x}{:064x}",
+        hex::encode(selector),
+        usdc_min,
+        eth_min
+    );
+    serde_json::json!({
+        "to": inbox,
+        "value_wei": "0",
+        "data": data
+    })
+    .to_string()
+}
+
 #[allow(dead_code)]
 pub fn strategy_call_to_send_eth_args_json(call: &StrategyExecutionCall) -> Result<String, String> {
     let to = normalize_evm_address(&call.to)?;
@@ -3774,6 +3815,62 @@ mod tests {
 
         assert_eq!(
             tx_hash,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn set_min_prices_rejects_unconfigured_inbox_and_invalid_amounts() {
+        stable::init_storage();
+        let signer = FixedSignatureSigner;
+        let error = block_on_with_spin(set_min_prices_tool(
+            r#"{"usdc_min_raw":"x","eth_min_wei":"1"}"#,
+            &signer,
+        ))
+        .expect_err("invalid amount must fail before broadcast");
+        assert!(error.contains("usdc_min_raw must be a decimal string"));
+
+        let error = block_on_with_spin(set_min_prices_tool(
+            r#"{"usdc_min_raw":"1000000","eth_min_wei":"1"}"#,
+            &signer,
+        ))
+        .expect_err("missing inbox must fail");
+        assert!(error.contains("inbox contract is not configured"));
+    }
+
+    #[test]
+    fn set_min_prices_targets_configured_inbox_with_exact_calldata_and_broadcasts() {
+        stable::init_storage();
+        let inbox = "0x2222222222222222222222222222222222222222";
+        stable::set_inbox_contract_address(Some(inbox.to_string()))
+            .expect("inbox should be configured");
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string())
+            .expect("rpc url should be set");
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).expect("key should be set");
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .expect("address should be set");
+
+        let call =
+            set_min_prices_send_eth_args_json(inbox, U256::from(1_500_000u64), U256::from(7u64));
+        assert_eq!(
+            call,
+            format!(
+                r#"{{"to":"{inbox}","value_wei":"0","data":"0x{}{:064x}{:064x}"}}"#,
+                function_selector_hex("setMinPrices(uint256,uint256)"),
+                U256::from(1_500_000u64),
+                U256::from(7u64)
+            )
+        );
+
+        let hash = block_on_with_spin(set_min_prices_tool(
+            r#"{"usdc_min_raw":"1500000","eth_min_wei":"7"}"#,
+            &FixedSignatureSigner,
+        ))
+        .expect("configured price update should broadcast");
+        assert_eq!(
+            hash,
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
     }

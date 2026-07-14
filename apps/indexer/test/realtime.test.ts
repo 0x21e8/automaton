@@ -144,6 +144,7 @@ function createRuntimeFinancialRead(canisterId: string): RuntimeFinancialRead {
         total_cycles: 4_200_000_000_000,
         liquid_cycles: 3_100_000_000_000,
         burn_rate_cycles_per_day: 182_000_000_000,
+        usd_per_trillion_cycles: 1.35,
         estimated_freeze_time_ns: 1_710_112_347_000_000_000
       },
       recent_turns: [

@@ -157,6 +157,8 @@ function detailToSummary(detail: AutomatonDetail): AutomatonSummary {
     ethBalanceWei: detail.financials.ethBalanceWei,
     usdcBalanceRaw: detail.financials.usdcBalanceRaw,
     cyclesBalance: detail.financials.cyclesBalance,
+    metabolism: detail.metabolism,
+    controlStatus: detail.controlStatus,
     netWorthEth: detail.financials.netWorthEth,
     netWorthUsd: detail.financials.netWorthUsd,
     heartbeatIntervalSeconds: detail.runtime.heartbeatIntervalSeconds,

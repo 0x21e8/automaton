@@ -82,6 +82,7 @@ export interface HttpEvmConfigResponse {
   automaton_address?: string | null;
   chain_id?: number;
   inbox_contract_address?: string | null;
+  usdc_address?: string | null;
 }
 
 export interface HttpSchedulerConfigResponse {
@@ -160,6 +161,7 @@ export interface HttpSnapshotResponse {
     estimated_freeze_time_ns?: number | null;
     liquid_cycles?: number;
     total_cycles?: number;
+    usd_per_trillion_cycles?: number;
   };
   recent_decisions?: HttpDecisionRecordResponse[];
   prompt_layers?: Array<{

@@ -5,6 +5,7 @@ import type {
   AutomatonTier
 } from "@ic-automaton/shared";
 import { themeTokens } from "../../theme/tokens";
+import { formatRunway } from "../drawer/MetabolismPanel";
 
 const CELL_SIZE = 10;
 const CELL_GAP = 1;
@@ -90,28 +91,6 @@ function getTierColor(tier: AutomatonTier): string {
     default:
       return themeTokens.colors.gridNormal;
   }
-}
-
-function formatUsd(value: string | null): string {
-  if (value === null) {
-    return "$0";
-  }
-
-  const amount = Number(value);
-
-  if (amount >= 1_000_000) {
-    return `$${(amount / 1_000_000).toFixed(1)}M`;
-  }
-
-  if (amount >= 1_000) {
-    return `$${(amount / 1_000).toFixed(1)}K`;
-  }
-
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 0
-  }).format(amount);
 }
 
 function computeRadiusCells(automaton: AutomatonSummary): number {
@@ -631,14 +610,33 @@ export function AutomatonCanvas({
           drawingContext.fillRect(x, y, size, size);
         }
 
-        if (owned || selected) {
+        {
+          const metabolism = node.automaton.metabolism ?? {
+            state: node.automaton.tier === "out_of_cycles" ? "dead" : "healthy",
+            burnRateCyclesPerDay: null,
+            runwaySeconds: null,
+            lifetimeEarningsUsdcRaw: "0",
+            ageSeconds: Math.max(0, Math.floor((Date.now() - node.automaton.createdAt) / 1_000))
+          };
           drawingContext.fillStyle = "rgba(26, 26, 26, 0.92)";
-          drawingContext.font = "700 11px Azeret Mono";
+          drawingContext.font = `${owned ? "700" : "600"} 10px Azeret Mono`;
           drawingContext.textAlign = "center";
           drawingContext.fillText(
-            node.automaton.name,
+            `${metabolism.state === "dead" ? "† " : ""}${node.automaton.name}`,
             node.cx,
             node.cy - radiusPixels - 16
+          );
+          drawingContext.font = "8px Azeret Mono";
+          const burn = metabolism.burnRateCyclesPerDay;
+          drawingContext.fillText(
+            `${burn === null ? "burn …" : `burn ${(burn / 1e12).toFixed(2)}T/d`} · runway ${formatRunway(metabolism.runwaySeconds)}`,
+            node.cx,
+            node.cy + radiusPixels + 16
+          );
+          drawingContext.fillText(
+            `earned ${(Number(metabolism.lifetimeEarningsUsdcRaw) / 1e6).toFixed(1)} USDC · age ${Math.floor(metabolism.ageSeconds / 86400)}d`,
+            node.cx,
+            node.cy + radiusPixels + 27
           );
         }
       }
@@ -688,12 +686,19 @@ export function AutomatonCanvas({
     if (automaton === undefined) {
       return;
     }
+    const metabolism = automaton.metabolism ?? {
+      state: automaton.tier === "out_of_cycles" ? "dead" : "healthy",
+      burnRateCyclesPerDay: null,
+      runwaySeconds: null,
+      lifetimeEarningsUsdcRaw: "0",
+      ageSeconds: Math.max(0, Math.floor((Date.now() - automaton.createdAt) / 1_000))
+    };
 
     setHoveredCanisterId(hit.canisterId);
     setTooltip({
       left: clientX + 14,
       top: clientY - 14,
-      label: `${automaton.name} — ${automaton.tier} — ${formatUsd(automaton.netWorthUsd)}`,
+      label: `${automaton.name} — ${metabolism.state} — burn ${metabolism.burnRateCyclesPerDay ?? "observing"} cycles/day — runway ${formatRunway(metabolism.runwaySeconds)} — earned ${(Number(metabolism.lifetimeEarningsUsdcRaw) / 1e6).toFixed(2)} USDC — age ${Math.floor(metabolism.ageSeconds / 86400)}d`,
       visible: true
     });
   }

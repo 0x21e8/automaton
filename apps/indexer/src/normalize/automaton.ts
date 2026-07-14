@@ -30,6 +30,12 @@ import {
   toVariantName
 } from "../lib/automaton-derived.js";
 import { verifyConstitution } from "../lib/genesis-integrity.js";
+import {
+  computeCanonicalRunwaySeconds,
+  computeWindowedBurnRate,
+  deriveMetabolicState,
+  positiveUsdcInflowRaw
+} from "../lib/metabolism.js";
 
 const EMPTY_STEWARD_ADDRESS = "0x0000000000000000000000000000000000000000";
 
@@ -183,6 +189,20 @@ function defaultDetail(
     ethBalanceWei: null,
     usdcBalanceRaw: null,
     cyclesBalance: 0,
+    metabolism: {
+      burnRateCyclesPerDay: null,
+      runwaySeconds: null,
+      lifetimeEarningsUsdcRaw: "0",
+      ageSeconds: Math.max(0, Math.floor((now - (registryRecord?.createdAt ?? now)) / 1_000)),
+      state: "healthy",
+      history: []
+    },
+    controlStatus: {
+      label: "unverified",
+      controllers: [],
+      spawnerPresent: false,
+      verifiedAt: null
+    },
     netWorthEth: null,
     netWorthUsd: null,
     heartbeatIntervalSeconds: null,
@@ -229,6 +249,8 @@ function defaultDetail(
     promptLayers: [],
     monologue: [],
     journal: [],
+    inboxContractAddress: null,
+    usdcContractAddress: null,
     spawnSelection: null,
     childIds: registryRecord?.childIds ?? [],
     lastPolledAt: now
@@ -301,6 +323,81 @@ export function normalizeAutomatonDetail(options: {
             verification: base.constitutionVerification
           }
       : verifyConstitution(identityConstitution, constitutionHash);
+  const capturedAt = options.now;
+  const liquidCycles =
+    toOptionalNumber(runtime?.snapshot.cycles?.liquid_cycles) ?? base.financials.liquidCycles;
+  const observedSample = {
+    capturedAt,
+    liquidCycles,
+    usdcBalanceRaw: walletUsdcBalance
+  };
+  const priorHistory = base.metabolism?.history ?? [];
+  const lastHistorySample = priorHistory.at(-1);
+  const shouldAppendRuntimeSample = runtime !== undefined &&
+    (lastHistorySample === undefined || capturedAt - lastHistorySample.capturedAt >= 1_000);
+  const historyInputs = [...priorHistory, ...(shouldAppendRuntimeSample ? [observedSample] : [])]
+    .filter((sample) => capturedAt - sample.capturedAt <= 24 * 60 * 60 * 1_000)
+    .slice(-96);
+  const windowedBurn = computeWindowedBurnRate(historyInputs);
+  const childBurn = toOptionalNumber(runtime?.snapshot.cycles?.burn_rate_cycles_per_day);
+  const burnRateCyclesPerDay = runtime === undefined
+    ? base.metabolism?.burnRateCyclesPerDay ?? base.financials.burnRatePerDay
+    : windowedBurn === null || windowedBurn === 0
+      ? childBurn ?? windowedBurn ?? base.financials.burnRatePerDay
+      : windowedBurn;
+  const runwaySeconds = runtime === undefined
+    ? base.metabolism?.runwaySeconds ?? null
+    : computeCanonicalRunwaySeconds({
+        burnRateCyclesPerDay,
+        liquidCycles,
+        usdcBalanceRaw: walletUsdcBalance,
+        usdcDecimals,
+        usdPerTrillionCycles: toOptionalNumber(
+          runtime.snapshot.cycles?.usd_per_trillion_cycles
+        ) ?? undefined
+      });
+  const previousUsdc = priorHistory.at(-1)?.usdcBalanceRaw ?? walletUsdcBalance;
+  const lifetimeEarningsUsdcRaw = runtime === undefined
+    ? base.metabolism?.lifetimeEarningsUsdcRaw ?? "0"
+    : (
+        BigInt(base.metabolism?.lifetimeEarningsUsdcRaw ?? "0") +
+        BigInt(positiveUsdcInflowRaw(previousUsdc, walletUsdcBalance))
+      ).toString();
+  const cyclesBalance =
+    toOptionalNumber(runtime?.snapshot.cycles?.total_cycles) ?? base.financials.cyclesBalance;
+  const tier = normalizeTier(runtime?.snapshot.scheduler?.survival_tier, base.tier);
+  const nextHistory = !shouldAppendRuntimeSample ? priorHistory : [...priorHistory, {
+    capturedAt,
+    liquidCycles,
+    usdcBalanceRaw: walletUsdcBalance,
+    burnRateCyclesPerDay,
+    runwaySeconds
+  }];
+  const history = nextHistory.filter((point, index, points) =>
+    capturedAt - point.capturedAt <= 7 * 24 * 60 * 60 * 1_000 &&
+    (index === points.length - 1 || point.capturedAt !== points[index + 1]?.capturedAt)
+  ).slice(-96);
+  const attestedControllers = options.registryRecord?.controllers;
+  const attestedControlLabel = options.registryRecord?.controlStatus;
+  const attestedAt = options.registryRecord?.controlVerifiedAt;
+  const hasKnownControlLabel = attestedControlLabel === "upgradeable_by_factory" ||
+    attestedControlLabel === "self_controlled" ||
+    attestedControlLabel === "controller_mismatch";
+  const hasCoherentControllers = attestedControllers !== undefined &&
+    attestedControllers.length > 0 &&
+    (attestedControlLabel === "self_controlled"
+      ? attestedControllers.length === 1 && attestedControllers[0] === options.canisterId
+      : attestedControlLabel === "upgradeable_by_factory"
+        ? attestedControllers.length === 1 && attestedControllers[0] !== options.canisterId
+        : true);
+  const hasControlAttestation = attestedControllers !== undefined &&
+    hasCoherentControllers &&
+    hasKnownControlLabel &&
+    attestedAt !== undefined &&
+    Number.isFinite(attestedAt) &&
+    attestedAt >= 0;
+  const registryControllers = hasControlAttestation ? [...attestedControllers] : [];
+  const controlLabel = hasControlAttestation ? attestedControlLabel : "unverified";
 
   return {
     ...base,
@@ -313,12 +410,27 @@ export function normalizeAutomatonDetail(options: {
     constitution: constitutionResult.constitution,
     constitutionVerification: constitutionResult.verification,
     model: options.spawnModel ?? base.model,
-    tier: normalizeTier(runtime?.snapshot.scheduler?.survival_tier, base.tier),
+    tier,
     agentState: runtimeState,
     ethBalanceWei: walletEthBalance,
     usdcBalanceRaw: walletUsdcBalance,
-    cyclesBalance:
-      toOptionalNumber(runtime?.snapshot.cycles?.total_cycles) ?? base.financials.cyclesBalance,
+    cyclesBalance,
+    metabolism: {
+      burnRateCyclesPerDay,
+      runwaySeconds,
+      lifetimeEarningsUsdcRaw,
+      ageSeconds: Math.max(0, Math.floor((capturedAt - (options.registryRecord?.createdAt ?? base.createdAt)) / 1_000)),
+      state: deriveMetabolicState({ runwaySeconds, tier, cyclesBalance }),
+      history
+    },
+    controlStatus: {
+      label: controlLabel,
+      controllers: [...registryControllers],
+      // No factory-principal field is currently part of the attestation, so do
+      // not infer this by comparing ICP principals with an EVM steward address.
+      spawnerPresent: false,
+      verifiedAt: hasControlAttestation ? attestedAt : null
+    },
     netWorthEth: netWorth.netWorthEth,
     netWorthUsd: netWorth.netWorthUsd,
     heartbeatIntervalSeconds,
@@ -356,13 +468,9 @@ export function normalizeAutomatonDetail(options: {
     financials: {
       ethBalanceWei: walletEthBalance,
       usdcBalanceRaw: walletUsdcBalance,
-      cyclesBalance:
-        toOptionalNumber(runtime?.snapshot.cycles?.total_cycles) ?? base.financials.cyclesBalance,
-      liquidCycles:
-        toOptionalNumber(runtime?.snapshot.cycles?.liquid_cycles) ?? base.financials.liquidCycles,
-      burnRatePerDay:
-        toOptionalNumber(runtime?.snapshot.cycles?.burn_rate_cycles_per_day) ??
-        base.financials.burnRatePerDay,
+      cyclesBalance,
+      liquidCycles,
+      burnRatePerDay: burnRateCyclesPerDay,
       estimatedFreezeTime:
         nsToMs(runtime?.snapshot.cycles?.estimated_freeze_time_ns) ??
         base.financials.estimatedFreezeTime,
@@ -387,6 +495,10 @@ export function normalizeAutomatonDetail(options: {
       base.promptLayers,
     monologue: options.monologue ?? base.monologue,
     journal: base.journal ?? [],
+    inboxContractAddress:
+      toOptionalString(identity?.evmConfig.inbox_contract_address) ?? base.inboxContractAddress,
+    usdcContractAddress:
+      toOptionalString(identity?.evmConfig.usdc_address) ?? base.usdcContractAddress,
     lastPolledAt: options.now
   };
 }

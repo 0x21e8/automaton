@@ -563,6 +563,9 @@ mod tests {
             child_ids: Vec::new(),
             created_at,
             version_commit: SHA40.to_string(),
+            controllers: Some(vec![canister_id.to_string()]),
+            control_status: Some("self_controlled".to_string()),
+            control_verified_at: Some(created_at),
         }
     }
 
@@ -1618,6 +1621,9 @@ mod tests {
                     child_ids: Vec::new(),
                     created_at: 5_100,
                     version_commit: SHA40.to_string(),
+                    controllers: Some(vec!["aaaaa-aa".to_string()]),
+                    control_status: Some("self_controlled".to_string()),
+                    control_verified_at: Some(5_100),
                 },
             );
             state.runtimes.insert(
@@ -2003,6 +2009,24 @@ mod tests {
             .registry_record
             .expect("registry record should exist");
         assert_eq!(registry.evm_address, receipt.automaton_evm_address);
+        assert_eq!(
+            receipt.controller,
+            format!(
+                "controller:{}",
+                crate::spawn::HOST_FACTORY_CONTROLLER_PRINCIPAL
+            )
+        );
+        assert_eq!(
+            registry.controllers,
+            Some(vec![
+                crate::spawn::HOST_FACTORY_CONTROLLER_PRINCIPAL.to_string()
+            ])
+        );
+        assert_eq!(
+            registry.control_status.as_deref(),
+            Some("upgradeable_by_factory")
+        );
+        assert_eq!(registry.control_verified_at, Some(registry.created_at));
         assert_eq!(registry.name.as_deref(), Some("Meridian"));
         assert_eq!(
             registry.constitution_hash.as_deref().map(str::len),

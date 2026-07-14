@@ -203,6 +203,7 @@ function createRuntimeFinancialRead(canisterId: string): RuntimeFinancialRead {
         total_cycles: 4_200_000_000_000,
         liquid_cycles: 3_100_000_000_000,
         burn_rate_cycles_per_day: 182_000_000_000,
+        usd_per_trillion_cycles: 1.35,
         estimated_freeze_time_ns: 1_710_112_347_000_000_000
       },
       recent_turns: [
@@ -459,6 +460,13 @@ describe("automaton indexer poller", () => {
       financials: {
         cyclesBalance: 4_200_000_000_000,
         liquidCycles: 3_100_000_000_000
+      },
+      metabolism: {
+        burnRateCyclesPerDay: 182_000_000_000,
+        runwaySeconds: expect.any(Number),
+        lifetimeEarningsUsdcRaw: "0",
+        state: "hibernating",
+        history: [expect.objectContaining({ liquidCycles: 3_100_000_000_000 })]
       },
       strategies: [
         {
@@ -982,7 +990,11 @@ describe("automaton indexer poller", () => {
           agentState: "Idle",
           cyclesBalance: 4_200_000_000_000,
           netWorthUsd: 14_611.69,
-          tier: "low"
+          tier: "low",
+          metabolism: expect.objectContaining({
+            state: "hibernating",
+            runwaySeconds: expect.any(Number)
+          })
         })
       })
     );

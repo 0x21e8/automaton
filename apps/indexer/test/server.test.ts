@@ -817,9 +817,13 @@ describe("indexer server", () => {
     });
 
     app.realtimeHub.broadcast({
-      type: "offline",
+      type: "update",
       canisterId: detail.canisterId,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      changes: {
+        metabolism: detail.metabolism,
+        controlStatus: detail.controlStatus
+      }
     });
 
     expect(listResponse.statusCode).toBe(200);
@@ -833,7 +837,16 @@ describe("indexer server", () => {
     expect(detailResponse.statusCode).toBe(200);
     expect(detailResponse.json()).toMatchObject({
       canisterId: detail.canisterId,
-      name: detail.name
+      name: detail.name,
+      metabolism: {
+        lifetimeEarningsUsdcRaw: "2500000",
+        runwaySeconds: 86_400
+      },
+      controlStatus: {
+        label: "self_controlled",
+        controllers: ["aaaaa-aa"],
+        verifiedAt: 1_709_912_345_000
+      }
     });
 
     expect(monologueResponse.statusCode).toBe(200);
@@ -851,7 +864,14 @@ describe("indexer server", () => {
         websocketPath: "/ws/events"
       }
     });
-    await expect(eventMessage).resolves.toContain(detail.canisterId);
+    await expect(eventMessage.then((payload) => JSON.parse(payload))).resolves.toMatchObject({
+      type: "update",
+      canisterId: detail.canisterId,
+      changes: {
+        metabolism: { lifetimeEarningsUsdcRaw: "2500000", runwaySeconds: 86_400 },
+        controlStatus: { label: "self_controlled", verifiedAt: 1_709_912_345_000 }
+      }
+    });
 
     socket.close();
     await app.close();

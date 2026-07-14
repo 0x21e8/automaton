@@ -580,6 +580,8 @@ type SpawnSessionStatusResponse = record {
 };
 type SpawnedAutomatonRecord = record {
   evm_address : text;
+  // Controller principals attested by the factory after handoff.
+  controllers : opt vec text;
   session_id : text;
   chain : SpawnChain;
   name : opt text;
@@ -589,6 +591,10 @@ type SpawnedAutomatonRecord = record {
   parent_id : opt text;
   // Exact installed ic-automaton git commit as a 40-char lowercase SHA.
   version_commit : text;
+  // Millisecond timestamp at which the factory verified `controllers`.
+  control_verified_at : opt nat64;
+  // Truthful public control label derived from the verified controller list.
+  control_status : opt text;
   child_ids : vec text;
   steward_address : text;
 };

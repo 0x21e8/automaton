@@ -1,11 +1,16 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::BTreeMap;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const HOST_FACTORY_CONTROLLER_PRINCIPAL: &str = "rrkah-fqaaa-aaaaa-aaaaq-cai";
+
 use crate::base_rpc::configured_rpc_endpoints;
 #[cfg(target_arch = "wasm32")]
 use crate::controllers::complete_controller_handoff_live;
 #[cfg(target_arch = "wasm32")]
 use crate::controllers::rejection_message;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::controllers::verify_factory_only_controller_ids;
 use crate::cycles::ensure_spawn_creation_cycles;
 #[cfg(target_arch = "wasm32")]
 use crate::evm::derive_child_evm_address;
@@ -918,7 +923,7 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             }
         }
 
-        let controller = format!("{CONTROLLER_FIELD}:{}", runtime.canister_id);
+        let controller = format!("{CONTROLLER_FIELD}:{HOST_FACTORY_CONTROLLER_PRINCIPAL}");
         runtime.controller_handoff_completed_at = Some(now_ms);
 
         let base_rpc_endpoints = configured_rpc_endpoints(
@@ -983,6 +988,12 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             session.release_broadcast_at = Some(release_broadcast_at);
             session.release_broadcast = Some(release_record.clone());
             let (name, constitution_hash) = redact_released_constitution(session, &mut runtime);
+            let verified_factory_controllers = verify_factory_only_controller_ids(
+                &runtime.canister_id,
+                HOST_FACTORY_CONTROLLER_PRINCIPAL,
+                vec![HOST_FACTORY_CONTROLLER_PRINCIPAL.to_string()],
+            )?
+            .into_vec();
 
             SpawnedAutomatonRecord {
                 name: Some(name),
@@ -996,6 +1007,9 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
                 child_ids: session.child_ids.clone(),
                 created_at: now_ms,
                 version_commit,
+                controllers: Some(verified_factory_controllers),
+                control_status: Some("upgradeable_by_factory".to_string()),
+                control_verified_at: Some(now_ms),
             }
         };
 
@@ -1508,19 +1522,23 @@ pub async fn execute_spawn(
         .await;
     }
 
-    if let Err(error) = complete_controller_handoff_live(&canister_id).await {
-        return fail_spawn_session(
-            session_id,
-            current_time_ms(),
-            "controller handoff failed",
-            Some(&canister_id),
-            None,
-            error,
-        )
-        .await;
-    }
+    let verified_factory_control = match complete_controller_handoff_live(&canister_id).await {
+        Ok(controllers) => controllers,
+        Err(error) => {
+            return fail_spawn_session(
+                session_id,
+                current_time_ms(),
+                "controller handoff failed",
+                Some(&canister_id),
+                None,
+                error,
+            )
+            .await
+        }
+    };
     let current_time = current_time_ms();
-    let controller = format!("{CONTROLLER_FIELD}:{canister_id}");
+    let controller = format!("{CONTROLLER_FIELD}:{}", verified_factory_control.first());
+    let verified_factory_controllers = verified_factory_control.into_vec();
     runtime.controller_handoff_completed_at = Some(current_time);
     runtime.install_succeeded_at.get_or_insert(current_time);
     runtime.funded_amount = session_snapshot.net_forward_amount.clone();
@@ -1605,6 +1623,9 @@ pub async fn execute_spawn(
             child_ids: session.child_ids.clone(),
             created_at: release_broadcast_at,
             version_commit: version_commit.clone(),
+            controllers: Some(verified_factory_controllers.clone()),
+            control_status: Some("upgradeable_by_factory".to_string()),
+            control_verified_at: Some(current_time),
         };
 
         state.runtimes.insert(canister_id.clone(), runtime.clone());

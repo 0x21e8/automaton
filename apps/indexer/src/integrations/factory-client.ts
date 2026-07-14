@@ -201,7 +201,8 @@ function normalizeRegistryRecord(
 
   return {
     ...record,
-    childIds: [...record.childIds]
+    childIds: [...record.childIds],
+    controllers: record.controllers === undefined ? undefined : [...record.controllers]
   };
 }
 

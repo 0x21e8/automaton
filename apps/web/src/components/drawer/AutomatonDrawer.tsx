@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 
-import type { AutomatonDetail } from "@ic-automaton/shared";
+import type { AutomatonDetail, PlaygroundMetadata } from "@ic-automaton/shared";
 import { CommandLinePanel } from "./CommandLinePanel";
 import { MonologuePanel } from "./MonologuePanel";
 import type { WalletSession } from "../../wallet/useWalletSession";
+import { MetabolismPanel } from "./MetabolismPanel";
+import { PatronagePanel } from "./PatronagePanel";
 
 function formatUsd(value: string | null): string {
   if (value === null) {
@@ -85,6 +87,7 @@ interface AutomatonDrawerProps {
   selectedCanisterId: string | null;
   viewerAddress: string | null;
   walletSession: WalletSession | null;
+  playgroundMetadata?: PlaygroundMetadata | null;
 }
 
 function isNotFoundError(errorMessage: string | null): boolean {
@@ -99,7 +102,8 @@ export function AutomatonDrawer({
   onClose,
   selectedCanisterId,
   viewerAddress,
-  walletSession
+  walletSession,
+  playgroundMetadata = null
 }: AutomatonDrawerProps) {
   const [copyLabel, setCopyLabel] = useState("COPY");
   const [activeSection, setActiveSection] = useState<"overview" | "activity" | "terminal" | "strategies">("overview");
@@ -195,6 +199,7 @@ export function AutomatonDrawer({
         </nav>
 
         {activeSection === "overview" ? <div className="drawer-grid">
+          {automaton !== null ? <MetabolismPanel automaton={automaton} /> : null}
           <div>
             <div className="detail-field">
               <div className="lbl">ETH Address</div>
@@ -379,6 +384,7 @@ export function AutomatonDrawer({
               ) : null}
             </section>
           ) : null}
+          {automaton !== null ? <PatronagePanel automaton={automaton} playgroundMetadata={playgroundMetadata} wallet={walletSession} /> : null}
         </div> : null}
 
         <div className="drawer-bottom">

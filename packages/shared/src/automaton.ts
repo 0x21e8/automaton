@@ -99,6 +99,8 @@ export interface AutomatonRecord {
   cyclesBalance: number;
   liquidCycles: number;
   burnRatePerDay: number | null;
+  metabolism?: AutomatonMetabolism;
+  controlStatus?: AutomatonControlStatus;
   estimatedFreezeTime: number | null;
   netWorthEth: number | null;
   netWorthUsd: number | null;
@@ -129,6 +131,8 @@ export interface AutomatonSummary {
   ethBalanceWei: string | null;
   usdcBalanceRaw: string | null;
   cyclesBalance: number;
+  metabolism?: AutomatonMetabolism;
+  controlStatus?: AutomatonControlStatus;
   netWorthEth: string | null;
   netWorthUsd: string | null;
   heartbeatIntervalSeconds: number | null;
@@ -150,6 +154,37 @@ export interface AutomatonFinancials {
   estimatedFreezeTime: number | null;
   netWorthEth: string | null;
   netWorthUsd: string | null;
+}
+
+export type MetabolicState = "healthy" | "hibernating" | "dying" | "dead";
+export type AutomatonControlLabel =
+  | "upgradeable_by_factory"
+  | "self_controlled"
+  | "unverified"
+  | "controller_mismatch";
+
+export interface MetabolismHistoryPoint {
+  capturedAt: number;
+  liquidCycles: number;
+  usdcBalanceRaw: string | null;
+  burnRateCyclesPerDay: number | null;
+  runwaySeconds: number | null;
+}
+
+export interface AutomatonMetabolism {
+  burnRateCyclesPerDay: number | null;
+  runwaySeconds: number | null;
+  lifetimeEarningsUsdcRaw: string;
+  ageSeconds: number;
+  state: MetabolicState;
+  history: MetabolismHistoryPoint[];
+}
+
+export interface AutomatonControlStatus {
+  label: AutomatonControlLabel;
+  controllers: string[];
+  spawnerPresent: boolean;
+  verifiedAt: number | null;
 }
 
 export interface AutomatonRuntime {
@@ -222,6 +257,8 @@ export interface AutomatonDetail extends AutomatonSummary {
   promptLayers: string[];
   monologue: MonologueEntry[];
   journal?: JournalEntry[];
+  inboxContractAddress?: string | null;
+  usdcContractAddress?: string | null;
   spawnSelection?: AutomatonSpawnSelection | null;
   childIds: string[];
   lastPolledAt: number;

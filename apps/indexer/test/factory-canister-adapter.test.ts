@@ -104,7 +104,10 @@ function createRegistryRecord() {
     parent_id: [],
     session_id: "550e8400-e29b-41d4-a716-446655440000",
     steward_address: "0x0000000000000000000000000000000000000002",
-    version_commit: "abcdef1234567890abcdef1234567890abcdef12"
+    version_commit: "abcdef1234567890abcdef1234567890abcdef12",
+    controllers: [["rrkah-fqaaa-aaaaa-aaaaq-cai"]],
+    control_status: ["upgradeable_by_factory"],
+    control_verified_at: [1_709_912_360_000n]
   };
 }
 
@@ -422,7 +425,10 @@ describe("CanisterFactoryAdapter", () => {
     expect(missingSession).toBeNull();
     expect(registry).toMatchObject({
       canisterId: "ryjl3-tyaaa-aaaaa-aaaba-cai",
-      versionCommit: "abcdef1234567890abcdef1234567890abcdef12"
+      versionCommit: "abcdef1234567890abcdef1234567890abcdef12",
+      controllers: ["rrkah-fqaaa-aaaaa-aaaaq-cai"],
+      controlStatus: "upgradeable_by_factory",
+      controlVerifiedAt: 1_709_912_360_000
     });
     expect(missingRegistry).toBeNull();
     expect(page).toEqual({

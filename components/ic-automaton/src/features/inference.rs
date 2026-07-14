@@ -1164,6 +1164,18 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
             }),
         }),
         IcLlmTool::Function(IcLlmFunction {
+            name: "set_min_prices".to_string(),
+            description: Some("Set my own minimum USDC and ETH prices for paid Inbox attention. Amounts are raw decimal units; the runtime selects the configured Inbox and signs the transaction.".to_string()),
+            parameters: Some(IcLlmParameters {
+                type_: "object".to_string(),
+                properties: Some(vec![
+                    IcLlmProperty { type_: "string".to_string(), name: "usdc_min_raw".to_string(), description: Some("Minimum USDC in raw 6-decimal units.".to_string()), enum_values: None },
+                    IcLlmProperty { type_: "string".to_string(), name: "eth_min_wei".to_string(), description: Some("Minimum ETH in wei.".to_string()), enum_values: None },
+                ]),
+                required: Some(vec!["usdc_min_raw".to_string(), "eth_min_wei".to_string()]),
+            }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
             name: "remember".to_string(),
             description: Some(
                 "Store a persistent memory fact by key; overwrites existing value for that key."
@@ -2059,7 +2071,7 @@ fn ic_llm_tools_with_capabilities_and_scope(
         tools.retain(|tool| {
             !matches!(
                 ic_llm_tool_name(tool),
-                "evm_read" | "send_eth" | "execute_strategy_action"
+                "evm_read" | "send_eth" | "set_min_prices" | "execute_strategy_action"
             )
         });
     }
@@ -3341,7 +3353,7 @@ fn build_openrouter_request_body_with_transcript_capabilities(
                     .and_then(Value::as_str);
                 !matches!(
                     function_name,
-                    Some("evm_read" | "send_eth" | "execute_strategy_action")
+                    Some("evm_read" | "send_eth" | "set_min_prices" | "execute_strategy_action")
                 )
             });
         }

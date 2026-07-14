@@ -208,6 +208,9 @@ interface CandidSpawnedAutomatonRecord {
   session_id: string;
   steward_address: string;
   version_commit: string;
+  controllers: Optional<string[]>;
+  control_status: Optional<string>;
+  control_verified_at: Optional<bigint>;
 }
 
 interface CandidSpawnedAutomatonRegistryPage {
@@ -515,6 +518,9 @@ function createFactoryIdl() {
       created_at: candid.Nat64,
       parent_id: candid.Opt(candid.Text),
       version_commit: candid.Text,
+      controllers: candid.Opt(candid.Vec(candid.Text)),
+      control_status: candid.Opt(candid.Text),
+      control_verified_at: candid.Opt(candid.Nat64),
       child_ids: candid.Vec(candid.Text),
       steward_address: candid.Text
     });
@@ -1034,7 +1040,19 @@ function mapRegistryRecord(record: CandidSpawnedAutomatonRecord): SpawnedAutomat
     parentId: unwrapOptional(record.parent_id),
     sessionId: record.session_id,
     stewardAddress: record.steward_address,
-    versionCommit: record.version_commit
+    versionCommit: record.version_commit,
+    controllers: unwrapOptional(record.controllers) === null
+      ? undefined
+      : [...(unwrapOptional(record.controllers) as string[])],
+    controlStatus:
+      unwrapOptional(record.control_status) === "upgradeable_by_factory" ||
+      unwrapOptional(record.control_status) === "self_controlled" ||
+      unwrapOptional(record.control_status) === "controller_mismatch"
+        ? unwrapOptional(record.control_status) as SpawnedAutomatonRecord["controlStatus"]
+        : undefined,
+    controlVerifiedAt: unwrapOptional(record.control_verified_at) === null
+      ? undefined
+      : toNumber(unwrapOptional(record.control_verified_at) as bigint)
   };
 }
 

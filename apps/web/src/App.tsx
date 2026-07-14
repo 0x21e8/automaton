@@ -192,6 +192,7 @@ export default function App() {
         selectedCanisterId={selectedCanisterId}
         viewerAddress={viewerAddress}
         walletSession={wallet}
+        playgroundMetadata={playground.metadata}
       />
 
       <SpawnWizard

@@ -24,6 +24,8 @@ const AUTOMATON_RECORD_KEYS = [
   "cyclesBalance",
   "liquidCycles",
   "burnRatePerDay",
+  "metabolism",
+  "controlStatus",
   "estimatedFreezeTime",
   "netWorthEth",
   "netWorthUsd",
@@ -63,6 +65,8 @@ export function toAutomatonRecord(detail: AutomatonDetail): AutomatonRecord {
     cyclesBalance: detail.financials.cyclesBalance,
     liquidCycles: detail.financials.liquidCycles,
     burnRatePerDay: detail.financials.burnRatePerDay,
+    metabolism: detail.metabolism,
+    controlStatus: detail.controlStatus,
     estimatedFreezeTime: detail.financials.estimatedFreezeTime,
     netWorthEth:
       detail.financials.netWorthEth === null ? null : Number(detail.financials.netWorthEth),

@@ -656,6 +656,15 @@ pub struct SpawnedAutomatonRecord {
     pub created_at: u64,
     /// Exact installed ic-automaton git commit as a 40-char lowercase SHA.
     pub version_commit: String,
+    /// Controller principals attested by the factory after handoff.
+    #[serde(default)]
+    pub controllers: Option<Vec<String>>,
+    /// Truthful public control label derived from the verified controller list.
+    #[serde(default)]
+    pub control_status: Option<String>,
+    /// Millisecond timestamp at which the factory verified `controllers`.
+    #[serde(default)]
+    pub control_verified_at: Option<u64>,
 }
 
 impl SpawnSession {

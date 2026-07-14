@@ -224,6 +224,11 @@ export interface SpawnedAutomatonRecord {
   createdAt: number;
   // Exact installed ic-automaton git commit as a 40-char lowercase SHA.
   versionCommit: string;
+  /** Factory attestation captured after the controller handoff. */
+  controllers?: string[];
+  controlStatus?: "upgradeable_by_factory" | "self_controlled" | "controller_mismatch";
+  /** Millisecond timestamp of the factory's successful controller-status attestation. */
+  controlVerifiedAt?: number;
 }
 
 export interface SpawnedAutomatonRegistryPage {

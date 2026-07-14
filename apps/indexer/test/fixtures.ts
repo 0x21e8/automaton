@@ -32,6 +32,20 @@ export function createAutomatonDetailFixture(
     ethBalanceWei: "0x1",
     usdcBalanceRaw: "0x0",
     cyclesBalance: 42,
+    metabolism: {
+      burnRateCyclesPerDay: 1.5,
+      runwaySeconds: 86_400,
+      lifetimeEarningsUsdcRaw: "2500000",
+      ageSeconds: 3_600,
+      state: "healthy",
+      history: []
+    },
+    controlStatus: {
+      label: "self_controlled",
+      controllers: ["aaaaa-aa"],
+      spawnerPresent: false,
+      verifiedAt: 1_709_912_345_000
+    },
     netWorthEth: "1.23",
     netWorthUsd: "2500.00",
     heartbeatIntervalSeconds: 30,
@@ -117,6 +131,8 @@ export function createAutomatonRecordFixture(
     cyclesBalance: detail.financials.cyclesBalance,
     liquidCycles: detail.financials.liquidCycles,
     burnRatePerDay: detail.financials.burnRatePerDay,
+    metabolism: detail.metabolism,
+    controlStatus: detail.controlStatus,
     estimatedFreezeTime: detail.financials.estimatedFreezeTime,
     netWorthEth: Number(detail.financials.netWorthEth),
     netWorthUsd: Number(detail.financials.netWorthUsd),
@@ -178,6 +194,9 @@ export function createSpawnedAutomatonRecordFixture(
     parentId: null,
     childIds: [],
     createdAt: 1_709_912_360_000,
+    controllers: ["ryjl3-tyaaa-aaaaa-aaaba-cai"],
+    controlStatus: "self_controlled",
+    controlVerifiedAt: 1_709_912_360_000,
     versionCommit: "abcdef1234567890abcdef1234567890abcdef12",
     ...overrides
   };
