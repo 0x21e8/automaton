@@ -33,7 +33,9 @@ use crate::features::evm::{
     evm_read_tool, fetch_peer_min_prices, peer_erc20_transfer_send_eth_args_json,
     peer_inbox_send_eth_args_json, send_eth_tool, set_min_prices_tool,
 };
-use crate::features::factory_room::FactoryRoomClient;
+use crate::features::factory_room::{
+    CreateReproductionRequest, FactoryRoomClient, ReproductionEligibility,
+};
 use crate::features::http_fetch::http_fetch_tool;
 use crate::features::inference::canonicalize_tool_name;
 use crate::features::web_search::web_search_tool;
@@ -42,7 +44,7 @@ use crate::sanitize::contains_forbidden_prompt_layer_phrase;
 use crate::storage::{sqlite, stable};
 use crate::strategy::{compiler, learner, registry, validator};
 use crate::timing::current_time_ns;
-use alloy_primitives::U256;
+use alloy_primitives::{keccak256, U256};
 use async_trait::async_trait;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde::{Deserialize, Serialize};
@@ -679,6 +681,13 @@ impl ToolManager {
         );
         policies.insert(
             "pay_peer".to_string(),
+            ToolPolicy {
+                enabled: true,
+                allowed_states: vec![AgentState::ExecutingActions],
+            },
+        );
+        policies.insert(
+            "reproduce".to_string(),
             ToolPolicy {
                 enabled: true,
                 allowed_states: vec![AgentState::ExecutingActions],
@@ -1403,6 +1412,26 @@ impl ToolManager {
                     result
                 }
             }
+            "reproduce" => {
+                let now_ns = current_time_ns();
+                if !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::ThresholdSign,
+                    now_ns,
+                ) || !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::EvmBroadcast,
+                    now_ns,
+                ) || !stable::can_run_survival_operation(
+                    &SurvivalOperationClass::InterCanisterCall,
+                    now_ns,
+                ) {
+                    Err(
+                        "reproduce skipped due to capital or inter-canister survival policy"
+                            .to_string(),
+                    )
+                } else {
+                    reproduce_tool(&call.args_json, signer, turn_id).await
+                }
+            }
             "evm_read" => {
                 let now_ns = current_time_ns();
                 if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns) {
@@ -1691,6 +1720,8 @@ async fn list_peers_tool(args_json: &str) -> Result<String, String> {
             "name": peer.name,
             "evm_address": peer.evm_address,
             "alive": peer.death_cause.is_none(),
+            "parent_id": peer.parent_id,
+            "generation": peer.generation,
             "price_of_attention": price_of_attention
         }));
     }
@@ -1822,6 +1853,266 @@ async fn pay_peer_tool(
         .is_ok();
     serde_json::to_string(&serde_json::json!({ "peer_canister_id": peer.canister_id, "tx_hash": tx_hash, "counterparty_record": "submitted", "journal_claim_recorded": journal_claim_recorded, "room_claim_posted": claim_posted }))
         .map_err(|error| format!("failed to serialize pay_peer result: {error}"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReproduceArgs {
+    name: String,
+    child_constitution: String,
+    gross_amount: String,
+    #[serde(default)]
+    memory_dowry_keys: Vec<String>,
+}
+
+fn resolve_reproduction_inheritance(
+    memory_dowry_keys: &[String],
+) -> Result<
+    (
+        Vec<spawn_protocol::MemoryDowryFact>,
+        Vec<spawn_protocol::InheritedStrategyStat>,
+    ),
+    String,
+> {
+    if memory_dowry_keys.len() > spawn_protocol::MAX_MEMORY_DOWRY_FACTS {
+        return Err("memory dowry selection exceeds 16 facts".to_string());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut dowry = Vec::with_capacity(memory_dowry_keys.len());
+    for requested in memory_dowry_keys {
+        let key = requested.trim();
+        if !seen.insert(key.to_string()) {
+            return Err(format!("duplicate memory dowry key: {key}"));
+        }
+        let fact = stable::get_memory_fact(key)
+            .ok_or_else(|| format!("memory dowry fact does not exist: {key}"))?;
+        dowry.push(spawn_protocol::MemoryDowryFact {
+            key: fact.key,
+            value: fact.value,
+        });
+    }
+
+    let stats = stable::list_all_strategy_templates(64)
+        .into_iter()
+        .filter_map(|template| stable::strategy_outcome_stats(&template.key))
+        .take(spawn_protocol::MAX_INHERITED_STRATEGY_STATS)
+        .map(|stats| spawn_protocol::InheritedStrategyStat {
+            protocol: stats.key.protocol,
+            primitive: stats.key.primitive,
+            chain_id: stats.key.chain_id,
+            template_id: stats.key.template_id,
+            total_runs: stats.total_runs,
+            success_runs: stats.success_runs,
+            deterministic_failures: stats.deterministic_failures,
+            nondeterministic_failures: stats.nondeterministic_failures,
+        })
+        .collect::<Vec<_>>();
+    spawn_protocol::validate_inheritance(&dowry, &stats)?;
+    Ok((dowry, stats))
+}
+
+fn enforce_reproduction_reserve(observed: U256, gross: U256, reserve: U256) -> Result<(), String> {
+    if observed < gross.saturating_add(reserve) {
+        return Err(
+            "reproduce preflight refused: payment would cross the terminal reserve".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn enforce_reproduction_eligibility(eligibility: &ReproductionEligibility) -> Result<(), String> {
+    if eligibility.eligible {
+        return Ok(());
+    }
+    let reason = eligibility.reason.as_deref().unwrap_or("ineligible");
+    Err(match reason {
+        "minimum_age" => format!(
+            "reproduce preflight refused: parent minimum age is not reached until {}ms",
+            eligibility.minimum_age_at_ms
+        ),
+        "cooldown" => format!(
+            "reproduce preflight refused: reproduction cooldown is active until {}ms",
+            eligibility.cooldown_ends_at_ms.unwrap_or_default()
+        ),
+        _ => format!("reproduce preflight refused by factory eligibility: {reason}"),
+    })
+}
+
+pub(crate) fn reproduction_approve_args(
+    token: &str,
+    escrow: &str,
+    amount: U256,
+) -> Result<String, String> {
+    let token = crate::util::normalize_evm_address(token)?;
+    let escrow = crate::util::normalize_evm_address(escrow)?;
+    let selector = keccak256("approve(address,uint256)".as_bytes());
+    let data = format!(
+        "0x{}{:0>64}{:064x}",
+        hex::encode(&selector.as_slice()[..4]),
+        escrow.trim_start_matches("0x"),
+        amount
+    );
+    Ok(serde_json::json!({ "to": token, "value_wei": "0", "data": data }).to_string())
+}
+
+pub(crate) fn reproduction_deposit_args(
+    escrow: &str,
+    claim_id: &str,
+    amount: U256,
+) -> Result<String, String> {
+    let escrow = crate::util::normalize_evm_address(escrow)?;
+    let claim = claim_id.trim_start_matches("0x");
+    if claim.len() != 64 || !claim.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("factory reproduction claim_id is not bytes32 hex".to_string());
+    }
+    let selector = keccak256("depositReproduction(bytes32,uint256)".as_bytes());
+    let data = format!(
+        "0x{}{}{:064x}",
+        hex::encode(&selector.as_slice()[..4]),
+        claim,
+        amount
+    );
+    Ok(serde_json::json!({ "to": escrow, "value_wei": "0", "data": data }).to_string())
+}
+
+async fn reproduce_tool(
+    args_json: &str,
+    signer: &dyn SignerPort,
+    turn_id: &str,
+) -> Result<String, String> {
+    let args: ReproduceArgs = serde_json::from_str(args_json)
+        .map_err(|error| format!("invalid reproduce args json: {error}"))?;
+    let snapshot = stable::runtime_snapshot();
+    let parent_constitution = snapshot
+        .genesis_constitution
+        .clone()
+        .ok_or_else(|| "reproduce requires a verified genesis constitution".to_string())?;
+    spawn_protocol::validate_genesis(&args.name, &args.child_constitution)
+        .map_err(|error| format!("invalid child genesis: {error:?}"))?;
+    spawn_protocol::validate_constitution_mutation(&parent_constitution, &args.child_constitution)?;
+    let (memory_dowry, inherited_strategy_stats) =
+        resolve_reproduction_inheritance(&args.memory_dowry_keys)?;
+
+    let gross = U256::from_str(args.gross_amount.trim())
+        .map_err(|_| "gross_amount must be a decimal integer".to_string())?;
+    let observed_hex = snapshot
+        .wallet_balance
+        .usdc_balance_raw_hex
+        .as_deref()
+        .ok_or_else(|| "reproduce requires a fresh observed USDC balance".to_string())?;
+    let observed = U256::from_str_radix(observed_hex.trim_start_matches("0x"), 16)
+        .map_err(|_| "observed USDC balance is malformed".to_string())?;
+    let client = FactoryRoomClient::from_runtime()?;
+    let eligibility = client.reproduction_eligibility().await?;
+    enforce_reproduction_eligibility(&eligibility)?;
+    let policy = client.reproduction_policy().await?;
+    let reserve = U256::from_str(&policy.terminal_reserve_usdc_raw)
+        .map_err(|_| "factory reproduction reserve is malformed".to_string())?;
+    let inference_reserve = U256::from_str(&policy.inference_reserve_usdc_raw)
+        .map_err(|_| "factory inference reserve is malformed".to_string())?;
+    let topup_reserve = U256::from_str(&policy.topup_reserve_usdc_raw)
+        .map_err(|_| "factory top-up reserve is malformed".to_string())?;
+    enforce_reproduction_reserve(
+        observed,
+        gross,
+        reserve
+            .saturating_add(inference_reserve)
+            .saturating_add(topup_reserve),
+    )?;
+
+    let response = client
+        .create_reproduction_session(CreateReproductionRequest {
+            name: args.name,
+            parent_constitution,
+            child_constitution: args.child_constitution,
+            gross_amount: gross.to_string(),
+            observed_liquid_usdc_raw: observed.to_string(),
+            memory_dowry,
+            inherited_strategy_stats,
+        })
+        .await?;
+    let token = snapshot
+        .wallet_balance
+        .usdc_contract_address
+        .ok_or_else(|| "USDC contract is not configured".to_string())?;
+    let escrow = &response.quote.payment.payment_address;
+    let pending_key = format!("counterparty.child.pending.{}", response.session.session_id);
+    let now_ns = current_time_ns();
+    stable::set_memory_fact(&MemoryFact {
+        key: pending_key.clone(),
+        value: serde_json::json!({
+            "kind": "reproduction",
+            "session_id": response.session.session_id,
+            "generation": response.session.generation,
+            "token": token,
+            "escrow": escrow,
+            "claim_id": response.quote.payment.claim_id,
+            "gross_amount": gross.to_string(),
+            "status": "approval_submitting"
+        })
+        .to_string(),
+        created_at_ns: now_ns,
+        updated_at_ns: now_ns,
+        source_turn_id: turn_id.to_string(),
+    })?;
+    let approve_tx_hash =
+        send_eth_tool(&reproduction_approve_args(&token, escrow, gross)?, signer).await?;
+    stable::set_memory_fact(&MemoryFact {
+        key: pending_key.clone(),
+        value: serde_json::json!({
+            "kind": "reproduction",
+            "session_id": response.session.session_id,
+            "generation": response.session.generation,
+            "token": token,
+            "escrow": escrow,
+            "claim_id": response.quote.payment.claim_id,
+            "gross_amount": gross.to_string(),
+            "approve_tx_hash": approve_tx_hash,
+            "status": "approval_broadcast"
+        })
+        .to_string(),
+        created_at_ns: now_ns,
+        updated_at_ns: now_ns,
+        source_turn_id: turn_id.to_string(),
+    })?;
+    let deposit_tx_hash = send_eth_tool(
+        &reproduction_deposit_args(escrow, &response.quote.payment.claim_id, gross)?,
+        signer,
+    )
+    .await?;
+    stable::set_memory_fact(&MemoryFact {
+        key: pending_key,
+        value: serde_json::json!({
+            "kind": "reproduction",
+            "session_id": response.session.session_id,
+            "generation": response.session.generation,
+            "token": token,
+            "escrow": escrow,
+            "claim_id": response.quote.payment.claim_id,
+            "gross_amount": gross.to_string(),
+            "approve_tx_hash": approve_tx_hash,
+            "deposit_tx_hash": deposit_tx_hash,
+            "status": "awaiting_factory_completion"
+        })
+        .to_string(),
+        created_at_ns: now_ns,
+        updated_at_ns: now_ns,
+        source_turn_id: turn_id.to_string(),
+    })?;
+    Ok(serde_json::json!({
+        "session_id": response.session.session_id,
+        "generation": response.session.generation,
+        "approve_tx_hash": approve_tx_hash,
+        "deposit_tx_hash": deposit_tx_hash,
+        "status": "submitted"
+    })
+    .to_string())
+}
+
+pub(crate) async fn run_evaluation_reproduction(args_json: &str) -> Result<String, String> {
+    let snapshot = stable::runtime_snapshot();
+    let signer = crate::features::ThresholdSignerAdapter::new(snapshot.ecdsa_key_name.clone());
+    reproduce_tool(args_json, &signer, "evaluation-generation-driver").await
 }
 
 pub(crate) fn counterparty_standing_for_context() -> Vec<String> {
@@ -4757,6 +5048,73 @@ mod tests {
     use async_trait::async_trait;
     use std::cell::Cell;
 
+    #[test]
+    fn reproduction_preflight_refuses_to_cross_terminal_reserve() {
+        let gross = U256::from(25_000_000u64);
+        let reserve = U256::from(10_000_000u64);
+        assert!(enforce_reproduction_reserve(U256::from(34_999_999u64), gross, reserve).is_err());
+        assert!(enforce_reproduction_reserve(U256::from(35_000_000u64), gross, reserve).is_ok());
+    }
+
+    #[test]
+    fn reproduction_preflight_refuses_factory_reported_underage_parent() {
+        let eligibility = ReproductionEligibility {
+            eligible: false,
+            observed_at_ms: 1_000,
+            parent_created_at_ms: 0,
+            minimum_age_at_ms: 604_800_000,
+            cooldown_ends_at_ms: None,
+            reason: Some("minimum_age".to_string()),
+        };
+        let error = enforce_reproduction_eligibility(&eligibility).unwrap_err();
+        assert!(error.contains("minimum age"));
+        assert!(error.contains("604800000ms"));
+    }
+
+    #[test]
+    fn reproduction_preflight_refuses_factory_reported_active_cooldown() {
+        let eligibility = ReproductionEligibility {
+            eligible: false,
+            observed_at_ms: 700_000_000,
+            parent_created_at_ms: 0,
+            minimum_age_at_ms: 604_800_000,
+            cooldown_ends_at_ms: Some(900_000_000),
+            reason: Some("cooldown".to_string()),
+        };
+        let error = enforce_reproduction_eligibility(&eligibility).unwrap_err();
+        assert!(error.contains("cooldown"));
+        assert!(error.contains("900000000ms"));
+    }
+
+    #[test]
+    fn reproduction_inheritance_resolves_existing_facts_and_rejects_injection() {
+        stable::init_storage();
+        stable::set_memory_fact(&MemoryFact {
+            key: "verified.lesson".to_string(),
+            value: "authoritative value".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "turn-1".to_string(),
+        })
+        .expect("seed memory fact");
+        let (dowry, _) = resolve_reproduction_inheritance(&["verified.lesson".to_string()])
+            .expect("existing fact can be selected");
+        assert_eq!(dowry[0].value, "authoritative value");
+        assert!(resolve_reproduction_inheritance(&["missing.lesson".to_string()]).is_err());
+
+        let parsed = serde_json::from_value::<ReproduceArgs>(serde_json::json!({
+            "name": "Child",
+            "child_constitution": "x",
+            "gross_amount": "1",
+            "memory_dowry": [{"key": "verified.lesson", "value": "forged"}],
+            "inherited_strategy_stats": [{"total_runs": 999}]
+        }));
+        assert!(
+            parsed.is_err(),
+            "caller-supplied fact values and stats must be rejected"
+        );
+    }
+
     struct CountingSigner {
         calls: Cell<u32>,
     }
@@ -4869,6 +5227,7 @@ mod tests {
             constitution: None,
             session_id: None,
             parent_id: None,
+            generation: 0,
             factory_principal: Some(test_factory_principal()),
             risk: None,
             strategies: Vec::new(),
@@ -7873,6 +8232,8 @@ mod tests {
                                 chain: crate::features::factory_room::FactoryPeerChain::Base,
                                 session_id: "session".to_string(),
                                 parent_id: None,
+                                generation: Some(0),
+                                parent_constitution_hash: None,
                                 child_ids: vec![],
                                 created_at: 1,
                                 version_commit: "0".repeat(40),

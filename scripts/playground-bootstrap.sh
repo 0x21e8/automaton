@@ -4,6 +4,7 @@ set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT_DIR/scripts/load-repo-env.sh"
+. "$ROOT_DIR/scripts/lib/playground-icp-home.sh"
 AUTOMATON_COMPONENT_ROOT=$(AUTOMATON_LAUNCHPAD_ROOT="$ROOT_DIR" sh "$ROOT_DIR/scripts/resolve-automaton-component.sh")
 export AUTOMATON_COMPONENT_ROOT
 TMP_DIR=${PLAYGROUND_TMP_DIR:-"$ROOT_DIR/tmp"}
@@ -67,7 +68,8 @@ export LOCAL_EVM_DEPLOYMENT_FILE
 export AUTOMATON_INBOX_DEPLOYMENT_FILE
 export INDEXER_DB_PATH
 
-mkdir -p "$TMP_DIR" "$SERVICE_DIR" "$PLAYGROUND_ICP_HOME"
+mkdir -p "$TMP_DIR" "$SERVICE_DIR"
+initialize_playground_icp_home
 
 require_command() {
   tool_name=$1
@@ -107,7 +109,7 @@ preferred_component_child_wasm_path() {
     return 1
   fi
 
-  printf '%s\n' "$AUTOMATON_COMPONENT_ROOT/target/wasm32-wasip1/release/backend_nowasi.wasm"
+  printf '%s\n' "$ROOT_DIR/target/wasm32-wasip1/release/backend_nowasi.wasm"
 }
 
 should_build_component_child_artifact() {
@@ -120,7 +122,7 @@ should_build_component_child_artifact() {
   fi
 
   case "$CHILD_WASM_PATH" in
-    "$AUTOMATON_COMPONENT_ROOT"/target/*)
+    "$ROOT_DIR"/target/*|"$AUTOMATON_COMPONENT_ROOT"/target/*)
       return 0
       ;;
     *)
@@ -150,7 +152,7 @@ resolve_child_wasm_path() {
   preferred_path=
   if preferred_path=$(preferred_component_child_wasm_path 2>/dev/null); then
     case "$CHILD_WASM_PATH" in
-      ""|"$AUTOMATON_COMPONENT_ROOT/target/wasm32-unknown-unknown/release/backend.wasm"|"$AUTOMATON_COMPONENT_ROOT/target/wasm32-wasip1/release/backend.wasm")
+      ""|"$AUTOMATON_COMPONENT_ROOT/target/wasm32-unknown-unknown/release/backend.wasm"|"$AUTOMATON_COMPONENT_ROOT/target/wasm32-wasip1/release/backend.wasm"|"$AUTOMATON_COMPONENT_ROOT/target/wasm32-wasip1/release/backend_nowasi.wasm")
         if [ -f "$preferred_path" ]; then
           if [ -n "$CHILD_WASM_PATH" ] && [ "$CHILD_WASM_PATH" != "$preferred_path" ]; then
             echo "switching CHILD_WASM_PATH to canister-ready sibling artifact $preferred_path" >&2
@@ -176,6 +178,12 @@ ensure_child_artifact() {
   build_component_child_artifact
 
   if resolve_child_wasm_path; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      child_sha=$(sha256sum "$CHILD_WASM_PATH" | awk '{print $1}')
+    else
+      child_sha=$(shasum -a 256 "$CHILD_WASM_PATH" | awk '{print $1}')
+    fi
+    echo "selected child Wasm: $CHILD_WASM_PATH sha256=$child_sha"
     return 0
   fi
 
@@ -314,12 +322,7 @@ wait_for_rpc_endpoint() {
 }
 
 ensure_local_network() {
-  if icp --project-root-override "$ROOT_DIR" network ping "$PLAYGROUND_ICP_NETWORK_NAME" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  icp --project-root-override "$ROOT_DIR" network start --background "$PLAYGROUND_ICP_NETWORK_NAME"
-  icp --project-root-override "$ROOT_DIR" network ping "$PLAYGROUND_ICP_NETWORK_NAME" >/dev/null
+  ensure_playground_icp_network "$ROOT_DIR" "$PLAYGROUND_ICP_NETWORK_NAME"
 }
 
 deploy_factory() {
@@ -466,6 +469,34 @@ deploy_escrow() {
     run_with_repo_node node "$ROOT_DIR/scripts/deploy-local-escrow.mjs"
 }
 
+deploy_factory_owned_escrow() {
+  if [ "${PLAYGROUND_DEPLOY_FACTORY_OWNED_ESCROW:-1}" = "0" ]; then
+    return 0
+  fi
+
+  factory_releaser=$(
+    icp --project-root-override "$ROOT_DIR" canister call \
+      -e "$PLAYGROUND_ICP_ENVIRONMENT" \
+      "$PLAYGROUND_FACTORY_CANISTER" \
+      derive_factory_evm_address \
+      "()" | run_with_repo_node node -e '
+        const input = require("node:fs").readFileSync(0, "utf8");
+        const match = input.match(/0x[a-fA-F0-9]{40}/);
+        if (!match) process.exit(1);
+        process.stdout.write(match[0]);
+      '
+  )
+
+  if [ -z "$factory_releaser" ]; then
+    echo "Unable to derive the factory EVM releaser address" >&2
+    return 1
+  fi
+
+  LOCAL_EVM_RELEASER="$factory_releaser"
+  export LOCAL_EVM_RELEASER
+  deploy_escrow
+}
+
 deploy_automaton_inbox() {
   if [ -n "${FACTORY_CHILD_INBOX_CONTRACT_ADDRESS:-}" ]; then
     return 0
@@ -519,6 +550,7 @@ start_indexer() {
   trusted_usdc_address=$(run_with_repo_node node -e 'const fs=require("node:fs");const p=process.argv[1];const d=fs.existsSync(p)?JSON.parse(fs.readFileSync(p,"utf8")):{};process.stdout.write(d.usdcTokenAddress||d.mockUsdcAddress||"")' "$LOCAL_EVM_DEPLOYMENT_FILE")
 
   INDEXER_FACTORY_CANISTER_ID=$1 \
+  INDEXER_INGESTION_CANISTER_IDS="${INDEXER_INGESTION_CANISTER_IDS:-}" \
   INDEXER_TRUSTED_INBOX_ADDRESSES="$trusted_inbox_address" \
   INDEXER_TRUSTED_USDC_ADDRESSES="$trusted_usdc_address" \
   HOST="$PLAYGROUND_INDEXER_HOST" \
@@ -540,6 +572,7 @@ start_indexer() {
   PLAYGROUND_FAUCET_MAX_CLAIMS_PER_WALLET="$PLAYGROUND_FAUCET_MAX_CLAIMS_PER_WALLET" \
   PLAYGROUND_FAUCET_MAX_CLAIMS_PER_IP="$PLAYGROUND_FAUCET_MAX_CLAIMS_PER_IP" \
   PLAYGROUND_RESET_CADENCE_LABEL="$PLAYGROUND_RESET_CADENCE_LABEL" \
+  LOCAL_EVM_DEPLOYMENT_FILE="$LOCAL_EVM_DEPLOYMENT_FILE" \
   LOCAL_EVM_RPC_URL="$LOCAL_EVM_RPC_URL" \
     nohup sh "$ROOT_DIR/scripts/with-repo-node.sh" node --import tsx "$ROOT_DIR/apps/indexer/src/server.ts" >"$PLAYGROUND_INDEXER_LOG_FILE" 2>&1 &
 
@@ -599,6 +632,8 @@ ensure_anvil
 deploy_escrow
 deploy_automaton_inbox
 deploy_factory
+deploy_factory_owned_escrow
+deploy_factory
 reconcile_factory_runtime_config
 top_up_factory_canister
 upload_child_artifact
@@ -609,7 +644,10 @@ mkdir -p "$(dirname "$PLAYGROUND_FACTORY_CANISTER_ID_FILE")"
 printf '%s\n' "$factory_canister_id" >"$PLAYGROUND_FACTORY_CANISTER_ID_FILE"
 ensure_services "$factory_canister_id"
 
-sh "$ROOT_DIR/scripts/playground-smoke.sh"
+  PLAYGROUND_INDEXER_BASE_URL="$PLAYGROUND_INDEXER_BASE_URL" \
+  PLAYGROUND_PUBLIC_RPC_URL="$PLAYGROUND_PUBLIC_RPC_URL" \
+  PLAYGROUND_RPC_GATEWAY_URL="$PLAYGROUND_RPC_GATEWAY_URL" \
+    sh "$ROOT_DIR/scripts/playground-smoke.sh"
 
 PLAYGROUND_STATUS_ENVIRONMENT_VERSION="$CHILD_VERSION_COMMIT" \
 PLAYGROUND_STATUS_MAINTENANCE="false" \

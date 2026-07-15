@@ -109,6 +109,8 @@ export interface AutomatonRecord {
   steward: StewardIdentity;
   commitHash: string;
   parentId: string | null;
+  generation?: number;
+  parentConstitutionHash?: string | null;
   childIds: string[];
   strategies: StrategySelection[];
   skills: SkillSelection[];
@@ -142,6 +144,8 @@ export interface AutomatonSummary {
   corePatternIndex: number;
   corePattern: number[][] | null;
   parentId: string | null;
+  generation?: number;
+  parentConstitutionHash?: string | null;
   createdAt: number;
   lastTransitionAt: number;
 }
@@ -177,6 +181,8 @@ export interface AutomatonMetabolism {
   burnRateCyclesPerDay: number | null;
   runwaySeconds: number | null;
   lifetimeEarningsUsdcRaw: string;
+  /** Verified, explicitly classified patronage only; excludes generic inflows. */
+  lifetimePatronageUsdcRaw?: string;
   ageSeconds: number;
   state: MetabolicState;
   history: MetabolismHistoryPoint[];

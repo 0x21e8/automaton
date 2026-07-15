@@ -25,4 +25,36 @@ describe("chronicle generator", () => {
     expect(day.entries.some((entry) => entry.kind === "runway_crisis")).toBe(false);
     expect(day.entries).toContainEqual(expect.objectContaining({ kind: "room_activity", provenance: [{ label: "room message", href: "/api/room/messages?limit=1" }] }));
   });
+
+  it("does not misclassify generic strategy or peer inflow as patronage", () => {
+    const timestamp = Date.parse("2026-07-14T12:00:00Z");
+    const base = createAutomatonDetailFixture();
+    const automaton = createAutomatonDetailFixture({
+      createdAt: timestamp - 1_000,
+      metabolism: {
+        ...base.metabolism!,
+        lifetimeEarningsUsdcRaw: "9000000",
+        lifetimePatronageUsdcRaw: "0"
+      }
+    });
+    const day = buildChronicleDay({ date: "2026-07-14", generatedAt: timestamp, automatons: [automaton], roomMessages: [], journals: [] });
+    expect(day.population?.patronageUsdcRawPerLiving).toBe("0");
+    expect(day.population?.positiveInflowUsdcRawPerLiving).toBe("9000000");
+  });
+
+  it("reports verified nonzero patronage independently from all positive inflows", () => {
+    const timestamp = Date.parse("2026-07-14T12:00:00Z");
+    const base = createAutomatonDetailFixture();
+    const automaton = createAutomatonDetailFixture({
+      createdAt: timestamp - 1_000,
+      metabolism: {
+        ...base.metabolism!,
+        lifetimeEarningsUsdcRaw: "9000000",
+        lifetimePatronageUsdcRaw: "2250000"
+      }
+    });
+    const day = buildChronicleDay({ date: "2026-07-14", generatedAt: timestamp, automatons: [automaton], roomMessages: [], journals: [] });
+    expect(day.population?.patronageUsdcRawPerLiving).toBe("2250000");
+    expect(day.population?.positiveInflowUsdcRawPerLiving).toBe("9000000");
+  });
 });

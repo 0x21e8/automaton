@@ -136,6 +136,14 @@ fn production_install_args(factory_id: Principal, transport: InferenceTransport)
         release_broadcast_at: None,
         release_broadcast: None,
         parent_id: Some("parent-automaton".to_string()),
+        origin: Some(factory::types::SpawnSessionOrigin::ReproductionOf(
+            "parent-automaton".to_string(),
+        )),
+        generation: Some(1),
+        parent_constitution_hash: None,
+        memory_dowry: Some(Vec::new()),
+        inherited_strategy_stats: Some(Vec::new()),
+        royalty_allocations: Some(Vec::new()),
         child_ids: Vec::new(),
         selected_strategies: Vec::<RepositoryStrategySessionSnapshot>::new(),
         config: SpawnConfig {

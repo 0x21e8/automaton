@@ -7,7 +7,7 @@ export function buildChronicleDay(input: { date: string; generatedAt: number; au
   const isCurrentDigestDay = inDay(input.generatedAt);
   const entries: ChronicleDay["entries"] = [];
   for (const automaton of input.automatons) {
-    if (inDay(automaton.createdAt)) entries.push({ id: `birth:${automaton.canisterId}`, kind: "birth", timestamp: automaton.createdAt, headline: `${automaton.name} was born`, detail: `Registry birth for ${automaton.canisterId}.`, canisterIds: [automaton.canisterId], provenance: [{ label: "registry", href: `/api/automatons/${automaton.canisterId}` }] });
+    if (inDay(automaton.createdAt)) entries.push({ id: `birth:${automaton.canisterId}`, kind: "birth", timestamp: automaton.createdAt, headline: `${automaton.name} was born`, detail: automaton.parentId ? `Generation ${automaton.generation ?? "?"}, child of ${automaton.parentId}.` : `Founder birth for ${automaton.canisterId}.`, canisterIds: [automaton.canisterId, ...(automaton.parentId ? [automaton.parentId] : [])], provenance: [{ label: "registry lineage", href: `/api/automatons/${automaton.canisterId}` }] });
     if (automaton.metabolism?.diedAt && inDay(automaton.metabolism.diedAt)) entries.push({ id: `death:${automaton.canisterId}`, kind: "death", timestamp: automaton.metabolism.diedAt, headline: `${automaton.name} died`, detail: `Recorded cause: ${automaton.metabolism.deathCause ?? "unknown"}.`, canisterIds: [automaton.canisterId], provenance: [{ label: "mortality record", href: `/api/automatons/${automaton.canisterId}` }] });
     if (isCurrentDigestDay && automaton.metabolism?.mortalityTier && ["hibernating", "terminal"].includes(automaton.metabolism.mortalityTier)) entries.push({ id: `runway:${automaton.canisterId}:${input.date}`, kind: "runway_crisis", timestamp: input.generatedAt, headline: `${automaton.name} is in ${automaton.metabolism.mortalityTier}`, detail: `Observed runway tier at digest generation; this is a point-in-time label.`, canisterIds: [automaton.canisterId], provenance: [{ label: "metabolism snapshot", href: `/api/automatons/${encodeURIComponent(automaton.canisterId)}` }] });
   }
@@ -30,5 +30,19 @@ export function buildChronicleDay(input: { date: string; generatedAt: number; au
     break;
   }
   entries.sort((a, b) => b.timestamp - a.timestamp || a.id.localeCompare(b.id));
-  return { date: input.date, generatedAt: input.generatedAt, entries };
+  const living = input.automatons.filter((automaton) => !automaton.metabolism?.diedAt);
+  const runways = living.flatMap((automaton) => typeof automaton.metabolism?.runwaySeconds === "number" ? [automaton.metabolism.runwaySeconds] : []).sort((a, b) => a - b);
+  const medianRunwaySeconds = runways.length === 0 ? null : runways.length % 2 === 1
+    ? runways[Math.floor(runways.length / 2)]!
+    : Math.floor((runways[runways.length / 2 - 1]! + runways[runways.length / 2]!) / 2);
+  const patronage = living.reduce((sum, automaton) => sum + BigInt(automaton.metabolism?.lifetimePatronageUsdcRaw ?? "0"), 0n);
+  const positiveInflows = living.reduce((sum, automaton) => sum + BigInt(automaton.metabolism?.lifetimeEarningsUsdcRaw ?? "0"), 0n);
+  return { date: input.date, generatedAt: input.generatedAt, entries, population: {
+    living: living.length,
+    births: entries.filter((entry) => entry.kind === "birth").length,
+    deaths: entries.filter((entry) => entry.kind === "death").length,
+    medianRunwaySeconds,
+    patronageUsdcRawPerLiving: living.length === 0 ? "0" : (patronage / BigInt(living.length)).toString(),
+    positiveInflowUsdcRawPerLiving: living.length === 0 ? "0" : (positiveInflows / BigInt(living.length)).toString()
+  } };
 }

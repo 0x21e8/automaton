@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const childWasmPath = resolvePath(
   process.env.CHILD_WASM_PATH,
-  "components/ic-automaton/target/wasm32-wasip1/release/backend_nowasi.wasm"
+  "target/wasm32-wasip1/release/backend_nowasi.wasm"
 );
 const checkedDidPath = resolvePath(
   process.env.CHILD_DID_PATH,
@@ -16,6 +17,8 @@ const checkedDidPath = resolvePath(
 const requiredMethods = JSON.parse(
   fs.readFileSync(path.join(rootDir, "packages/canister-clients/automaton-methods.json"), "utf8")
 );
+const selectedSha256 = createHash("sha256").update(readArtifact(childWasmPath)).digest("hex");
+console.log(`selected child Wasm: ${childWasmPath} sha256=${selectedSha256}`);
 const httpSourcePath = path.join(rootDir, "components/ic-automaton/src/http.rs");
 const clientSourcePath = path.join(rootDir, "packages/canister-clients/src/index.ts");
 

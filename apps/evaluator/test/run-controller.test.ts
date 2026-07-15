@@ -74,6 +74,11 @@ function createController(options: {
     }>;
   }>;
   automatonClient?: AutomatonClientLike;
+  indexerClient?: Partial<{
+    fetchRepositoryStrategies: () => Promise<any>;
+    fetchAutomatonDetail: (canisterId: string) => Promise<any>;
+    fetchRoomMessages: () => Promise<any>;
+  }>;
   sleep?: (ms: number) => Promise<void>;
 }) {
   const loggerApp = Fastify({ logger: false });
@@ -294,7 +299,8 @@ function createController(options: {
             nextAfterSeq: null,
             latestSeq: null
           };
-        }
+        },
+        ...(options.indexerClient ?? {})
       },
       automatonClient: options.automatonClient ?? {
         async readEvidence(canisterId) {
@@ -999,6 +1005,243 @@ describe("run controller", () => {
       expect(dashboard?.run.runState).toBe("completed");
       expect(dashboard?.report?.completionReason).toBe("stopped_manually");
       expect(dashboard?.report?.comparisonValid).toBe(false);
+    } finally {
+      await loggerApp.close();
+    }
+  });
+
+  it("includes descendant automatons in fitness observatory lineage", async () => {
+    const repoRoot = await createTempDirectory("evaluator-controller-repo-lineage-");
+    const artifactsRoot = await createTempDirectory("evaluator-controller-artifacts-lineage-");
+    const experimentPath = await writeExperiment(
+      repoRoot,
+      [
+        "name: smoke",
+        "description: lineage evidence scenario",
+        "maxRuntimeMinutes: 240",
+        "samplingIntervalSeconds: 15",
+        "stallAfterMinutes: 10",
+        "spawn:",
+        "  grossAmount: \"75000000\"",
+        "  minSuccessRatio: 1",
+        "automatons:",
+        "  - id: alpha",
+        "    label: Alpha",
+        "    model: model-alpha",
+        "    strategies:",
+        "      - momentum"
+      ].join("\n")
+    );
+
+    const fetchCalls: string[] = [];
+    const { controller, loggerApp } = createController({
+      repoRoot,
+      artifactsRoot,
+      experimentPath,
+      loadPlaygroundHelpers: async () => ({
+        async claimPlaygroundFaucet() {},
+        createEphemeralWallet() {
+          return {
+            address: "0x0000000000000000000000000000000000000aaa",
+            privateKey: "0x01"
+          };
+        },
+        async submitSpawnPayment() {},
+        async waitForSessionCompletion() {
+          return {
+            registryRecord: {
+              canisterId: "canister-alpha",
+              evmAddress: "0x0000000000000000000000000000000000000aaa",
+              versionCommit: "89abcdef0123456789abcdef0123456789abcdef"
+            }
+          };
+        }
+      }),
+      indexerClient: {
+        async fetchAutomatonDetail(canisterId) {
+          fetchCalls.push(canisterId);
+          if (canisterId === "canister-alpha") {
+            return {
+              canisterId,
+              ethAddress: "0x0000000000000000000000000000000000000aaa",
+              chain: "base",
+              chainId: 8453,
+              name: canisterId,
+              tier: "normal",
+              agentState: "running",
+              ethBalanceWei: "200",
+              usdcBalanceRaw: "300",
+              cyclesBalance: 900,
+              netWorthEth: "0",
+              netWorthUsd: "110",
+              heartbeatIntervalSeconds: 60,
+              steward: {
+                address: "0x0000000000000000000000000000000000000001",
+                chainId: 8453,
+                ensName: null,
+                enabled: true
+              },
+              gridPosition: { x: 0, y: 0 },
+              corePatternIndex: 0,
+              corePattern: null,
+              parentId: null,
+              generation: 0,
+              createdAt: 1,
+              lastTransitionAt: 1,
+              soul: "test",
+              canisterUrl: "http://127.0.0.1:8000/?canisterId=test",
+              explorerUrl: null,
+              model: "test-model",
+              financials: {
+                ethBalanceWei: "200",
+                usdcBalanceRaw: "300",
+                cyclesBalance: 900,
+                liquidCycles: 900,
+                burnRatePerDay: null,
+                estimatedFreezeTime: null,
+                netWorthEth: "0",
+                netWorthUsd: "110"
+              },
+              runtime: {
+                agentState: "running",
+                loopEnabled: true,
+                lastTransitionAt: 1,
+                lastError: null
+              },
+              version: {
+                commitHash: "89abcdef0123456789abcdef0123456789abcdef",
+                shortCommitHash: "89abcdef"
+              },
+              strategies: [],
+              skills: [],
+              promptLayers: [],
+              monologue: [],
+              childIds: ["canister-child"],
+              lastPolledAt: 1,
+              metabolism: {
+                cycleBurnRate: "1",
+                totalCyclesBurned: "10",
+                runAt: 1,
+                diedAt: null
+              },
+              constitution: "ancestor constitution text",
+              constitutionHash: "parent-hash",
+              constitutionVerification: {
+                status: "verified"
+              }
+            };
+          }
+
+          if (canisterId === "canister-child") {
+            return {
+              canisterId,
+              ethAddress: "0x0000000000000000000000000000000000000bbb",
+              chain: "base",
+              chainId: 8453,
+              name: canisterId,
+              tier: "normal",
+              agentState: "running",
+              ethBalanceWei: "200",
+              usdcBalanceRaw: "300",
+              cyclesBalance: 900,
+              netWorthEth: "0",
+              netWorthUsd: "90",
+              heartbeatIntervalSeconds: 60,
+              steward: {
+                address: "0x0000000000000000000000000000000000000001",
+                chainId: 8453,
+                ensName: null,
+                enabled: true
+              },
+              gridPosition: { x: 1, y: 0 },
+              corePatternIndex: 0,
+              corePattern: null,
+              parentId: "canister-alpha",
+              generation: 1,
+              createdAt: 2,
+              lastTransitionAt: 2,
+              soul: "test",
+              canisterUrl: "http://127.0.0.1:8000/?canisterId=child",
+              explorerUrl: null,
+              model: "test-model",
+              financials: {
+                ethBalanceWei: "200",
+                usdcBalanceRaw: "300",
+                cyclesBalance: 900,
+                liquidCycles: 900,
+                burnRatePerDay: null,
+                estimatedFreezeTime: null,
+                netWorthEth: "0",
+                netWorthUsd: "90"
+              },
+              runtime: {
+                agentState: "running",
+                loopEnabled: true,
+                lastTransitionAt: 2,
+                lastError: null
+              },
+              version: {
+                commitHash: "89abcdef0123456789abcdef0123456789abcdef",
+                shortCommitHash: "89abcdef"
+              },
+              strategies: [],
+              skills: [],
+              promptLayers: [],
+              monologue: [],
+              childIds: [],
+              lastPolledAt: 2,
+              metabolism: {
+                cycleBurnRate: "1",
+                totalCyclesBurned: "10",
+                runAt: 2,
+                diedAt: null
+              },
+              constitution: "child constitution text",
+              constitutionHash: "child-hash",
+              constitutionVerification: {
+                status: "verified"
+              }
+            };
+          }
+
+          throw new Error(`unexpected canister detail ${canisterId}`);
+        }
+      },
+      sleep: async () => {}
+    });
+
+    try {
+      await controller.startRun(experimentPath);
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        if (controller.getDashboard()?.run.successfulSpawnCount === 1) {
+          break;
+        }
+
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        });
+      }
+
+      await controller.requestStop();
+      await controller.waitForCompletion();
+
+      const dashboard = controller.getDashboard();
+      expect(dashboard?.run.runState).toBe("completed");
+
+      const runDirectory = join(artifactsRoot, dashboard?.run.runId ?? "");
+      const summary = JSON.parse(await readFile(join(runDirectory, "summary.json"), "utf8")) as {
+        fitnessObservatory?: {
+          lineage?: {
+            descendants?: number;
+            maxGeneration?: number;
+          };
+        };
+      };
+
+      expect(fetchCalls).toContain("canister-alpha");
+      expect(fetchCalls).toContain("canister-child");
+      expect(summary.fitnessObservatory?.lineage?.descendants).toBe(1);
+      expect(summary.fitnessObservatory?.lineage?.maxGeneration).toBe(1);
     } finally {
       await loggerApp.close();
     }

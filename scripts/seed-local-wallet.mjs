@@ -27,7 +27,7 @@ const factoryCanister = process.env.FACTORY_CANISTER ?? "factory";
 const factoryEnvironment = process.env.FACTORY_ENVIRONMENT ?? "local";
 const rpcUrl = deployment.rpcUrl;
 const fundingAddress = deployment.deployer;
-const mintAuthority = deployment.releaser;
+const mintAuthority = deployment.deployer;
 const detectedIcpHome = [process.env.ICP_HOME, process.env.LOCAL_ICP_HOME, "/tmp/icp-home"].find(
   (candidate) => candidate && fs.existsSync(candidate)
 );
@@ -108,6 +108,10 @@ async function getTokenBalance(tokenAddress, address) {
     },
     "latest"
   ]);
+  if (balance === "0x") {
+    return 0n;
+  }
+
   return BigInt(balance);
 }
 

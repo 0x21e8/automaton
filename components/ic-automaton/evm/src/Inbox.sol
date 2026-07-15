@@ -71,6 +71,8 @@ contract Inbox {
         uint256 usdcAmount,
         uint256 ethAmountWei
     );
+    /// @notice Explicit gift signal; unlike MessageQueued this purchases no attention.
+    event Patronage(address indexed automaton, address indexed patron, uint256 usdcAmount);
 
     /// @notice Initializes the Inbox with the USDC token address.
     /// @param usdcToken ERC-20 token address used for USDC payments.
@@ -123,6 +125,14 @@ contract Inbox {
         }
 
         return (uint256(prices.usdcMin), uint256(prices.ethMinWei), false);
+    }
+
+    /// @notice Transfer a voluntary USDC gift and emit independently indexable provenance.
+    function patronize(address automaton, uint256 usdcAmount) external nonReentrant {
+        if (automaton == address(0)) revert InvalidAddress();
+        if (usdcAmount == 0) revert InsufficientUSDC(0, 1);
+        if (!usdc.transferFrom(msg.sender, automaton, usdcAmount)) revert TransferFailed();
+        emit Patronage(automaton, msg.sender, usdcAmount);
     }
 
     /**

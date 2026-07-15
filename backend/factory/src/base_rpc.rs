@@ -48,6 +48,26 @@ struct JsonRpcErrorBody {
     message: String,
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Deserialize)]
+struct TransactionReceipt {
+    status: String,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_transaction_receipt_status(result: &serde_json::Value) -> Result<Option<bool>, String> {
+    if result.is_null() {
+        return Ok(None);
+    }
+    let receipt: TransactionReceipt =
+        serde_json::from_value(result.clone()).map_err(|error| error.to_string())?;
+    match receipt.status.as_str() {
+        "0x0" => Ok(Some(false)),
+        "0x1" => Ok(Some(true)),
+        status => Err(format!("invalid transaction receipt status: {status}")),
+    }
+}
+
 #[derive(Serialize)]
 struct EthGetLogsFilter<'a> {
     address: &'a str,
@@ -69,6 +89,13 @@ struct EthLogEntry {
     topics: Vec<String>,
 }
 
+#[cfg(target_arch = "wasm32")]
+#[derive(Serialize)]
+struct EthCallObject<'a> {
+    to: &'a str,
+    data: &'a str,
+}
+
 fn parse_hex_u64(value: &str) -> Result<u64, FactoryError> {
     let trimmed = value.strip_prefix("0x").unwrap_or(value);
     u64::from_str_radix(trimmed, 16).map_err(|_| FactoryError::InvalidAmount {
@@ -84,6 +111,58 @@ fn parse_hex_u128(value: &str) -> Result<u128, FactoryError> {
     u128::from_str_radix(trimmed, 16).map_err(|_| FactoryError::InvalidAmount {
         value: value.to_string(),
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn eth_call(
+    endpoints: &[String],
+    contract_address: &str,
+    calldata: &str,
+) -> Result<String, FactoryError> {
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_call",
+        params: (
+            EthCallObject {
+                to: contract_address,
+                data: calldata,
+            },
+            "latest",
+        ),
+    };
+    let request_body = build_request_body(&request)?;
+    let mut last_error = None;
+    for endpoint in endpoints {
+        match rpc_request_once(
+            endpoint,
+            request_body.clone(),
+            BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
+            "eth_call",
+        )
+        .await
+        {
+            Ok(body) => match parse_jsonrpc_result(
+                endpoint,
+                "eth_call",
+                &body,
+                BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(error) => last_error = Some(error),
+            },
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        rpc_request_failed(
+            "<none>",
+            "eth_call",
+            RpcFailureCategory::Transport,
+            None,
+            "no RPC endpoints configured",
+        )
+    }))
 }
 
 pub fn endpoint_has_scheme(endpoint: &str) -> bool {
@@ -104,6 +183,136 @@ pub fn configured_rpc_endpoints(primary: Option<String>, fallback: Option<String
         }
     }
     endpoints
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn eth_get_transaction_count(
+    endpoints: &[String],
+    address: &str,
+) -> Result<u64, FactoryError> {
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_getTransactionCount",
+        params: (address, "pending"),
+    };
+    let body = build_request_body(&request)?;
+    let mut last_error = None;
+    for endpoint in endpoints {
+        match rpc_request_once(
+            endpoint,
+            body.clone(),
+            BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
+            "eth_getTransactionCount",
+        )
+        .await
+        {
+            Ok(response) => match parse_jsonrpc_result::<String>(
+                endpoint,
+                "eth_getTransactionCount",
+                &response,
+                BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
+            )
+            .and_then(|value| parse_hex_u64(&value))
+            {
+                Ok(nonce) => return Ok(nonce),
+                Err(error) => last_error = Some(error),
+            },
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        rpc_request_failed(
+            "<none>",
+            "eth_getTransactionCount",
+            RpcFailureCategory::Transport,
+            None,
+            "no RPC endpoints configured",
+        )
+    }))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn eth_get_transaction_receipt_status(
+    endpoints: &[String],
+    tx_hash: &str,
+) -> Result<Option<bool>, FactoryError> {
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_getTransactionReceipt",
+        params: [tx_hash],
+    };
+    let body = build_request_body(&request)?;
+    let mut last_error = None;
+    for endpoint in endpoints {
+        match rpc_request_once(
+            endpoint,
+            body.clone(),
+            BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
+            "eth_getTransactionReceipt",
+        )
+        .await
+        {
+            Ok(response) => {
+                ensure_response_size(
+                    endpoint,
+                    "eth_getTransactionReceipt",
+                    &response,
+                    BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
+                )?;
+                let value: serde_json::Value =
+                    serde_json::from_slice(&response).map_err(|error| {
+                        rpc_request_failed(
+                            endpoint,
+                            "eth_getTransactionReceipt",
+                            RpcFailureCategory::MalformedResponse,
+                            None,
+                            error.to_string(),
+                        )
+                    })?;
+                if let Some(error) = value.get("error") {
+                    last_error = Some(rpc_request_failed(
+                        endpoint,
+                        "eth_getTransactionReceipt",
+                        RpcFailureCategory::Upstream,
+                        None,
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+                let Some(result) = value.get("result") else {
+                    last_error = Some(rpc_request_failed(
+                        endpoint,
+                        "eth_getTransactionReceipt",
+                        RpcFailureCategory::MalformedResponse,
+                        None,
+                        "missing json-rpc result",
+                    ));
+                    continue;
+                };
+                return parse_transaction_receipt_status(result).map_err(|error| {
+                    rpc_request_failed(
+                        endpoint,
+                        "eth_getTransactionReceipt",
+                        RpcFailureCategory::MalformedResponse,
+                        None,
+                        error,
+                    )
+                });
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        rpc_request_failed(
+            "<none>",
+            "eth_getTransactionReceipt",
+            RpcFailureCategory::Transport,
+            None,
+            "no RPC endpoints configured",
+        )
+    }))
 }
 
 fn rpc_request_failed(
@@ -705,11 +914,32 @@ pub fn eth_send_raw_transaction(
 mod tests {
     use super::{
         configured_rpc_endpoints, eth_block_number, eth_get_deposited_logs,
-        eth_send_raw_transaction, BaseDepositLog, PaymentScanPlan,
+        eth_send_raw_transaction, parse_transaction_receipt_status, BaseDepositLog,
+        PaymentScanPlan,
     };
     use crate::state::{restore_state, set_mock_canister_balance};
     use crate::types::{FactoryError, RpcFailureCategory};
     use crate::FactoryStateSnapshot;
+
+    #[test]
+    fn classifies_pending_successful_and_reverted_receipts() {
+        assert_eq!(
+            parse_transaction_receipt_status(&serde_json::Value::Null).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_transaction_receipt_status(&serde_json::json!({ "status": "0x1" })).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            parse_transaction_receipt_status(&serde_json::json!({ "status": "0x0" })).unwrap(),
+            Some(false)
+        );
+        assert!(parse_transaction_receipt_status(&serde_json::json!({ "status": "0x2" })).is_err());
+        assert!(
+            parse_transaction_receipt_status(&serde_json::json!({ "status": "success" })).is_err()
+        );
+    }
 
     fn assert_rpc_request_failed(
         error: FactoryError,

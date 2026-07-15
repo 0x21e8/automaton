@@ -9,9 +9,12 @@ import {
 } from "@ic-automaton/shared";
 
 import type { ExperimentFile } from "../types.js";
+import { parseGenerationScenario } from "./generation-scenario.js";
+import type { GenerationScenario } from "./generation-scenario.js";
 
 export interface LoadedExperiment extends ExperimentFile {
   parsed: EvaluationExperiment;
+  generationScenario: GenerationScenario | null;
 }
 
 export async function loadExperimentFile(
@@ -24,7 +27,13 @@ export async function loadExperimentFile(
   const source = await readFile(absolutePath, "utf8");
 
   try {
-    const parsed = parseEvaluationExperimentYaml(source);
+    let generationScenario = null;
+    const scenarioLine = source.match(/^generationScenarioJson:\s*'(.+)'\s*$/m);
+    const evaluationSource = scenarioLine === null ? source : source.replace(scenarioLine[0], "");
+    if (scenarioLine !== null) {
+      generationScenario = parseGenerationScenario(JSON.parse(scenarioLine[1] ?? "null"));
+    }
+    const parsed = parseEvaluationExperimentYaml(evaluationSource);
     const hash = createHash("sha256").update(source).digest("hex");
 
     return {
@@ -32,7 +41,8 @@ export async function loadExperimentFile(
       absolutePath,
       source,
       hash,
-      parsed
+      parsed,
+      generationScenario
     };
   } catch (error) {
     throw new Error(

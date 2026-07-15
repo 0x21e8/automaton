@@ -50,14 +50,20 @@ use crate::features::evm::{
     classify_evm_failure, decode_message_queued_payload, fetch_peer_min_prices,
     fetch_transaction_receipt_status, fetch_wallet_balance_sync_read, TransactionReceiptStatus,
 };
-use crate::features::factory_room::{FactoryPeer, FactoryRoomClient};
+use crate::features::factory_room::{FactoryPeer, FactoryRoomClient, ReproductionSessionState};
 use crate::features::inference::classify_inference_failure;
+use crate::features::ThresholdSignerAdapter;
 use crate::features::{EvmPoller, HttpEvmPoller};
 use crate::storage::stable;
 use crate::timing::{self, current_time_ns};
-use crate::tools::{counterparty_pending_receipt_key, record_counterparty_deal};
+use crate::tools::{
+    counterparty_pending_receipt_key, record_counterparty_deal, reproduction_approve_args,
+    reproduction_deposit_args,
+};
+use alloy_primitives::U256;
 use canlog::{log, GetLogFilter, LogFilter, LogPriorityLevels};
 use serde_json::json;
+use std::str::FromStr;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -719,6 +725,18 @@ fn ingest_inbox_message(
     stable::post_inbox_message_with_source(body, sender, source)
 }
 
+fn ingest_verified_patronage_event(event: &EvmEvent) -> Result<Option<u128>, String> {
+    let Ok(amount) = crate::features::evm::decode_patronage_payload(&event.payload) else {
+        return Ok(None);
+    };
+    let amount_raw = amount
+        .to_string()
+        .parse::<u128>()
+        .map_err(|_| "patronage amount exceeds supported counter range".to_string())?;
+    stable::record_verified_patronage_usdc(amount_raw)?;
+    Ok(Some(amount_raw))
+}
+
 /// Ingests a direct steward message through the same inbox path used by EVM
 /// event delivery, then promotes pending messages into the staged queue.
 pub(crate) fn ingest_steward_direct_message(
@@ -803,7 +821,7 @@ async fn refresh_peer_directory(
                 json!({ "status": "unavailable", "usdc_min_raw": null, "eth_min_wei": null, "error": error })
             }
         };
-        peers.push(json!({ "canister_id": peer.canister_id, "name": peer.name, "evm_address": peer.evm_address, "alive": peer.death_cause.is_none(), "price_of_attention": price }));
+        peers.push(json!({ "canister_id": peer.canister_id, "name": peer.name, "evm_address": peer.evm_address, "alive": peer.death_cause.is_none(), "parent_id": peer.parent_id, "generation": peer.generation, "price_of_attention": price }));
     }
     let value =
         json!({ "peers": peers, "bounded": true, "next_cursor": page.next_cursor }).to_string();
@@ -817,6 +835,259 @@ async fn refresh_peer_directory(
         updated_at_ns: now_ns,
         source_turn_id: "room_poll".to_string(),
     });
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReproductionPaymentRecoveryAction {
+    Wait,
+    BroadcastApproval,
+    BroadcastDeposit,
+}
+
+fn reproduction_payment_recovery_action(
+    factory_state: &ReproductionSessionState,
+    approve_hash: Option<&str>,
+    approve_receipt: Option<TransactionReceiptStatus>,
+    deposit_hash: Option<&str>,
+    deposit_receipt: Option<TransactionReceiptStatus>,
+) -> ReproductionPaymentRecoveryAction {
+    if !matches!(factory_state, ReproductionSessionState::AwaitingPayment) {
+        return ReproductionPaymentRecoveryAction::Wait;
+    }
+    match (approve_hash, approve_receipt) {
+        (None, _) | (Some(_), Some(TransactionReceiptStatus::Reverted)) => {
+            ReproductionPaymentRecoveryAction::BroadcastApproval
+        }
+        (Some(_), Some(TransactionReceiptStatus::Confirmed)) => match deposit_hash {
+            Some(_) if deposit_receipt == Some(TransactionReceiptStatus::Reverted) => {
+                ReproductionPaymentRecoveryAction::BroadcastDeposit
+            }
+            Some(_) => ReproductionPaymentRecoveryAction::Wait,
+            None => ReproductionPaymentRecoveryAction::BroadcastDeposit,
+        },
+        _ => ReproductionPaymentRecoveryAction::Wait,
+    }
+}
+
+fn prepare_reproduction_payment_retry_value(
+    value: &serde_json::Value,
+    action: ReproductionPaymentRecoveryAction,
+) -> serde_json::Value {
+    let mut prepared = value.clone();
+    if action == ReproductionPaymentRecoveryAction::BroadcastApproval {
+        if let Some(object) = prepared.as_object_mut() {
+            // A deposit signed after a reverted approval necessarily depended
+            // on stale allowance/nonce state and must not suppress reapproval.
+            object.remove("approve_tx_hash");
+            object.remove("deposit_tx_hash");
+        }
+    }
+    prepared
+}
+
+fn persist_reproduction_payment_value(
+    fact: &MemoryFact,
+    mut value: serde_json::Value,
+    now_ns: u64,
+    status: &str,
+    field: Option<(&str, String)>,
+    error: Option<String>,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert("status".to_string(), json!(status));
+    if let Some((name, field_value)) = field {
+        object.insert(name.to_string(), json!(field_value));
+    }
+    if let Some(error) = error {
+        object.insert("last_error".to_string(), json!(error));
+    } else {
+        object.remove("last_error");
+    }
+    let _ = stable::set_memory_fact(&MemoryFact {
+        value: value.to_string(),
+        updated_at_ns: now_ns,
+        source_turn_id: "reproduction_payment_recovery".to_string(),
+        ..fact.clone()
+    });
+}
+
+async fn recover_reproduction_payment(
+    now_ns: u64,
+    snapshot: &RuntimeSnapshot,
+    fact: &MemoryFact,
+    value: &serde_json::Value,
+    factory_state: &ReproductionSessionState,
+) {
+    let approve_hash = value
+        .get("approve_tx_hash")
+        .and_then(serde_json::Value::as_str);
+    let deposit_hash = value
+        .get("deposit_tx_hash")
+        .and_then(serde_json::Value::as_str);
+    let approve_receipt = match approve_hash {
+        Some(hash) => fetch_transaction_receipt_status(snapshot, hash).await.ok(),
+        None => None,
+    };
+    let deposit_receipt = match deposit_hash {
+        Some(hash) => fetch_transaction_receipt_status(snapshot, hash).await.ok(),
+        None => None,
+    };
+    let action = reproduction_payment_recovery_action(
+        factory_state,
+        approve_hash,
+        approve_receipt,
+        deposit_hash,
+        deposit_receipt,
+    );
+    if action == ReproductionPaymentRecoveryAction::Wait {
+        return;
+    }
+    let recovery_value = prepare_reproduction_payment_retry_value(value, action);
+    if action == ReproductionPaymentRecoveryAction::BroadcastApproval {
+        // Persist the cleared dependency chain before the outcall so a crash
+        // cannot revive a stale deposit hash on the next scheduler tick.
+        persist_reproduction_payment_value(
+            fact,
+            recovery_value.clone(),
+            now_ns,
+            "approval_rebroadcasting",
+            None,
+            None,
+        );
+    }
+    let Some(token) = value.get("token").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let Some(escrow) = value.get("escrow").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let Some(claim_id) = value.get("claim_id").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let Some(gross) = value
+        .get("gross_amount")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| U256::from_str(raw).ok())
+    else {
+        return;
+    };
+    if gross.is_zero() {
+        return;
+    }
+    let args = match action {
+        ReproductionPaymentRecoveryAction::BroadcastApproval => {
+            reproduction_approve_args(token, escrow, gross)
+        }
+        ReproductionPaymentRecoveryAction::BroadcastDeposit => {
+            reproduction_deposit_args(escrow, claim_id, gross)
+        }
+        ReproductionPaymentRecoveryAction::Wait => return,
+    };
+    let args = match args {
+        Ok(args) => args,
+        Err(error) => {
+            persist_reproduction_payment_value(
+                fact,
+                recovery_value.clone(),
+                now_ns,
+                "payment_recovery_failed",
+                None,
+                Some(error),
+            );
+            return;
+        }
+    };
+    let signer = ThresholdSignerAdapter::new(snapshot.ecdsa_key_name.clone());
+    match crate::features::evm::send_eth_tool(&args, &signer).await {
+        Ok(hash) => {
+            let (status, field) = match action {
+                ReproductionPaymentRecoveryAction::BroadcastApproval => {
+                    ("approval_broadcast", "approve_tx_hash")
+                }
+                ReproductionPaymentRecoveryAction::BroadcastDeposit => {
+                    ("deposit_broadcast", "deposit_tx_hash")
+                }
+                ReproductionPaymentRecoveryAction::Wait => return,
+            };
+            persist_reproduction_payment_value(
+                fact,
+                recovery_value.clone(),
+                now_ns,
+                status,
+                Some((field, hash)),
+                None,
+            );
+        }
+        Err(error) => persist_reproduction_payment_value(
+            fact,
+            recovery_value,
+            now_ns,
+            "payment_recovery_retryable",
+            None,
+            Some(error),
+        ),
+    }
+}
+
+async fn reconcile_reproduction_sessions(
+    now_ns: u64,
+    snapshot: &RuntimeSnapshot,
+    client: &FactoryRoomClient,
+) {
+    for fact in stable::list_memory_facts_by_prefix_sorted(
+        "counterparty.child.pending.",
+        8,
+        MemoryFactSort::UpdatedAtDesc,
+    ) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&fact.value) else {
+            continue;
+        };
+        let Some(session_id) = value
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Ok(status) = client.get_reproduction_session(&session_id).await else {
+            continue;
+        };
+        match status.session.state {
+            ReproductionSessionState::Complete => {
+                let Some(child_id) = status.session.automaton_canister_id else {
+                    continue;
+                };
+                let _ = stable::set_memory_fact(&MemoryFact {
+                    key: format!("counterparty.child.{}.birth.{}", child_id.to_ascii_lowercase(), session_id),
+                    value: json!({ "kind": "reproduction", "session_id": session_id, "child_canister_id": child_id, "generation": status.session.generation, "status": "born" }).to_string(),
+                    created_at_ns: fact.created_at_ns,
+                    updated_at_ns: now_ns,
+                    source_turn_id: "reproduction_reconciler".to_string(),
+                });
+                stable::remove_memory_fact(&fact.key);
+            }
+            ReproductionSessionState::Failed | ReproductionSessionState::Expired => {
+                let _ = stable::set_memory_fact(&MemoryFact {
+                    value: json!({ "kind": "reproduction", "session_id": session_id, "status": format!("{:?}", status.session.state).to_ascii_lowercase() }).to_string(),
+                    updated_at_ns: now_ns,
+                    ..fact
+                });
+            }
+            ReproductionSessionState::AwaitingPayment => {
+                recover_reproduction_payment(
+                    now_ns,
+                    snapshot,
+                    &fact,
+                    &value,
+                    &status.session.state,
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
 }
 
 async fn reconcile_submitted_peer_payments(now_ns: u64, snapshot: &RuntimeSnapshot) {
@@ -990,6 +1261,7 @@ async fn maybe_poll_factory_room(now_ns: u64, snapshot: &RuntimeSnapshot) {
         refresh_peer_directory(now_ns, snapshot, &client).await;
         reconcile_submitted_peer_payments(now_ns, snapshot).await;
     }
+    reconcile_reproduction_sessions(now_ns, snapshot, &client).await;
 
     match client
         .list_my_room_messages(snapshot.room_poll.last_seen_seq, Some(ROOM_POLL_PAGE_LIMIT))
@@ -1250,6 +1522,22 @@ async fn maybe_sync_wallet_balances(now_ns: u64, snapshot: &RuntimeSnapshot) {
     }
 }
 
+/// Forces the ordinary wallet-balance synchronization path for the local
+/// generations observatory. Authorization is enforced by the caller-facing
+/// canister endpoint before this helper is reached.
+pub(crate) async fn run_evaluation_wallet_balance_sync() -> Result<String, String> {
+    stable::set_wallet_balance_bootstrap_pending(true);
+    let snapshot = stable::runtime_snapshot();
+    maybe_sync_wallet_balances(current_time_ns(), &snapshot).await;
+    let balance = stable::wallet_balance_snapshot();
+    if let Some(error) = balance.last_error {
+        return Err(error);
+    }
+    balance
+        .usdc_balance_raw_hex
+        .ok_or_else(|| "wallet balance sync returned no USDC balance".to_string())
+}
+
 /// Executes the `PollInbox` job: polls the EVM inbox contract for new
 /// `MessageQueued` events, ingests them as inbox messages, advances the cursor,
 /// then calls `maybe_sync_wallet_balances` and stages any pending messages.
@@ -1327,6 +1615,12 @@ async fn run_poll_inbox_job(now_ns: u64) -> Result<(), String> {
         for event in &poll.events {
             if !stable::try_mark_evm_event_ingested(&event.tx_hash, event.log_index) {
                 skipped_duplicate_events = skipped_duplicate_events.saturating_add(1);
+                continue;
+            }
+            if ingest_verified_patronage_event(event)?.is_some() {
+                // Patronage is telemetry, not paid correspondence: deliberately
+                // do not create an inbox item or schedule an autonomy turn.
+                ingested_events = ingested_events.saturating_add(1);
                 continue;
             }
             let (body, sender) = evm_event_to_inbox_message(event);
@@ -1472,6 +1766,12 @@ async fn run_check_cycles() -> Result<(), String> {
         topup_state
     );
     Ok(())
+}
+
+/// Runs the ordinary mortality observation immediately for the guarded local
+/// evaluation starvation fixture instead of waiting for the periodic cadence.
+pub(crate) async fn run_evaluation_mortality_check() -> Result<(), String> {
+    run_check_cycles().await
 }
 
 /// Parses an optional hex string (with or without `0x` prefix) into a `u64`.
@@ -1822,6 +2122,8 @@ mod tests {
             chain: crate::features::factory_room::FactoryPeerChain::Base,
             session_id: format!("session-{index}"),
             parent_id: None,
+            generation: Some(0),
+            parent_constitution_hash: None,
             child_ids: vec![],
             created_at: 1,
             version_commit: "0".repeat(40),
@@ -1834,6 +2136,126 @@ mod tests {
             death_recorded_by: None,
             death_incident_reference: None,
         }
+    }
+
+    #[test]
+    fn reproduction_payment_recovery_is_restart_safe_and_idempotent_after_deposit() {
+        assert_eq!(
+            reproduction_payment_recovery_action(
+                &ReproductionSessionState::AwaitingPayment,
+                Some("0xapprove"),
+                Some(TransactionReceiptStatus::Confirmed),
+                None,
+                None,
+            ),
+            ReproductionPaymentRecoveryAction::BroadcastDeposit,
+            "restart after approval must resume the same session at deposit"
+        );
+        assert_eq!(
+            reproduction_payment_recovery_action(
+                &ReproductionSessionState::AwaitingPayment,
+                Some("0xapprove"),
+                Some(TransactionReceiptStatus::Confirmed),
+                Some("0xdeposit"),
+                Some(TransactionReceiptStatus::Reverted),
+            ),
+            ReproductionPaymentRecoveryAction::BroadcastDeposit,
+            "a reverted deposit submission is retried without reapproval"
+        );
+        assert_eq!(
+            reproduction_payment_recovery_action(
+                &ReproductionSessionState::AwaitingPayment,
+                Some("0xapprove"),
+                Some(TransactionReceiptStatus::Confirmed),
+                Some("0xdeposit"),
+                Some(TransactionReceiptStatus::Confirmed),
+            ),
+            ReproductionPaymentRecoveryAction::Wait,
+            "a mined deposit waits for factory log reconciliation"
+        );
+        assert_eq!(
+            reproduction_payment_recovery_action(
+                &ReproductionSessionState::PaymentDetected,
+                None,
+                None,
+                None,
+                None,
+            ),
+            ReproductionPaymentRecoveryAction::Wait,
+            "factory-observed deposits are never rebroadcast even if local persistence was lost"
+        );
+    }
+
+    #[test]
+    fn reverted_approval_clears_dependent_deposit_before_persisted_retry() {
+        stable::init_storage();
+        let fact = MemoryFact {
+            key: "counterparty.child.pending.recovery-regression".to_string(),
+            value: json!({
+                "session_id": "recovery-regression",
+                "token": "0x1111111111111111111111111111111111111111",
+                "escrow": "0x2222222222222222222222222222222222222222",
+                "claim_id": format!("0x{}", "33".repeat(32)),
+                "gross_amount": "50000000",
+                "approve_tx_hash": "0xold-approve",
+                "deposit_tx_hash": "0xold-dependent-deposit"
+            })
+            .to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            source_turn_id: "test".to_string(),
+        };
+        stable::set_memory_fact(&fact).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fact.value).unwrap();
+        let action = reproduction_payment_recovery_action(
+            &ReproductionSessionState::AwaitingPayment,
+            Some("0xold-approve"),
+            Some(TransactionReceiptStatus::Reverted),
+            Some("0xold-dependent-deposit"),
+            Some(TransactionReceiptStatus::Reverted),
+        );
+        assert_eq!(action, ReproductionPaymentRecoveryAction::BroadcastApproval);
+
+        let cleared = prepare_reproduction_payment_retry_value(&value, action);
+        persist_reproduction_payment_value(
+            &fact,
+            cleared,
+            2,
+            "approval_rebroadcasting",
+            None,
+            None,
+        );
+        let persisted = stable::get_memory_fact(&fact.key).unwrap();
+        let mut persisted_value: serde_json::Value =
+            serde_json::from_str(&persisted.value).unwrap();
+        assert!(persisted_value.get("approve_tx_hash").is_none());
+        assert!(persisted_value.get("deposit_tx_hash").is_none());
+
+        persisted_value["approve_tx_hash"] = json!("0xnew-approve");
+        persist_reproduction_payment_value(
+            &persisted,
+            persisted_value,
+            3,
+            "approval_broadcast",
+            None,
+            None,
+        );
+        let resumed: serde_json::Value =
+            serde_json::from_str(&stable::get_memory_fact(&fact.key).unwrap().value).unwrap();
+        assert_eq!(
+            reproduction_payment_recovery_action(
+                &ReproductionSessionState::AwaitingPayment,
+                resumed
+                    .get("approve_tx_hash")
+                    .and_then(serde_json::Value::as_str),
+                Some(TransactionReceiptStatus::Confirmed),
+                resumed
+                    .get("deposit_tx_hash")
+                    .and_then(serde_json::Value::as_str),
+                None,
+            ),
+            ReproductionPaymentRecoveryAction::BroadcastDeposit
+        );
     }
 
     #[test]
@@ -2012,6 +2434,7 @@ mod tests {
             constitution: None,
             session_id: None,
             parent_id: None,
+            generation: 0,
             factory_principal: Some(test_factory_principal()),
             risk: None,
             strategies: Vec::new(),
@@ -3198,6 +3621,40 @@ mod tests {
             stable::list_outbox_messages(10).is_empty(),
             "poll job must not emit an outbox reply"
         );
+    }
+
+    #[test]
+    fn verified_patronage_increments_telemetry_without_creating_inbox_attention() {
+        stable::init_storage();
+        let inbox_before = stable::inbox_stats().total_messages;
+        let turns_before = stable::runtime_snapshot().turn_counter;
+        let patronage_before = stable::runtime_snapshot()
+            .lifetime_patronage_usdc_raw
+            .parse::<u128>()
+            .expect("patronage counter should be numeric");
+        let event = EvmEvent {
+            tx_hash: format!("0x{}", "ab".repeat(32)),
+            chain_id: 8453,
+            block_number: 42,
+            log_index: 7,
+            source: "0x2222222222222222222222222222222222222222".to_string(),
+            payload: format!("0x{:064x}", U256::from(2_250_000_u64)),
+        };
+
+        assert_eq!(
+            ingest_verified_patronage_event(&event).unwrap(),
+            Some(2_250_000)
+        );
+        let snapshot = stable::runtime_snapshot();
+        assert_eq!(
+            snapshot
+                .lifetime_patronage_usdc_raw
+                .parse::<u128>()
+                .unwrap(),
+            patronage_before + 2_250_000
+        );
+        assert_eq!(stable::inbox_stats().total_messages, inbox_before);
+        assert_eq!(snapshot.turn_counter, turns_before);
     }
 
     #[test]

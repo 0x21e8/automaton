@@ -90,15 +90,21 @@ describe("patronage chain calls", () => {
     fetchMock.mockRestore();
   });
 
-  it("sends direct USDC patronage to the being rather than the inbox", async () => {
+  it("registers USDC patronage through the verified inbox event path", async () => {
     const request = vi.fn().mockResolvedValue("0xgift");
+    const inboxAddress = "0x2222222222222222222222222222222222222222";
     await sendDirectPatronage({
       amountRaw: 2_000_000n,
       automatonAddress: address,
+      inboxAddress,
       usdcAddress: "0x3333333333333333333333333333333333333333",
       wallet: { address, chainId: 8453, request } as never,
       expectedChainId: 8453
     });
     expect(request.mock.calls[0]?.[0].params[0].to).toBe("0x3333333333333333333333333333333333333333");
+    expect(request.mock.calls[1]?.[0].params[0]).toMatchObject({
+      to: inboxAddress,
+      data: expect.stringMatching(/^0x4984ea4a/)
+    });
   });
 });

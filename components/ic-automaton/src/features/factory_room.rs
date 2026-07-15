@@ -8,6 +8,7 @@ use crate::domain::types::{PostRoomMessageRequest, RoomMessage, RoomMessagePage}
 use crate::storage::stable;
 use candid::{CandidType, Principal};
 use serde::Deserialize;
+use spawn_protocol::{InheritedStrategyStat, MemoryDowryFact};
 
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct FactoryPeer {
@@ -19,6 +20,8 @@ pub struct FactoryPeer {
     pub chain: FactoryPeerChain,
     pub session_id: String,
     pub parent_id: Option<String>,
+    pub generation: Option<u32>,
+    pub parent_constitution_hash: Option<String>,
     pub child_ids: Vec<String>,
     pub created_at: u64,
     pub version_commit: String,
@@ -30,6 +33,90 @@ pub struct FactoryPeer {
     pub estate_disposition: Option<String>,
     pub death_recorded_by: Option<String>,
     pub death_incident_reference: Option<String>,
+}
+
+#[derive(CandidType, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct CreateReproductionRequest {
+    pub name: String,
+    pub parent_constitution: String,
+    pub child_constitution: String,
+    pub gross_amount: String,
+    pub observed_liquid_usdc_raw: String,
+    pub memory_dowry: Vec<MemoryDowryFact>,
+    pub inherited_strategy_stats: Vec<InheritedStrategyStat>,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReproductionPolicy {
+    pub min_age_ms: u64,
+    pub cooldown_ms: u64,
+    pub terminal_reserve_usdc_raw: String,
+    pub inference_reserve_usdc_raw: String,
+    pub topup_reserve_usdc_raw: String,
+    pub min_endowment_usdc_raw: String,
+    pub max_constitution_edit_distance_bps: u16,
+    pub parent_royalty_bps: u16,
+    pub progenitor_royalty_bps: u16,
+    pub royalty_depth: u8,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReproductionEligibility {
+    pub eligible: bool,
+    pub observed_at_ms: u64,
+    pub parent_created_at_ms: u64,
+    pub minimum_age_at_ms: u64,
+    pub cooldown_ends_at_ms: Option<u64>,
+    pub reason: Option<String>,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReproductionPayment {
+    pub session_id: String,
+    pub claim_id: String,
+    pub payment_address: String,
+    pub gross_amount: String,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReproductionQuote {
+    pub payment: ReproductionPayment,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReproductionSessionSummary {
+    pub session_id: String,
+    pub generation: Option<u32>,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CreateReproductionResponse {
+    pub session: ReproductionSessionSummary,
+    pub quote: ReproductionQuote,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum ReproductionSessionState {
+    AwaitingPayment,
+    PaymentDetected,
+    Spawning,
+    BroadcastingRelease,
+    Complete,
+    Failed,
+    Expired,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReproductionSessionStatus {
+    pub session_id: String,
+    pub state: ReproductionSessionState,
+    pub automaton_canister_id: Option<String>,
+    pub generation: Option<u32>,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ReproductionStatusResponse {
+    pub session: ReproductionSessionStatus,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -130,6 +217,53 @@ impl FactoryRoomClient {
         .await?;
         decode_factory_room_response("get_spawned_automaton", &response_bytes)
     }
+
+    pub async fn reproduction_policy(&self) -> Result<ReproductionPolicy, String> {
+        let response_bytes = do_factory_room_call(
+            self.factory_principal,
+            "get_reproduction_policy",
+            candid::encode_args(()).map_err(|error| error.to_string())?,
+        )
+        .await?;
+        candid::decode_one(&response_bytes)
+            .map_err(|error| format!("failed to decode get_reproduction_policy response: {error}"))
+    }
+
+    pub async fn reproduction_eligibility(&self) -> Result<ReproductionEligibility, String> {
+        let response_bytes = do_factory_room_call(
+            self.factory_principal,
+            "get_reproduction_eligibility",
+            candid::encode_args(()).map_err(|error| error.to_string())?,
+        )
+        .await?;
+        decode_factory_room_response("get_reproduction_eligibility", &response_bytes)
+    }
+
+    pub async fn create_reproduction_session(
+        &self,
+        request: CreateReproductionRequest,
+    ) -> Result<CreateReproductionResponse, String> {
+        let encoded_args = candid::encode_one(request)
+            .map_err(|error| format!("failed to encode reproduction request: {error}"))?;
+        let response_bytes = do_factory_room_call(
+            self.factory_principal,
+            "create_reproduction_session",
+            encoded_args,
+        )
+        .await?;
+        decode_factory_room_response("create_reproduction_session", &response_bytes)
+    }
+
+    pub async fn get_reproduction_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ReproductionStatusResponse, String> {
+        let encoded_args = candid::encode_one(session_id.to_string())
+            .map_err(|error| format!("failed to encode reproduction session id: {error}"))?;
+        let response_bytes =
+            do_factory_room_call(self.factory_principal, "get_spawn_session", encoded_args).await?;
+        decode_factory_room_response("get_spawn_session", &response_bytes)
+    }
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -162,6 +296,15 @@ pub(crate) enum FactoryRoomError {
     },
     InvalidAmount {
         value: String,
+    },
+    InvalidReproduction {
+        reason: String,
+    },
+    UnauthorizedReproduction {
+        caller: String,
+    },
+    ReproductionIneligible {
+        reason: String,
     },
     InvalidSha256 {
         value: String,
@@ -423,6 +566,7 @@ mod tests {
             constitution: None,
             session_id: None,
             parent_id: None,
+            generation: 0,
             factory_principal: Some(test_factory_principal()),
             risk: None,
             strategies: Vec::new(),

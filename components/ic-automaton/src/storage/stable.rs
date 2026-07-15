@@ -64,6 +64,7 @@ const STORAGE_GROWTH_SAMPLES_KEY: &str = "storage.growth.samples";
 const RETENTION_CONFIG_KEY: &str = "retention.config";
 const RETENTION_RUNTIME_KEY: &str = "retention.runtime";
 const TOPUP_STATE_KEY: &str = "cycle_topup.state";
+const EVALUATION_MODE_KEY: &str = "evaluation.mode";
 /// Persisted cadence multiplier for overriding `TICKS_PER_TURN_INTERVAL` at runtime.
 #[allow(dead_code)]
 const CADENCE_MULTIPLIER_KEY: &str = "timing.cadence_multiplier";
@@ -1448,6 +1449,23 @@ pub fn set_loop_enabled(enabled: bool) {
     save_runtime_snapshot(&snapshot);
 }
 
+pub fn record_verified_patronage_usdc(amount_raw: u128) -> Result<String, String> {
+    if amount_raw == 0 {
+        return Err("patronage amount must be positive".to_string());
+    }
+    let mut snapshot = runtime_snapshot();
+    let current = snapshot
+        .lifetime_patronage_usdc_raw
+        .parse::<u128>()
+        .map_err(|_| "stored patronage counter is malformed".to_string())?;
+    let updated = current
+        .checked_add(amount_raw)
+        .ok_or_else(|| "patronage counter overflow".to_string())?;
+    snapshot.lifetime_patronage_usdc_raw = updated.to_string();
+    save_runtime_snapshot(&snapshot);
+    Ok(updated.to_string())
+}
+
 pub fn mortality_runtime() -> crate::domain::types::MortalityRuntime {
     runtime_snapshot().mortality
 }
@@ -2028,6 +2046,7 @@ pub fn set_spawn_bootstrap_metadata(view: SpawnBootstrapView) -> SpawnBootstrapV
     }
     snapshot.spawn_session_id = view.session_id.clone();
     snapshot.spawn_parent_id = view.parent_id.clone();
+    snapshot.spawn_generation = view.generation;
     snapshot.factory_principal = view.factory_principal.map(|value| value.to_text());
     snapshot.room_poll.configured = snapshot
         .factory_principal
@@ -2676,6 +2695,14 @@ fn runtime_bool(key: &str) -> Option<bool> {
 
 fn save_runtime_bool(key: &str, value: bool) {
     let _ = sqlite::set_runtime_scalar(key, if value { "true" } else { "false" });
+}
+
+pub fn set_evaluation_mode(enabled: bool) {
+    save_runtime_bool(EVALUATION_MODE_KEY, enabled);
+}
+
+pub fn evaluation_mode() -> bool {
+    runtime_bool(EVALUATION_MODE_KEY).unwrap_or(false)
 }
 
 fn load_pending_inference_proxy_jobs() -> BTreeMap<String, PendingInferenceProxyJob> {
@@ -6366,6 +6393,7 @@ mod tests {
             constitution: None,
             session_id: None,
             parent_id: None,
+            generation: 0,
             factory_principal: Some(
                 Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
                     .expect("test principal should parse"),
@@ -6384,6 +6412,21 @@ mod tests {
             )
         );
         assert!(room_poll_state().configured);
+    }
+
+    #[test]
+    fn verified_patronage_counter_is_nonzero_and_does_not_follow_wallet_inflows() {
+        init_storage();
+        set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            usdc_balance_raw_hex: Some("0x895440".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(runtime_snapshot().lifetime_patronage_usdc_raw, "0");
+        assert_eq!(
+            record_verified_patronage_usdc(2_250_000).unwrap(),
+            "2250000"
+        );
+        assert_eq!(runtime_snapshot().lifetime_patronage_usdc_raw, "2250000");
     }
 
     #[test]

@@ -55,11 +55,11 @@ export function PatronagePanel({ automaton, playgroundMetadata = null, wallet }:
 
   async function submitGift() {
     const amountRaw = parseDecimalAmount(gift, 6);
-    if (wallet === null || automaton.ethAddress === null || (automaton.usdcContractAddress ?? null) === null || amountRaw === null) {
+    if (wallet === null || automaton.ethAddress === null || (automaton.inboxContractAddress ?? null) === null || (automaton.usdcContractAddress ?? null) === null || amountRaw === null) {
       setStatus("Enter a valid USDC amount and connect a wallet."); return;
     }
     try {
-      const hash = await sendDirectPatronage({ wallet, amountRaw, automatonAddress: automaton.ethAddress, usdcAddress: automaton.usdcContractAddress as string, expectedChainId: automaton.chainId });
+      const hash = await sendDirectPatronage({ wallet, amountRaw, automatonAddress: automaton.ethAddress, inboxAddress: automaton.inboxContractAddress as string, usdcAddress: automaton.usdcContractAddress as string, expectedChainId: automaton.chainId });
       setStatus(`Patronage submitted: ${hash}`); setGift("");
     } catch (error) { setStatus(error instanceof Error ? error.message : "Patronage failed."); }
   }
@@ -77,7 +77,7 @@ export function PatronagePanel({ automaton, playgroundMetadata = null, wallet }:
     </div>
     <div className="panel-heading"><h3>Direct patronage</h3><span className="panel-note">Gift</span></div>
     <p className="empty-copy">This is a gift the being can metabolize. It purchases nothing and carries no promise of value or return.</p>
-    <div className="patronage-row"><input aria-label="Patronage amount in USDC" onChange={(event) => setGift(event.target.value)} placeholder="USDC amount" value={gift} /><button disabled={wallet?.address == null || (automaton.usdcContractAddress ?? null) === null} onClick={() => void submitGift()} type="button">GIFT USDC</button></div>
+    <div className="patronage-row"><input aria-label="Patronage amount in USDC" onChange={(event) => setGift(event.target.value)} placeholder="USDC amount" value={gift} /><button disabled={wallet?.address == null || (automaton.inboxContractAddress ?? null) === null || (automaton.usdcContractAddress ?? null) === null} onClick={() => void submitGift()} type="button">GIFT USDC</button></div>
     {status ? <p role="status">{status}</p> : null}
     {!available ? <p className="empty-copy">Connect a wallet to pay for attention or send patronage. The public quote remains readable without a wallet.</p> : null}
   </section>;

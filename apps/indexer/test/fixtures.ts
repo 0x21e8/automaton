@@ -36,6 +36,7 @@ export function createAutomatonDetailFixture(
       burnRateCyclesPerDay: 1.5,
       runwaySeconds: 86_400,
       lifetimeEarningsUsdcRaw: "2500000",
+      lifetimePatronageUsdcRaw: "0",
       ageSeconds: 3_600,
       state: "healthy",
       history: []

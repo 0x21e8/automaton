@@ -13,6 +13,16 @@ pub struct ReleaseBroadcastReceipt {
     pub release_tx_hash: String,
     pub release_broadcast_at: u64,
     pub record: ReleaseBroadcastRecord,
+    pub confirmed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReproductionRelease {
+    pub child_amount: u128,
+    pub royalty_one_recipient: String,
+    pub royalty_one_amount: u128,
+    pub royalty_two_recipient: String,
+    pub royalty_two_amount: u128,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -221,6 +231,49 @@ fn encode_release_calldata(claim_id: &str, recipient: &str) -> Result<Vec<u8>, F
     Ok(encoded)
 }
 
+fn encode_refund_calldata(claim_id: &str) -> Result<Vec<u8>, FactoryError> {
+    let claim_id = decode_fixed_hex::<32>(claim_id)?;
+    let selector = &keccak256(b"refund(bytes32)")[..4];
+    let mut encoded = Vec::with_capacity(4 + 32);
+    encoded.extend_from_slice(selector);
+    encoded.extend_from_slice(&claim_id);
+    Ok(encoded)
+}
+
+fn encode_address_word(value: &str) -> Result<[u8; 32], FactoryError> {
+    let address = decode_fixed_hex::<20>(value)?;
+    let mut word = [0_u8; 32];
+    word[12..].copy_from_slice(&address);
+    Ok(word)
+}
+
+fn encode_u128_word(value: u128) -> [u8; 32] {
+    let mut word = [0_u8; 32];
+    word[16..].copy_from_slice(&value.to_be_bytes());
+    word
+}
+
+fn encode_reproduction_release_calldata(
+    claim_id: &str,
+    child: &str,
+    release: &ReproductionRelease,
+) -> Result<Vec<u8>, FactoryError> {
+    let claim_id = decode_fixed_hex::<32>(claim_id)?;
+    let selector =
+        &keccak256(b"releaseReproduction(bytes32,address,uint256,address,uint256,address,uint256)")
+            [..4];
+    let mut encoded = Vec::with_capacity(4 + 7 * 32);
+    encoded.extend_from_slice(selector);
+    encoded.extend_from_slice(&claim_id);
+    encoded.extend_from_slice(&encode_address_word(child)?);
+    encoded.extend_from_slice(&encode_u128_word(release.child_amount));
+    encoded.extend_from_slice(&encode_address_word(&release.royalty_one_recipient)?);
+    encoded.extend_from_slice(&encode_u128_word(release.royalty_one_amount));
+    encoded.extend_from_slice(&encode_address_word(&release.royalty_two_recipient)?);
+    encoded.extend_from_slice(&encode_u128_word(release.royalty_two_amount));
+    Ok(encoded)
+}
+
 fn build_release_plan(
     claim_id: &str,
     recipient: &str,
@@ -234,6 +287,41 @@ fn build_release_plan(
         escrow_contract_address: escrow_contract_address.to_string(),
         nonce,
         calldata: encode_release_calldata(claim_id, recipient)?,
+        config,
+    })
+}
+
+fn build_refund_plan(
+    claim_id: &str,
+    recipient: &str,
+    escrow_contract_address: &str,
+    nonce: u64,
+    config: ReleaseBroadcastConfig,
+) -> Result<ReleaseTransactionPlan, FactoryError> {
+    Ok(ReleaseTransactionPlan {
+        claim_id: claim_id.to_string(),
+        recipient: recipient.to_string(),
+        escrow_contract_address: escrow_contract_address.to_string(),
+        nonce,
+        calldata: encode_refund_calldata(claim_id)?,
+        config,
+    })
+}
+
+fn build_reproduction_release_plan(
+    claim_id: &str,
+    recipient: &str,
+    escrow_contract_address: &str,
+    nonce: u64,
+    config: ReleaseBroadcastConfig,
+    release: &ReproductionRelease,
+) -> Result<ReleaseTransactionPlan, FactoryError> {
+    Ok(ReleaseTransactionPlan {
+        claim_id: claim_id.to_string(),
+        recipient: recipient.to_string(),
+        escrow_contract_address: escrow_contract_address.to_string(),
+        nonce,
+        calldata: encode_reproduction_release_calldata(claim_id, recipient, release)?,
         config,
     })
 }
@@ -508,6 +596,7 @@ pub fn derive_factory_evm_address_from_bytes(public_key: &[u8]) -> Result<String
 }
 
 #[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn broadcast_release_transaction(
     claim_id: &str,
     recipient: &str,
@@ -516,16 +605,39 @@ pub(crate) async fn broadcast_release_transaction(
     nonce: u64,
     now_ms: u64,
     config: &ReleaseBroadcastConfig,
+    reproduction: Option<&ReproductionRelease>,
+    refund: bool,
 ) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
     use ic_cdk::management_canister::{ecdsa_public_key, sign_with_ecdsa};
 
-    let plan = match build_release_plan(
-        claim_id,
-        recipient,
-        escrow_contract_address,
-        nonce,
-        config.clone(),
-    ) {
+    let plan_result = if refund {
+        build_refund_plan(
+            claim_id,
+            recipient,
+            escrow_contract_address,
+            nonce,
+            config.clone(),
+        )
+    } else {
+        match reproduction {
+            Some(release) => build_reproduction_release_plan(
+                claim_id,
+                recipient,
+                escrow_contract_address,
+                nonce,
+                config.clone(),
+                release,
+            ),
+            None => build_release_plan(
+                claim_id,
+                recipient,
+                escrow_contract_address,
+                nonce,
+                config.clone(),
+            ),
+        }
+    };
+    let plan = match plan_result {
         Ok(plan) => plan,
         Err(error) => {
             return Err(release_broadcast_error(
@@ -646,15 +758,42 @@ pub(crate) async fn broadcast_release_transaction(
     record.rpc_tx_hash = Some(rpc_hash.clone());
     record.broadcast_at = Some(now_ms);
 
+    let confirmed =
+        match base_rpc::eth_get_transaction_receipt_status(base_rpc_endpoints, &rpc_hash).await {
+            Ok(Some(true)) => true,
+            Ok(Some(false)) => {
+                return Err(release_broadcast_error(
+                    ReleaseBroadcastStage::ReceiptConfirmation,
+                    record,
+                    FactoryError::ManagementCallFailed {
+                        method: "eth_getTransactionReceipt".to_string(),
+                        message: "release transaction reverted".to_string(),
+                    },
+                    now_ms,
+                ));
+            }
+            Ok(None) => false,
+            Err(error) => {
+                return Err(release_broadcast_error(
+                    ReleaseBroadcastStage::ReceiptConfirmation,
+                    record,
+                    error,
+                    now_ms,
+                ));
+            }
+        };
+
     Ok(ReleaseBroadcastReceipt {
         release_tx_hash: rpc_hash,
         release_broadcast_at: now_ms,
         record,
+        confirmed,
     })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn broadcast_release_transaction(
     claim_id: &str,
     recipient: &str,
@@ -663,14 +802,36 @@ pub(crate) fn broadcast_release_transaction(
     nonce: u64,
     now_ms: u64,
     config: &ReleaseBroadcastConfig,
+    reproduction: Option<&ReproductionRelease>,
+    refund: bool,
 ) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
-    let plan = build_release_plan(
-        claim_id,
-        recipient,
-        escrow_contract_address,
-        nonce,
-        config.clone(),
-    )
+    let plan = if refund {
+        build_refund_plan(
+            claim_id,
+            recipient,
+            escrow_contract_address,
+            nonce,
+            config.clone(),
+        )
+    } else {
+        match reproduction {
+            Some(release) => build_reproduction_release_plan(
+                claim_id,
+                recipient,
+                escrow_contract_address,
+                nonce,
+                config.clone(),
+                release,
+            ),
+            None => build_release_plan(
+                claim_id,
+                recipient,
+                escrow_contract_address,
+                nonce,
+                config.clone(),
+            ),
+        }
+    }
     .map_err(|error| {
         release_broadcast_error(
             ReleaseBroadcastStage::CalldataEncoding,
@@ -758,6 +919,7 @@ pub(crate) fn broadcast_release_transaction(
         release_tx_hash: rpc_hash,
         release_broadcast_at: now_ms,
         record,
+        confirmed: true,
     })
 }
 
@@ -815,6 +977,8 @@ mod tests {
             99,
             1_234,
             &ReleaseBroadcastConfig::default(),
+            None,
+            false,
         )
         .expect_err("broadcast should fail");
 
@@ -847,6 +1011,8 @@ mod tests {
             5,
             9_876,
             &ReleaseBroadcastConfig::default(),
+            None,
+            false,
         )
         .expect("broadcast should succeed");
 
@@ -872,6 +1038,8 @@ mod tests {
             5,
             9_876,
             &ReleaseBroadcastConfig::default(),
+            None,
+            false,
         )
         .expect_err("broadcast should fail before signing");
 

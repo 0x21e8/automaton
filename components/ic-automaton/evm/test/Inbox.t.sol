@@ -109,6 +109,15 @@ contract InboxTest {
         _assertEq(automatonAddress.balance, ethAmount * 2, "second eth forward mismatch");
     }
 
+    function test_PatronageForwardsUsdcWithoutBuyingAttention() public {
+        uint256 gift = 2_250_000;
+        vm.prank(PAYER);
+        inbox.patronize(AUTOMATON, gift);
+
+        _assertEq(usdc.balanceOf(AUTOMATON), gift, "patronage was not forwarded");
+        _assertEq(uint256(inbox.nonces(AUTOMATON)), 0, "patronage must not buy a message nonce");
+    }
+
     function test_NoRegistrationRequiredForNewAutomaton() public {
         EthReceiver automaton = new EthReceiver();
         address automatonAddress = address(automaton);

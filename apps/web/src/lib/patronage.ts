@@ -2,7 +2,6 @@ import type { WalletSession } from "../wallet/useWalletSession";
 import {
   bigintToHex,
   encodeErc20ApproveData,
-  encodeErc20TransferData,
   stripHexPrefix
 } from "./wallet-transaction-helpers";
 import { requestJsonRpcResult } from "./spawn-payment";
@@ -10,6 +9,7 @@ import { requestJsonRpcResult } from "./spawn-payment";
 const MIN_PRICES_FOR_SELECTOR = "0x2bf589a9";
 const QUEUE_MESSAGE_SELECTOR = "0xdc0a1b6a";
 const QUEUE_MESSAGE_ETH_SELECTOR = "0x9f1b19ac";
+const PATRONIZE_SELECTOR = "0x4984ea4a";
 
 function encodeWord(value: bigint): string {
   return value.toString(16).padStart(64, "0");
@@ -124,6 +124,7 @@ export async function sendPaidMessage(options: {
 export async function sendDirectPatronage(options: {
   amountRaw: bigint;
   automatonAddress: string;
+  inboxAddress: string;
   usdcAddress: string;
   wallet: WalletSession;
   expectedChainId: number;
@@ -133,10 +134,18 @@ export async function sendDirectPatronage(options: {
     await options.wallet.request({ method: "wallet_switchEthereumChain", params: [{ chainId: `0x${options.expectedChainId.toString(16)}` }] });
   }
   if (options.amountRaw <= 0n) throw new Error("Enter a positive patronage amount.");
-  const data = encodeErc20TransferData(options.automatonAddress, options.amountRaw);
-  if (data === null) throw new Error("Could not encode the patronage transfer.");
+  const approval = encodeErc20ApproveData(options.inboxAddress, options.amountRaw);
+  if (approval === null) throw new Error("Could not encode the patronage approval.");
+  await options.wallet.request<string>({
+    method: "eth_sendTransaction",
+    params: [{ from: options.wallet.address, to: options.usdcAddress, data: approval }]
+  });
   return options.wallet.request<string>({
     method: "eth_sendTransaction",
-    params: [{ from: options.wallet.address, to: options.usdcAddress, data }]
+    params: [{
+      from: options.wallet.address,
+      to: options.inboxAddress,
+      data: `${PATRONIZE_SELECTOR}${encodeAddress(options.automatonAddress)}${encodeWord(options.amountRaw)}`
+    }]
   });
 }

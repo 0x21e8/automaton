@@ -4,6 +4,7 @@ import type {
   CreateSpawnSessionResponse,
   RepositoryStrategyListResponse,
   RoomMessagePage,
+  ChronicleFeed,
   SpawnSessionDetail
 } from "@ic-automaton/shared";
 
@@ -17,6 +18,16 @@ async function readErrorMessage(response: Response) {
     return payload.error ?? payload.message ?? `Request failed with ${response.status}.`;
   } catch {
     return `Request failed with ${response.status}.`;
+  }
+}
+
+export class IndexerHttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string
+  ) {
+    super(message);
+    this.name = "IndexerHttpError";
   }
 }
 
@@ -63,7 +74,7 @@ export class IndexerClient {
     });
 
     if (!response.ok) {
-      throw new Error(await readErrorMessage(response));
+      throw new IndexerHttpError(response.status, await readErrorMessage(response));
     }
 
     return (await response.json()) as T;
@@ -96,6 +107,10 @@ export class IndexerClient {
       }
     });
   }
+
+  async fetchChronicle() {
+    return this.requestJson<ChronicleFeed>("/api/chronicle");
+  }
 }
 
 export interface IndexerClientLike {
@@ -104,4 +119,5 @@ export interface IndexerClientLike {
   fetchSpawnSession(sessionId: string): Promise<SpawnSessionDetail>;
   fetchAutomatonDetail(canisterId: string): Promise<AutomatonDetail>;
   fetchRoomMessages(canisterId: string, limit?: number): Promise<RoomMessagePage>;
+  fetchChronicle?(): Promise<ChronicleFeed>;
 }

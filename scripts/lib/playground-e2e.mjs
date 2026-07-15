@@ -141,7 +141,7 @@ export function createEphemeralWallet(rootDir) {
 }
 
 export function sendContractTransaction({ rootDir, rpcUrl, privateKey, to, signature, args }) {
-  const output = runCast(rootDir, [
+  const baseArgs = [
     "send",
     "--async",
     "--rpc-url",
@@ -151,7 +151,19 @@ export function sendContractTransaction({ rootDir, rpcUrl, privateKey, to, signa
     to,
     signature,
     ...args
-  ]);
+  ];
+
+  let output;
+  try {
+    output = runCast(rootDir, baseArgs);
+  } catch (error) {
+    const message = normalizeOptionalString(error?.message) ?? "";
+    const needsLegacy = message.includes("Failed to decode transaction") || message.includes("Failed to decode raw");
+    if (!needsLegacy) {
+      throw error;
+    }
+    output = runCast(rootDir, ["send", "--legacy", ...baseArgs.slice(1)]);
+  }
   const match = output.match(/0x[a-fA-F0-9]{64}/);
   assert(match !== null, "cast send did not return a transaction hash", { output });
   return match[0];

@@ -206,9 +206,7 @@ pub(crate) fn sync_payment_poll_job_in_state(state: &mut FactoryState, now_ms: u
         .or_insert_with(|| payment_poll_job(now_ms));
 
     if !job_has_live_lease(job, now_ms) {
-        if job.next_run_at_ms.is_none() {
-            job.next_run_at_ms = Some(now_ms);
-        }
+        job.next_run_at_ms = Some(job.next_run_at_ms.unwrap_or(now_ms).min(now_ms));
         job.status = SchedulerJobStatus::Pending;
         job.leased_at_ms = None;
         job.leased_until_ms = None;

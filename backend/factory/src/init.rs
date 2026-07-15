@@ -286,7 +286,11 @@ pub fn build_automaton_install_args(
             steward_address: session.steward_address.clone(),
             session_id: session.session_id.clone(),
             parent_id: session.parent_id.clone(),
+            generation: session.generation.unwrap_or_default(),
+            memory_dowry: session.memory_dowry.clone().unwrap_or_default(),
+            inherited_strategy_stats: session.inherited_strategy_stats.clone().unwrap_or_default(),
             factory_principal,
+            evaluation_mode: child_runtime.evm_chain_id == 20_260_326,
             risk: session.config.risk,
             strategies: session.config.strategies.clone(),
             skills: session.config.skills.clone(),
@@ -443,7 +447,8 @@ mod tests {
     #[test]
     fn encodes_the_real_child_init_args_envelope() {
         crate::restore_state(Default::default());
-        let request = sample_request();
+        let mut request = sample_request();
+        request.parent_id = None;
         let config = validate_automaton_child_runtime_config(&AutomatonChildRuntimeConfig {
             ecdsa_key_name: Some(" key_1 ".to_string()),
             inbox_contract_address: Some(" 0xInbox ".to_string()),
@@ -468,6 +473,12 @@ mod tests {
             request,
             1_700_000,
             "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            crate::types::SpawnSessionOrigin::Human,
+            0,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
         )
         .expect("session should be created")
         .session;

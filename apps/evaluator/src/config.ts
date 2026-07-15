@@ -49,6 +49,15 @@ function parseOptionalString(value: string | undefined) {
   return normalized === "" ? null : normalized;
 }
 
+function inferBaseUrlFromPort(portValue: string | undefined, fallback: string) {
+  const parsedPort = Number(portValue);
+  if (!Number.isInteger(parsedPort) || parsedPort <= 0 || parsedPort > 65_535) {
+    return fallback;
+  }
+
+  return `http://127.0.0.1:${parsedPort}`;
+}
+
 export function resolveEvaluatorConfig(
   env: NodeJS.ProcessEnv = process.env,
   overrides: EvaluatorConfigOverrides = {}
@@ -66,10 +75,12 @@ export function resolveEvaluatorConfig(
     indexerBaseUrl:
       overrides.indexerBaseUrl ??
       env.PLAYGROUND_INDEXER_BASE_URL?.trim() ??
+      inferBaseUrlFromPort(env.PLAYGROUND_INDEXER_PORT, "http://127.0.0.1:3001") ??
       "http://127.0.0.1:3001",
     rpcGatewayUrl:
       overrides.rpcGatewayUrl ??
       env.PLAYGROUND_RPC_GATEWAY_URL?.trim() ??
+      inferBaseUrlFromPort(env.PLAYGROUND_RPC_GATEWAY_PORT, "http://127.0.0.1:3002") ??
       env.PLAYGROUND_PUBLIC_RPC_URL?.trim() ??
       "http://127.0.0.1:3002",
     localReplicaHost:

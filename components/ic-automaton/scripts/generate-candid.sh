@@ -26,12 +26,18 @@ else
   output_path="${repo_root}/ic-automaton.did"
 fi
 
+if [[ -f "${repo_root}/../../Cargo.toml" ]] && grep -q 'components/ic-automaton' "${repo_root}/../../Cargo.toml"; then
+  target_root="$(cd "${repo_root}/../.." && pwd)/target"
+else
+  target_root="${repo_root}/target"
+fi
+
 wasm_path=""
 for candidate in \
-  "${repo_root}/target/wasm32-wasip1/release/backend_nowasi.wasm" \
-  "${repo_root}/target/wasm32-wasip1/release/backend.wasm" \
-  "${repo_root}/target/wasm32-unknown-unknown/release/backend.wasm" \
-  "${repo_root}/target/wasm32-unknown-unknown/release/deps/backend.wasm"
+  "${target_root}/wasm32-wasip1/release/backend_nowasi.wasm" \
+  "${target_root}/wasm32-wasip1/release/backend.wasm" \
+  "${target_root}/wasm32-unknown-unknown/release/backend.wasm" \
+  "${target_root}/wasm32-unknown-unknown/release/deps/backend.wasm"
 do
   if [[ -f "${candidate}" ]]; then
     wasm_path="${candidate}"
@@ -48,4 +54,5 @@ fi
 mkdir -p "$(dirname "${output_path}")"
 candid-extractor "${wasm_path}" | sed 's/[[:space:]]*$//' > "${output_path}"
 
-echo "Generated Candid: ${output_path}"
+wasm_sha=$(shasum -a 256 "${wasm_path}" | awk '{print $1}')
+echo "Generated Candid: ${output_path} from ${wasm_path} sha256=${wasm_sha}"

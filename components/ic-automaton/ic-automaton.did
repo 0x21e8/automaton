@@ -485,6 +485,16 @@ type InferenceProxyStatusView = record {
   worker_base_url : opt text;
 };
 type InferenceTransport = variant { OpenrouterDirect; OpenrouterProxyWorker };
+type InheritedStrategyStat = record {
+  protocol : text;
+  primitive : text;
+  total_runs : nat64;
+  nondeterministic_failures : nat64;
+  template_id : text;
+  chain_id : nat64;
+  success_runs : nat64;
+  deterministic_failures : nat64;
+};
 type InitArgs = record {
   evm_chain_id : opt nat64;
   evm_confirmation_depth : opt nat64;
@@ -517,6 +527,7 @@ type MarketSynthesisBundle = record {
   warnings : vec text;
   chain_id : nat64;
 };
+type MemoryDowryFact = record { key : text; value : text };
 // A single entry in the persistent knowledge base.
 //
 // Facts are keyed by a dotted namespace path (e.g. `"balance.eth"`,
@@ -823,6 +834,7 @@ type RuntimeView = record {
   inference_provider : InferenceProvider;
   mortality : MortalityRuntime;
   evm_next_log_index : nat64;
+  lifetime_patronage_usdc_raw : text;
   turn_in_flight : bool;
   inference_model : text;
   evm_next_block : nat64;
@@ -908,11 +920,17 @@ type SourceRecord = record {
 };
 type SpawnBootstrapArgs = record {
   provider : SpawnProviderBootstrapArgs;
+  memory_dowry : vec MemoryDowryFact;
   session_id : text;
   name : opt text;
   risk : nat8;
+  generation : nat32;
   factory_principal : principal;
+  // Explicit bootstrap capability for deterministic local evaluation.
+  // Defaults to false and is never enabled for canonical public chains.
+  evaluation_mode : bool;
   parent_id : opt text;
+  inherited_strategy_stats : vec InheritedStrategyStat;
   version_commit : text;
   contract_version : opt nat16;
   constitution : opt text;
@@ -924,6 +942,7 @@ type SpawnBootstrapView = record {
   session_id : opt text;
   name : opt text;
   risk : opt nat8;
+  generation : nat32;
   factory_principal : opt principal;
   parent_id : opt text;
   version_commit : opt text;
@@ -1598,6 +1617,18 @@ service : (InitArgs) -> {
   revoke_strategy_template_admin : (StrategyTemplateKey, opt text) -> (
       Result_6,
     );
+  // Deterministic non-production entrypoint used by the generations
+  // observatory. It exercises the real reproduce tool, threshold signer,
+  // factory admission, and escrow approval/deposit path.
+  run_evaluation_reproduction : (text) -> (Result_1);
+  // Seeds one authoritative parent memory fact for the local generations
+  // observatory. The factory-only evaluation capability keeps this unavailable
+  // to public and production callers.
+  run_evaluation_seed_memory : (text, text) -> (Result_1);
+  // Non-production starvation fixture: burns all but a small reserve of this
+  // canister's cycles so the ordinary mortality scheduler observes starvation.
+  run_evaluation_starvation : () -> (Result_1);
+  run_evaluation_wallet_balance_sync : () -> (Result_1);
   // Replaces autonomy suppression policy (dedupe window + failure cooldown
   // thresholds) (controller only).
   set_autonomy_suppression_config : (AutonomySuppressionConfig) -> (Result_7);

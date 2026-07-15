@@ -34,5 +34,4 @@ pub use inference::{
 };
 pub use signer::MockSignerAdapter;
 pub use skills::DefaultSkillLoader;
-#[cfg(target_arch = "wasm32")]
 pub use threshold_signer::ThresholdSignerAdapter;

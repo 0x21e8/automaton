@@ -1790,6 +1790,7 @@ mod tests {
             constitution: None,
             session_id: None,
             parent_id: None,
+            generation: 0,
             factory_principal: None,
             risk: None,
             strategies: Vec::new(),

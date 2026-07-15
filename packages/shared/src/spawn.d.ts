@@ -86,6 +86,9 @@ export interface SpawnSession {
     releaseTxHash: string | null;
     releaseBroadcastAt: number | null;
     parentId: string | null;
+    origin?: "human" | { reproductionOf: string };
+    generation?: number;
+    parentConstitutionHash?: string | null;
     childIds: string[];
     config: SpawnConfig;
     createdAt: number;
@@ -117,6 +120,7 @@ export interface RefundSpawnResponse {
     state: SpawnSessionState;
     paymentStatus: PaymentStatus;
     refundedAt: number;
+    refundTxHash?: string;
 }
 export interface SessionAuditEntry {
     sessionId: string;
@@ -153,6 +157,8 @@ export interface SpawnedAutomatonRecord {
     chain: SpawnChain;
     sessionId: string;
     parentId: string | null;
+    generation?: number;
+    parentConstitutionHash?: string | null;
     childIds: string[];
     createdAt: number;
     versionCommit: string;

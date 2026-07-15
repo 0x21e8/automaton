@@ -5,15 +5,12 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { IDL } from "@dfinity/candid";
-import { resolveAutomatonComponentRoot } from "./resolve-automaton-component.mjs";
-
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tmpDir = path.join(rootDir, "tmp");
 const canister = process.env.FACTORY_CANISTER ?? "factory";
 const environment = process.env.FACTORY_ENVIRONMENT ?? "local";
-const componentRoot = resolveAutomatonComponentRoot();
 const wasmPath = process.env.CHILD_WASM_PATH ??
-  path.join(componentRoot, "target", "wasm32-wasip1", "release", "backend_nowasi.wasm");
+  path.join(rootDir, "target", "wasm32-wasip1", "release", "backend_nowasi.wasm");
 const chunkSizeBytes = Number.parseInt(
   process.env.FACTORY_ARTIFACT_CHUNK_SIZE_BYTES ?? `${512 * 1024}`,
   10
@@ -50,17 +47,11 @@ function resolveVersionCommit() {
     return normalizeCommit(process.env.FACTORY_VERSION_COMMIT);
   }
 
-  if (componentRoot) {
-    const head = execFileSync("git", ["-C", componentRoot, "rev-parse", "HEAD"], {
-      cwd: rootDir,
-      encoding: "utf8"
-    }).trim();
-    return normalizeCommit(head);
-  }
-
-  throw new Error(
-    "CHILD_VERSION_COMMIT or FACTORY_VERSION_COMMIT is required"
-  );
+  const head = execFileSync("git", ["-C", rootDir, "rev-parse", "HEAD"], {
+    cwd: rootDir,
+    encoding: "utf8"
+  }).trim();
+  return normalizeCommit(head);
 }
 
 const versionCommit = resolveVersionCommit();

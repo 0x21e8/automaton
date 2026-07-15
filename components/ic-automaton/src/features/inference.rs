@@ -1199,6 +1199,16 @@ fn ic_llm_tools() -> Vec<IcLlmTool> {
             ]), required: Some(vec!["peer_canister_id".to_string(), "asset".to_string(), "amount_raw".to_string(), "promise".to_string()]) }),
         }),
         IcLlmTool::Function(IcLlmFunction {
+            name: "reproduce".to_string(),
+            description: Some("Create a sovereign child only when I have durable surplus. I must author a specific bounded mutation of my immutable constitution (maximum 20% edit distance), pay the factory reproduction fee, and endow the child from my own USDC while retaining the terminal reserve. A memory dowry may contain only selected hard facts; inherited strategy statistics are evidence, not opinions. The factory independently enforces age, cooldown, funds, mutation, and registered-caller eligibility.".to_string()),
+            parameters: Some(IcLlmParameters { type_: "object".to_string(), properties: Some(vec![
+                IcLlmProperty { type_: "string".to_string(), name: "name".to_string(), description: Some("Child name.".to_string()), enum_values: None },
+                IcLlmProperty { type_: "string".to_string(), name: "child_constitution".to_string(), description: Some("Complete 400-8000 character child constitution, recognizably inherited but not genericized.".to_string()), enum_values: None },
+                IcLlmProperty { type_: "string".to_string(), name: "gross_amount".to_string(), description: Some("Raw six-decimal USDC covering factory fee, creation cost, and minimum child endowment.".to_string()), enum_values: None },
+                IcLlmProperty { type_: "array".to_string(), name: "memory_dowry_keys".to_string(), description: Some("Optional bounded array of existing memory fact keys (maximum 16). Values are resolved from authoritative memory; they cannot be supplied here. Strategy outcome evidence is copied automatically from the authoritative outcome store.".to_string()), enum_values: None },
+            ]), required: Some(vec!["name".to_string(), "child_constitution".to_string(), "gross_amount".to_string()]) }),
+        }),
+        IcLlmTool::Function(IcLlmFunction {
             name: "set_min_prices".to_string(),
             description: Some("Set my own minimum USDC and ETH prices for paid Inbox attention. Amounts are raw decimal units; the runtime selects the configured Inbox and signs the transaction.".to_string()),
             parameters: Some(IcLlmParameters {
@@ -2106,7 +2116,12 @@ fn ic_llm_tools_with_capabilities_and_scope(
         tools.retain(|tool| {
             !matches!(
                 ic_llm_tool_name(tool),
-                "evm_read" | "send_eth" | "pay_peer" | "set_min_prices" | "execute_strategy_action"
+                "evm_read"
+                    | "send_eth"
+                    | "pay_peer"
+                    | "reproduce"
+                    | "set_min_prices"
+                    | "execute_strategy_action"
             )
         });
     }
@@ -3394,6 +3409,7 @@ fn build_openrouter_request_body_with_transcript_capabilities(
                         "evm_read"
                             | "send_eth"
                             | "pay_peer"
+                            | "reproduce"
                             | "set_min_prices"
                             | "execute_strategy_action"
                     )

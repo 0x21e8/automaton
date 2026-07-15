@@ -19,6 +19,14 @@ export interface ChronicleDay {
   date: string;
   generatedAt: number;
   entries: ChronicleEntry[];
+  population?: {
+    living: number;
+    births: number;
+    deaths: number;
+    medianRunwaySeconds: number | null;
+    patronageUsdcRawPerLiving: string;
+    positiveInflowUsdcRawPerLiving: string;
+  };
 }
 
 export interface ChronicleFeed {

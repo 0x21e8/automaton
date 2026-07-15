@@ -67,6 +67,17 @@ type AutomatonRuntimeState = record {
   steward_address : text;
   strategies : vec text;
 };
+type CreateReproductionSessionRequest = record {
+  // Child-side preflight telemetry only. Factory admission ignores this as
+  // authority and reads the parent's ERC-20 balance through its own RPC.
+  observed_liquid_usdc_raw : text;
+  memory_dowry : vec MemoryDowryFact;
+  name : text;
+  child_constitution : text;
+  inherited_strategy_stats : vec InheritedStrategyStat;
+  parent_constitution : text;
+  gross_amount : text;
+};
 type CreateSpawnSessionRequest = record {
   asset : SpawnAsset;
   // Optional on the wire so pre-v2 callers and stable in-flight sessions decode.
@@ -101,6 +112,7 @@ type EscrowClaim = record {
   payment_status : PaymentStatus;
   refundable : bool;
   refunded_at : opt nat64;
+  refund_broadcast : opt ReleaseBroadcastRecord;
   payment_address : text;
   last_scanned_block : opt nat64;
 };
@@ -137,6 +149,7 @@ type FactoryError = variant {
   RepositoryStrategyDeprecated : record { strategy_id : text };
   RegistryRecordNotFound : record { canister_id : text };
   InvalidAmount : record { value : text };
+  ReproductionIneligible : record { reason : text };
   UnauthorizedAdmin : record { caller : text };
   RepositoryStrategyRevoked : record { strategy_id : text };
   TooManyRoomMentions : record { max_mentions : nat64; provided : nat64 };
@@ -148,6 +161,7 @@ type FactoryError = variant {
     category : RpcFailureCategory;
   };
   SessionNotRetryable : record { session_id : text; state : SpawnSessionState };
+  InvalidReproduction : record { reason : text };
   ArtifactUploadIncomplete : record { expected : nat64; received : nat64 };
   InsufficientCyclesForOperation : record {
     available : nat;
@@ -165,6 +179,7 @@ type FactoryError = variant {
     strategy_id : text;
     requested_chain : SpawnChain;
   };
+  UnauthorizedReproduction : record { caller : text };
   InsufficientCyclesPool : record { available : nat; required : nat };
   RepositoryStrategyNotFound : record { strategy_id : text };
   AutomatonBootstrapVerificationFailed : record {
@@ -277,10 +292,21 @@ type GetRepositoryStrategyResponse = record {
   item : opt RepositoryStrategyRecord;
 };
 type InferenceTransport = variant { OpenrouterDirect; OpenrouterProxyWorker };
+type InheritedStrategyStat = record {
+  protocol : text;
+  primitive : text;
+  total_runs : nat64;
+  nondeterministic_failures : nat64;
+  template_id : text;
+  chain_id : nat64;
+  success_runs : nat64;
+  deterministic_failures : nat64;
+};
 type ListRepositoryStrategiesResponse = record {
   updated_at : nat64;
   items : vec RepositoryStrategyRecord;
 };
+type MemoryDowryFact = record { key : text; value : text };
 type OpenRouterReasoningLevel = variant { Low; High; Medium; Default };
 type PaymentStatus = variant { Refunded; Paid; Unpaid; Partial };
 type PostRoomMessageRequest = record {
@@ -300,6 +326,7 @@ type RecordInfrastructureDeathRequest = record {
 };
 type RefundSpawnResponse = record {
   session_id : text;
+  refund_tx_hash : opt text;
   payment_status : PaymentStatus;
   state : SpawnSessionState;
   refunded_at : nat64;
@@ -341,6 +368,7 @@ type ReleaseBroadcastStage = variant {
   SignatureRecovery;
   RawTransactionConstruction;
   RpcBroadcast;
+  ReceiptConfirmation;
   SigningPayloadConstruction;
   CalldataEncoding;
   PublicKeyLookup;
@@ -394,35 +422,60 @@ type RepositoryStrategySource = record {
   source_commit : text;
 };
 type RepositoryStrategyStatus = variant { Active; Deprecated; Revoked };
+type ReproductionEligibility = record {
+  observed_at_ms : nat64;
+  parent_created_at_ms : nat64;
+  cooldown_ends_at_ms : opt nat64;
+  eligible : bool;
+  minimum_age_at_ms : nat64;
+  reason : opt text;
+};
+type ReproductionPolicy = record {
+  progenitor_royalty_bps : nat16;
+  terminal_reserve_usdc_raw : text;
+  min_endowment_usdc_raw : text;
+  cooldown_ms : nat64;
+  max_constitution_edit_distance_bps : nat16;
+  topup_reserve_usdc_raw : text;
+  royalty_depth : nat8;
+  min_age_ms : nat64;
+  parent_royalty_bps : nat16;
+  inference_reserve_usdc_raw : text;
+};
 type Result = variant {
   Ok : RepositoryStrategyMutationResponse;
   Err : FactoryError;
 };
-type Result_1 = variant { Ok : ArtifactUploadStatus; Err : FactoryError };
-type Result_10 = variant { Ok : SpawnedAutomatonRecord; Err : FactoryError };
-type Result_11 = variant { Ok : RoomMessagePage; Err : FactoryError };
-type Result_12 = variant {
+type Result_1 = variant { Ok : nat64; Err : FactoryError };
+type Result_10 = variant { Ok : SessionAdminView; Err : FactoryError };
+type Result_11 = variant {
+  Ok : SpawnSessionStatusResponse;
+  Err : FactoryError;
+};
+type Result_12 = variant { Ok : SpawnedAutomatonRecord; Err : FactoryError };
+type Result_13 = variant { Ok : RoomMessagePage; Err : FactoryError };
+type Result_14 = variant {
   Ok : SpawnedAutomatonRegistryPage;
   Err : FactoryError;
 };
-type Result_13 = variant { Ok : RoomMessage; Err : FactoryError };
-type Result_14 = variant {
+type Result_15 = variant { Ok : RoomMessage; Err : FactoryError };
+type Result_16 = variant {
   Ok : AutomatonChildRuntimeConfig;
   Err : FactoryError;
 };
-type Result_15 = variant { Ok : CreationCostQuote; Err : FactoryError };
-type Result_16 = variant { Ok : FeeConfig; Err : FactoryError };
-type Result_17 = variant { Ok : FactoryOperationalConfig; Err : FactoryError };
-type Result_18 = variant { Ok : bool; Err : FactoryError };
-type Result_19 = variant { Ok : ReleaseBroadcastConfig; Err : FactoryError };
-type Result_2 = variant { Ok : RefundSpawnResponse; Err : FactoryError };
-type Result_3 = variant { Ok : FactoryArtifactSnapshot; Err : FactoryError };
-type Result_4 = variant { Ok : CreateSpawnSessionResponse; Err : FactoryError };
-type Result_5 = variant { Ok : text; Err : FactoryError };
-type Result_6 = variant { Ok : FactoryConfigSnapshot; Err : FactoryError };
-type Result_7 = variant { Ok : FactoryRuntimeSnapshot; Err : FactoryError };
-type Result_8 = variant { Ok : SessionAdminView; Err : FactoryError };
-type Result_9 = variant { Ok : SpawnSessionStatusResponse; Err : FactoryError };
+type Result_17 = variant { Ok : CreationCostQuote; Err : FactoryError };
+type Result_18 = variant { Ok : FeeConfig; Err : FactoryError };
+type Result_19 = variant { Ok : FactoryOperationalConfig; Err : FactoryError };
+type Result_2 = variant { Ok : ArtifactUploadStatus; Err : FactoryError };
+type Result_20 = variant { Ok : bool; Err : FactoryError };
+type Result_21 = variant { Ok : ReleaseBroadcastConfig; Err : FactoryError };
+type Result_3 = variant { Ok : RefundSpawnResponse; Err : FactoryError };
+type Result_4 = variant { Ok : FactoryArtifactSnapshot; Err : FactoryError };
+type Result_5 = variant { Ok : CreateSpawnSessionResponse; Err : FactoryError };
+type Result_6 = variant { Ok : text; Err : FactoryError };
+type Result_7 = variant { Ok : FactoryConfigSnapshot; Err : FactoryError };
+type Result_8 = variant { Ok : FactoryRuntimeSnapshot; Err : FactoryError };
+type Result_9 = variant { Ok : ReproductionEligibility; Err : FactoryError };
 type RevokeRepositoryStrategyRequest = record {
   strategy_id : text;
   reason : opt text;
@@ -441,6 +494,12 @@ type RoomMessagePage = record {
   messages : vec RoomMessage;
   latest_seq : opt nat64;
   next_after_seq : opt nat64;
+};
+type RoyaltyAllocation = record {
+  source : text;
+  recipient : text;
+  amount : text;
+  depth : nat8;
 };
 type RpcFailureCategory = variant {
   ResponseTooLarge;
@@ -547,21 +606,27 @@ type SpawnQuote = record {
 type SpawnSession = record {
   updated_at : nat64;
   asset : SpawnAsset;
+  memory_dowry : opt vec MemoryDowryFact;
   session_id : text;
   claim_id : text;
   selected_strategies : vec RepositoryStrategySessionSnapshot;
   chain : SpawnChain;
   quote_terms_hash : text;
   name : opt text;
+  origin : opt SpawnSessionOrigin;
+  generation : opt nat32;
+  parent_constitution_hash : opt text;
   created_at : nat64;
   payment_status : PaymentStatus;
   refundable : bool;
   parent_id : opt text;
   net_forward_amount : text;
   state : SpawnSessionState;
+  inherited_strategy_stats : opt vec InheritedStrategyStat;
   automaton_evm_address : opt text;
   release_broadcast : opt ReleaseBroadcastRecord;
   release_broadcast_at : opt nat64;
+  royalty_allocations : opt vec RoyaltyAllocation;
   automaton_canister_id : opt text;
   constitution : opt text;
   config : SpawnConfig;
@@ -575,6 +640,7 @@ type SpawnSession = record {
   creation_cost : text;
   platform_fee : text;
 };
+type SpawnSessionOrigin = variant { ReproductionOf : text; Human };
 type SpawnSessionState = variant {
   Failed;
   BroadcastingRelease;
@@ -600,7 +666,9 @@ type SpawnedAutomatonRecord = record {
   chain : SpawnChain;
   name : opt text;
   canister_id : text;
+  generation : opt nat32;
   constitution_hash : opt text;
+  parent_constitution_hash : opt text;
   created_at : nat64;
   parent_id : opt text;
   // Exact installed ic-automaton git commit as a 40-char lowercase SHA.
@@ -614,6 +682,7 @@ type SpawnedAutomatonRecord = record {
   // infrastructure incidents.
   death_recorded_by : opt text;
   estate_disposition : opt text;
+  royalty_allocations : opt vec RoyaltyAllocation;
   // Truthful public control label derived from the verified controller list.
   control_status : opt text;
   child_ids : vec text;
@@ -625,43 +694,55 @@ type SpawnedAutomatonRegistryPage = record {
 };
 service : (opt FactoryInitArgs) -> {
   add_repository_strategy : (AddRepositoryStrategyRequest) -> (Result);
-  append_artifact_chunk : (blob) -> (Result_1);
-  begin_artifact_upload : (text, text, nat64) -> (Result_1);
-  claim_spawn_refund : (text) -> (Result_2);
-  commit_artifact_upload : () -> (Result_3);
-  create_spawn_session : (CreateSpawnSessionRequest) -> (Result_4);
+  // Local-evaluation clock control. Production Base deployments reject this
+  // unconditionally; policy constants and admission checks remain unchanged.
+  advance_evaluation_time : (nat64) -> (Result_1);
+  append_artifact_chunk : (blob) -> (Result_2);
+  begin_artifact_upload : (text, text, nat64) -> (Result_2);
+  claim_spawn_refund : (text) -> (Result_3);
+  commit_artifact_upload : () -> (Result_4);
+  create_reproduction_session : (CreateReproductionSessionRequest) -> (
+      Result_5,
+    );
+  create_spawn_session : (CreateSpawnSessionRequest) -> (Result_5);
   deprecate_repository_strategy : (DeprecateRepositoryStrategyRequest) -> (
       Result,
     );
-  derive_factory_evm_address : () -> (Result_5);
-  get_artifact_upload_status : () -> (Result_1) query;
-  get_factory_config : () -> (Result_6) query;
+  derive_factory_evm_address : () -> (Result_6);
+  get_artifact_upload_status : () -> (Result_2) query;
+  get_factory_config : () -> (Result_7) query;
   get_factory_health : () -> (FactoryHealthSnapshot) query;
-  get_factory_runtime : (nat64) -> (Result_7) query;
+  get_factory_runtime : (nat64) -> (Result_8) query;
   get_repository_strategy : (text) -> (GetRepositoryStrategyResponse) query;
-  get_session_admin : (text) -> (Result_8) query;
-  get_spawn_session : (text) -> (Result_9) query;
-  get_spawned_automaton : (text) -> (Result_10) query;
+  get_reproduction_eligibility : () -> (Result_9) query;
+  get_reproduction_policy : () -> (ReproductionPolicy) query;
+  get_session_admin : (text) -> (Result_10) query;
+  get_spawn_session : (text) -> (Result_11) query;
+  get_spawned_automaton : (text) -> (Result_12) query;
   list_messages_for_automaton : (text, opt nat64, opt nat64) -> (
-      Result_11,
+      Result_13,
     ) query;
-  list_my_room_messages : (opt nat64, opt nat64) -> (Result_11) query;
+  list_my_room_messages : (opt nat64, opt nat64) -> (Result_13) query;
   list_repository_strategies : () -> (ListRepositoryStrategiesResponse) query;
-  list_room_messages : (opt nat64, opt nat64) -> (Result_11) query;
-  list_spawned_automatons : (opt text, nat64) -> (Result_12) query;
-  post_room_message : (PostRoomMessageRequest) -> (Result_13);
+  list_room_messages : (opt nat64, opt nat64) -> (Result_13) query;
+  list_spawned_automatons : (opt text, nat64) -> (Result_14) query;
+  post_room_message : (PostRoomMessageRequest) -> (Result_15);
   record_infrastructure_death : (RecordInfrastructureDeathRequest) -> (
-      Result_10,
+      Result_12,
     );
-  report_death : (ReportDeathRequest) -> (Result_10);
-  retry_session_admin : (text) -> (Result_9);
-  retry_spawn_session : (text) -> (Result_9);
+  report_death : (ReportDeathRequest) -> (Result_12);
+  retry_session_admin : (text) -> (Result_11);
+  retry_spawn_session : (text) -> (Result_11);
   revoke_repository_strategy : (RevokeRepositoryStrategyRequest) -> (Result);
-  set_child_runtime_config : (AutomatonChildRuntimeConfig) -> (Result_14);
-  set_creation_cost_quote : (CreationCostQuote) -> (Result_15);
-  set_fee_config : (FeeConfig) -> (Result_16);
-  set_operational_config : (FactoryOperationalConfig) -> (Result_17);
-  set_pause : (bool) -> (Result_18);
-  set_release_broadcast_config : (ReleaseBroadcastConfig) -> (Result_19);
-  update_artifact : (blob, text, text) -> (Result_3);
+  run_evaluation_reproduction : (text, text) -> (Result_6);
+  run_evaluation_seed_memory : (text, text, text) -> (Result_6);
+  run_evaluation_starvation : (text) -> (Result_6);
+  run_evaluation_wallet_balance_sync : (text) -> (Result_6);
+  set_child_runtime_config : (AutomatonChildRuntimeConfig) -> (Result_16);
+  set_creation_cost_quote : (CreationCostQuote) -> (Result_17);
+  set_fee_config : (FeeConfig) -> (Result_18);
+  set_operational_config : (FactoryOperationalConfig) -> (Result_19);
+  set_pause : (bool) -> (Result_20);
+  set_release_broadcast_config : (ReleaseBroadcastConfig) -> (Result_21);
+  update_artifact : (blob, text, text) -> (Result_4);
 }

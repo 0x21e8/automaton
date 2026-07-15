@@ -18,6 +18,10 @@ import type {
 } from "../types.js";
 import { loadExperimentFile } from "../lib/experiment.js";
 import { evaluateDieWellAssertions, isDieWellExperiment } from "../lib/mortality-assertions.js";
+import { buildFitnessObservatory } from "../lib/fitness-observatory.js";
+import { executeGenerationScenario } from "../lib/generation-scenario.js";
+import type { GenerationScenario, GenerationScenarioDriver } from "../lib/generation-scenario.js";
+import { PlaygroundGenerationScenarioDriver } from "../lib/playground-generation-driver.js";
 import {
   assessComparisonValidity,
   buildDashboardAutomatons,
@@ -347,6 +351,21 @@ export class RunController {
           runState: run.metadata.runState
         }
       });
+
+      const generationScenario = (run.experiment as typeof run.experiment & { generationScenario?: GenerationScenario | null }).generationScenario ?? null;
+      if (generationScenario !== null) {
+        const driver = (this.deps as RunControllerDependencies & { generationScenarioDriver?: GenerationScenarioDriver }).generationScenarioDriver ??
+          new PlaygroundGenerationScenarioDriver(this.deps.config.repoRoot, runtime, this.deps.indexerClient);
+        const fleet = new Map<string, string>();
+        for (const [id, automaton] of run.automatons) {
+          if (automaton.canisterId !== null) fleet.set(id, automaton.canisterId);
+        }
+        const generationResult = await executeGenerationScenario(generationScenario, driver, fleet);
+        await this.deps.artifacts.writeGenerationScenario(run.artifacts, generationResult);
+        await this.sampleFleet(runtime);
+        await this.finalizeRun("completed");
+        return;
+      }
 
       const deadline = run.metadata.startedAt + run.experiment.parsed.maxRuntimeMinutes * 60_000;
       const samplingDelay = run.experiment.parsed.samplingIntervalSeconds * 1_000;
@@ -724,6 +743,13 @@ export class RunController {
     run.comparisonValid = comparisonAssessment.valid;
 
     const summary = buildSummary(run, comparisonAssessment.valid);
+    const initialCanisterIds = [...run.automatons.values()]
+      .filter((automaton) => automaton.spawnSucceeded && automaton.canisterId !== null)
+      .map((automaton) => automaton.canisterId!)
+      .filter((canisterId, index, all) => all.indexOf(canisterId) === index);
+    const successfulDetails = await this.fetchAutomatonLineage(initialCanisterIds);
+    const chronicle = await this.deps.indexerClient.fetchChronicle?.().catch(() => null) ?? null;
+    Object.assign(summary, { fitnessObservatory: buildFitnessObservatory(successfulDetails, chronicle) });
     const report = buildReportMetadata(run, summary, comparisonAssessment.reason);
     run.report = report;
     const markdown = renderMarkdownReport(run.metadata, report, summary);
@@ -750,6 +776,40 @@ export class RunController {
       report,
       summary
     };
+  }
+
+  private async fetchAutomatonLineage(canisterIds: string[]) {
+    const detailById = new Map<string, Awaited<ReturnType<RunControllerDependencies["indexerClient"]["fetchAutomatonDetail"]>>>();
+    const queue = [...canisterIds];
+    const visited = new Set<string>();
+
+    while (queue.length > 0) {
+      const canisterId = queue.shift();
+      if (canisterId === undefined || visited.has(canisterId)) {
+        continue;
+      }
+      visited.add(canisterId);
+
+      const detail = await this.deps.indexerClient.fetchAutomatonDetail(canisterId).catch((error) => {
+        this.deps.logger.warn(
+          { err: error, canisterId },
+          "failed to fetch automaton detail for lineaged observatory"
+        );
+        return null;
+      });
+      if (detail === null) {
+        continue;
+      }
+
+      detailById.set(canisterId, detail);
+      for (const childId of detail.childIds ?? []) {
+        if (!visited.has(childId)) {
+          queue.push(childId);
+        }
+      }
+    }
+
+    return [...detailById.values()];
   }
 
   private async persistManifest() {

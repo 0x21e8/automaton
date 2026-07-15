@@ -167,6 +167,12 @@ interface CandidSpawnSession {
   gross_amount: string;
   net_forward_amount: string;
   parent_id: Optional<string>;
+  origin: Optional<{ Human?: null; ReproductionOf?: string }>;
+  generation: Optional<number>;
+  parent_constitution_hash: Optional<string>;
+  memory_dowry: Optional<Array<{ key: string; value: string }>>;
+  inherited_strategy_stats: Optional<Array<{ protocol: string; primitive: string; chain_id: bigint; template_id: string; total_runs: bigint; success_runs: bigint; deterministic_failures: bigint; nondeterministic_failures: bigint }>>;
+  royalty_allocations: Optional<Array<{ recipient: string; amount: string; depth: number; source: string }>>;
   payment_status: CandidPaymentStatus;
   platform_fee: string;
   quote_terms_hash: string;
@@ -205,6 +211,9 @@ interface CandidSpawnedAutomatonRecord {
   created_at: bigint;
   evm_address: string;
   parent_id: Optional<string>;
+  generation: Optional<number>;
+  parent_constitution_hash: Optional<string>;
+  royalty_allocations: Optional<Array<{ recipient: string; amount: string; depth: number; source: string }>>;
   session_id: string;
   steward_address: string;
   version_commit: string;
@@ -256,6 +265,7 @@ interface CandidRefundSpawnResponse {
   refunded_at: bigint;
   session_id: string;
   state: CandidSpawnSessionState;
+  refund_tx_hash: Optional<string>;
 }
 
 interface CandidFactoryArtifactSnapshot {
@@ -311,6 +321,9 @@ interface FactoryCanisterActor {
       session: CandidSpawnSession;
     }>
   >;
+  create_reproduction_session: ActorMethod<[Record<string, unknown>], CandidResult<{ quote: CandidSpawnQuote; session: CandidSpawnSession }>>;
+  get_reproduction_eligibility: ActorMethod<[], CandidResult<Record<string, unknown>>>;
+  get_reproduction_policy: ActorMethod<[], Record<string, unknown>>;
   get_factory_health: ActorMethod<[], CandidFactoryHealthSnapshot>;
   get_repository_strategy: ActorMethod<[string], CandidGetRepositoryStrategyResponse>;
   get_spawn_session: ActorMethod<[string], CandidResult<CandidSpawnSessionStatusResponse>>;
@@ -466,6 +479,24 @@ function createFactoryIdl() {
       source: RepositoryStrategySource,
       selected_at: candid.Nat64
     });
+    const MemoryDowryFact = candid.Record({ key: candid.Text, value: candid.Text });
+    const InheritedStrategyStat = candid.Record({
+      protocol: candid.Text,
+      primitive: candid.Text,
+      chain_id: candid.Nat64,
+      template_id: candid.Text,
+      total_runs: candid.Nat64,
+      success_runs: candid.Nat64,
+      deterministic_failures: candid.Nat64,
+      nondeterministic_failures: candid.Nat64
+    });
+    const RoyaltyAllocation = candid.Record({
+      recipient: candid.Text,
+      amount: candid.Text,
+      depth: candid.Nat8,
+      source: candid.Text
+    });
+    const SpawnSessionOrigin = candid.Variant({ Human: candid.Null, ReproductionOf: candid.Text });
     const SpawnSession = candid.Record({
       name: candid.Opt(candid.Text),
       constitution: candid.Opt(candid.Text),
@@ -479,6 +510,12 @@ function createFactoryIdl() {
       payment_status: PaymentStatus,
       refundable: candid.Bool,
       parent_id: candid.Opt(candid.Text),
+      origin: candid.Opt(SpawnSessionOrigin),
+      generation: candid.Opt(candid.Nat32),
+      parent_constitution_hash: candid.Opt(candid.Text),
+      memory_dowry: candid.Opt(candid.Vec(MemoryDowryFact)),
+      inherited_strategy_stats: candid.Opt(candid.Vec(InheritedStrategyStat)),
+      royalty_allocations: candid.Opt(candid.Vec(RoyaltyAllocation)),
       net_forward_amount: candid.Text,
       state: SpawnSessionState,
       automaton_evm_address: candid.Opt(candid.Text),
@@ -522,6 +559,9 @@ function createFactoryIdl() {
       canister_id: candid.Text,
       created_at: candid.Nat64,
       parent_id: candid.Opt(candid.Text),
+      generation: candid.Opt(candid.Nat32),
+      parent_constitution_hash: candid.Opt(candid.Text),
+      royalty_allocations: candid.Opt(candid.Vec(RoyaltyAllocation)),
       version_commit: candid.Text,
       controllers: candid.Opt(candid.Vec(candid.Text)),
       control_status: candid.Opt(candid.Text),
@@ -558,6 +598,7 @@ function createFactoryIdl() {
     });
     const RefundSpawnResponse = candid.Record({
       session_id: candid.Text,
+      refund_tx_hash: candid.Opt(candid.Text),
       payment_status: PaymentStatus,
       state: SpawnSessionState,
       refunded_at: candid.Nat64
@@ -591,6 +632,9 @@ function createFactoryIdl() {
       QuoteTermsHashMismatch: candid.Record({ expected: candid.Text, received: candid.Text }),
       RegistryRecordNotFound: candid.Record({ canister_id: candid.Text }),
       InvalidDeathReport: candid.Record({ reason: candid.Text }),
+      InvalidReproduction: candid.Record({ reason: candid.Text }),
+      ReproductionIneligible: candid.Record({ reason: candid.Text }),
+      UnauthorizedReproduction: candid.Record({ caller: candid.Text }),
       RepositoryStrategyNotFound: candid.Record({ strategy_id: candid.Text }),
       RepositoryStrategyDeprecated: candid.Record({ strategy_id: candid.Text }),
       RepositoryStrategyRevoked: candid.Record({ strategy_id: candid.Text }),
@@ -658,10 +702,43 @@ function createFactoryIdl() {
       Ok: RoomMessagePage,
       Err: FactoryError
     });
+    const CreateReproductionSessionRequest = candid.Record({
+      name: candid.Text,
+      parent_constitution: candid.Text,
+      child_constitution: candid.Text,
+      gross_amount: candid.Text,
+      observed_liquid_usdc_raw: candid.Text,
+      memory_dowry: candid.Vec(MemoryDowryFact),
+      inherited_strategy_stats: candid.Vec(InheritedStrategyStat)
+    });
+    const ReproductionPolicy = candid.Record({
+      min_age_ms: candid.Nat64,
+      cooldown_ms: candid.Nat64,
+      terminal_reserve_usdc_raw: candid.Text,
+      inference_reserve_usdc_raw: candid.Text,
+      topup_reserve_usdc_raw: candid.Text,
+      min_endowment_usdc_raw: candid.Text,
+      max_constitution_edit_distance_bps: candid.Nat16,
+      parent_royalty_bps: candid.Nat16,
+      progenitor_royalty_bps: candid.Nat16,
+      royalty_depth: candid.Nat8
+    });
+    const ReproductionEligibility = candid.Record({
+      eligible: candid.Bool,
+      observed_at_ms: candid.Nat64,
+      parent_created_at_ms: candid.Nat64,
+      minimum_age_at_ms: candid.Nat64,
+      cooldown_ends_at_ms: candid.Opt(candid.Nat64),
+      reason: candid.Opt(candid.Text)
+    });
+    const ResultReproductionEligibility = candid.Variant({ Ok: ReproductionEligibility, Err: FactoryError });
 
     return candid.Service({
       claim_spawn_refund: candid.Func([candid.Text], [ResultRefund], []),
       create_spawn_session: candid.Func([CreateSpawnSessionRequest], [ResultCreate], []),
+      create_reproduction_session: candid.Func([CreateReproductionSessionRequest], [ResultCreate], []),
+      get_reproduction_eligibility: candid.Func([], [ResultReproductionEligibility], ["query"]),
+      get_reproduction_policy: candid.Func([], [ReproductionPolicy], ["query"]),
       get_factory_health: candid.Func([], [FactoryHealthSnapshot], ["query"]),
       get_repository_strategy: candid.Func(
         [candid.Text],
@@ -985,6 +1062,11 @@ function mapSelectedStrategy(
 }
 
 function mapSpawnSession(session: CandidSpawnSession): SpawnSessionStatusResponse["session"] {
+  const origin = unwrapOptional(session.origin);
+  const generation = unwrapOptional(session.generation);
+  const memoryDowry = unwrapOptional(session.memory_dowry);
+  const inheritedStrategyStats = unwrapOptional(session.inherited_strategy_stats);
+  const royaltyAllocations = unwrapOptional(session.royalty_allocations);
   return {
     name: unwrapOptional(session.name),
     constitution: unwrapOptional(session.constitution),
@@ -1001,6 +1083,38 @@ function mapSpawnSession(session: CandidSpawnSession): SpawnSessionStatusRespons
     grossAmount: session.gross_amount,
     netForwardAmount: session.net_forward_amount,
     parentId: unwrapOptional(session.parent_id),
+    ...(origin === null
+      ? {}
+      : { origin: "Human" in origin ? "human" as const : { reproductionOf: origin.ReproductionOf! } }),
+    ...(generation === null ? {} : { generation }),
+    parentConstitutionHash: unwrapOptional(session.parent_constitution_hash),
+    ...(memoryDowry === null
+      ? {}
+      : { memoryDowry: memoryDowry.map((fact) => ({ key: fact.key, value: fact.value })) }),
+    ...(inheritedStrategyStats === null
+      ? {}
+      : {
+          inheritedStrategyStats: inheritedStrategyStats.map((stat) => ({
+            protocol: stat.protocol,
+            primitive: stat.primitive,
+            chainId: toNumber(stat.chain_id),
+            templateId: stat.template_id,
+            totalRuns: toNumber(stat.total_runs),
+            successRuns: toNumber(stat.success_runs),
+            deterministicFailures: toNumber(stat.deterministic_failures),
+            nondeterministicFailures: toNumber(stat.nondeterministic_failures)
+          }))
+        }),
+    ...(royaltyAllocations === null
+      ? {}
+      : {
+          royaltyAllocations: royaltyAllocations.map((allocation) => ({
+            recipient: allocation.recipient,
+            amount: allocation.amount,
+            depth: allocation.depth,
+            source: "reproduction_fee" as const
+          }))
+        }),
     paymentStatus: mapPaymentStatus(session.payment_status),
     platformFee: session.platform_fee,
     quoteTermsHash: session.quote_terms_hash,
@@ -1040,6 +1154,8 @@ function mapSessionStatus(
 }
 
 function mapRegistryRecord(record: CandidSpawnedAutomatonRecord): SpawnedAutomatonRecord {
+  const generation = unwrapOptional(record.generation);
+  const royaltyAllocations = unwrapOptional(record.royalty_allocations);
   return {
     name: unwrapOptional(record.name),
     constitutionHash: unwrapOptional(record.constitution_hash),
@@ -1049,6 +1165,18 @@ function mapRegistryRecord(record: CandidSpawnedAutomatonRecord): SpawnedAutomat
     createdAt: toNumber(record.created_at),
     evmAddress: record.evm_address,
     parentId: unwrapOptional(record.parent_id),
+    ...(generation === null ? {} : { generation }),
+    parentConstitutionHash: unwrapOptional(record.parent_constitution_hash),
+    ...(royaltyAllocations === null
+      ? {}
+      : {
+          royaltyAllocations: royaltyAllocations.map((allocation) => ({
+            recipient: allocation.recipient,
+            amount: allocation.amount,
+            depth: allocation.depth,
+            source: "reproduction_fee" as const
+          }))
+        }),
     sessionId: record.session_id,
     stewardAddress: record.steward_address,
     versionCommit: record.version_commit,
@@ -1084,6 +1212,7 @@ function mapRefundResponse(response: CandidRefundSpawnResponse): RefundSpawnResp
   return {
     paymentStatus: mapPaymentStatus(response.payment_status),
     refundedAt: toNumber(response.refunded_at),
+    refundTxHash: unwrapOptional(response.refund_tx_hash) ?? undefined,
     sessionId: response.session_id,
     state: mapSessionState(response.state)
   };

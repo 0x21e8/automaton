@@ -67,6 +67,7 @@ const CONTROL_PLANE_MAX_RESPONSE_BYTES: u64 = 4 * 1024;
 
 const INBOX_MESSAGE_QUEUED_EVENT_SIGNATURE: &str =
     "MessageQueued(address,uint64,address,string,uint256,uint256)";
+const INBOX_PATRONAGE_EVENT_SIGNATURE: &str = "Patronage(address,address,uint256)";
 const INBOX_USDC_FUNCTION_SIGNATURE: &str = "usdc()";
 const INBOX_MIN_PRICES_FOR_FUNCTION_SIGNATURE: &str = "minPricesFor(address)";
 const ERC20_BALANCE_OF_FUNCTION_SIGNATURE: &str = "balanceOf(address)";
@@ -116,6 +117,20 @@ pub struct DecodedMessageQueuedPayload {
     pub usdc_amount: U256,
     /// ETH amount attached to the message (wei).
     pub eth_amount: U256,
+}
+
+pub fn decode_patronage_payload(payload_hex: &str) -> Result<U256, String> {
+    let payload = normalize_hex_blob(payload_hex, "patronage payload")?;
+    let bytes = hex::decode(payload.trim_start_matches("0x"))
+        .map_err(|error| format!("failed to decode patronage payload: {error}"))?;
+    if bytes.len() != 32 {
+        return Err("patronage payload must be exactly 32 bytes".to_string());
+    }
+    let amount = U256::from_be_slice(&bytes);
+    if amount.is_zero() {
+        return Err("patronage amount must be positive".to_string());
+    }
+    Ok(amount)
 }
 
 /// Decode a raw `MessageQueued` event data blob into its constituent fields.
@@ -275,16 +290,36 @@ impl EvmPoller for HttpEvmPoller {
             });
         }
 
-        let logs = self
+        // Query both event signatures explicitly. This keeps the RPC-side
+        // automaton filter selective while ensuring gift-only Patronage logs
+        // are not excluded by a MessageQueued-only topic0 filter.
+        let topic1 = self
+            .log_filter_topics
+            .get(1)
+            .cloned()
+            .ok_or_else(|| "log filter topic1 is missing".to_string())?;
+        let [message_topics, patronage_topics] = poll_log_topic_filters(&topic1);
+        let mut logs = self
             .rpc
             .eth_get_logs(
                 from_block,
                 to_block,
                 Some(self.log_filter_address.as_str()),
-                Some(self.log_filter_topics.as_slice()),
+                Some(&message_topics),
                 self.rpc.max_response_bytes,
             )
             .await?;
+        logs.extend(
+            self.rpc
+                .eth_get_logs(
+                    from_block,
+                    to_block,
+                    Some(self.log_filter_address.as_str()),
+                    Some(&patronage_topics),
+                    self.rpc.max_response_bytes,
+                )
+                .await?,
+        );
 
         let events = filter_route_matched_logs(
             logs,
@@ -338,6 +373,13 @@ fn effective_from_block(
     }
 
     cursor.next_block
+}
+
+fn poll_log_topic_filters(topic1: &str) -> [Vec<String>; 2] {
+    [
+        vec![inbox_message_queued_topic0(), topic1.to_string()],
+        vec![inbox_patronage_topic0(), topic1.to_string()],
+    ]
 }
 
 #[allow(dead_code)]
@@ -1538,6 +1580,11 @@ fn inbox_message_queued_topic0() -> String {
     format!("0x{}", hex::encode(hash.as_slice()))
 }
 
+fn inbox_patronage_topic0() -> String {
+    let hash = keccak256(INBOX_PATRONAGE_EVENT_SIGNATURE.as_bytes());
+    format!("0x{}", hex::encode(hash.as_slice()))
+}
+
 fn address_to_topic(raw: &str) -> Result<String, String> {
     let normalized = normalize_evm_address(raw)?;
     let bytes = normalized.trim_start_matches("0x");
@@ -1639,6 +1686,7 @@ fn filter_route_matched_logs(
 ) -> Result<Vec<EvmEvent>, String> {
     let expected_contract = normalize_evm_address(expected_contract)?;
     let expected_topic0 = inbox_message_queued_topic0();
+    let patronage_topic0 = inbox_patronage_topic0();
     let expected_topic1 = normalize_topic(expected_topic1, "topic1")?;
 
     let mut events = Vec::new();
@@ -1674,7 +1722,7 @@ fn filter_route_matched_logs(
             log.topics
                 .first()
                 .map(|value| normalize_topic(value, "topic0")),
-            Some(Ok(topic)) if topic == expected_topic0
+            Some(Ok(topic)) if topic == expected_topic0 || topic == patronage_topic0
         ) {
             continue;
         }
@@ -1711,6 +1759,11 @@ fn filter_route_matched_logs(
     }
 
     events.sort_by_key(|event| (event.block_number, event.log_index));
+    events.dedup_by(|left, right| {
+        left.block_number == right.block_number
+            && left.log_index == right.log_index
+            && left.tx_hash == right.tx_hash
+    });
     if events.len() > max_logs_per_poll {
         events.truncate(max_logs_per_poll);
     }
@@ -3482,6 +3535,17 @@ mod tests {
     }
 
     #[test]
+    fn patronage_decoder_accepts_only_the_explicit_single_amount_event_payload() {
+        let payload = format!("0x{:064x}", U256::from(2_250_000u64));
+        assert_eq!(
+            decode_patronage_payload(&payload).unwrap(),
+            U256::from(2_250_000u64)
+        );
+        assert!(decode_patronage_payload(&format!("{payload}{}", "00".repeat(32))).is_err());
+        assert!(decode_patronage_payload(&format!("0x{:064x}", U256::ZERO)).is_err());
+    }
+
+    #[test]
     fn poll_bootstrap_from_block_uses_recent_head_window_when_cursor_is_unset() {
         let cursor = EvmPollCursor {
             next_block: 0,
@@ -3690,6 +3754,45 @@ mod tests {
         let poller =
             HttpEvmPoller::from_snapshot(&snapshot).expect("poller should initialize from config");
         assert_eq!(poller.bootstrap_lookback_blocks, 0);
+    }
+
+    #[test]
+    fn http_evm_poller_requests_and_routes_patronage_logs() {
+        let topic1 = address_to_topic("0x1111111111111111111111111111111111111111")
+            .expect("topic should encode");
+        let filters = poll_log_topic_filters(&topic1);
+        assert_eq!(
+            filters[0],
+            vec![inbox_message_queued_topic0(), topic1.clone()]
+        );
+        assert_eq!(filters[1], vec![inbox_patronage_topic0(), topic1.clone()]);
+
+        let cursor = EvmPollCursor {
+            chain_id: 8453,
+            next_block: 10,
+            ..EvmPollCursor::default()
+        };
+        let contract = "0x2222222222222222222222222222222222222222";
+        let events = filter_route_matched_logs(
+            vec![RpcLog {
+                block_number: Some("0xa".to_string()),
+                log_index: Some("0x0".to_string()),
+                tx_hash: Some(format!("0x{}", "cd".repeat(32))),
+                topics: filters[1].clone(),
+                address: contract.to_string(),
+                data: format!("0x{:064x}", U256::from(2_250_000_u64)),
+            }],
+            &cursor,
+            contract,
+            &topic1,
+            10,
+        )
+        .expect("patronage log should route through the poller filter");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            decode_patronage_payload(&events[0].payload).unwrap(),
+            U256::from(2_250_000_u64)
+        );
     }
 
     #[test]

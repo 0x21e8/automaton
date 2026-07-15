@@ -994,6 +994,11 @@ pub struct RuntimeSnapshot {
     #[serde(default)]
     pub spawn_parent_id: Option<String>,
     #[serde(default)]
+    pub spawn_generation: u32,
+    /// Sum of confirmed Inbox Patronage events, in raw 6-decimal USDC.
+    #[serde(default)]
+    pub lifetime_patronage_usdc_raw: String,
+    #[serde(default)]
     pub factory_principal: Option<String>,
     #[serde(default)]
     pub spawn_risk: Option<u8>,
@@ -1057,6 +1062,8 @@ impl Default for RuntimeSnapshot {
             genesis_name: None,
             genesis_constitution: None,
             spawn_parent_id: None,
+            spawn_generation: 0,
+            lifetime_patronage_usdc_raw: "0".to_string(),
             factory_principal: None,
             spawn_risk: None,
             spawn_strategies: Vec::new(),
@@ -1902,6 +1909,8 @@ pub struct RuntimeView {
     pub inference_provider: InferenceProvider,
     pub inference_model: String,
     #[serde(default)]
+    pub lifetime_patronage_usdc_raw: String,
+    #[serde(default)]
     pub timing_telemetry: RuntimeTimingTelemetry,
     #[serde(default)]
     pub room_poll: RoomPollingState,
@@ -1965,6 +1974,7 @@ impl From<&RuntimeSnapshot> for RuntimeView {
             last_transition_at_ns: snapshot.last_transition_at_ns,
             inference_provider: snapshot.inference_provider.clone(),
             inference_model: snapshot.inference_model.clone(),
+            lifetime_patronage_usdc_raw: snapshot.lifetime_patronage_usdc_raw.clone(),
             timing_telemetry: snapshot.timing_telemetry.clone(),
             room_poll: snapshot.room_poll.clone(),
             mortality: snapshot.mortality.clone(),
@@ -1980,6 +1990,7 @@ impl From<&RuntimeSnapshot> for SpawnBootstrapView {
             constitution: snapshot.genesis_constitution.clone(),
             session_id: snapshot.spawn_session_id.clone(),
             parent_id: snapshot.spawn_parent_id.clone(),
+            generation: snapshot.spawn_generation,
             factory_principal: snapshot
                 .factory_principal
                 .as_deref()

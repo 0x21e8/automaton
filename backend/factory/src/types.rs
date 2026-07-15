@@ -10,6 +10,7 @@ pub use spawn_protocol::{
     SPAWN_CONTRACT_VERSION,
 };
 pub use spawn_protocol::{InferenceTransport, OpenRouterReasoningLevel};
+pub use spawn_protocol::{InheritedStrategyStat, MemoryDowryFact};
 
 pub const QUOTE_TERMS_HASH_FIELD: &str = "quoteTermsHash";
 pub const EXPIRES_AT_FIELD: &str = "expiresAt";
@@ -21,6 +22,85 @@ pub const MAX_ROOM_BODY_BYTES: usize = 2_048;
 pub const MAX_ROOM_MENTIONS: usize = 16;
 pub const DEFAULT_ROOM_READ_LIMIT: usize = 50;
 pub const MAX_ROOM_READ_LIMIT: usize = 100;
+pub const REPRODUCTION_MIN_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+pub const REPRODUCTION_COOLDOWN_MS: u64 = 3 * 24 * 60 * 60 * 1_000;
+pub const REPRODUCTION_TERMINAL_RESERVE_USDC_RAW: u128 = 10_000_000;
+pub const REPRODUCTION_INFERENCE_RESERVE_USDC_RAW: u128 = 10_000_000;
+pub const REPRODUCTION_TOPUP_RESERVE_USDC_RAW: u128 = 10_000_000;
+pub const REPRODUCTION_MIN_ENDOWMENT_USDC_RAW: u128 = 25_000_000;
+pub const REPRODUCTION_PARENT_ROYALTY_BPS: u16 = 1_000;
+pub const REPRODUCTION_PROGENITOR_ROYALTY_BPS: u16 = 500;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub enum SpawnSessionOrigin {
+    #[default]
+    Human,
+    ReproductionOf(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct ReproductionPolicy {
+    pub min_age_ms: u64,
+    pub cooldown_ms: u64,
+    pub terminal_reserve_usdc_raw: String,
+    pub inference_reserve_usdc_raw: String,
+    pub topup_reserve_usdc_raw: String,
+    pub min_endowment_usdc_raw: String,
+    pub max_constitution_edit_distance_bps: u16,
+    pub parent_royalty_bps: u16,
+    pub progenitor_royalty_bps: u16,
+    pub royalty_depth: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct ReproductionEligibility {
+    pub eligible: bool,
+    pub observed_at_ms: u64,
+    pub parent_created_at_ms: u64,
+    pub minimum_age_at_ms: u64,
+    pub cooldown_ends_at_ms: Option<u64>,
+    pub reason: Option<String>,
+}
+
+impl Default for ReproductionPolicy {
+    fn default() -> Self {
+        Self {
+            min_age_ms: REPRODUCTION_MIN_AGE_MS,
+            cooldown_ms: REPRODUCTION_COOLDOWN_MS,
+            terminal_reserve_usdc_raw: REPRODUCTION_TERMINAL_RESERVE_USDC_RAW.to_string(),
+            inference_reserve_usdc_raw: REPRODUCTION_INFERENCE_RESERVE_USDC_RAW.to_string(),
+            topup_reserve_usdc_raw: REPRODUCTION_TOPUP_RESERVE_USDC_RAW.to_string(),
+            min_endowment_usdc_raw: REPRODUCTION_MIN_ENDOWMENT_USDC_RAW.to_string(),
+            max_constitution_edit_distance_bps: spawn_protocol::MAX_CONSTITUTION_EDIT_DISTANCE_BPS,
+            parent_royalty_bps: REPRODUCTION_PARENT_ROYALTY_BPS,
+            progenitor_royalty_bps: REPRODUCTION_PROGENITOR_ROYALTY_BPS,
+            royalty_depth: 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RoyaltyAllocation {
+    pub recipient: String,
+    pub amount: String,
+    pub depth: u8,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct CreateReproductionSessionRequest {
+    pub name: String,
+    pub parent_constitution: String,
+    pub child_constitution: String,
+    pub gross_amount: String,
+    /// Child-side preflight telemetry only. Factory admission ignores this as
+    /// authority and reads the parent's ERC-20 balance through its own RPC.
+    pub observed_liquid_usdc_raw: String,
+    #[serde(default)]
+    pub memory_dowry: Vec<MemoryDowryFact>,
+    #[serde(default)]
+    pub inherited_strategy_stats: Vec<InheritedStrategyStat>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub enum SpawnChain {
@@ -319,6 +399,7 @@ pub enum ReleaseBroadcastStage {
     SignatureRecovery,
     RawTransactionConstruction,
     RpcBroadcast,
+    ReceiptConfirmation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
@@ -398,6 +479,8 @@ pub struct EscrowClaim {
     pub last_scanned_block: Option<u64>,
     pub refundable: bool,
     pub refunded_at: Option<u64>,
+    #[serde(default)]
+    pub refund_broadcast: Option<ReleaseBroadcastRecord>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -494,6 +577,18 @@ pub struct SpawnSession {
     pub release_broadcast_at: Option<u64>,
     pub release_broadcast: Option<ReleaseBroadcastRecord>,
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub origin: Option<SpawnSessionOrigin>,
+    #[serde(default)]
+    pub generation: Option<u32>,
+    #[serde(default)]
+    pub parent_constitution_hash: Option<String>,
+    #[serde(default)]
+    pub memory_dowry: Option<Vec<MemoryDowryFact>>,
+    #[serde(default)]
+    pub inherited_strategy_stats: Option<Vec<InheritedStrategyStat>>,
+    #[serde(default)]
+    pub royalty_allocations: Option<Vec<RoyaltyAllocation>>,
     pub child_ids: Vec<String>,
     #[serde(default)]
     pub selected_strategies: Vec<RepositoryStrategySessionSnapshot>,
@@ -638,6 +733,7 @@ pub struct RefundSpawnResponse {
     pub state: SpawnSessionState,
     pub payment_status: PaymentStatus,
     pub refunded_at: u64,
+    pub refund_tx_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
@@ -652,6 +748,12 @@ pub struct SpawnedAutomatonRecord {
     pub chain: SpawnChain,
     pub session_id: String,
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub generation: Option<u32>,
+    #[serde(default)]
+    pub parent_constitution_hash: Option<String>,
+    #[serde(default)]
+    pub royalty_allocations: Option<Vec<RoyaltyAllocation>>,
     pub child_ids: Vec<String>,
     pub created_at: u64,
     /// Exact installed ic-automaton git commit as a 40-char lowercase SHA.
@@ -932,6 +1034,15 @@ pub enum FactoryError {
     InvalidDeathReport {
         reason: String,
     },
+    InvalidReproduction {
+        reason: String,
+    },
+    UnauthorizedReproduction {
+        caller: String,
+    },
+    ReproductionIneligible {
+        reason: String,
+    },
     RepositoryStrategyNotFound {
         strategy_id: String,
     },
@@ -1089,6 +1200,13 @@ impl Display for FactoryError {
                 write!(f, "registry record not found: {canister_id}")
             }
             Self::InvalidDeathReport { reason } => write!(f, "invalid death report: {reason}"),
+            Self::InvalidReproduction { reason } => write!(f, "invalid reproduction: {reason}"),
+            Self::UnauthorizedReproduction { caller } => {
+                write!(f, "caller is not a registered living automaton: {caller}")
+            }
+            Self::ReproductionIneligible { reason } => {
+                write!(f, "reproduction eligibility failed: {reason}")
+            }
             Self::RepositoryStrategyNotFound { strategy_id } => {
                 write!(f, "repository strategy not found: {strategy_id}")
             }

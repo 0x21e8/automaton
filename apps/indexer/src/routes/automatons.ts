@@ -129,6 +129,8 @@ export const automatonRoutes: FastifyPluginAsync = async (fastify) => {
             }
           : automaton.steward,
       parentId: automaton.parentId ?? registryRecord?.parentId ?? null,
+      generation: registryRecord?.generation ?? automaton.generation ?? 0,
+      parentConstitutionHash: registryRecord?.parentConstitutionHash ?? automaton.parentConstitutionHash ?? null,
       childIds:
         automaton.childIds.length > 0 ? automaton.childIds : registryRecord?.childIds ?? [],
       createdAt: registryRecord?.createdAt ?? automaton.createdAt,

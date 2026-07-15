@@ -45,7 +45,7 @@
     "verify:child-contract": "node ./scripts/validate-child-canister-interface.mjs",
     "verify:strategies": "node ./scripts/verify-strategies.mjs",
     "test:child-contract": "node --test ./scripts/validate-child-canister-interface.test.mjs",
-    "verify:integration": "AUTOMATON_WASM_PATH=components/ic-automaton/target/wasm32-wasip1/release/backend_nowasi.wasm cargo test -p integration-tests spawn_contract",
+    "verify:integration": "AUTOMATON_WASM_PATH=target/wasm32-wasip1/release/backend_nowasi.wasm cargo test -p integration-tests spawn_contract",
     "build:factory-wasm": "sh ./scripts/build-factory-wasm.sh dist/factory.wasm",
     "release:manifest": "node ./scripts/render-release-manifest.mjs",
     "generate:ui-assets": "node ./scripts/generate-ui-assets.mjs --write",

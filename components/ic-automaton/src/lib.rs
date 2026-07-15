@@ -537,6 +537,12 @@ fn ensure_spawn_bootstrap_proxy_configured() -> Result<(), String> {
 }
 
 fn apply_spawn_bootstrap(args: SpawnBootstrapArgs) -> Result<(), String> {
+    spawn_protocol::validate_inheritance(&args.memory_dowry, &args.inherited_strategy_stats)
+        .map_err(|error| format!("invalid inherited bootstrap evidence: {error}"))?;
+    let generation = args.generation;
+    stable::set_evaluation_mode(args.evaluation_mode);
+    let memory_dowry = args.memory_dowry.clone();
+    let inherited_strategy_stats = args.inherited_strategy_stats.clone();
     let session_id = args.session_id.trim().to_string();
     if session_id.is_empty() {
         return Err("spawn bootstrap session_id cannot be empty".to_string());
@@ -601,12 +607,62 @@ fn apply_spawn_bootstrap(args: SpawnBootstrapArgs) -> Result<(), String> {
         constitution: Some(constitution),
         session_id: Some(session_id),
         parent_id,
+        generation,
         factory_principal: Some(args.factory_principal),
         risk: Some(args.risk),
         strategies,
         skills,
         version_commit: Some(version_commit),
     });
+
+    let inherited_at_ns = current_time_ns();
+    for fact in memory_dowry {
+        stable::set_memory_fact(&MemoryFact {
+            key: format!("inherited.dowry.{}", fact.key.trim()),
+            value: fact.value,
+            created_at_ns: inherited_at_ns,
+            updated_at_ns: inherited_at_ns,
+            source_turn_id: "genesis:inherited".to_string(),
+        })?;
+    }
+    for inherited in inherited_strategy_stats {
+        let key = StrategyTemplateKey {
+            protocol: inherited.protocol,
+            primitive: inherited.primitive,
+            chain_id: inherited.chain_id,
+            template_id: inherited.template_id,
+        };
+        let stats = StrategyOutcomeStats {
+            key: key.clone(),
+            total_runs: inherited.total_runs,
+            success_runs: inherited.success_runs,
+            deterministic_failures: inherited.deterministic_failures,
+            nondeterministic_failures: inherited.nondeterministic_failures,
+            deterministic_failure_streak: 0,
+            last_error: None,
+            last_tx_hash: None,
+            last_observed_at_ns: None,
+        };
+        stable::upsert_strategy_outcome_stats(stats)?;
+        stable::set_memory_fact(&MemoryFact {
+            key: format!(
+                "inherited.strategy.{}.{}.{}",
+                key.protocol, key.primitive, key.chain_id
+            ),
+            value: serde_json::json!({
+                "source": "parent_outcome_stats",
+                "template_id": key.template_id,
+                "total_runs": inherited.total_runs,
+                "success_runs": inherited.success_runs,
+                "deterministic_failures": inherited.deterministic_failures,
+                "nondeterministic_failures": inherited.nondeterministic_failures
+            })
+            .to_string(),
+            created_at_ns: inherited_at_ns,
+            updated_at_ns: inherited_at_ns,
+            source_turn_id: "genesis:inherited".to_string(),
+        })?;
+    }
 
     log!(
         StewardAdminLogPriority::StewardInfo,
@@ -1478,6 +1534,90 @@ fn set_evm_chain_id_admin(chain_id: u64) -> Result<u64, String> {
     stable::set_evm_chain_id(chain_id)
 }
 
+/// Deterministic non-production entrypoint used by the generations
+/// observatory. It exercises the real reproduce tool, threshold signer,
+/// factory admission, and escrow approval/deposit path.
+#[ic_cdk::update]
+async fn run_evaluation_reproduction(args_json: String) -> Result<String, String> {
+    ensure_evaluation_factory_caller(&ic_cdk::api::msg_caller())?;
+    tools::run_evaluation_reproduction(&args_json).await
+}
+
+/// Seeds one authoritative parent memory fact for the local generations
+/// observatory. The factory-only evaluation capability keeps this unavailable
+/// to public and production callers.
+#[ic_cdk::update]
+fn run_evaluation_seed_memory(key: String, value: String) -> Result<String, String> {
+    ensure_evaluation_factory_caller(&ic_cdk::api::msg_caller())?;
+    let key = key.trim();
+    if key.is_empty() || key.len() > 256 || value.len() > 4_096 {
+        return Err("invalid evaluation memory fact".to_string());
+    }
+    let now_ns = current_time_ns();
+    stable::set_memory_fact(&MemoryFact {
+        key: key.to_string(),
+        value,
+        created_at_ns: now_ns,
+        updated_at_ns: now_ns,
+        source_turn_id: "evaluation:seed".to_string(),
+    })?;
+    Ok(key.to_string())
+}
+
+#[ic_cdk::update]
+async fn run_evaluation_wallet_balance_sync() -> Result<String, String> {
+    ensure_evaluation_factory_caller(&ic_cdk::api::msg_caller())?;
+    scheduler::run_evaluation_wallet_balance_sync().await
+}
+
+/// Non-production starvation fixture: burns all but a small reserve of this
+/// canister's cycles so the ordinary mortality scheduler observes starvation.
+#[ic_cdk::update]
+async fn run_evaluation_starvation() -> Result<String, String> {
+    ensure_evaluation_factory_caller(&ic_cdk::api::msg_caller())?;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let balance = ic_cdk::api::canister_cycle_balance();
+        let keep = domain::mortality::TERMINAL_TURN_RESERVED_CYCLES;
+        let burn = balance.saturating_sub(keep);
+        let burned = ic_cdk::api::cycles_burn(burn);
+        scheduler::run_evaluation_mortality_check().await?;
+        let terminal_turn = agent::run_scheduled_turn_job().await;
+        if stable::mortality_is_dead() {
+            return Ok(burned.to_string());
+        }
+        terminal_turn?;
+        return Err("evaluation starvation did not complete the terminal turn".to_string());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    Ok("0".to_string())
+}
+
+fn authorize_evaluation_factory_caller(
+    caller: candid::Principal,
+    evaluation_mode: bool,
+    chain_id: u64,
+    factory_principal: Option<candid::Principal>,
+) -> Result<(), String> {
+    if !evaluation_mode || chain_id != 20_260_326 {
+        return Err("evaluation capability is disabled for this deployment".to_string());
+    }
+    if factory_principal != Some(caller) {
+        return Err("caller is not the bootstrapped factory".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_evaluation_factory_caller(caller: &candid::Principal) -> Result<(), String> {
+    let bootstrap = stable::spawn_bootstrap_view_snapshot();
+    authorize_evaluation_factory_caller(
+        *caller,
+        stable::evaluation_mode(),
+        stable::snapshot_to_view().evm_chain_id,
+        bootstrap.factory_principal,
+    )
+}
+
 /// Sets how many block confirmations must pass before an EVM event is
 /// considered finalised (controller only).
 #[ic_cdk::update]
@@ -2316,8 +2456,12 @@ mod tests {
             steward_address: "0x62dAFfDC4D59eA05fedDb0a77A266B0a7b6F28ca".to_string(),
             session_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             parent_id: Some("parent-automaton".to_string()),
+            generation: 1,
+            memory_dowry: Vec::new(),
+            inherited_strategy_stats: Vec::new(),
             factory_principal: Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
                 .expect("test principal should parse"),
+            evaluation_mode: false,
             risk: 4,
             strategies: vec![" carry ".to_string(), "".to_string()],
             skills: vec![" messaging ".to_string()],
@@ -2821,12 +2965,25 @@ mod tests {
 
     #[test]
     fn apply_init_args_can_apply_spawn_bootstrap() {
-        apply_init_args(sample_init_args(Some(sample_spawn_bootstrap_args(
-            spawn_bootstrap_provider_args(
-                InferenceTransport::OpenrouterDirect,
-                OpenRouterReasoningLevel::High,
-            ),
-        ))));
+        let mut bootstrap_args = sample_spawn_bootstrap_args(spawn_bootstrap_provider_args(
+            InferenceTransport::OpenrouterDirect,
+            OpenRouterReasoningLevel::High,
+        ));
+        bootstrap_args.memory_dowry = vec![spawn_protocol::MemoryDowryFact {
+            key: "market.lesson".to_string(),
+            value: "Prefer evidence over momentum.".to_string(),
+        }];
+        bootstrap_args.inherited_strategy_stats = vec![spawn_protocol::InheritedStrategyStat {
+            protocol: "morpho".to_string(),
+            primitive: "supply".to_string(),
+            chain_id: 8_453,
+            template_id: "morpho-supply-v1".to_string(),
+            total_runs: 7,
+            success_runs: 5,
+            deterministic_failures: 1,
+            nondeterministic_failures: 1,
+        }];
+        apply_init_args(sample_init_args(Some(bootstrap_args)));
 
         let steward = stable::active_steward().expect("spawn bootstrap should configure steward");
         assert_eq!(steward.chain_id, 31337);
@@ -2852,6 +3009,18 @@ mod tests {
             stable::get_search_api_key(),
             Some("brave-test-key".to_string())
         );
+        let inherited_fact = stable::get_memory_fact("inherited.dowry.market.lesson")
+            .expect("dowry fact should be imported");
+        assert_eq!(inherited_fact.source_turn_id, "genesis:inherited");
+        let inherited_stats = stable::strategy_outcome_stats(&StrategyTemplateKey {
+            protocol: "morpho".to_string(),
+            primitive: "supply".to_string(),
+            chain_id: 8_453,
+            template_id: "morpho-supply-v1".to_string(),
+        })
+        .expect("inherited strategy statistics should be imported");
+        assert_eq!(inherited_stats.total_runs, 7);
+        assert_eq!(inherited_stats.success_runs, 5);
 
         let bootstrap = get_spawn_bootstrap_view();
         assert_eq!(
@@ -2862,6 +3031,7 @@ mod tests {
                 constitution: Some("I am Meridian. ".repeat(30).trim().to_string()),
                 session_id: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
                 parent_id: Some("parent-automaton".to_string()),
+                generation: 1,
                 factory_principal: Some(
                     Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
                         .expect("test principal should parse"),
@@ -3656,6 +3826,27 @@ mod tests {
             stable::journal_count(),
             3,
             "bootstrap replay must not reseed credo"
+        );
+    }
+
+    #[test]
+    fn evaluation_capability_rejects_forged_and_non_evaluation_callers() {
+        let factory = Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai").unwrap();
+        let forged = Principal::anonymous();
+        assert_eq!(
+            authorize_evaluation_factory_caller(forged, true, 20_260_326, Some(factory)),
+            Err("caller is not the bootstrapped factory".to_string())
+        );
+        assert_eq!(
+            authorize_evaluation_factory_caller(factory, false, 20_260_326, Some(factory)),
+            Err("evaluation capability is disabled for this deployment".to_string())
+        );
+        assert_eq!(
+            authorize_evaluation_factory_caller(factory, true, 84532, Some(factory)),
+            Err("evaluation capability is disabled for this deployment".to_string())
+        );
+        assert!(
+            authorize_evaluation_factory_caller(factory, true, 20_260_326, Some(factory)).is_ok()
         );
     }
 }

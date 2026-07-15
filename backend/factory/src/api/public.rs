@@ -10,10 +10,11 @@ use crate::state::store_spawn_provider_secrets;
 use crate::state::{read_state, write_state, FactoryState};
 use crate::types::{
     amount_to_string, derive_claim_id, hash_quote_terms, parse_amount, CreateSpawnSessionRequest,
-    CreateSpawnSessionResponse, FactoryError, PostRoomMessageRequest, RefundSpawnResponse,
-    RepositoryStrategyRecord, RepositoryStrategySessionSnapshot, RepositoryStrategyStatus,
-    RoomContentType, RoomMessage, RoomMessagePage, SessionAuditActor, SpawnPaymentInstructions,
-    SpawnQuote, SpawnSession, SpawnSessionState, SpawnSessionStatusResponse,
+    CreateSpawnSessionResponse, FactoryError, InheritedStrategyStat, MemoryDowryFact,
+    PostRoomMessageRequest, RefundSpawnResponse, RepositoryStrategyRecord,
+    RepositoryStrategySessionSnapshot, RepositoryStrategyStatus, RoomContentType, RoomMessage,
+    RoomMessagePage, RoyaltyAllocation, SessionAuditActor, SpawnPaymentInstructions, SpawnQuote,
+    SpawnSession, SpawnSessionOrigin, SpawnSessionState, SpawnSessionStatusResponse,
     SpawnedAutomatonRegistryPage, DEFAULT_ROOM_READ_LIMIT, MAX_ROOM_BODY_BYTES, MAX_ROOM_MENTIONS,
     MAX_ROOM_MESSAGES_RETAINED, MAX_ROOM_READ_LIMIT,
 };
@@ -305,11 +306,33 @@ pub fn list_my_room_messages(
     list_messages_for_automaton(caller, after_seq, limit)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_spawn_session_with_session_id(
     mut request: CreateSpawnSessionRequest,
     now_ms: u64,
     session_id: String,
+    origin: SpawnSessionOrigin,
+    generation: u32,
+    parent_constitution_hash: Option<String>,
+    memory_dowry: Vec<MemoryDowryFact>,
+    inherited_strategy_stats: Vec<InheritedStrategyStat>,
+    royalty_allocations: Vec<RoyaltyAllocation>,
 ) -> Result<CreateSpawnSessionResponse, FactoryError> {
+    match &origin {
+        SpawnSessionOrigin::Human if request.parent_id.is_some() => {
+            return Err(FactoryError::InvalidReproduction {
+                reason: "human spawn sessions cannot claim parentage".to_string(),
+            });
+        }
+        SpawnSessionOrigin::ReproductionOf(parent_id)
+            if request.parent_id.as_deref() != Some(parent_id.as_str()) =>
+        {
+            return Err(FactoryError::InvalidReproduction {
+                reason: "reproduction origin and parent_id disagree".to_string(),
+            });
+        }
+        _ => {}
+    }
     let raw_name =
         request
             .name
@@ -410,6 +433,12 @@ pub(crate) fn create_spawn_session_with_session_id(
             release_broadcast_at: None,
             release_broadcast: None,
             parent_id: request.parent_id.clone(),
+            origin: Some(origin),
+            generation: Some(generation),
+            parent_constitution_hash,
+            memory_dowry: Some(memory_dowry),
+            inherited_strategy_stats: Some(inherited_strategy_stats),
+            royalty_allocations: Some(royalty_allocations),
             child_ids: Vec::new(),
             selected_strategies,
             config: request.config.clone(),
@@ -478,7 +507,17 @@ pub fn create_spawn_session(
 ) -> Result<CreateSpawnSessionResponse, FactoryError> {
     let session_id =
         read_state(|state| deterministic_session_id_from_nonce(state.next_session_nonce + 1));
-    create_spawn_session_with_session_id(request, now_ms, session_id)
+    create_spawn_session_with_session_id(
+        request,
+        now_ms,
+        session_id,
+        SpawnSessionOrigin::Human,
+        0,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 pub fn get_spawn_session(session_id: &str) -> Result<SpawnSessionStatusResponse, FactoryError> {
@@ -514,6 +553,7 @@ pub fn retry_spawn_session(
     get_spawn_session(session_id)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn claim_spawn_refund(
     caller: &str,
     session_id: &str,
@@ -522,6 +562,17 @@ pub fn claim_spawn_refund(
     ensure_steward(caller, session_id)?;
     let _ = expire_spawn_session(session_id, now_ms)?;
     claim_escrow_refund(session_id, now_ms)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn claim_spawn_refund(
+    caller: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<RefundSpawnResponse, FactoryError> {
+    ensure_steward(caller, session_id)?;
+    let _ = expire_spawn_session(session_id, now_ms)?;
+    claim_escrow_refund(session_id, now_ms).await
 }
 
 pub fn list_spawned_automatons(

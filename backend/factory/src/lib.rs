@@ -1,5 +1,19 @@
 #[cfg(target_arch = "wasm32")]
+use ic_cdk::call::Call;
+#[cfg(target_arch = "wasm32")]
+use std::cell::Cell;
+#[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static EVALUATION_TIME_OFFSET_MS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(target_arch = "wasm32")]
+fn reproduction_now_ms() -> u64 {
+    now_ms().saturating_add(EVALUATION_TIME_OFFSET_MS.with(Cell::get))
+}
 
 mod api;
 pub mod base_rpc;
@@ -9,6 +23,7 @@ pub mod escrow;
 pub mod evm;
 pub mod expiry;
 pub mod init;
+pub mod reproduction;
 pub mod retry;
 pub mod scheduler;
 pub mod session_transitions;
@@ -41,6 +56,11 @@ pub use escrow::{
     register_escrow_claim,
 };
 pub use expiry::expire_spawn_session;
+#[cfg(not(target_arch = "wasm32"))]
+pub use reproduction::{
+    create_reproduction_session_with_verified_balance, reproduction_eligibility,
+    reproduction_policy,
+};
 pub use retry::{mark_session_failed, retry_failed_session};
 pub use spawn::execute_spawn;
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -53,22 +73,24 @@ pub use state::{
 };
 pub use types::{
     derive_claim_id, AddRepositoryStrategyRequest, ArtifactUploadStatus,
-    AutomatonChildRuntimeConfig, AutomatonRuntimeState, CreateSpawnSessionRequest,
-    CreateSpawnSessionResponse, CreationCostQuote, DeprecateRepositoryStrategyRequest, EscrowClaim,
-    FactoryArtifactSnapshot, FactoryConfigSnapshot, FactoryError, FactoryHealthSnapshot,
-    FactoryInitArgs, FactoryOperationalConfig, FactoryRuntimeSnapshot,
-    FactorySchedulerHealthSnapshot, FactorySchedulerJobCounts, FactorySessionHealthCounts,
-    FeeConfig, GetRepositoryStrategyResponse, ListRepositoryStrategiesResponse, PaymentStatus,
+    AutomatonChildRuntimeConfig, AutomatonRuntimeState, CreateReproductionSessionRequest,
+    CreateSpawnSessionRequest, CreateSpawnSessionResponse, CreationCostQuote,
+    DeprecateRepositoryStrategyRequest, EscrowClaim, FactoryArtifactSnapshot,
+    FactoryConfigSnapshot, FactoryError, FactoryHealthSnapshot, FactoryInitArgs,
+    FactoryOperationalConfig, FactoryRuntimeSnapshot, FactorySchedulerHealthSnapshot,
+    FactorySchedulerJobCounts, FactorySessionHealthCounts, FeeConfig,
+    GetRepositoryStrategyResponse, ListRepositoryStrategiesResponse, PaymentStatus,
     PostRoomMessageRequest, ProviderConfig, RecordInfrastructureDeathRequest, RefundSpawnResponse,
     ReleaseBroadcastConfig, ReleaseBroadcastFailure, ReleaseBroadcastRecord, ReleaseBroadcastStage,
     ReleaseSignatureRecord, ReportDeathRequest, RepositoryStrategyMetadata,
     RepositoryStrategyMutationResponse, RepositoryStrategyRecord,
     RepositoryStrategySessionSnapshot, RepositoryStrategySource, RepositoryStrategyStatus,
-    RevokeRepositoryStrategyRequest, RoomContentType, RoomMessage, RoomMessagePage, RoomState,
-    SchedulerFailureAction, SchedulerFailureSource, SchedulerJob, SchedulerJobFailure,
-    SchedulerJobKind, SchedulerJobStatus, SchedulerRuntime, SessionAdminView, SessionAuditActor,
-    SessionAuditEntry, SpawnAsset, SpawnChain, SpawnConfig, SpawnExecutionReceipt,
-    SpawnPaymentInstructions, SpawnProviderSecrets, SpawnQuote, SpawnSession, SpawnSessionState,
+    ReproductionEligibility, ReproductionPolicy, RevokeRepositoryStrategyRequest, RoomContentType,
+    RoomMessage, RoomMessagePage, RoomState, RoyaltyAllocation, SchedulerFailureAction,
+    SchedulerFailureSource, SchedulerJob, SchedulerJobFailure, SchedulerJobKind,
+    SchedulerJobStatus, SchedulerRuntime, SessionAdminView, SessionAuditActor, SessionAuditEntry,
+    SpawnAsset, SpawnChain, SpawnConfig, SpawnExecutionReceipt, SpawnPaymentInstructions,
+    SpawnProviderSecrets, SpawnQuote, SpawnSession, SpawnSessionOrigin, SpawnSessionState,
     SpawnSessionStatusResponse, SpawnedAutomatonRecord, SpawnedAutomatonRegistryPage,
     DEFAULT_ROOM_READ_LIMIT, MAX_ROOM_BODY_BYTES, MAX_ROOM_MENTIONS, MAX_ROOM_MESSAGES_RETAINED,
     MAX_ROOM_READ_LIMIT,
@@ -170,7 +192,211 @@ async fn create_spawn_session(
             message: error.to_string(),
         })?;
     let session_id = api::public::uuid_v4_from_entropy(&entropy);
-    api::public::create_spawn_session_with_session_id(request, now_ms(), session_id)
+    api::public::create_spawn_session_with_session_id(
+        request,
+        now_ms(),
+        session_id,
+        SpawnSessionOrigin::Human,
+        0,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::query]
+fn get_reproduction_policy() -> ReproductionPolicy {
+    reproduction::reproduction_policy()
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::query]
+fn get_reproduction_eligibility() -> Result<ReproductionEligibility, FactoryError> {
+    reproduction::reproduction_eligibility(
+        &ic_cdk::api::msg_caller().to_text(),
+        reproduction_now_ms(),
+    )
+}
+
+/// Local-evaluation clock control. Production Base deployments reject this
+/// unconditionally; policy constants and admission checks remain unchanged.
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
+fn advance_evaluation_time(delta_ms: u64) -> Result<u64, FactoryError> {
+    state::read_state(|state| {
+        state::ensure_admin_in_state(state, &ic_cdk::api::msg_caller().to_text())
+    })?;
+    let chain_id = state::read_state(|state| state.child_runtime.evm_chain_id.unwrap_or_default());
+    if chain_id != 20_260_326 || delta_ms == 0 {
+        return Err(FactoryError::InvalidReproduction {
+            reason: "evaluation clock is available only on non-production chains".to_string(),
+        });
+    }
+    Ok(EVALUATION_TIME_OFFSET_MS.with(|offset| {
+        let next = offset.get().saturating_add(delta_ms);
+        offset.set(next);
+        next
+    }))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn authorize_evaluation_target(
+    caller: &str,
+    canister_id: &str,
+) -> Result<candid::Principal, FactoryError> {
+    state::read_state(|state| {
+        state::ensure_admin_in_state(state, caller)?;
+        if state.child_runtime.evm_chain_id != Some(20_260_326) {
+            return Err(FactoryError::InvalidReproduction {
+                reason: "evaluation capability is disabled for this deployment".to_string(),
+            });
+        }
+        let record = state.registry.get(canister_id).ok_or_else(|| {
+            FactoryError::RegistryRecordNotFound {
+                canister_id: canister_id.to_string(),
+            }
+        })?;
+        if record.death_cause.is_some() {
+            return Err(FactoryError::InvalidReproduction {
+                reason: "evaluation target is already dead".to_string(),
+            });
+        }
+        candid::Principal::from_text(&record.canister_id).map_err(|error| {
+            FactoryError::InvalidReproduction {
+                reason: format!("invalid registered evaluation target: {error}"),
+            }
+        })
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
+async fn run_evaluation_reproduction(
+    canister_id: String,
+    args_json: String,
+) -> Result<String, FactoryError> {
+    let principal =
+        authorize_evaluation_target(&ic_cdk::api::msg_caller().to_text(), &canister_id)?;
+    let response = Call::bounded_wait(principal, "run_evaluation_reproduction")
+        .with_args(&(args_json,))
+        .await
+        .map_err(|error| FactoryError::ManagementCallFailed {
+            method: "run_evaluation_reproduction".to_string(),
+            message: controllers::rejection_message(error),
+        })?;
+    let (result,): (Result<String, String>,) =
+        response
+            .candid_tuple()
+            .map_err(|error| FactoryError::ManagementCallFailed {
+                method: "run_evaluation_reproduction".to_string(),
+                message: controllers::rejection_message(error),
+            })?;
+    result.map_err(|message| FactoryError::ManagementCallFailed {
+        method: "run_evaluation_reproduction".to_string(),
+        message,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
+async fn run_evaluation_seed_memory(
+    canister_id: String,
+    key: String,
+    value: String,
+) -> Result<String, FactoryError> {
+    let principal =
+        authorize_evaluation_target(&ic_cdk::api::msg_caller().to_text(), &canister_id)?;
+    let response = Call::bounded_wait(principal, "run_evaluation_seed_memory")
+        .with_args(&(key, value))
+        .await
+        .map_err(|error| FactoryError::ManagementCallFailed {
+            method: "run_evaluation_seed_memory".to_string(),
+            message: controllers::rejection_message(error),
+        })?;
+    let (result,): (Result<String, String>,) =
+        response
+            .candid_tuple()
+            .map_err(|error| FactoryError::ManagementCallFailed {
+                method: "run_evaluation_seed_memory".to_string(),
+                message: controllers::rejection_message(error),
+            })?;
+    result.map_err(|message| FactoryError::ManagementCallFailed {
+        method: "run_evaluation_seed_memory".to_string(),
+        message,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
+async fn run_evaluation_wallet_balance_sync(canister_id: String) -> Result<String, FactoryError> {
+    let principal =
+        authorize_evaluation_target(&ic_cdk::api::msg_caller().to_text(), &canister_id)?;
+    let response = Call::bounded_wait(principal, "run_evaluation_wallet_balance_sync")
+        .await
+        .map_err(|error| FactoryError::ManagementCallFailed {
+            method: "run_evaluation_wallet_balance_sync".to_string(),
+            message: controllers::rejection_message(error),
+        })?;
+    let (result,): (Result<String, String>,) =
+        response
+            .candid_tuple()
+            .map_err(|error| FactoryError::ManagementCallFailed {
+                method: "run_evaluation_wallet_balance_sync".to_string(),
+                message: controllers::rejection_message(error),
+            })?;
+    result.map_err(|message| FactoryError::ManagementCallFailed {
+        method: "run_evaluation_wallet_balance_sync".to_string(),
+        message,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
+async fn run_evaluation_starvation(canister_id: String) -> Result<String, FactoryError> {
+    let principal =
+        authorize_evaluation_target(&ic_cdk::api::msg_caller().to_text(), &canister_id)?;
+    let response = Call::bounded_wait(principal, "run_evaluation_starvation")
+        .await
+        .map_err(|error| FactoryError::ManagementCallFailed {
+            method: "run_evaluation_starvation".to_string(),
+            message: controllers::rejection_message(error),
+        })?;
+    let (result,): (Result<String, String>,) =
+        response
+            .candid_tuple()
+            .map_err(|error| FactoryError::ManagementCallFailed {
+                method: "run_evaluation_starvation".to_string(),
+                message: controllers::rejection_message(error),
+            })?;
+    result.map_err(|message| FactoryError::ManagementCallFailed {
+        method: "run_evaluation_starvation".to_string(),
+        message,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+#[ic_cdk::update]
+async fn create_reproduction_session(
+    request: CreateReproductionSessionRequest,
+) -> Result<CreateSpawnSessionResponse, FactoryError> {
+    let entropy = ic_cdk::management_canister::raw_rand()
+        .await
+        .map_err(|error| FactoryError::ManagementCallFailed {
+            method: "raw_rand".to_string(),
+            message: error.to_string(),
+        })?;
+    let session_id = api::public::uuid_v4_from_entropy(&entropy);
+    let response = reproduction::create_reproduction_session(
+        &ic_cdk::api::msg_caller().to_text(),
+        request,
+        reproduction_now_ms(),
+        session_id,
+    )
+    .await?;
+    scheduler::enqueue_payment_poll(now_ms());
+    Ok(response)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -254,8 +480,9 @@ fn retry_spawn_session(session_id: String) -> Result<SpawnSessionStatusResponse,
 
 #[cfg(target_arch = "wasm32")]
 #[ic_cdk::update]
-fn claim_spawn_refund(session_id: String) -> Result<RefundSpawnResponse, FactoryError> {
+async fn claim_spawn_refund(session_id: String) -> Result<RefundSpawnResponse, FactoryError> {
     api::public::claim_spawn_refund(&ic_cdk::api::msg_caller().to_text(), &session_id, now_ms())
+        .await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -438,19 +665,19 @@ ic_cdk::export_candid!();
 mod tests {
     use super::{
         add_repository_strategy, append_artifact_chunk, apply_factory_init_args,
-        auto_run_spawn_scheduler, begin_artifact_upload, bootstrap_status, claim_spawn_refund,
-        commit_artifact_upload, create_spawn_session, deprecate_repository_strategy,
-        derive_claim_id, execute_spawn, expire_spawn_session, get_artifact_upload_status,
-        get_escrow_claim, get_factory_config, get_factory_health, get_factory_runtime,
-        get_repository_strategy, get_session_admin, get_spawn_session, get_spawned_automaton,
-        insert_spawned_automaton_record, list_messages_for_automaton, list_my_room_messages,
-        list_repository_strategies, list_room_messages, list_spawned_automatons,
-        load_spawn_provider_secrets, mark_session_failed, next_payment_scan_plan,
-        post_room_message, read_state, reconcile_escrow_payments, record_infrastructure_death,
-        report_death, restore_state, retry_session_admin, retry_spawn_session,
-        revoke_repository_strategy, set_child_runtime_config, set_creation_cost_quote,
-        set_fee_config, set_mock_canister_balance, set_operational_config, set_pause,
-        set_release_broadcast_config, snapshot_state, update_artifact, write_state,
+        authorize_evaluation_target, auto_run_spawn_scheduler, begin_artifact_upload,
+        bootstrap_status, claim_spawn_refund, commit_artifact_upload, create_spawn_session,
+        deprecate_repository_strategy, derive_claim_id, execute_spawn, expire_spawn_session,
+        get_artifact_upload_status, get_escrow_claim, get_factory_config, get_factory_health,
+        get_factory_runtime, get_repository_strategy, get_session_admin, get_spawn_session,
+        get_spawned_automaton, insert_spawned_automaton_record, list_messages_for_automaton,
+        list_my_room_messages, list_repository_strategies, list_room_messages,
+        list_spawned_automatons, load_spawn_provider_secrets, mark_session_failed,
+        next_payment_scan_plan, post_room_message, read_state, reconcile_escrow_payments,
+        record_infrastructure_death, report_death, restore_state, retry_session_admin,
+        retry_spawn_session, revoke_repository_strategy, set_child_runtime_config,
+        set_creation_cost_quote, set_fee_config, set_mock_canister_balance, set_operational_config,
+        set_pause, set_release_broadcast_config, snapshot_state, update_artifact, write_state,
         AddRepositoryStrategyRequest, AutomatonChildRuntimeConfig, CreateSpawnSessionRequest,
         CreationCostQuote, DeprecateRepositoryStrategyRequest, FactoryError, FactoryInitArgs,
         FactoryOperationalConfig, FactoryStateSnapshot, FeeConfig, PaymentStatus,
@@ -464,7 +691,8 @@ mod tests {
     };
     use crate::base_rpc::BaseDepositLog;
     use crate::scheduler::{
-        lease_due_jobs_for_test, run_scheduler_tick, spawn_job_id, PAYMENT_POLL_JOB_ID,
+        enqueue_payment_poll, lease_due_jobs_for_test, run_scheduler_tick, spawn_job_id,
+        PAYMENT_POLL_JOB_ID,
     };
     use crate::types::{InferenceTransport, OpenRouterReasoningLevel};
     use candid::Principal;
@@ -576,6 +804,9 @@ mod tests {
             chain: SpawnChain::Base,
             session_id: session_id.to_string(),
             parent_id: None,
+            generation: Some(0),
+            parent_constitution_hash: None,
+            royalty_allocations: Some(Vec::new()),
             child_ids: Vec::new(),
             created_at,
             version_commit: SHA40.to_string(),
@@ -1761,6 +1992,9 @@ mod tests {
                     chain: SpawnChain::Base,
                     session_id: response.session.session_id.clone(),
                     parent_id: None,
+                    generation: Some(0),
+                    parent_constitution_hash: None,
+                    royalty_allocations: Some(Vec::new()),
                     child_ids: Vec::new(),
                     created_at: 5_100,
                     version_commit: SHA40.to_string(),
@@ -2999,6 +3233,22 @@ mod tests {
     }
 
     #[test]
+    fn wall_clock_rearm_pulls_virtual_time_payment_poll_forward() {
+        reset_factory_state();
+        create_spawn_session(sample_request("60000000"), 604_800_000)
+            .expect("virtual-time session should be created");
+        assert_eq!(
+            snapshot_state().scheduler_jobs[PAYMENT_POLL_JOB_ID].next_run_at_ms,
+            Some(604_800_000)
+        );
+
+        enqueue_payment_poll(10_000);
+        let poll = &snapshot_state().scheduler_jobs[PAYMENT_POLL_JOB_ID];
+        assert_eq!(poll.next_run_at_ms, Some(10_000));
+        assert_eq!(poll.status, SchedulerJobStatus::Pending);
+    }
+
+    #[test]
     fn backs_off_failed_spawn_jobs_instead_of_hot_looping() {
         reset_factory_state();
         upload_test_artifact();
@@ -3151,6 +3401,11 @@ mod tests {
     #[test]
     fn expires_underfunded_sessions_and_allows_refund() {
         reset_factory_state();
+        write_state(|state| {
+            state.base_rpc_endpoint = Some("mock://success".to_string());
+            state.escrow_contract_address =
+                "0x3333333333333333333333333333333333333333".to_string();
+        });
 
         let response = create_spawn_session(sample_request("60000000"), 20_000)
             .expect("session should be created");
@@ -3197,6 +3452,7 @@ mod tests {
         .expect("refund should succeed");
         assert_eq!(refund.state, SpawnSessionState::Expired);
         assert_eq!(refund.payment_status, PaymentStatus::Refunded);
+        assert!(refund.refund_tx_hash.is_some());
 
         let refunded =
             get_spawn_session(&response.session.session_id).expect("session should load");
@@ -3208,8 +3464,64 @@ mod tests {
                 .last()
                 .expect("refund audit should exist")
                 .reason,
-            "refund claimed after expiration"
+            "refund transaction confirmed on-chain"
         );
+    }
+
+    #[test]
+    fn failed_paid_refund_is_receipt_backed_idempotent_and_retryable_after_rpc_failure() {
+        reset_factory_state();
+        write_state(|state| {
+            state.base_rpc_endpoint = Some("mock://success".to_string());
+            state.escrow_contract_address =
+                "0x3333333333333333333333333333333333333333".to_string();
+        });
+        let response = create_spawn_session(sample_request("75000000"), 30_000)
+            .expect("session should be created");
+        reconcile_escrow_payments(
+            &[base_deposit_log(
+                &response.session.session_id,
+                "75000000",
+                4_000,
+            )],
+            4_000,
+            31_000,
+        )
+        .expect("claim should become paid");
+        mark_session_failed(
+            &response.session.session_id,
+            SessionAuditActor::System,
+            31_001,
+            "reproduction failed after parent debit",
+        )
+        .expect("paid spawn should enter failed state");
+        let failed = get_spawn_session(&response.session.session_id).expect("session should load");
+        assert!(failed.session.retryable);
+        assert!(failed.session.refundable);
+
+        write_state(|state| state.base_rpc_endpoint = Some("mock://error/rate-limit".to_string()));
+        let error = claim_spawn_refund("0xsteward", &response.session.session_id, 31_002)
+            .expect_err("failed RPC must not become a bookkeeping refund");
+        assert!(matches!(error, FactoryError::RpcRequestFailed { .. }));
+        let after_error =
+            get_spawn_session(&response.session.session_id).expect("session should load");
+        assert_eq!(after_error.session.payment_status, PaymentStatus::Paid);
+        assert!(after_error.session.refundable);
+        assert!(get_escrow_claim(&response.session.session_id)
+            .expect("claim should load")
+            .refund_broadcast
+            .and_then(|record| record.last_error)
+            .is_some());
+
+        write_state(|state| state.base_rpc_endpoint = Some("mock://success".to_string()));
+        let first = claim_spawn_refund("0xsteward", &response.session.session_id, 31_003)
+            .expect("confirmed retry should refund");
+        let second = claim_spawn_refund("0xsteward", &response.session.session_id, 31_004)
+            .expect("refund replay should be idempotent");
+        assert_eq!(first.payment_status, PaymentStatus::Refunded);
+        assert_eq!(second.refund_tx_hash, first.refund_tx_hash);
+        assert_eq!(second.refunded_at, first.refunded_at);
+        assert!(first.refund_tx_hash.is_some());
     }
 
     #[test]
@@ -3265,6 +3577,15 @@ mod tests {
             derive_claim_id("550e8400-e29b-41d4-a716-446655440000"),
             "0x2f779c94a35dceba72fe536ce28c5fea7566753044cdf9da29f6402ea964b7f9"
         );
+    }
+
+    #[test]
+    fn evaluation_orchestration_rejects_forged_admin_caller() {
+        reset_factory_state();
+        assert!(matches!(
+            authorize_evaluation_target("forged-caller", "aaaaa-aa"),
+            Err(FactoryError::UnauthorizedAdmin { caller }) if caller == "forged-caller"
+        ));
     }
 
     #[test]

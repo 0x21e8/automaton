@@ -8,6 +8,7 @@ export function Chronicle({ days, error }: { days: ChronicleDay[]; error: string
     {error ? <p>{error}</p> : null}
     {days.map((day) => <article key={day.date}>
       <h3>{day.date}</h3>
+      {day.population ? <p className="chronicle-population">Living {day.population.living} · births {day.population.births} · deaths {day.population.deaths} · median runway {day.population.medianRunwaySeconds ?? "unknown"}s · patronage/living {day.population.patronageUsdcRawPerLiving} raw USDC</p> : null}
       {day.entries.length === 0 ? <p>No recorded events.</p> : <ol>{day.entries.map((entry) => <li key={entry.id}>
         <time dateTime={new Date(entry.timestamp).toISOString()}>{new Date(entry.timestamp).toLocaleTimeString()}</time>{" "}
         <strong>{entry.headline}</strong> — {entry.detail}{" "}

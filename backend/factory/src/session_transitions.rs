@@ -45,8 +45,10 @@ fn derive_retryable(session: &SpawnSession, now_ms: u64) -> bool {
 }
 
 fn derive_refundable(session: &SpawnSession) -> bool {
-    session.state == SpawnSessionState::Expired
-        && is_refundable_payment_status(&session.payment_status)
+    matches!(
+        session.state,
+        SpawnSessionState::Expired | SpawnSessionState::Failed
+    ) && is_refundable_payment_status(&session.payment_status)
 }
 
 fn transition_error(
@@ -269,6 +271,12 @@ mod tests {
             release_broadcast_at: None,
             release_broadcast: None,
             parent_id: None,
+            origin: Some(crate::types::SpawnSessionOrigin::Human),
+            generation: Some(0),
+            parent_constitution_hash: None,
+            memory_dowry: Some(Vec::new()),
+            inherited_strategy_stats: Some(Vec::new()),
+            royalty_allocations: Some(Vec::new()),
             child_ids: Vec::new(),
             selected_strategies: Vec::new(),
             config: SpawnConfig {
@@ -535,7 +543,7 @@ mod tests {
         let updated_failed =
             sync_session_derived_flags_in_state(&mut failed, "session-1", 5_000).unwrap();
         assert!(updated_failed.retryable);
-        assert!(!updated_failed.refundable);
+        assert!(updated_failed.refundable);
 
         let mut expired_session = sample_session(SpawnSessionState::Expired);
         expired_session.payment_status = PaymentStatus::Partial;

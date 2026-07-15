@@ -64,6 +64,10 @@ export class ArtifactStore {
     await writeFile(artifacts.reportPath, `${reportMarkdown.trimEnd()}\n`, "utf8");
   }
 
+  async writeGenerationScenario(artifacts: EvaluationArtifacts, result: unknown) {
+    await writeFile(join(artifacts.runDirectory, "generation-scenario.json"), `${JSON.stringify(result, (_key, value) => value instanceof Map ? Object.fromEntries(value) : value, 2)}\n`, "utf8");
+  }
+
   async listHistoricalRuns(): Promise<EvaluationRunHistoryResponse> {
     await mkdir(this.rootDirectory, { recursive: true });
     const directoryEntries = await readdir(this.rootDirectory, {

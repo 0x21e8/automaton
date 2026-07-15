@@ -180,6 +180,7 @@ export interface HttpSnapshotResponse {
     last_error?: string | null;
     last_transition_at_ns?: number;
     loop_enabled?: boolean;
+    lifetime_patronage_usdc_raw?: string;
     soul?: string;
     state?: string | Record<string, null>;
     mortality?: {

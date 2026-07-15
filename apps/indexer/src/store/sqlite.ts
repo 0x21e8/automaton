@@ -167,6 +167,8 @@ function detailToSummary(detail: AutomatonDetail): AutomatonSummary {
     corePatternIndex: detail.corePatternIndex,
     corePattern: detail.corePattern,
     parentId: detail.parentId,
+    generation: detail.generation,
+    parentConstitutionHash: detail.parentConstitutionHash,
     createdAt: detail.createdAt,
     lastTransitionAt: detail.runtime.lastTransitionAt
   };

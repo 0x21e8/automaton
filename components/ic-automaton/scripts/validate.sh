@@ -90,8 +90,12 @@ check_candid_in_sync() {
 }
 
 sync_pocketic_wasm_artifact() {
-  local source_wasm="${repo_root}/target/wasm32-wasip1/release/backend_nowasi.wasm"
-  local target_wasm="${repo_root}/target/wasm32-unknown-unknown/release/backend.wasm"
+  local target_root="${repo_root}/target"
+  if [[ -f "${repo_root}/../../Cargo.toml" ]] && grep -q 'components/ic-automaton' "${repo_root}/../../Cargo.toml"; then
+    target_root="$(cd "${repo_root}/../.." && pwd)/target"
+  fi
+  local source_wasm="${target_root}/wasm32-wasip1/release/backend_nowasi.wasm"
+  local target_wasm="${target_root}/wasm32-unknown-unknown/release/backend.wasm"
 
   if [[ ! -f "${source_wasm}" ]]; then
     echo "Missing PocketIC source artifact: ${source_wasm}" >&2

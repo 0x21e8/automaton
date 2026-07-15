@@ -104,10 +104,14 @@ describe("PatronagePanel interactions", () => {
     fireEvent.change(screen.getByLabelText("Patronage amount in USDC"), { target: { value: "2.25" } });
     fireEvent.click(screen.getByRole("button", { name: "GIFT USDC" }));
 
-    await waitFor(() => expect(request).toHaveBeenCalledTimes(1));
-    expect(request).toHaveBeenCalledWith(expect.objectContaining({
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(2));
+    expect(request).toHaveBeenNthCalledWith(1, expect.objectContaining({
       method: "eth_sendTransaction",
       params: [expect.objectContaining({ from: SENDER, to: USDC })]
+    }));
+    expect(request).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      method: "eth_sendTransaction",
+      params: [expect.objectContaining({ from: SENDER, to: INBOX, data: expect.stringMatching(/^0x4984ea4a/) })]
     }));
     expect(await screen.findByText("Patronage submitted: 0xgift")).toBeTruthy();
   });

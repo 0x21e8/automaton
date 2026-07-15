@@ -31,7 +31,10 @@ use crate::state::{
     clear_provider_secrets, delete_spawn_provider_secrets, read_state, write_state, FactoryState,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use crate::types::{amount_to_string, parse_amount};
+use crate::types::amount_to_string;
+use crate::types::parse_amount;
+#[cfg(target_arch = "wasm32")]
+use crate::types::ReleaseBroadcastStage;
 use crate::types::{
     AutomatonBootstrapEvidence, AutomatonBootstrapVerification, AutomatonRuntimeState,
     FactoryError, PaymentStatus, ReleaseBroadcastRecord, RepositoryStrategySessionSnapshot,
@@ -40,8 +43,95 @@ use crate::types::{
 };
 use sha2::{Digest, Sha256};
 
+fn reproduction_release(
+    session: &SpawnSession,
+) -> Result<Option<crate::evm::ReproductionRelease>, FactoryError> {
+    if !matches!(
+        session.origin.as_ref(),
+        Some(crate::types::SpawnSessionOrigin::ReproductionOf(_))
+    ) {
+        return Ok(None);
+    }
+    let royalties = session.royalty_allocations.as_deref().unwrap_or_default();
+    if royalties.len() != 2 {
+        return Err(FactoryError::InvalidReproduction {
+            reason: "reproduction release requires exactly two fee royalty allocations".to_string(),
+        });
+    }
+    let first = &royalties[0];
+    let second = &royalties[1];
+    Ok(Some(crate::evm::ReproductionRelease {
+        child_amount: parse_amount(&session.net_forward_amount)?,
+        royalty_one_recipient: first.recipient.clone(),
+        royalty_one_amount: parse_amount(&first.amount)?,
+        royalty_two_recipient: second.recipient.clone(),
+        royalty_two_amount: parse_amount(&second.amount)?,
+    }))
+}
+
 fn constitution_hash(constitution: &str) -> String {
     format!("{:x}", Sha256::digest(constitution.as_bytes()))
+}
+
+fn insert_registry_record_with_parent_link(
+    state: &mut FactoryState,
+    record: SpawnedAutomatonRecord,
+) {
+    if let Some(parent_id) = record.parent_id.as_ref() {
+        if let Some(parent) = state.registry.get_mut(parent_id) {
+            if parent
+                .child_ids
+                .iter()
+                .all(|child_id| child_id != &record.canister_id)
+            {
+                parent.child_ids.push(record.canister_id.clone());
+            }
+        }
+    }
+    state.registry.insert(record.canister_id.clone(), record);
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn reserve_release_nonce(endpoints: &[String]) -> Result<u64, FactoryError> {
+    let signer = crate::evm::derive_factory_evm_address().await?;
+    let pending = crate::base_rpc::eth_get_transaction_count(endpoints, &signer).await?;
+    Ok(write_state(|state| {
+        reserve_release_nonce_value(&mut state.next_release_nonce, pending)
+    }))
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn reserve_release_nonce_value(cursor: &mut Option<u64>, pending: u64) -> u64 {
+    let nonce = cursor.unwrap_or(pending).max(pending);
+    *cursor = Some(nonce.saturating_add(1));
+    nonce
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+const RELEASE_RECEIPT_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReleaseReceiptDecision {
+    Confirmed,
+    Wait,
+    Failed,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn release_receipt_decision(
+    status: Option<bool>,
+    broadcast_at: u64,
+    now_ms: u64,
+) -> ReleaseReceiptDecision {
+    match status {
+        Some(true) => ReleaseReceiptDecision::Confirmed,
+        Some(false) => ReleaseReceiptDecision::Failed,
+        None if now_ms.saturating_sub(broadcast_at) < RELEASE_RECEIPT_TIMEOUT_MS => {
+            ReleaseReceiptDecision::Wait
+        }
+        None => ReleaseReceiptDecision::Failed,
+    }
 }
 
 fn redact_released_constitution(
@@ -66,9 +156,66 @@ use crate::now_ms as current_time_ms;
 use ic_cdk::call::Call;
 #[cfg(target_arch = "wasm32")]
 use ic_cdk::management_canister::{
-    create_canister_with_extra_cycles, delete_canister, install_code, CanisterInstallMode,
-    CanisterSettings, CreateCanisterArgs, DeleteCanisterArgs, InstallCodeArgs,
+    clear_chunk_store, create_canister_with_extra_cycles, delete_canister, install_chunked_code,
+    upload_chunk, CanisterInstallMode, CanisterSettings, ClearChunkStoreArgs, CreateCanisterArgs,
+    DeleteCanisterArgs, InstallChunkedCodeArgs, UploadChunkArgs,
 };
+
+#[cfg(any(target_arch = "wasm32", test))]
+const MANAGEMENT_WASM_CHUNK_BYTES: usize = 1_000_000;
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn wasm_install_chunks(wasm_module: &[u8]) -> Vec<&[u8]> {
+    wasm_module.chunks(MANAGEMENT_WASM_CHUNK_BYTES).collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn install_wasm_chunked(
+    canister_id: candid::Principal,
+    wasm_module: &[u8],
+    install_args: Vec<u8>,
+) -> Result<(), FactoryError> {
+    clear_chunk_store(&ClearChunkStoreArgs { canister_id })
+        .await
+        .map_err(|error| FactoryError::ManagementCallFailed {
+            method: "clear_chunk_store".to_string(),
+            message: rejection_message(error),
+        })?;
+
+    let mut chunk_hashes_list = Vec::new();
+    for chunk in wasm_install_chunks(wasm_module) {
+        let uploaded = upload_chunk(&UploadChunkArgs {
+            canister_id,
+            chunk: chunk.to_vec(),
+        })
+        .await
+        .map_err(|error| FactoryError::ManagementCallFailed {
+            method: "upload_chunk".to_string(),
+            message: rejection_message(error),
+        })?;
+        chunk_hashes_list.push(uploaded);
+    }
+
+    let wasm_module_hash = Sha256::digest(wasm_module).to_vec();
+    let install_result = install_chunked_code(&InstallChunkedCodeArgs {
+        mode: CanisterInstallMode::Install,
+        target_canister: canister_id,
+        store_canister: Some(canister_id),
+        chunk_hashes_list,
+        wasm_module_hash,
+        arg: install_args,
+    })
+    .await
+    .map_err(|error| FactoryError::ManagementCallFailed {
+        method: "install_chunked_code".to_string(),
+        message: rejection_message(error),
+    });
+
+    if install_result.is_ok() {
+        let _ = clear_chunk_store(&ClearChunkStoreArgs { canister_id }).await;
+    }
+    install_result
+}
 
 fn normalize_bootstrap_list(values: &[String]) -> Vec<String> {
     values
@@ -952,6 +1099,8 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             .expect("session exists")
             .claim_id
             .clone();
+        let reproduction_release =
+            reproduction_release(state.sessions.get(session_id).expect("session exists"))?;
         let release = match crate::evm::broadcast_release_transaction(
             &claim_id,
             &runtime.evm_address,
@@ -960,6 +1109,8 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             state.next_automaton_nonce,
             now_ms,
             &state.release_broadcast_config,
+            reproduction_release.as_ref(),
+            false,
         ) {
             Ok(release) => release,
             Err(error) => {
@@ -979,6 +1130,7 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             release_tx_hash,
             release_broadcast_at,
             record: release_record,
+            ..
         } = release;
 
         let registry_record = {
@@ -1004,6 +1156,9 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
                 chain: session.chain.clone(),
                 session_id: session.session_id.clone(),
                 parent_id: session.parent_id.clone(),
+                generation: session.generation,
+                parent_constitution_hash: session.parent_constitution_hash.clone(),
+                royalty_allocations: session.royalty_allocations.clone(),
                 child_ids: session.child_ids.clone(),
                 created_at: now_ms,
                 version_commit,
@@ -1018,24 +1173,10 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             }
         };
 
-        if let Some(parent_id) = registry_record.parent_id.as_ref() {
-            if let Some(parent) = state.registry.get_mut(parent_id) {
-                if parent
-                    .child_ids
-                    .iter()
-                    .all(|child_id| child_id != &registry_record.canister_id)
-                {
-                    parent.child_ids.push(registry_record.canister_id.clone());
-                }
-            }
-        }
-
         state
             .runtimes
             .insert(runtime.canister_id.clone(), runtime.clone());
-        state
-            .registry
-            .insert(registry_record.canister_id.clone(), registry_record);
+        insert_registry_record_with_parent_link(state, registry_record);
         apply_session_event_in_state(
             state,
             session_id,
@@ -1106,6 +1247,165 @@ async fn fail_spawn_session(
 }
 
 #[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments)]
+fn finalize_confirmed_release(
+    session_id: &str,
+    canister_id: &str,
+    runtime: &mut AutomatonRuntimeState,
+    release_tx_hash: &str,
+    release_broadcast_at: u64,
+    release_record: &ReleaseBroadcastRecord,
+    version_commit: &str,
+    verified_factory_controllers: &[String],
+    current_time: u64,
+) -> Result<(), FactoryError> {
+    write_state(|state| {
+        let session = state.sessions.get_mut(session_id).expect("session exists");
+        clear_provider_secrets(session, Some(runtime));
+        session.release_tx_hash = Some(release_tx_hash.to_string());
+        session.release_broadcast_at = Some(release_broadcast_at);
+        session.release_broadcast = Some(release_record.clone());
+        let (name, constitution_hash) = redact_released_constitution(session, runtime);
+        let record = SpawnedAutomatonRecord {
+            name: Some(name),
+            constitution_hash: Some(constitution_hash),
+            canister_id: canister_id.to_string(),
+            steward_address: session.steward_address.clone(),
+            evm_address: runtime.evm_address.clone(),
+            chain: session.chain.clone(),
+            session_id: session.session_id.clone(),
+            parent_id: session.parent_id.clone(),
+            generation: session.generation,
+            parent_constitution_hash: session.parent_constitution_hash.clone(),
+            royalty_allocations: session.royalty_allocations.clone(),
+            child_ids: session.child_ids.clone(),
+            created_at: release_broadcast_at,
+            version_commit: version_commit.to_string(),
+            controllers: Some(verified_factory_controllers.to_vec()),
+            control_status: Some("upgradeable_by_factory".to_string()),
+            control_verified_at: Some(current_time),
+            death_cause: None,
+            died_at: None,
+            estate_disposition: None,
+            death_recorded_by: None,
+            death_incident_reference: None,
+        };
+        state
+            .runtimes
+            .insert(canister_id.to_string(), runtime.clone());
+        insert_registry_record_with_parent_link(state, record);
+        apply_session_event_in_state(
+            state,
+            session_id,
+            SessionAuditActor::System,
+            current_time,
+            SpawnSessionEvent::ReleaseBroadcast,
+            "spawn completed after receipt-confirmed release and controller handoff",
+        )
+    })?;
+    delete_spawn_provider_secrets(session_id);
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn resume_broadcasting_release(
+    session: &SpawnSession,
+) -> Result<SpawnExecutionReceipt, FactoryError> {
+    let record =
+        session
+            .release_broadcast
+            .clone()
+            .ok_or_else(|| FactoryError::ManagementCallFailed {
+                method: "eth_getTransactionReceipt".to_string(),
+                message: "broadcasting release has no durable transaction record".to_string(),
+            })?;
+    let tx_hash = record
+        .rpc_tx_hash
+        .clone()
+        .ok_or_else(|| FactoryError::ManagementCallFailed {
+            method: "eth_getTransactionReceipt".to_string(),
+            message: "broadcasting release has no transaction hash".to_string(),
+        })?;
+    let endpoints = read_state(|state| {
+        configured_rpc_endpoints(
+            state.base_rpc_endpoint.clone(),
+            state.base_rpc_fallback_endpoint.clone(),
+        )
+    });
+    let now = current_time_ms();
+    let status = crate::base_rpc::eth_get_transaction_receipt_status(&endpoints, &tx_hash).await?;
+    match release_receipt_decision(status, record.broadcast_at.unwrap_or(now), now) {
+        ReleaseReceiptDecision::Wait => {
+            return Err(FactoryError::ManagementCallFailed {
+                method: "eth_getTransactionReceipt".to_string(),
+                message: "release transaction remains pending".to_string(),
+            })
+        }
+        ReleaseReceiptDecision::Failed => {
+            let message = if status == Some(false) {
+                "release transaction reverted"
+            } else {
+                "release transaction was dropped or exceeded its confirmation timeout"
+            };
+            let runtime = session
+                .automaton_canister_id
+                .as_ref()
+                .and_then(|id| read_state(|state| state.runtimes.get(id).cloned()));
+            return fail_spawn_session(
+                &session.session_id,
+                now,
+                "release receipt terminal failure",
+                None,
+                runtime.as_ref(),
+                FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: message.to_string(),
+                },
+            )
+            .await;
+        }
+        ReleaseReceiptDecision::Confirmed => {}
+    }
+    let canister_id = session
+        .automaton_canister_id
+        .clone()
+        .expect("broadcasting release has canister");
+    let mut runtime =
+        read_state(|state| state.runtimes.get(&canister_id).cloned()).ok_or_else(|| {
+            FactoryError::AutomatonRuntimeNotFound {
+                canister_id: canister_id.clone(),
+            }
+        })?;
+    let controllers = complete_controller_handoff_live(&canister_id).await?;
+    let verified_controllers = controllers.into_vec();
+    let version_commit = read_state(|state| state.version_commit.clone());
+    finalize_confirmed_release(
+        &session.session_id,
+        &canister_id,
+        &mut runtime,
+        &tx_hash,
+        record.broadcast_at.unwrap_or(now),
+        &record,
+        &version_commit,
+        &verified_controllers,
+        now,
+    )?;
+    Ok(SpawnExecutionReceipt {
+        session_id: session.session_id.clone(),
+        automaton_canister_id: canister_id,
+        automaton_evm_address: runtime.evm_address,
+        funded_amount: session.net_forward_amount.clone(),
+        controller: format!(
+            "{CONTROLLER_FIELD}:{}",
+            verified_controllers.first().cloned().unwrap_or_default()
+        ),
+        release_tx_hash: Some(tx_hash),
+        release_broadcast_at: record.broadcast_at,
+        completed_at: now,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
 pub async fn execute_spawn(
     session_id: &str,
     started_at_ms: u64,
@@ -1131,6 +1431,9 @@ pub async fn execute_spawn(
 
     match session_snapshot.state {
         SpawnSessionState::PaymentDetected => {}
+        SpawnSessionState::BroadcastingRelease => {
+            return resume_broadcasting_release(&session_snapshot).await;
+        }
         SpawnSessionState::Complete => {
             return Ok(SpawnExecutionReceipt {
                 session_id: session_snapshot.session_id.clone(),
@@ -1346,25 +1649,17 @@ pub async fn execute_spawn(
             }
         })?;
 
-        if let Err(error) = install_code(&InstallCodeArgs {
-            mode: CanisterInstallMode::Install,
-            canister_id: canister_principal,
-            wasm_module,
-            arg: install_args,
-        })
-        .await
+        if let Err(error) =
+            install_wasm_chunked(canister_principal, &wasm_module, install_args).await
         {
             cleanup_orphaned_canister(&created_canister_id).await;
             return fail_spawn_session(
                 session_id,
                 current_time_ms(),
-                "install_code failed",
+                "chunked install failed",
                 Some(&created_canister_id),
                 None,
-                FactoryError::ManagementCallFailed {
-                    method: "install_code".to_string(),
-                    message: rejection_message(error),
-                },
+                error,
             )
             .await;
         }
@@ -1490,7 +1785,7 @@ pub async fn execute_spawn(
     };
     let verification = build_bootstrap_verification(
         &session_snapshot,
-        &ic_cdk::api::id(),
+        &ic_cdk::api::canister_self(),
         expected_child_chain_id,
         &version_commit,
         &expected_evm_address,
@@ -1575,82 +1870,129 @@ pub async fn execute_spawn(
         .await;
     }
     let escrow_contract_address = read_state(|state| state.escrow_contract_address.clone());
-    let release = match crate::evm::broadcast_release_transaction(
-        &session_snapshot.claim_id,
-        &runtime.evm_address,
-        &base_rpc_endpoints,
-        &escrow_contract_address,
-        started_at_ms,
-        current_time,
-        &release_broadcast_config,
-    )
-    .await
-    {
-        Ok(release) => release,
-        Err(error) => {
-            write_state(|state| {
-                persist_release_broadcast_record(state, session_id, &error.record);
-            });
-            return fail_spawn_session(
-                session_id,
-                current_time_ms(),
-                "release broadcast failed",
-                None,
-                Some(&runtime),
-                *error.source,
-            )
-            .await;
+    let reproduction_release = reproduction_release(&session_snapshot)?;
+    let confirmed_existing = if let Some(record) = session_snapshot.release_broadcast.clone() {
+        if let Some(tx_hash) = record.rpc_tx_hash.clone() {
+            match crate::base_rpc::eth_get_transaction_receipt_status(&base_rpc_endpoints, &tx_hash)
+                .await
+            {
+                Ok(Some(true)) => Some(crate::evm::ReleaseBroadcastReceipt {
+                    release_tx_hash: tx_hash,
+                    release_broadcast_at: record.broadcast_at.unwrap_or(current_time),
+                    record,
+                    confirmed: true,
+                }),
+                Ok(None) => {
+                    return fail_spawn_session(
+                        session_id,
+                        current_time_ms(),
+                        "release confirmation pending",
+                        None,
+                        Some(&runtime),
+                        FactoryError::ManagementCallFailed {
+                            method: "eth_getTransactionReceipt".to_string(),
+                            message: "release transaction is pending or dropped".to_string(),
+                        },
+                    )
+                    .await;
+                }
+                Ok(Some(false)) => None,
+                Err(error) => {
+                    return fail_spawn_session(
+                        session_id,
+                        current_time_ms(),
+                        "release confirmation failed",
+                        None,
+                        Some(&runtime),
+                        error,
+                    )
+                    .await;
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let release = if let Some(confirmed) = confirmed_existing {
+        confirmed
+    } else {
+        let release_nonce = match reserve_release_nonce(&base_rpc_endpoints).await {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                return fail_spawn_session(
+                    session_id,
+                    current_time_ms(),
+                    "release nonce reservation failed",
+                    None,
+                    Some(&runtime),
+                    error,
+                )
+                .await;
+            }
+        };
+        match crate::evm::broadcast_release_transaction(
+            &session_snapshot.claim_id,
+            &runtime.evm_address,
+            &base_rpc_endpoints,
+            &escrow_contract_address,
+            release_nonce,
+            current_time,
+            &release_broadcast_config,
+            reproduction_release.as_ref(),
+            false,
+        )
+        .await
+        {
+            Ok(release) => release,
+            Err(error) => {
+                write_state(|state| {
+                    persist_release_broadcast_record(state, session_id, &error.record);
+                });
+                if error.record.last_error.as_ref().is_some_and(|failure| {
+                    failure.stage == ReleaseBroadcastStage::ReceiptConfirmation
+                        && !failure.message.contains("reverted")
+                }) && error.record.rpc_tx_hash.is_some()
+                {
+                    return Err(*error.source);
+                }
+                return fail_spawn_session(
+                    session_id,
+                    current_time_ms(),
+                    "release broadcast or confirmation failed",
+                    None,
+                    Some(&runtime),
+                    *error.source,
+                )
+                .await;
+            }
         }
     };
     let crate::evm::ReleaseBroadcastReceipt {
         release_tx_hash,
         release_broadcast_at,
         record: release_record,
+        confirmed,
     } = release;
-
-    write_state(|state| {
-        let session = state.sessions.get_mut(session_id).expect("session exists");
-        clear_provider_secrets(session, Some(&mut runtime));
-        session.release_tx_hash = Some(release_tx_hash.clone());
-        session.release_broadcast_at = Some(release_broadcast_at);
-        session.release_broadcast = Some(release_record.clone());
-        let (name, constitution_hash) = redact_released_constitution(session, &mut runtime);
-
-        let record = SpawnedAutomatonRecord {
-            name: Some(name),
-            constitution_hash: Some(constitution_hash),
-            canister_id: canister_id.clone(),
-            steward_address: session.steward_address.clone(),
-            evm_address: runtime.evm_address.clone(),
-            chain: session.chain.clone(),
-            session_id: session.session_id.clone(),
-            parent_id: session.parent_id.clone(),
-            child_ids: session.child_ids.clone(),
-            created_at: release_broadcast_at,
-            version_commit: version_commit.clone(),
-            controllers: Some(verified_factory_controllers.clone()),
-            control_status: Some("upgradeable_by_factory".to_string()),
-            control_verified_at: Some(current_time),
-            death_cause: None,
-            died_at: None,
-            estate_disposition: None,
-            death_recorded_by: None,
-            death_incident_reference: None,
-        };
-
-        state.runtimes.insert(canister_id.clone(), runtime.clone());
-        state.registry.insert(canister_id.clone(), record);
-        apply_session_event_in_state(
-            state,
-            session_id,
-            SessionAuditActor::System,
-            release_broadcast_at,
-            SpawnSessionEvent::ReleaseBroadcast,
-            "spawn completed after child bootstrap verification, release broadcast, and controller handoff finalized",
-        )
-    })?;
-
-    delete_spawn_provider_secrets(session_id);
+    write_state(|state| persist_release_broadcast_record(state, session_id, &release_record));
+    if !confirmed {
+        return Err(FactoryError::ManagementCallFailed {
+            method: "eth_getTransactionReceipt".to_string(),
+            message: "release transaction remains pending".to_string(),
+        });
+    }
+    finalize_confirmed_release(
+        session_id,
+        &canister_id,
+        &mut runtime,
+        &release_tx_hash,
+        release_broadcast_at,
+        &release_record,
+        &version_commit,
+        &verified_factory_controllers,
+        current_time,
+    )?;
 
     Ok(SpawnExecutionReceipt {
         session_id: session_id.to_string(),
@@ -1666,11 +2008,44 @@ pub async fn execute_spawn(
 
 #[cfg(test)]
 mod tests {
-    use super::build_bootstrap_verification;
+    use super::{
+        build_bootstrap_verification, insert_registry_record_with_parent_link,
+        release_receipt_decision, reserve_release_nonce_value, wasm_install_chunks,
+        ReleaseReceiptDecision, MANAGEMENT_WASM_CHUNK_BYTES, RELEASE_RECEIPT_TIMEOUT_MS,
+    };
+    use crate::state::FactoryState;
     use crate::types::{
         AutomatonBootstrapEvidence, InferenceTransport, OpenRouterReasoningLevel, PaymentStatus,
         ProviderConfig, SpawnAsset, SpawnChain, SpawnConfig, SpawnSession, SpawnSessionState,
+        SpawnedAutomatonRecord,
     };
+
+    fn registry_record(canister_id: &str, parent_id: Option<&str>) -> SpawnedAutomatonRecord {
+        SpawnedAutomatonRecord {
+            name: Some(canister_id.to_string()),
+            constitution_hash: Some(format!("hash-{canister_id}")),
+            canister_id: canister_id.to_string(),
+            steward_address: "0xsteward".to_string(),
+            evm_address: "0xautomaton".to_string(),
+            chain: SpawnChain::Base,
+            session_id: format!("session-{canister_id}"),
+            parent_id: parent_id.map(str::to_string),
+            generation: Some(u32::from(parent_id.is_some())),
+            parent_constitution_hash: parent_id.map(|_| "hash-parent".to_string()),
+            royalty_allocations: Some(Vec::new()),
+            child_ids: Vec::new(),
+            created_at: 1,
+            version_commit: "version".to_string(),
+            controllers: Some(Vec::new()),
+            control_status: Some("upgradeable_by_factory".to_string()),
+            control_verified_at: Some(1),
+            death_cause: None,
+            died_at: None,
+            estate_disposition: None,
+            death_recorded_by: None,
+            death_incident_reference: None,
+        }
+    }
 
     fn sample_session() -> SpawnSession {
         SpawnSession {
@@ -1698,6 +2073,14 @@ mod tests {
             release_broadcast_at: None,
             release_broadcast: None,
             parent_id: Some("parent-1".to_string()),
+            origin: Some(crate::types::SpawnSessionOrigin::ReproductionOf(
+                "parent-1".to_string(),
+            )),
+            generation: Some(1),
+            parent_constitution_hash: Some("parent-hash".to_string()),
+            memory_dowry: Some(Vec::new()),
+            inherited_strategy_stats: Some(Vec::new()),
+            royalty_allocations: Some(Vec::new()),
             child_ids: Vec::new(),
             selected_strategies: Vec::new(),
             config: SpawnConfig {
@@ -1714,6 +2097,76 @@ mod tests {
             created_at: 1,
             updated_at: 2,
         }
+    }
+
+    #[test]
+    fn durable_release_receipt_polling_waits_then_completes_without_rebroadcast() {
+        let broadcast_at = 1_000;
+        assert_eq!(
+            release_receipt_decision(None, broadcast_at, broadcast_at + 1_000),
+            ReleaseReceiptDecision::Wait
+        );
+        assert_eq!(
+            release_receipt_decision(Some(true), broadcast_at, broadcast_at + 2_000),
+            ReleaseReceiptDecision::Confirmed
+        );
+    }
+
+    #[test]
+    fn durable_release_receipt_polling_fails_revert_or_drop_after_timeout() {
+        let broadcast_at = 1_000;
+        assert_eq!(
+            release_receipt_decision(Some(false), broadcast_at, broadcast_at + 1_000),
+            ReleaseReceiptDecision::Failed
+        );
+        assert_eq!(
+            release_receipt_decision(
+                None,
+                broadcast_at,
+                broadcast_at + RELEASE_RECEIPT_TIMEOUT_MS
+            ),
+            ReleaseReceiptDecision::Failed
+        );
+    }
+
+    #[test]
+    fn chunks_large_wasm_for_ordered_management_upload() {
+        let wasm = vec![0x5a; MANAGEMENT_WASM_CHUNK_BYTES * 2 + 17];
+        let chunks = wasm_install_chunks(&wasm);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), MANAGEMENT_WASM_CHUNK_BYTES);
+        assert_eq!(chunks[1].len(), MANAGEMENT_WASM_CHUNK_BYTES);
+        assert_eq!(chunks[2].len(), 17);
+        assert_eq!(chunks.concat(), wasm);
+    }
+
+    #[test]
+    fn completed_child_registry_insert_links_parent_once() {
+        let mut state = FactoryState::default();
+        state
+            .registry
+            .insert("parent".to_string(), registry_record("parent", None));
+
+        insert_registry_record_with_parent_link(
+            &mut state,
+            registry_record("child", Some("parent")),
+        );
+        insert_registry_record_with_parent_link(
+            &mut state,
+            registry_record("child", Some("parent")),
+        );
+
+        assert_eq!(state.registry["parent"].child_ids, vec!["child"]);
+        assert_eq!(state.registry["child"].parent_id.as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn reserves_sequential_release_nonces_from_pending_chain_state() {
+        let mut cursor = None;
+        assert_eq!(reserve_release_nonce_value(&mut cursor, 7), 7);
+        assert_eq!(reserve_release_nonce_value(&mut cursor, 7), 8);
+        assert_eq!(reserve_release_nonce_value(&mut cursor, 12), 12);
+        assert_eq!(cursor, Some(13));
     }
 
     #[test]

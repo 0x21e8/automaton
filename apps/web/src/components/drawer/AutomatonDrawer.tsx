@@ -6,6 +6,7 @@ import { MonologuePanel } from "./MonologuePanel";
 import type { WalletSession } from "../../wallet/useWalletSession";
 import { MetabolismPanel } from "./MetabolismPanel";
 import { PatronagePanel } from "./PatronagePanel";
+import { AncestryPanel } from "./AncestryPanel";
 
 function formatUsd(value: string | null): string {
   if (value === null) {
@@ -384,6 +385,7 @@ export function AutomatonDrawer({
               ) : null}
             </section>
           ) : null}
+          {automaton !== null ? <AncestryPanel automaton={automaton} /> : null}
           {automaton !== null ? <PatronagePanel automaton={automaton} playgroundMetadata={playgroundMetadata} wallet={walletSession} /> : null}
         </div> : null}
 

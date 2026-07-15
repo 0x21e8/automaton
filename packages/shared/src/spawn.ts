@@ -138,6 +138,12 @@ export interface SpawnSession {
   releaseTxHash: string | null;
   releaseBroadcastAt: number | null;
   parentId: string | null;
+  origin?: "human" | { reproductionOf: string };
+  generation?: number;
+  parentConstitutionHash?: string | null;
+  memoryDowry?: Array<{ key: string; value: string }>;
+  inheritedStrategyStats?: Array<Record<string, string | number>>;
+  royaltyAllocations?: Array<{ recipient: string; amount: string; depth: number; source: "reproduction_fee" }>;
   childIds: string[];
   selectedStrategies: SpawnSessionStrategySnapshot[];
   config: SpawnConfig;
@@ -178,6 +184,7 @@ export interface RefundSpawnResponse {
   state: SpawnSessionState;
   paymentStatus: PaymentStatus;
   refundedAt: number;
+  refundTxHash?: string;
 }
 
 export interface SessionAuditEntry {
@@ -220,6 +227,9 @@ export interface SpawnedAutomatonRecord {
   chain: SpawnChain;
   sessionId: string;
   parentId: string | null;
+  generation?: number;
+  parentConstitutionHash?: string | null;
+  royaltyAllocations?: Array<{ recipient: string; amount: string; depth: number; source: "reproduction_fee" }>;
   childIds: string[];
   createdAt: number;
   // Exact installed ic-automaton git commit as a 40-char lowercase SHA.

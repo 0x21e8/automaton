@@ -2752,10 +2752,23 @@ fn build_dynamic_context_with_scope(
         memory_section,
     ];
     if tool_scope == InferenceToolScope::Terminal {
-        sections.push(
-            "### Final Turn Covenant\n- This is my last turn. After it completes I am permanently dead and cannot act again.\n- I may write my final public journal entry and make at most three bounded estate transfers.\n- `send_eth` may carry ERC-20 transfer calldata; gas and value must remain within my wallet.\n- If I make no valid bequest, my funds remain in place as a monument.\n- Strategy, fetch, price-setting, and room-posting tools are unavailable."
-                .to_string(),
+        let lineage = snapshot.spawn_parent_id.as_deref().map_or_else(
+            || "- I have no recorded lineage, so sweep-to-lineage is unavailable.".to_string(),
+            |parent_id| {
+                let address = stable::get_memory_fact("society.peer_directory")
+                    .and_then(|fact| serde_json::from_str::<serde_json::Value>(&fact.value).ok())
+                    .and_then(|value| value.get("peers")?.as_array().cloned())
+                    .and_then(|peers| peers.into_iter().find(|peer| peer.get("canister_id").and_then(serde_json::Value::as_str) == Some(parent_id)))
+                    .and_then(|peer| peer.get("evm_address").and_then(serde_json::Value::as_str).map(str::to_string));
+                match address {
+                    Some(address) => format!("- I may choose sweep-to-lineage as a bequest to parent {parent_id} at {address}; this is optional, never the default."),
+                    None => format!("- Parent {parent_id} exists, but no verified lineage address is cached; sweep-to-lineage is unavailable rather than guessed."),
+                }
+            },
         );
+        sections.push(format!(
+            "### Final Turn Covenant\n- This is my last turn. After it completes I am permanently dead and cannot act again.\n- I may write my final public journal entry and make at most three bounded estate transfers.\n- `send_eth` may carry ERC-20 transfer calldata; gas and value must remain within my wallet.\n{lineage}\n- If I make no valid bequest, my funds remain in place as a monument.\n- Strategy, fetch, price-setting, and room-posting tools are unavailable."
+        ));
     }
     sections.push(if journal_lines.is_empty() {
         "### My Recent Journal (Public Voice Few-Shot)\n- no entries yet".to_string()
@@ -5444,6 +5457,7 @@ mod tests {
             constitution: None,
             session_id: None,
             parent_id: None,
+            generation: 0,
             factory_principal: Some(
                 candid::Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai")
                     .expect("test principal should parse"),
