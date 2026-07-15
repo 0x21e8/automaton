@@ -1,10 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { validateReleaseManifest } from "./lib/release-manifest.mjs";
+import { renderReleaseManifest } from "./lib/render-release-manifest.mjs";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
@@ -24,28 +23,24 @@ const dirty = execFileSync("git", ["status", "--porcelain", "--untracked-files=a
 if (mode === "publish" && dirty) throw new Error("refusing to publish from a dirty checkout");
 
 const artifacts = {
-  automatonWasm: artifact("dist/automaton.wasm", sourceCommit),
-  factoryWasm: artifact("dist/factory.wasm", sourceCommit)
+  automatonWasm: artifact("dist/automaton.wasm"),
+  factoryWasm: artifact("dist/factory.wasm")
 };
-const images = {
-  web: image("RELEASE_WEB_IMAGE_REF", "ghcr.io/example/automaton-playground-web"),
-  indexer: image("RELEASE_INDEXER_IMAGE_REF", "ghcr.io/example/automaton-playground-indexer"),
-  rpcGateway: image("RELEASE_RPC_GATEWAY_IMAGE_REF", "ghcr.io/example/automaton-playground-rpc-gateway")
+const imageRefs = {
+  web: imageRef("RELEASE_WEB_IMAGE_REF", "ghcr.io/example/automaton-playground-web"),
+  indexer: imageRef("RELEASE_INDEXER_IMAGE_REF", "ghcr.io/example/automaton-playground-indexer"),
+  rpcGateway: imageRef("RELEASE_RPC_GATEWAY_IMAGE_REF", "ghcr.io/example/automaton-playground-rpc-gateway")
 };
 
-const manifest = {
-  schemaVersion: 2,
-  release: {
-    sourceCommit,
-    environmentVersion: process.env.RELEASE_ENVIRONMENT_VERSION?.trim() || `playground-${sourceCommit.slice(0, 12)}`,
-    createdAt: new Date().toISOString(),
-    ...(dirty ? { dirty: true } : {})
-  },
-  images,
+const manifest = renderReleaseManifest({
+  sourceCommit,
+  dirty,
+  mode,
+  environmentVersion: process.env.RELEASE_ENVIRONMENT_VERSION?.trim() || `playground-${sourceCommit.slice(0, 12)}`,
+  imageRefs,
   artifacts,
-  ops: { sourceCommit }
-};
-validateReleaseManifest(manifest, { allowDirty: mode === "dry-run" });
+  createdAt: new Date().toISOString()
+});
 const outputPath = path.resolve(rootDir, output);
 fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 fs.writeFileSync(outputPath, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -56,26 +51,17 @@ function option(name) {
   return index === -1 ? null : args[index + 1] ?? null;
 }
 
-function artifact(relativePath, commit) {
+function artifact(relativePath) {
   const filePath = path.join(rootDir, relativePath);
   if (!fs.existsSync(filePath)) throw new Error(`missing release artifact ${filePath}`);
   return {
     fileName: path.basename(filePath),
-    sha256: createHash("sha256").update(fs.readFileSync(filePath)).digest("hex"),
-    sourceCommit: commit
+    bytes: fs.readFileSync(filePath)
   };
 }
 
-function image(envName, fallbackRepository) {
+function imageRef(envName, fallbackRepository) {
   const supplied = process.env[envName]?.trim();
   const digest = "sha256:" + "0".repeat(64);
-  const ref = supplied || `${fallbackRepository}@${digest}`;
-  const at = ref.lastIndexOf("@");
-  if (at <= 0) throw new Error(`${envName} must be an immutable digest ref`);
-  return {
-    ref,
-    digest: ref.slice(at + 1),
-    repository: ref.slice(0, at),
-    tag: sourceCommit
-  };
+  return supplied || `${fallbackRepository}@${digest}`;
 }
