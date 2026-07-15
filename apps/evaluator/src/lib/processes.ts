@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import type { PlaygroundRuntime } from "../types.js";
 
 const execFileAsync = promisify(execFile);
+const SCRIPT_OUTPUT_TAIL_LIMIT = 8_192;
 
 interface PlaygroundE2eModule {
   resolvePlaygroundRuntime(
@@ -33,11 +34,33 @@ async function runScriptStreaming(options: {
   env: NodeJS.ProcessEnv;
   scriptPath: string;
 }) {
+  let stdoutTail = "";
+  let stderrTail = "";
+
+  const appendOutputTail = (current: string, chunk: string) => {
+    const next = `${current}${chunk}`;
+    return next.length <= SCRIPT_OUTPUT_TAIL_LIMIT
+      ? next
+      : next.slice(next.length - SCRIPT_OUTPUT_TAIL_LIMIT);
+  };
+
   await new Promise<void>((resolve, reject) => {
     const child = spawn("sh", [options.scriptPath], {
       cwd: options.cwd,
       env: options.env,
-      stdio: "inherit"
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      const text = chunk.toString();
+      process.stdout.write(text);
+      stdoutTail = appendOutputTail(stdoutTail, text);
+    });
+
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      const text = chunk.toString();
+      process.stderr.write(text);
+      stderrTail = appendOutputTail(stderrTail, text);
     });
 
     child.on("error", reject);
@@ -51,7 +74,28 @@ async function runScriptStreaming(options: {
         signal === null
           ? `exit code ${code ?? "unknown"}`
           : `signal ${signal}`;
-      reject(new Error(`Command failed: sh ${options.scriptPath} (${suffix})`));
+      const recentOutput = [stderrTail.trim(), stdoutTail.trim()].filter(Boolean).join("\n");
+      const error = new Error(
+        recentOutput === ""
+          ? `Command failed: sh ${options.scriptPath} (${suffix})`
+          : `Command failed: sh ${options.scriptPath} (${suffix})\n${recentOutput}`
+      );
+      (
+        error as Error & {
+          details?: {
+            scriptPath: string;
+            exitCode: number | null;
+            signal: NodeJS.Signals | null;
+            recentOutput: string | null;
+          };
+        }
+      ).details = {
+        scriptPath: options.scriptPath,
+        exitCode: code,
+        signal,
+        recentOutput: recentOutput === "" ? null : recentOutput
+      };
+      reject(error);
     });
   });
 }

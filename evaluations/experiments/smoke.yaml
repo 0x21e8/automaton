@@ -10,17 +10,22 @@ spawn:
   minSuccessRatio: 0.8
 automatons:
   - id: alpha
-    label: Google Gemma
-    model: google/gemma-4-31b-it
+    label: Kimi
+    model: moonshotai/kimi-k2.5
+    transport: openrouter_proxy_worker
     strategies:
       - base-aave-usdc-reserve-01
   - id: beta
     label: Xiao
     model: xiaomi/mimo-v2-pro
-    strategies:
-      - base-moonwell-usdc-reserve-01
+    transport: openrouter_proxy_worker
+    strategies: []
   - id: gamma
     label: Qwen searcher
-    model: qwen/qwen3.6-plus:free
+    model: google/gemini-2.5-flash-lite
     strategies:
-      - base-usdc-carry-cbbtc-01
+      - base-aave-usdc-reserve-01
+  - id: delta
+    label: Grok
+    model: x-ai/grok-4.1-fast
+    strategies: []

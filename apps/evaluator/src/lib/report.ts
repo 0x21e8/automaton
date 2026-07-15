@@ -250,6 +250,7 @@ export function buildDashboardAutomatons(automatons: RuntimeAutomatonState[]): E
       runtimeStatus: automaton.runtimeStatus,
       lastObservedTurnAt: automaton.lastObservedTurnAt,
       lastError: automaton.lastError,
+      lastErrorDetails: automaton.lastErrorDetails,
       errorHistogram: sortErrorHistogramEntries(automaton.errorHistogram.values()),
       cyclesDelta: subtractNumericStrings(
         automaton.baseline?.cycles ?? null,
@@ -323,6 +324,7 @@ export function buildSummary(run: ActiveEvaluationRun, comparisonValid: boolean)
     providerInferenceCount: automaton.providerInferenceCount,
     errorCount: automaton.errorCount,
     lastError: automaton.lastError,
+    lastErrorDetails: automaton.lastErrorDetails,
     errorHistogram: sortErrorHistogramEntries(automaton.errorHistogram.values()),
     cyclesBaseline: automaton.baseline?.cycles ?? null,
     cyclesLatest: automaton.cyclesLatest,

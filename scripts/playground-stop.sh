@@ -3,6 +3,7 @@
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT_DIR/scripts/load-repo-env.sh"
 TMP_DIR=${PLAYGROUND_TMP_DIR:-"$ROOT_DIR/tmp"}
 STATUS_FILE=${PLAYGROUND_STATUS_FILE:-"$TMP_DIR/playground-status.json"}
 SERVICE_DIR=${PLAYGROUND_SERVICE_DIR:-"$TMP_DIR/playground-services"}

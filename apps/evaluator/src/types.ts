@@ -94,6 +94,7 @@ export interface RuntimeAutomatonState {
   finalObservedAt: number | null;
   lastObservedTurnAt: number | null;
   lastError: string | null;
+  lastErrorDetails: unknown | null;
   turnCount: number;
   toolCallCount: number;
   providerInferenceCount: number | "unavailable";

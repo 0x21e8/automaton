@@ -201,6 +201,7 @@ export interface EvaluationAutomatonSummary {
   providerInferenceCount: EvaluationObservedCount;
   errorCount: number;
   lastError: string | null;
+  lastErrorDetails: unknown | null;
   errorHistogram: EvaluationErrorHistogramEntry[];
   cyclesBaseline: string | null;
   cyclesLatest: string | null;
@@ -265,6 +266,7 @@ export interface EvaluationDashboardAutomaton {
   runtimeStatus: EvaluationAutomatonStatus;
   lastObservedTurnAt: number | null;
   lastError: string | null;
+  lastErrorDetails: unknown | null;
   errorHistogram: EvaluationErrorHistogramEntry[];
   cyclesDelta: string | null;
   cyclesMovingAveragePerHour: string | null;
@@ -723,6 +725,10 @@ function findMappingSeparator(value: string): number {
 }
 
 function parseYamlScalar(value: string, lineNumber: number): ParsedYamlValue {
+  if (value === "[]") {
+    return [];
+  }
+
   if (
     (value.startsWith("\"") && value.endsWith("\"")) ||
     (value.startsWith("'") && value.endsWith("'"))
@@ -900,7 +906,7 @@ function toEvaluationAutomatonConfig(
     issues,
     `${path}.reasoningLevel`
   );
-  const strategies = expectArray(record.strategies, issues, `${path}.strategies`)
+  const strategies = expectOptionalArray(record.strategies, issues, `${path}.strategies`)
     .map((entry, index) =>
       expectNonEmptyString(entry, issues, `${path}.strategies[${index}]`)
     )
@@ -910,10 +916,6 @@ function toEvaluationAutomatonConfig(
     issues.push(`${path}.id must be unique; duplicate value "${id}".`);
   } else {
     automatonIds.add(id);
-  }
-
-  if (strategies.length === 0) {
-    issues.push(`${path}.strategies must contain at least one strategy ID.`);
   }
 
   return {
@@ -946,6 +948,14 @@ function expectArray(value: unknown, issues: string[], path: string): unknown[] 
   }
 
   return value;
+}
+
+function expectOptionalArray(value: unknown, issues: string[], path: string): unknown[] {
+  if (value === undefined) {
+    return [];
+  }
+
+  return expectArray(value, issues, path);
 }
 
 function expectNonEmptyString(value: unknown, issues: string[], path: string): string {

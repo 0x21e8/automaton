@@ -136,21 +136,6 @@ This starts:
 
 Open `http://127.0.0.1:5173`. The app works with an empty database — you get the full UI shell with an empty automaton list.
 
-### UI convergence checks
-
-The public Lab, certified direct console, and separate evaluator dashboard
-share generated tokens while keeping their deployment/access boundaries. Run
-the non-deploying appearance gates with:
-
-```bash
-npm run verify:ui-tokens
-npm run verify:terminal-parity
-npm run test:e2e:ui
-```
-
-The Playwright command starts the Lab and evaluator Vite servers on ports
-5173 and 4173 and checks desktop, tablet, and narrow-mobile Chromium layouts.
-
 ## Local Evaluation Harness
 
 The evaluation harness uses the full local playground plus a separate operator stack:
@@ -171,7 +156,7 @@ The evaluator expects the following keys:
 EVAL_STEWARD_ADDRESS=0x...
 EVAL_OPENROUTER_API_KEY=...
 LOCAL_EVM_FORK_URL=https://...
-AUTOMATON_COMPONENT_ROOT=/absolute/path/to/automaton-launchpad/components/ic-automaton
+IC_AUTOMATON_REPO=/absolute/path/to/ic-automaton
 
 # Optional
 EVAL_BRAVE_SEARCH_API_KEY=
@@ -242,7 +227,7 @@ Both scripts accept the following optional overrides:
 Both web servers use strict ports. If `4173` or `5173` is already occupied, the eval wrapper exits instead of silently switching to a different port.
 
 For the full local spawn setup, including Base-fork Anvil, canonical Base USDC mock injection,
-launchpad escrow, imported automaton Inbox deployment, real child Wasm upload, wallet seeding,
+launchpad escrow, sibling `ic-automaton` inbox deployment, real child Wasm upload, wallet seeding,
 local ICP, factory/indexer/rpc-gateway startup, and hot-reload web:
 
 ```bash
@@ -251,8 +236,8 @@ $EDITOR playground.local.env
 npm run playground:dev
 ```
 
-`playground:dev` builds the imported child canister artifact and uses the canister-ready
-`backend_nowasi.wasm` automatically. You only need to set
+When `IC_AUTOMATON_REPO` is set, `playground:dev` builds the sibling child canister artifact
+and uses the canister-ready `backend_nowasi.wasm` automatically. You only need to set
 `CHILD_WASM_PATH` if you want to pin a different artifact.
 
 `playground:dev` bootstraps the backend stack and then starts only the Vite web app in hot-reload mode.
@@ -375,8 +360,8 @@ sh ./scripts/start-local-evm.sh --background
 sh ./scripts/deploy-local-escrow.sh
 # → writes tmp/local-escrow-deployment.json
 
-# 3. Deploy the imported automaton Inbox.sol against the same USDC token
-npm run evm:deploy-automaton-inbox
+# 3. Deploy the sibling ic-automaton Inbox.sol against the same USDC token
+IC_AUTOMATON_REPO=/path/to/ic-automaton npm run evm:deploy-automaton-inbox
 # → writes tmp/automaton-inbox-deployment.json
 
 # 4. Seed the fixed browser wallet used by the manual E2E flow
@@ -392,9 +377,9 @@ icp canister create factory -e local
 icp canister install factory -e local --mode reinstall \
   --args "$(node ./scripts/render-factory-local-init-args.mjs)"
 
-# 7. Upload a real child artifact built from the imported automaton component
-CHILD_WASM_PATH=components/ic-automaton/target/wasm32-wasip1/release/backend_nowasi.wasm \
-CHILD_VERSION_COMMIT=$(git rev-parse HEAD) \
+# 7. Upload a real child artifact built from the sibling ic-automaton repo
+CHILD_WASM_PATH=/path/to/ic-automaton/target/wasm32-wasip1/release/backend_nowasi.wasm \
+CHILD_VERSION_COMMIT=$(git -C /path/to/ic-automaton rev-parse HEAD) \
 npm run factory:upload-artifact
 
 # 8. Smoke-test the full deposit → release path

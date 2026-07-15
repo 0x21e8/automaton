@@ -125,6 +125,7 @@ export async function captureAutomatonSample(context: SampleContext): Promise<Sa
     walletError ??
     indexerError ??
     null;
+  context.automaton.lastErrorDetails = null;
 
   if (context.automaton.lastProgressAt === null) {
     context.automaton.lastProgressAt = context.automaton.baseline?.observedAt ?? context.now;

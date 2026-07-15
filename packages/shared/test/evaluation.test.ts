@@ -116,6 +116,30 @@ automatons:
     expect(experiment.automatons[1]?.reasoningLevel).toBe("high");
   });
 
+  it("allows automatons without preset strategies", () => {
+    const experiment = parseEvaluationExperimentYaml(`
+name: smoke-fleet
+description: Compare strategyless and seeded automatons.
+maxRuntimeMinutes: 240
+samplingIntervalSeconds: 15
+stallAfterMinutes: 10
+spawn:
+  grossAmount: "75000000"
+  minSuccessRatio: 0.8
+automatons:
+  - id: alpha
+    label: Strategyless explicit
+    model: openrouter/openai/gpt-5
+    strategies: []
+  - id: beta
+    label: Strategyless implicit
+    model: openrouter/anthropic/claude-sonnet-4
+`);
+
+    expect(experiment.automatons[0]?.strategies).toEqual([]);
+    expect(experiment.automatons[1]?.strategies).toEqual([]);
+  });
+
   it("rejects duplicate IDs and unknown secret-bearing keys", () => {
     const error = (() => {
       try {
@@ -208,6 +232,7 @@ automatons:
           providerInferenceCount: "unavailable",
           errorCount: 0,
           lastError: null,
+          lastErrorDetails: null,
           errorHistogram: [],
           cyclesBaseline: "4200000000000",
           cyclesLatest: "4100000000000",
@@ -279,6 +304,7 @@ automatons:
           runtimeStatus: "active",
           lastObservedTurnAt: 1_711_447_260_000,
           lastError: null,
+          lastErrorDetails: null,
           errorHistogram: [],
           cyclesDelta: "100000000000",
           cyclesMovingAveragePerHour: "600000000000",
