@@ -9,6 +9,7 @@ apps/indexer/data/*.sqlite*
 evm/cache/
 evm/out/
 tmp/
+advisor-plans/
 .claude
 .icp
 .env
