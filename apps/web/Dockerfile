@@ -6,12 +6,16 @@ COPY package.json package-lock.json ./
 COPY apps/indexer/package.json apps/indexer/package.json
 COPY apps/rpc-gateway/package.json apps/rpc-gateway/package.json
 COPY apps/web/package.json apps/web/package.json
+COPY packages/canister-clients/package.json packages/canister-clients/package.json
 COPY packages/shared/package.json packages/shared/package.json
+COPY packages/ui/package.json packages/ui/package.json
 
 RUN npm ci
 
 COPY tsconfig.base.json ./
+COPY packages/canister-clients packages/canister-clients
 COPY packages/shared packages/shared
+COPY packages/ui packages/ui
 COPY apps/web apps/web
 COPY scripts scripts
 

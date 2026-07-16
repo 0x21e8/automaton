@@ -10,11 +10,13 @@ COPY package.json package-lock.json ./
 COPY apps/indexer/package.json apps/indexer/package.json
 COPY apps/rpc-gateway/package.json apps/rpc-gateway/package.json
 COPY apps/web/package.json apps/web/package.json
+COPY packages/canister-clients/package.json packages/canister-clients/package.json
 COPY packages/shared/package.json packages/shared/package.json
 
 RUN npm ci
 
 COPY tsconfig.base.json ./
+COPY packages/canister-clients packages/canister-clients
 COPY packages/shared packages/shared
 COPY apps/indexer apps/indexer
 COPY scripts scripts
@@ -37,6 +39,8 @@ COPY --from=build /app/apps/indexer/dist ./apps/indexer/dist
 COPY --from=build /app/apps/indexer/src/store/schema.sql ./apps/indexer/src/store/schema.sql
 COPY --from=build /app/apps/rpc-gateway/package.json ./apps/rpc-gateway/package.json
 COPY --from=build /app/apps/web/package.json ./apps/web/package.json
+COPY --from=build /app/packages/canister-clients/package.json ./packages/canister-clients/package.json
+COPY --from=build /app/packages/canister-clients/src ./packages/canister-clients/src
 COPY --from=build /app/packages/shared/package.json ./packages/shared/package.json
 COPY --from=build /app/packages/shared/dist ./packages/shared/dist
 COPY --from=build /app/scripts/seed-local-wallet.mjs ./scripts/seed-local-wallet.mjs
