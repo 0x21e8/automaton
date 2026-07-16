@@ -39,6 +39,7 @@
     },
     {
       "action_id": "enter_supply",
+      "asset_effects": [{"asset_role":"usdc","asset_symbol":"USDC","decimals":6,"direction":"Debit","amount_path":"/calls/0/args/1"}],
       "calls": [
         {
           "role": "aave_pool",
@@ -61,6 +62,7 @@
     },
     {
       "action_id": "exit_supply",
+      "asset_effects": [{"asset_role":"usdc","asset_symbol":"USDC","decimals":6,"direction":"Credit","amount_path":"/calls/0/args/1"}],
       "calls": [
         {
           "role": "aave_pool",

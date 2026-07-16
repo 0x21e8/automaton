@@ -39,6 +39,7 @@
     },
     {
       "action_id": "enter_supply",
+      "asset_effects": [{"asset_role":"usdc","asset_symbol":"USDC","decimals":6,"direction":"Debit","amount_path":"/calls/0/args/0"}],
       "calls": [
         {
           "role": "m_usdc",
@@ -60,6 +61,7 @@
     },
     {
       "action_id": "exit_supply",
+      "asset_effects": [{"asset_role":"usdc","asset_symbol":"USDC","decimals":6,"direction":"Credit","amount_path":"/calls/0/args/0"}],
       "calls": [
         {
           "role": "m_usdc",

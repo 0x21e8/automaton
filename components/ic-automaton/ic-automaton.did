@@ -37,8 +37,11 @@ type ActionSpec = record {
 // Durable exposure record used for protocol concentration and reconciliation.
 type ActiveExposure = record {
   protocol : text;
+  decimals : opt nat8;
+  asset_address : opt text;
   updated_at_ns : nat64;
   strategy_id : text;
+  amount_raw : opt text;
   chain_id : nat64;
   notional_wei : opt nat;
   asset_symbol : text;

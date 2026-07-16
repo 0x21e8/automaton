@@ -19,7 +19,7 @@
       "recipe_file": "base-aave-usdc-reserve-01/recipe.json",
       "source_path": "docs/strategies/base-aave-usdc-reserve-01/recipe.json",
       "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
-      "recipe_sha256": "8f34884a3e8906e0c7883f9728bcbe88cfb828aa3f074f08d9cc84c2f26feb2d"
+      "recipe_sha256": "83cb9faf90648f9b77ba1a225346db0efc548ca5a1f565c0a7d08810d71c3202"
     },
     {
       "strategy_id": "base-moonwell-usdc-reserve-01",
@@ -34,7 +34,7 @@
       "recipe_file": "base-moonwell-usdc-reserve-01/recipe.json",
       "source_path": "docs/strategies/base-moonwell-usdc-reserve-01/recipe.json",
       "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
-      "recipe_sha256": "2f68ece1330ed65ee7497224ade69529925132bb0a9592a41f6734866a8f8c1a"
+      "recipe_sha256": "16bcbf3c75cb0c552ec41a9dbf2d824b7b44e2fb4bbf8204305b8c775e5e99e2"
     },
     {
       "strategy_id": "base-usdc-carry-cbbtc-01",
@@ -49,7 +49,7 @@
       "recipe_file": "base-usdc-carry-cbbtc-01/recipe.json",
       "source_path": "docs/strategies/base-usdc-carry-cbbtc-01/recipe.json",
       "source_commit": "03961659ec3b86f8586ac07e5f295084bb6f6ffa",
-      "recipe_sha256": "bbe400dc3984b99cf04da4293a23741da8b6cc1bd3f90563d0ac71fab1b64846"
+      "recipe_sha256": "66eec497ca1501beaf5a4994b7f00884eea9fac01c0eb24db9366a19e1d27c56"
     }
   ]
 }

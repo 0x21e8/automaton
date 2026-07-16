@@ -163,6 +163,8 @@ pub struct StrategyRecipeAction {
     pub postconditions: Vec<String>,
     #[serde(default)]
     pub risk_checks: Vec<String>,
+    #[serde(default)]
+    pub asset_effects: Vec<crate::domain::types::StrategyAssetEffectDeclaration>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,6 +298,7 @@ pub fn register_from_recipe(recipe: StrategyRecipe) -> Result<RegisteredStrategy
     }
 
     let mut actions = Vec::with_capacity(recipe.actions.len());
+    let mut asset_effects_by_action = serde_json::Map::new();
     for action in recipe.actions {
         let action_id = normalize_required_field(&action.action_id, "actions.action_id")?;
         if action.calls.is_empty() {
@@ -332,6 +335,12 @@ pub fn register_from_recipe(recipe: StrategyRecipe) -> Result<RegisteredStrategy
             })?;
             call_sequence.push(function);
         }
+        asset_effects_by_action.insert(
+            action_id.clone(),
+            serde_json::to_value(&action.asset_effects).map_err(|error| {
+                format!("failed to serialize action `{action_id}` asset effects: {error}")
+            })?,
+        );
         actions.push(ActionSpec {
             action_id,
             call_sequence,
@@ -369,6 +378,7 @@ pub fn register_from_recipe(recipe: StrategyRecipe) -> Result<RegisteredStrategy
         "max_value_wei_per_call": max_value_wei_per_call,
         "max_total_value_wei": max_value_wei_per_call,
         "template_budget_wei": template_budget_wei,
+        "asset_effects": asset_effects_by_action,
     })
     .to_string();
 

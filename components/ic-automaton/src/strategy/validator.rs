@@ -581,6 +581,8 @@ mod tests {
             }],
             preconditions: vec!["allowance_ok".to_string()],
             postconditions: vec!["balance_delta_gt_zero".to_string()],
+            asset_effects: vec![],
+            risk_checks: vec![],
         }
     }
 

@@ -4,6 +4,7 @@
   "chain_id": 8453,
   "template_id": "base-usdc-carry-cbbtc-01",
   "contracts": [
+    {"role":"usdc","address":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","abi_json":"[{\"type\":\"function\",\"name\":\"approve\",\"stateMutability\":\"nonpayable\",\"inputs\":[{\"name\":\"spender\",\"type\":\"address\"},{\"name\":\"value\",\"type\":\"uint256\"}],\"outputs\":[{\"name\":\"\",\"type\":\"bool\"}]}]","source_ref":"https://raw.githubusercontent.com/base-org/web3-json-rpc/main/openrpc.json"},
     {
       "role": "morpho",
       "address": "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",
@@ -14,6 +15,7 @@
   "actions": [
     {
       "action_id": "enter_supply",
+      "asset_effects": [{"asset_role":"usdc","asset_symbol":"USDC","decimals":6,"direction":"Debit","amount_path":"/calls/0/args/1"}],
       "calls": [{ "role": "morpho", "function": "supply" }],
       "preconditions": [
         "market_supply_apy_gte_0.03",
@@ -32,6 +34,7 @@
     },
     {
       "action_id": "exit_supply",
+      "asset_effects": [{"asset_role":"usdc","asset_symbol":"USDC","decimals":6,"direction":"Credit","amount_path":"/calls/0/args/1"}],
       "calls": [{ "role": "morpho", "function": "withdraw" }],
       "preconditions": [
         "market_supply_apy_lte_exit_threshold_or_better_opportunity_exists"

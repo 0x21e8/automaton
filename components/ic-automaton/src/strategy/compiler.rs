@@ -24,8 +24,9 @@
 /// [`StrategyTemplate`]: crate::domain::types::StrategyTemplate
 /// [`AbiArtifact`]: crate::domain::types::AbiArtifact
 use crate::domain::types::{
-    AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, ExecutionPlan, StrategyExecutionCall,
-    StrategyExecutionIntent, StrategyTemplateKey,
+    AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, ExecutionPlan,
+    StrategyAssetDirection, StrategyAssetEffect, StrategyExecutionCall, StrategyExecutionIntent,
+    StrategyTemplateKey,
 };
 use crate::strategy::{abi, registry};
 use crate::util::{normalize_evm_address, normalize_hex_blob, normalize_selector_hex};
@@ -88,6 +89,8 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
 
     // Each element of `typed.calls` must correspond 1:1 with `action.call_sequence`.
     let typed: IntentTypedParams = serde_json::from_str(&intent.typed_params_json)
+        .map_err(|error| format!("invalid typed_params_json: {error}"))?;
+    let typed_value: Value = serde_json::from_str(&intent.typed_params_json)
         .map_err(|error| format!("invalid typed_params_json: {error}"))?;
     if typed.calls.len() != action_schema.calls.len() {
         return Err(format!(
@@ -183,13 +186,148 @@ pub fn compile_intent(intent: &StrategyExecutionIntent) -> Result<ExecutionPlan,
         });
     }
 
+    let constraints: Value = serde_json::from_str(&template.constraints_json)
+        .map_err(|error| format!("invalid template constraints_json: {error}"))?;
+    let declarations: Vec<crate::domain::types::StrategyAssetEffectDeclaration> = constraints
+        .get("asset_effects")
+        .and_then(|value| value.get(&action_id))
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("strategy action {action_id} has invalid asset_effects: {error}"))?
+        .unwrap_or_default();
+    let mut asset_effects = Vec::new();
+    for declaration in declarations {
+        if declaration.decimals > 36 {
+            return Err(format!(
+                "strategy action {action_id} has unsupported asset_effects.decimals {}",
+                declaration.decimals
+            ));
+        }
+        let amount = resolve_effect_amount(&typed_value, &declaration.amount_path, &action_schema)
+            .ok_or_else(|| {
+                format!(
+                    "strategy action {action_id} asset effect amount path `{}` is missing",
+                    declaration.amount_path
+                )
+            })?;
+        let amount_raw = match amount {
+            Value::String(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => value.clone(),
+            Value::Number(value) if value.is_u64() => value.to_string(),
+            _ => return Err(format!("strategy action {action_id} asset effect amount path `{}` must be an unsigned integer", declaration.amount_path)),
+        };
+        let asset_address = declaration.asset_role.as_deref().map(|role| {
+            role_bindings.get(role).ok_or_else(|| format!("strategy action {action_id} asset effect references unknown role `{role}`"))
+                .and_then(|binding| normalize_evm_address(&binding.address))
+        }).transpose()?;
+        let effect = StrategyAssetEffect {
+            chain_id: intent.key.chain_id,
+            asset_address,
+            asset_symbol: declaration.asset_symbol,
+            decimals: declaration.decimals,
+            amount_raw,
+            direction: declaration.direction,
+        };
+        if asset_effects.iter().any(|prior: &StrategyAssetEffect| {
+            prior.chain_id == effect.chain_id
+                && prior.asset_address == effect.asset_address
+                && prior.amount_raw == effect.amount_raw
+                && prior.direction != effect.direction
+        }) {
+            return Err(format!(
+                "strategy action {action_id} has contradictory asset effects"
+            ));
+        }
+        asset_effects.push(effect);
+    }
+    for call in &calls {
+        if call.value_wei != "0" {
+            asset_effects.push(StrategyAssetEffect {
+                chain_id: intent.key.chain_id,
+                asset_address: None,
+                asset_symbol: "ETH".into(),
+                decimals: 18,
+                amount_raw: call.value_wei.clone(),
+                direction: StrategyAssetDirection::Debit,
+            });
+        }
+    }
+    if (action_id.starts_with("enter_") || action_id.starts_with("exit_"))
+        && asset_effects.is_empty()
+    {
+        return Err(format!(
+            "strategy action {action_id} is capital-moving but has no asset effect declaration"
+        ));
+    }
+    validate_asset_effect_bindings(&template, &action_id, &calls, &asset_effects)?;
     Ok(ExecutionPlan {
         key: intent.key.clone(),
         action_id,
         calls,
         preconditions: action.preconditions.clone(),
         postconditions: action.postconditions.clone(),
+        asset_effects,
+        risk_checks: action.risk_checks.clone(),
     })
+}
+
+fn validate_asset_effect_bindings(
+    template: &crate::domain::types::StrategyTemplate,
+    action_id: &str,
+    calls: &[StrategyExecutionCall],
+    effects: &[StrategyAssetEffect],
+) -> Result<(), String> {
+    let Some(call) = calls.first() else {
+        return Ok(());
+    };
+    for effect in effects
+        .iter()
+        .filter(|effect| effect.asset_address.is_some())
+    {
+        let expected = effect.asset_address.as_deref().unwrap_or_default();
+        let bound = match template.key.protocol.as_str() {
+            "aave-v3" => calldata_address_word(call, 0)
+                .is_some_and(|value| value.eq_ignore_ascii_case(expected)),
+            "morpho-v1" => calldata_address_word(call, 0)
+                .is_some_and(|value| value.eq_ignore_ascii_case(expected)),
+            "moonwell-v2" => {
+                call.role == "m_usdc"
+                    && template.contract_roles.iter().any(|binding| {
+                        binding.role == "usdc" && binding.address.eq_ignore_ascii_case(expected)
+                    })
+            }
+            _ => false,
+        };
+        if !bound {
+            return Err(format!("strategy action {action_id} asset effect is not bound to calldata/target asset {expected}"));
+        }
+    }
+    Ok(())
+}
+
+fn calldata_address_word(call: &StrategyExecutionCall, index: usize) -> Option<String> {
+    let data = call.data.strip_prefix("0x")?;
+    let start = 8usize.checked_add(index.checked_mul(64)?)?;
+    let word = data.get(start..start.checked_add(64)?)?;
+    Some(format!("0x{}", word.get(24..)?.to_ascii_lowercase()))
+}
+
+fn resolve_effect_amount<'a>(
+    value: &'a Value,
+    path: &str,
+    schema: &StrategyActionArgumentSchema,
+) -> Option<&'a Value> {
+    if let Some(found) = value.pointer(path) {
+        return Some(found);
+    }
+    let segments = path.strip_prefix("/calls/")?.split('/').collect::<Vec<_>>();
+    if segments.len() != 3 || segments[1] != "args" {
+        return None;
+    }
+    let call_index = segments[0].parse::<usize>().ok()?;
+    let arg_index = segments[2].parse::<usize>().ok()?;
+    let name = &schema.calls.get(call_index)?.args.get(arg_index)?.name;
+    value.get("calls")?.get(call_index)?.get("args")?.get(name)
 }
 
 pub(crate) fn derive_action_argument_schema(
@@ -231,6 +369,34 @@ pub fn dry_run_compile(key: &StrategyTemplateKey) -> Result<(), String> {
             "args": Value::Object(args),
             "value_wei": "0",
         }));
+    }
+    if let Some(usdc) = template
+        .contract_roles
+        .iter()
+        .find(|binding| binding.role == "usdc")
+    {
+        match template.key.protocol.as_str() {
+            "aave-v3" => {
+                if let Some(args) = calls
+                    .get_mut(0)
+                    .and_then(|call| call.get_mut("args"))
+                    .and_then(Value::as_object_mut)
+                {
+                    args.insert("asset".to_string(), Value::String(usdc.address.clone()));
+                }
+            }
+            "morpho-v1" => {
+                if let Some(market) = calls
+                    .get_mut(0)
+                    .and_then(|call| call.get_mut("args"))
+                    .and_then(|args| args.get_mut("marketParams"))
+                    .and_then(Value::as_object_mut)
+                {
+                    market.insert("loanToken".to_string(), Value::String(usdc.address.clone()));
+                }
+            }
+            _ => {}
+        }
     }
 
     let intent = StrategyExecutionIntent {
@@ -882,11 +1048,13 @@ mod tests {
     use super::{compile_intent, dry_run_compile};
     use crate::domain::types::{
         AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, ContractRoleBinding,
-        StrategyExecutionIntent, StrategyTemplate, StrategyTemplateKey, TemplateStatus,
+        StrategyAssetDirection, StrategyExecutionIntent, StrategyTemplate, StrategyTemplateKey,
+        TemplateStatus,
     };
     use crate::storage::stable;
     use crate::strategy::registry;
     use alloy_primitives::U256;
+    use serde_json::Value;
 
     fn sample_key(template_id: &str) -> StrategyTemplateKey {
         StrategyTemplateKey {
@@ -1155,9 +1323,9 @@ mod tests {
                 address: "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb".to_string(),
                 source_ref: "https://docs.morpho.org/get-started/resources/addresses/".to_string(),
                 codehash: None,
-            }],
+            }, ContractRoleBinding { role: "usdc".to_string(), address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_string(), source_ref: "test".to_string(), codehash: None }],
             actions: vec![action],
-            constraints_json: "{}".to_string(),
+            constraints_json: serde_json::json!({"asset_effects":{"enter_supply":[{"asset_role":"usdc","asset_symbol":"USDC","decimals":6,"direction":"Debit","amount_path":"/calls/0/args/1"}]}}).to_string(),
             created_at_ns: 1,
             updated_at_ns: 1,
         })
@@ -1182,7 +1350,7 @@ mod tests {
     fn morpho_supply_named_args_json() -> serde_json::Value {
         serde_json::json!({
             "marketParams": {
-                "loanToken": "0x4200000000000000000000000000000000000006",
+                "loanToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
                 "collateralToken": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
                 "oracle": "0x663E04CBb82e44A8544828C7C3e2f02820085f00",
                 "irm": "0x46415998764C29aB2a25CbeA6E5D2F226b40b5f0",
@@ -1208,7 +1376,7 @@ mod tests {
         };
 
         let market_params = serde_json::json!([
-            "0x4200000000000000000000000000000000000006",
+            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
             "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
             "0x663E04CBb82e44A8544828C7C3e2f02820085f00",
             "0x46415998764C29aB2a25CbeA6E5D2F226b40b5f0",
@@ -1234,6 +1402,13 @@ mod tests {
         };
 
         let plan = compile_intent(&intent).expect("morpho enter_supply should compile");
+        assert_eq!(plan.asset_effects.len(), 1);
+        assert_eq!(plan.asset_effects[0].asset_symbol, "USDC");
+        assert_eq!(plan.asset_effects[0].amount_raw, "1000000");
+        assert_eq!(
+            plan.asset_effects[0].direction,
+            StrategyAssetDirection::Debit
+        );
         assert!(
             !plan.calls.is_empty(),
             "enter_supply must produce at least one compiled call"
@@ -1248,6 +1423,16 @@ mod tests {
             "calldata must start with supply selector, got {}",
             &plan.calls[0].data[..std::cmp::min(10, plan.calls[0].data.len())]
         );
+        let mut wrong: Value = serde_json::from_str(&intent.typed_params_json).unwrap();
+        *wrong.pointer_mut("/calls/0/args/0/0").unwrap() =
+            Value::String("0x2222222222222222222222222222222222222222".to_string());
+        let wrong_intent = StrategyExecutionIntent {
+            typed_params_json: wrong.to_string(),
+            ..intent
+        };
+        assert!(compile_intent(&wrong_intent)
+            .unwrap_err()
+            .contains("not bound to calldata/target"));
     }
 
     #[test]
@@ -1303,7 +1488,7 @@ mod tests {
                 "calls": [{
                     "args": [
                         [
-                            "0x4200000000000000000000000000000000000006",
+                            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
                             "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
                             "0x663E04CBb82e44A8544828C7C3e2f02820085f00",
                             "0x46415998764C29aB2a25CbeA6E5D2F226b40b5f0",

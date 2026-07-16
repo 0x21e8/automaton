@@ -83,6 +83,8 @@ const HOST_EVM_RPC_STUB_FORCE_STATUS_ENV: &str = "IC_AUTOMATON_EVM_RPC_STUB_FORC
 #[cfg(not(target_arch = "wasm32"))]
 const HOST_EVM_RPC_STUB_FORCE_BODY_ENV: &str = "IC_AUTOMATON_EVM_RPC_STUB_FORCE_BODY";
 #[cfg(not(target_arch = "wasm32"))]
+const HOST_EVM_RPC_STUB_ETH_CALL_RESULT_ENV: &str = "IC_AUTOMATON_EVM_RPC_STUB_ETH_CALL_RESULT";
+#[cfg(not(target_arch = "wasm32"))]
 const HOST_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN_ENV: &str =
     "IC_AUTOMATON_EVM_RPC_STUB_MAX_LOG_BLOCK_SPAN";
 #[cfg(not(target_arch = "wasm32"))]
@@ -593,6 +595,43 @@ impl HttpEvmRpcClient {
     pub async fn eth_call(&self, address: &str, calldata: &str) -> Result<String, String> {
         self.eth_call_with_limit(address, calldata, self.control_plane_max_response_bytes())
             .await
+    }
+
+    /// Simulate an exact strategy transaction without broadcasting it.
+    pub async fn eth_call_transaction(
+        &self,
+        from: &str,
+        to: &str,
+        data: &str,
+        value_wei: &str,
+    ) -> Result<String, String> {
+        let value = U256::from_str(value_wei)
+            .map_err(|error| format!("invalid eth_call value: {error}"))?;
+        let response = self.rpc_call("eth_call", json!([{"from": from, "to": to, "data": data, "value": format!("0x{value:x}")}, "latest"]), self.control_plane_max_response_bytes()).await
+            .map_err(|error| format!("eth_call failed: {error}"))?;
+        let raw = response
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "eth_call result was missing".to_string())?;
+        normalize_hex_blob(raw, "eth_call result")
+    }
+
+    pub async fn simulate_strategy_plan(plan: &ExecutionPlan) -> Result<Vec<String>, String> {
+        let snapshot = stable::runtime_snapshot();
+        let from = snapshot
+            .evm_address
+            .as_deref()
+            .ok_or_else(|| "automaton evm address is not configured".to_string())?;
+        let rpc = HttpEvmRpcClient::from_snapshot(&snapshot)?;
+        let mut results = Vec::with_capacity(plan.calls.len());
+        for (index, call) in plan.calls.iter().enumerate() {
+            results.push(
+                rpc.eth_call_transaction(from, &call.to, &call.data, &call.value_wei)
+                    .await
+                    .map_err(|error| format!("strategy eth_call {index} failed: {error}"))?,
+            );
+        }
+        Ok(results)
     }
 
     /// Like `eth_call` but with a caller-supplied response byte cap.
@@ -1125,7 +1164,10 @@ fn host_rpc_stub_response(body: &[u8]) -> Result<Vec<u8>, String> {
         "eth_blockNumber" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
         "eth_getLogs" => host_rpc_stub_eth_get_logs_result(&request)?,
         "eth_getBalance" => json!({"jsonrpc":"2.0","id":1,"result":"0x1"}),
-        "eth_call" => host_rpc_stub_eth_call_result(&request),
+        "eth_call" => std::env::var(HOST_EVM_RPC_STUB_ETH_CALL_RESULT_ENV)
+            .ok()
+            .map(|result| json!({"jsonrpc":"2.0","id":1,"result":result}))
+            .unwrap_or_else(|| host_rpc_stub_eth_call_result(&request)),
         "eth_getCode" => host_rpc_stub_eth_get_code_result(&request)?,
         "eth_getTransactionCount" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
         "eth_gasPrice" => json!({"jsonrpc":"2.0","id":1,"result":"0x3b9aca00"}),
@@ -4188,6 +4230,8 @@ mod tests {
             }],
             preconditions: vec!["ok".to_string()],
             postconditions: vec!["delta".to_string()],
+            asset_effects: vec![],
+            risk_checks: vec![],
         };
 
         let signer = FixedSignatureSigner;
@@ -4203,6 +4247,58 @@ mod tests {
         assert_eq!(stats.total_runs, 1);
         assert_eq!(stats.deterministic_failures, 1);
         assert_eq!(stats.nondeterministic_failures, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn strategy_eth_call_simulation_is_hermetic_and_fails_closed() {
+        let snapshot = RuntimeSnapshot {
+            evm_rpc_url: "https://hermetic.invalid".to_string(),
+            ..RuntimeSnapshot::default()
+        };
+        let rpc = HttpEvmRpcClient::from_snapshot(&snapshot).unwrap();
+        let call = || {
+            block_on_with_spin(rpc.eth_call_transaction(
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                "0x1234",
+                "0",
+            ))
+        };
+        with_host_stub_env(&[], || assert_eq!(call().unwrap(), "0x"));
+        with_host_stub_env(&[(HOST_EVM_RPC_MODE_ENV, Some("real"))], || {
+            let transport_rpc = HttpEvmRpcClient::from_snapshot(&RuntimeSnapshot {
+                evm_rpc_url: "http://127.0.0.1:1".to_string(),
+                ..RuntimeSnapshot::default()
+            })
+            .unwrap();
+            let error = block_on_with_spin(transport_rpc.eth_call_transaction(
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                "0x1234",
+                "0",
+            ))
+            .unwrap_err();
+            assert!(error.contains("transport failed"), "{error}");
+        });
+        with_host_stub_env(
+            &[
+                (HOST_EVM_RPC_STUB_FORCE_STATUS_ENV, Some("400")),
+                (HOST_EVM_RPC_STUB_FORCE_BODY_ENV, Some("execution reverted")),
+            ],
+            || assert!(call().unwrap_err().contains("execution reverted")),
+        );
+        with_host_stub_env(
+            &[(HOST_EVM_RPC_STUB_ETH_CALL_RESULT_ENV, Some("not-hex"))],
+            || assert!(call().unwrap_err().contains("hex")),
+        );
+        let unavailable = RuntimeSnapshot {
+            evm_rpc_url: String::new(),
+            ..RuntimeSnapshot::default()
+        };
+        assert!(HttpEvmRpcClient::from_snapshot(&unavailable)
+            .unwrap_err()
+            .contains("not configured"));
     }
 
     #[cfg(all(not(feature = "anvil_e2e"), not(target_arch = "wasm32")))]

@@ -1158,6 +1158,12 @@ pub struct ActiveExposure {
     pub asset_symbol: String,
     #[serde(default)]
     pub notional_wei: Option<u128>,
+    #[serde(default)]
+    pub asset_address: Option<String>,
+    #[serde(default)]
+    pub decimals: Option<u8>,
+    #[serde(default)]
+    pub amount_raw: Option<String>,
     pub updated_at_ns: u64,
 }
 
@@ -1702,6 +1708,31 @@ pub struct ActionSpec {
     pub risk_checks: Vec<String>,
 }
 
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum StrategyAssetDirection {
+    Debit,
+    Credit,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyAssetEffectDeclaration {
+    pub asset_role: Option<String>,
+    pub asset_symbol: String,
+    pub decimals: u8,
+    pub direction: StrategyAssetDirection,
+    pub amount_path: String,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StrategyAssetEffect {
+    pub chain_id: u64,
+    pub asset_address: Option<String>,
+    pub asset_symbol: String,
+    pub decimals: u8,
+    pub amount_raw: String,
+    pub direction: StrategyAssetDirection,
+}
+
 /// A strategy template defining the actions, contract roles, and
 /// constraints for an on-chain DeFi operation (e.g. a Uniswap swap).
 ///
@@ -1782,6 +1813,10 @@ pub struct ExecutionPlan {
     pub calls: Vec<StrategyExecutionCall>,
     pub preconditions: Vec<String>,
     pub postconditions: Vec<String>,
+    #[serde(default)]
+    pub asset_effects: Vec<StrategyAssetEffect>,
+    #[serde(default)]
+    pub risk_checks: Vec<String>,
 }
 
 /// The pipeline stage at which a validation finding was produced.

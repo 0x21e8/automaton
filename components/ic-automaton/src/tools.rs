@@ -1274,7 +1274,7 @@ impl ToolManager {
                 if !stable::can_run_survival_operation(&SurvivalOperationClass::EvmPoll, now_ns) {
                     Err("simulate_strategy_action skipped due to survival policy".to_string())
                 } else {
-                    let result = simulate_strategy_action_tool(&call.args_json);
+                    let result = simulate_strategy_action_tool(&call.args_json).await;
                     if result.is_ok() {
                         stable::record_survival_operation_success(&SurvivalOperationClass::EvmPoll);
                     } else {
@@ -3737,7 +3737,7 @@ fn split_abi_array_type(kind: &str) -> Option<(String, Option<usize>)> {
 
 /// Compile and validate a strategy intent without submitting any transactions.
 /// Returns the compiled plan and validation findings as JSON.
-fn simulate_strategy_action_tool(args_json: &str) -> Result<String, String> {
+async fn simulate_strategy_action_tool(args_json: &str) -> Result<String, String> {
     let intent = parse_strategy_intent_args(args_json)?;
     log!(
         StrategyToolLogPriority::Info,
@@ -3766,11 +3766,128 @@ fn simulate_strategy_action_tool(args_json: &str) -> Result<String, String> {
         validation.passed,
         validation.findings.len()
     );
+    let (evaluated_checks, unevaluated_checks) = evaluate_static_risk_checks(&plan);
+    if !unevaluated_checks.is_empty() {
+        return Err(format!(
+            "strategy simulation blocked: unevaluated_risk_checks:{}",
+            unevaluated_checks.join(",")
+        ));
+    }
+    let call_results =
+        crate::features::evm::HttpEvmRpcClient::simulate_strategy_plan(&plan).await?;
     serde_json::to_string(&serde_json::json!({
         "plan": plan,
         "validation": validation,
+        "call_results": call_results,
+        "evaluated_checks": evaluated_checks,
+        "unevaluated_checks": unevaluated_checks,
     }))
     .map_err(|error| format!("failed to serialize simulation result: {error}"))
+}
+
+fn evaluate_static_risk_checks(plan: &ExecutionPlan) -> (Vec<String>, Vec<String>) {
+    plan.risk_checks
+        .iter()
+        .cloned()
+        .partition(|check| risk_check_evaluated(plan, check))
+}
+
+fn risk_check_evaluated(plan: &ExecutionPlan, check: &str) -> bool {
+    let template = crate::strategy::registry::get_template(&plan.key);
+    let role_address = |role: &str| {
+        template
+            .as_ref()?
+            .contract_roles
+            .iter()
+            .find(|binding| binding.role == role)
+            .map(|binding| binding.address.to_ascii_lowercase())
+    };
+    let automaton = stable::runtime_snapshot()
+        .evm_address
+        .map(|address| address.to_ascii_lowercase());
+    match check {
+        "asset_equals_base_usdc" => {
+            let snapshot = stable::wallet_balance_snapshot();
+            let Some(configured) = snapshot.usdc_contract_address else {
+                return false;
+            };
+            plan.calls
+                .iter()
+                .any(|call| call.role == "usdc" && call.to.eq_ignore_ascii_case(&configured))
+                || plan.asset_effects.iter().any(|effect| {
+                    effect.decimals == snapshot.usdc_decimals
+                        && effect
+                            .asset_address
+                            .as_deref()
+                            .is_some_and(|address| address.eq_ignore_ascii_case(&configured))
+                })
+        }
+        "spender_equals_aave_pool" => {
+            plan.calls
+                .first()
+                .and_then(|call| calldata_address_word(call, 0))
+                == role_address("aave_pool")
+        }
+        "spender_equals_moonwell_usdc_market" => {
+            plan.calls
+                .first()
+                .and_then(|call| calldata_address_word(call, 0))
+                == role_address("m_usdc")
+        }
+        "on_behalf_of_equals_automaton_wallet" => {
+            plan.calls
+                .first()
+                .and_then(|call| calldata_address_word(call, 2))
+                == automaton
+        }
+        "referral_code_zero" => plan
+            .calls
+            .first()
+            .and_then(|call| calldata_u256_word(call, 3))
+            .is_some_and(|value| value == U256::ZERO),
+        "withdraw_receiver_equals_automaton_wallet" => {
+            plan.calls
+                .first()
+                .and_then(|call| calldata_address_word(call, 2))
+                == automaton
+        }
+        "market_equals_moonwell_usdc" => {
+            plan.calls.first().is_some_and(|call| call.role == "m_usdc")
+        }
+        "lltv_equals_0.86e18" => plan
+            .calls
+            .first()
+            .and_then(|call| calldata_u256_word(call, 4))
+            .is_some_and(|value| value == U256::from(860_000_000_000_000_000u128)),
+        "oracle_address_matches_template" => {
+            plan.calls
+                .first()
+                .and_then(|call| calldata_address_word(call, 2))
+                == role_address("oracle")
+        }
+        _ => false,
+    }
+}
+
+fn calldata_word(call: &crate::domain::types::StrategyExecutionCall, index: usize) -> Option<&str> {
+    let data = call.data.strip_prefix("0x")?;
+    let start = 8usize.checked_add(index.checked_mul(64)?)?;
+    data.get(start..start.checked_add(64)?)
+}
+
+fn calldata_address_word(
+    call: &crate::domain::types::StrategyExecutionCall,
+    index: usize,
+) -> Option<String> {
+    let word = calldata_word(call, index)?;
+    Some(format!("0x{}", word.get(24..)?.to_ascii_lowercase()))
+}
+
+fn calldata_u256_word(
+    call: &crate::domain::types::StrategyExecutionCall,
+    index: usize,
+) -> Option<U256> {
+    U256::from_str_radix(calldata_word(call, index)?, 16).ok()
 }
 
 /// Compile, validate, and execute a strategy intent — sends real transactions.
@@ -3817,6 +3934,8 @@ async fn execute_strategy_action_tool(
                     calls: Vec::new(),
                     preconditions: Vec::new(),
                     postconditions: Vec::new(),
+                    asset_effects: Vec::new(),
+                    risk_checks: Vec::new(),
                 },
                 &error,
                 now_ns,
@@ -3867,7 +3986,6 @@ async fn execute_strategy_action_tool(
         &plan,
         prior_same_turn_history,
         current_batch_history,
-        args_json,
     )?;
 
     log!(
@@ -3921,7 +4039,8 @@ async fn execute_strategy_action_tool(
     serde_json::to_string(&serde_json::json!({
         "key": plan.key,
         "action_id": plan.action_id,
-        "tx_hashes": tx_hashes
+        "tx_hashes": tx_hashes,
+        "asset_effects": plan.asset_effects
     }))
     .map_err(|error| format!("failed to serialize execution result: {error}"))
 }
@@ -3932,7 +4051,6 @@ fn enforce_strategy_execution_policy(
     plan: &ExecutionPlan,
     prior_same_turn_history: &[ToolCallRecord],
     current_batch_history: &[ToolCallRecord],
-    args_json: &str,
 ) -> Result<(), String> {
     if !policy.execution_authority.require_simulation_first {
         return Ok(());
@@ -3943,19 +4061,19 @@ fn enforce_strategy_execution_policy(
     }
 
     let current_value_wei = plan_total_value_wei(plan)?;
-    if let Some(limit_wei) = policy.execution_authority.per_action_value_limit_wei {
-        if current_value_wei > U256::from(limit_wei) {
-            return Err(format!(
-                "execute_strategy_action blocked: per_action_value_limit_exceeded:{}",
-                current_value_wei
-            ));
+    if let Some(limit) = policy.execution_authority.per_action_value_limit_wei {
+        if current_value_wei > U256::from(limit) {
+            return Err(format!("execute_strategy_action blocked: per_action_value_limit_exceeded:{current_value_wei}"));
         }
     }
-
+    if is_enter_or_exit_action(&plan.action_id) {
+        enforce_asset_effect_policy(policy, plan)?;
+    }
     enforce_reserve_floors(policy)?;
+    enforce_projected_usdc_floor(policy, plan)?;
 
     if is_enter_or_exit_action(&plan.action_id) {
-        enforce_concentration_gate(policy, plan, args_json)?;
+        enforce_concentration_gate(policy, plan)?;
     }
 
     Ok(())
@@ -4021,6 +4139,37 @@ fn enforce_reserve_floors(policy: &AutonomyPolicy) -> Result<(), String> {
     Ok(())
 }
 
+fn enforce_projected_usdc_floor(
+    policy: &AutonomyPolicy,
+    plan: &ExecutionPlan,
+) -> Result<(), String> {
+    let Some(floor) = policy.reserve_policy.min_inference_usdc_6dp else {
+        return Ok(());
+    };
+    let snapshot = stable::wallet_balance_snapshot();
+    let has_usdc_effect = plan.asset_effects.iter().any(|effect| {
+        effect.asset_address.as_deref().is_some_and(|address| {
+            snapshot
+                .usdc_contract_address
+                .as_deref()
+                .is_some_and(|configured| configured.eq_ignore_ascii_case(address))
+        })
+    });
+    if !has_usdc_effect {
+        return Ok(());
+    }
+    let current =
+        parse_optional_hex_u128(snapshot.usdc_balance_raw_hex.as_deref()).ok_or_else(|| {
+            "execute_strategy_action blocked: missing_usdc_balance_source".to_string()
+        })?;
+    if projected_usdc_balance(plan, U256::from(current))? < U256::from(floor) {
+        return Err(format!(
+            "execute_strategy_action blocked: reserve_usdc_floor_below_min:{floor}"
+        ));
+    }
+    Ok(())
+}
+
 fn format_cycles_runway_below_floor(
     cycles: &CycleTelemetry,
     min_cycles_runway_secs: u128,
@@ -4036,18 +4185,7 @@ fn format_cycles_runway_below_floor(
     )
 }
 
-fn enforce_concentration_gate(
-    policy: &AutonomyPolicy,
-    plan: &ExecutionPlan,
-    args_json: &str,
-) -> Result<(), String> {
-    let Some(deployable_capital_wei) = deployable_capital_wei(policy) else {
-        return Ok(());
-    };
-    if deployable_capital_wei == U256::ZERO {
-        return Err("execute_strategy_action blocked: deployable_capital_zero".to_string());
-    }
-
+fn enforce_concentration_gate(policy: &AutonomyPolicy, plan: &ExecutionPlan) -> Result<(), String> {
     let existing_exposures = stable::list_active_exposures();
     let protocol = plan.key.protocol.trim().to_string();
     let enter_like = plan.action_id.starts_with("enter_");
@@ -4055,36 +4193,73 @@ fn enforce_concentration_gate(
         return Ok(());
     }
 
+    let groups = grouped_asset_effects(plan)?;
+    let debit_groups = groups
+        .iter()
+        .filter(|(_, amounts)| amounts.0 > U256::ZERO)
+        .collect::<Vec<_>>();
+    if debit_groups.len() != 1 {
+        return Err(
+            "execute_strategy_action blocked: multiple_debit_asset_groups_not_representable"
+                .to_string(),
+        );
+    }
+    let (debit_key, (current_notional, _)) = debit_groups[0];
+    let debit =
+        effect_for_key(plan, debit_key).ok_or_else(|| "missing grouped effect".to_string())?;
+    let deployable = known_asset_balance(policy, debit)?
+        .checked_sub(asset_reserve(policy, debit)?)
+        .ok_or_else(|| {
+            "execute_strategy_action blocked: asset_balance_below_reserve".to_string()
+        })?;
+    if deployable == U256::ZERO {
+        return Err("execute_strategy_action blocked: deployable_capital_zero".to_string());
+    }
     let mut total_exposure = U256::ZERO;
     let mut protocol_exposure = U256::ZERO;
     for exposure in existing_exposures {
-        let exposure_value = exposure
-            .notional_wei
-            .map(U256::from)
-            .unwrap_or(deployable_capital_wei);
-        total_exposure = total_exposure.saturating_add(exposure_value);
+        let (Some(decimals), Some(amount)) = (exposure.decimals, exposure.amount_raw.as_ref())
+        else {
+            return Err(
+                "execute_strategy_action blocked: legacy_exposure_asset_ambiguous".to_string(),
+            );
+        };
+        if exposure.chain_id != debit_key.chain_id
+            || exposure
+                .asset_address
+                .as_ref()
+                .map(|value| value.to_ascii_lowercase())
+                != debit_key.asset_address
+            || decimals != debit_key.decimals
+        {
+            continue;
+        }
+        let exposure_value = parse_u256_decimal(amount)?;
+        total_exposure = total_exposure
+            .checked_add(exposure_value)
+            .ok_or_else(|| "exposure arithmetic overflow".to_string())?;
         if exposure.protocol == protocol {
-            protocol_exposure = protocol_exposure.saturating_add(exposure_value);
+            protocol_exposure = protocol_exposure
+                .checked_add(exposure_value)
+                .ok_or_else(|| "exposure arithmetic overflow".to_string())?;
         }
     }
 
-    let current_notional = parse_strategy_notional_wei(args_json)
-        .map(U256::from)
-        .unwrap_or(deployable_capital_wei);
-    if enter_like {
-        let current_exposure = current_notional;
-        total_exposure = total_exposure.saturating_add(current_exposure);
-        protocol_exposure = protocol_exposure.saturating_add(current_exposure);
-    }
+    total_exposure = total_exposure
+        .checked_add(*current_notional)
+        .ok_or_else(|| "exposure arithmetic overflow".to_string())?;
+    protocol_exposure = protocol_exposure
+        .checked_add(*current_notional)
+        .ok_or_else(|| "exposure arithmetic overflow".to_string())?;
 
-    let total_bps = exposure_bps(total_exposure, deployable_capital_wei);
+    let total_bps = exposure_bps(total_exposure, deployable);
     if total_bps > u128::from(policy.risk_limits.max_total_exposure_bps) {
         return Err(format!(
             "execute_strategy_action blocked: total_exposure_bps_exceeded:{}",
             total_bps
         ));
     }
-    let protocol_bps = exposure_bps(protocol_exposure, deployable_capital_wei);
+    let protocol_bps = exposure_bps(protocol_exposure, deployable);
     if protocol_bps > u128::from(policy.risk_limits.max_protocol_concentration_bps) {
         return Err(format!(
             "execute_strategy_action blocked: protocol_concentration_bps_exceeded:{}",
@@ -4094,12 +4269,177 @@ fn enforce_concentration_gate(
     Ok(())
 }
 
-fn deployable_capital_wei(policy: &AutonomyPolicy) -> Option<U256> {
+fn known_asset_balance(
+    _policy: &AutonomyPolicy,
+    effect: &crate::domain::types::StrategyAssetEffect,
+) -> Result<U256, String> {
     let snapshot = stable::wallet_balance_snapshot();
-    let eth_balance_wei = parse_optional_hex_u128(snapshot.eth_balance_wei_hex.as_deref())?;
-    let gas_floor = policy.reserve_policy.min_gas_wei.unwrap_or_default();
-    let deployable = U256::from(eth_balance_wei).saturating_sub(U256::from(gas_floor));
-    Some(deployable)
+    match effect.asset_address.as_deref() {
+        None if effect.decimals == 18 => {
+            parse_optional_hex_u128(snapshot.eth_balance_wei_hex.as_deref())
+                .map(U256::from)
+                .ok_or_else(|| {
+                    "execute_strategy_action blocked: missing_native_balance_source".to_string()
+                })
+        }
+        Some(address)
+            if effect.decimals == snapshot.usdc_decimals
+                && snapshot
+                    .usdc_contract_address
+                    .as_deref()
+                    .is_some_and(|configured| configured.eq_ignore_ascii_case(address)) =>
+        {
+            parse_optional_hex_u128(snapshot.usdc_balance_raw_hex.as_deref())
+                .map(U256::from)
+                .ok_or_else(|| {
+                    "execute_strategy_action blocked: missing_usdc_balance_source".to_string()
+                })
+        }
+        Some(_) => {
+            Err("execute_strategy_action blocked: unsupported_asset_balance_source".to_string())
+        }
+        None => {
+            Err("execute_strategy_action blocked: unsupported_native_asset_decimals".to_string())
+        }
+    }
+}
+
+fn asset_reserve(
+    policy: &AutonomyPolicy,
+    effect: &crate::domain::types::StrategyAssetEffect,
+) -> Result<U256, String> {
+    if effect.asset_address.is_none() {
+        Ok(U256::from(
+            policy.reserve_policy.min_gas_wei.unwrap_or_default(),
+        ))
+    } else {
+        Ok(U256::from(
+            policy
+                .reserve_policy
+                .min_inference_usdc_6dp
+                .unwrap_or_default(),
+        ))
+    }
+}
+
+fn projected_usdc_balance(plan: &ExecutionPlan, current: U256) -> Result<U256, String> {
+    let snapshot = stable::wallet_balance_snapshot();
+    let configured = snapshot.usdc_contract_address.as_deref().ok_or_else(|| {
+        "execute_strategy_action blocked: missing_usdc_balance_source".to_string()
+    })?;
+    let mut debits = U256::ZERO;
+    let mut credits = U256::ZERO;
+    for (key, amounts) in grouped_asset_effects(plan)? {
+        if key
+            .asset_address
+            .as_deref()
+            .is_some_and(|address| configured.eq_ignore_ascii_case(address))
+        {
+            if plan.key.chain_id != 8453
+                || key.chain_id != plan.key.chain_id
+                || key.decimals != snapshot.usdc_decimals
+            {
+                return Err(
+                    "execute_strategy_action blocked: invalid_base_usdc_asset_identity".to_string(),
+                );
+            }
+            debits = debits
+                .checked_add(amounts.0)
+                .ok_or_else(|| "asset debit aggregate overflow".to_string())?;
+            credits = credits
+                .checked_add(amounts.1)
+                .ok_or_else(|| "asset credit aggregate overflow".to_string())?;
+        }
+    }
+    current
+        .checked_sub(debits)
+        .ok_or_else(|| "execute_strategy_action blocked: asset_debit_exceeds_balance".to_string())?
+        .checked_add(credits)
+        .ok_or_else(|| "execute_strategy_action blocked: asset_balance_overflow".to_string())
+}
+
+fn enforce_asset_effect_policy(
+    policy: &AutonomyPolicy,
+    plan: &ExecutionPlan,
+) -> Result<(), String> {
+    for (key, (amount, _)) in grouped_asset_effects(plan)? {
+        if amount == U256::ZERO {
+            continue;
+        }
+        let effect =
+            effect_for_key(plan, &key).ok_or_else(|| "missing grouped effect".to_string())?;
+        let deployable = known_asset_balance(policy, effect)?
+            .checked_sub(asset_reserve(policy, effect)?)
+            .ok_or_else(|| {
+                "execute_strategy_action blocked: asset_balance_below_reserve".to_string()
+            })?;
+        if amount > deployable {
+            return Err(
+                "execute_strategy_action blocked: asset_debit_exceeds_deployable_balance"
+                    .to_string(),
+            );
+        }
+        if exposure_bps(amount, deployable) > u128::from(policy.risk_limits.max_single_action_bps) {
+            return Err(
+                "execute_strategy_action blocked: max_single_action_bps_exceeded".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AssetGroupKey {
+    chain_id: u64,
+    asset_address: Option<String>,
+    decimals: u8,
+}
+
+fn asset_group_key(effect: &crate::domain::types::StrategyAssetEffect) -> AssetGroupKey {
+    AssetGroupKey {
+        chain_id: effect.chain_id,
+        asset_address: effect
+            .asset_address
+            .as_ref()
+            .map(|value| value.to_ascii_lowercase()),
+        decimals: effect.decimals,
+    }
+}
+
+fn grouped_asset_effects(
+    plan: &ExecutionPlan,
+) -> Result<BTreeMap<AssetGroupKey, (U256, U256)>, String> {
+    let mut grouped = BTreeMap::new();
+    for effect in &plan.asset_effects {
+        let amount = parse_u256_decimal(&effect.amount_raw)?;
+        let entry = grouped
+            .entry(asset_group_key(effect))
+            .or_insert((U256::ZERO, U256::ZERO));
+        match effect.direction {
+            crate::domain::types::StrategyAssetDirection::Debit => {
+                entry.0 = entry
+                    .0
+                    .checked_add(amount)
+                    .ok_or_else(|| "asset debit aggregate overflow".to_string())?
+            }
+            crate::domain::types::StrategyAssetDirection::Credit => {
+                entry.1 = entry
+                    .1
+                    .checked_add(amount)
+                    .ok_or_else(|| "asset credit aggregate overflow".to_string())?
+            }
+        }
+    }
+    Ok(grouped)
+}
+
+fn effect_for_key<'a>(
+    plan: &'a ExecutionPlan,
+    key: &AssetGroupKey,
+) -> Option<&'a crate::domain::types::StrategyAssetEffect> {
+    plan.asset_effects
+        .iter()
+        .find(|effect| asset_group_key(effect) == *key)
 }
 
 fn exposure_bps(exposure: U256, deployable: U256) -> u128 {
@@ -4152,16 +4492,13 @@ fn strategy_simulation_succeeded(
                 .as_ref()
                 .zip(prior_typed_params_digest.as_ref())
                 .is_some_and(|(current, prior)| current == prior);
-            if typed_params_match {
-                return true;
-            }
-
             let prior_plan_digest =
                 simulated_execution_plan_digest_from_output(&record.output).ok();
-            current_plan_digest
-                .as_ref()
-                .zip(prior_plan_digest.as_ref())
-                .is_some_and(|(current, prior)| current == prior)
+            typed_params_match
+                && current_plan_digest
+                    .as_ref()
+                    .zip(prior_plan_digest.as_ref())
+                    .is_some_and(|(current, prior)| current == prior)
         })
 }
 
@@ -4290,15 +4627,15 @@ fn record_strategy_failure(plan: &ExecutionPlan, reason: &str, now_ns: u64) {
 
 fn record_strategy_success(
     plan: &ExecutionPlan,
-    args_json: &str,
+    _args_json: &str,
     now_ns: u64,
 ) -> Result<(), String> {
     let strategy_id = strategy_id_from_key(&plan.key);
     if is_enter_or_exit_action(&plan.action_id) {
         let updated = match plan.action_id.starts_with("exit_") {
-            true => update_exposure_after_exit(&strategy_id, &plan.key, args_json, now_ns),
-            false => update_exposure_after_enter(&strategy_id, &plan.key, args_json, now_ns),
-        };
+            true => update_exposure_after_exit(&strategy_id, plan, now_ns),
+            false => update_exposure_after_enter(&strategy_id, plan, now_ns),
+        }?;
         if plan.action_id.starts_with("exit_") {
             if let Some(exposure) = updated {
                 stable::set_active_exposure(exposure)?;
@@ -4315,147 +4652,116 @@ fn record_strategy_success(
 
 fn update_exposure_after_enter(
     strategy_id: &str,
-    key: &StrategyTemplateKey,
-    args_json: &str,
+    plan: &ExecutionPlan,
     now_ns: u64,
-) -> Option<ActiveExposure> {
-    let notional_wei = parse_strategy_notional_wei(args_json);
-    let asset_symbol = parse_strategy_asset_symbol(args_json, &key.template_id);
+) -> Result<Option<ActiveExposure>, String> {
+    let groups = grouped_asset_effects(plan)?;
+    let debits = groups
+        .iter()
+        .filter(|(_, amounts)| amounts.0 > U256::ZERO)
+        .collect::<Vec<_>>();
+    if debits.len() != 1 {
+        return Err("strategy exposure cannot represent multiple debit asset groups".to_string());
+    }
+    let (key, (amount, _)) = debits[0];
+    let effect = effect_for_key(plan, key).ok_or_else(|| "missing grouped effect".to_string())?;
     let existing = stable::active_exposure(strategy_id);
-    let next_notional = match (
-        existing.as_ref().and_then(|exposure| exposure.notional_wei),
-        notional_wei,
-    ) {
-        (Some(current), Some(delta)) => Some(current.saturating_add(delta)),
-        (Some(current), None) => Some(current),
-        (None, Some(delta)) => Some(delta),
-        (None, None) => None,
-    };
-
-    Some(ActiveExposure {
+    if let Some(prior) = existing.as_ref() {
+        if prior.chain_id != key.chain_id
+            || prior
+                .asset_address
+                .as_ref()
+                .map(|value| value.to_ascii_lowercase())
+                != key.asset_address
+            || prior.decimals != Some(key.decimals)
+        {
+            return Err("strategy exposure asset identity mismatch".to_string());
+        }
+    }
+    let prior = existing
+        .as_ref()
+        .and_then(|exposure| exposure.amount_raw.as_deref())
+        .map(parse_u256_decimal)
+        .transpose()?
+        .unwrap_or(U256::ZERO);
+    let next = prior
+        .checked_add(*amount)
+        .ok_or_else(|| "strategy exposure amount overflow".to_string())?;
+    Ok(Some(ActiveExposure {
         strategy_id: strategy_id.to_string(),
-        protocol: key.protocol.clone(),
-        chain_id: key.chain_id,
-        asset_symbol,
-        notional_wei: next_notional,
+        protocol: plan.key.protocol.clone(),
+        chain_id: effect.chain_id,
+        asset_symbol: effect.asset_symbol.clone(),
+        notional_wei: if effect.asset_address.is_none() && effect.decimals == 18 {
+            next.try_into().ok()
+        } else {
+            None
+        },
+        asset_address: effect.asset_address.clone(),
+        decimals: Some(effect.decimals),
+        amount_raw: Some(next.to_string()),
         updated_at_ns: now_ns,
-    })
+    }))
 }
 
 fn update_exposure_after_exit(
     strategy_id: &str,
-    key: &StrategyTemplateKey,
-    args_json: &str,
+    plan: &ExecutionPlan,
     now_ns: u64,
-) -> Option<ActiveExposure> {
-    let existing = stable::active_exposure(strategy_id)?;
-    let current_notional = parse_strategy_notional_wei(args_json);
-    let asset_symbol = parse_strategy_asset_symbol(args_json, &existing.asset_symbol);
-    let next_notional = match (existing.notional_wei, current_notional) {
-        (Some(existing_value), Some(exit_value)) => existing_value.checked_sub(exit_value),
-        (Some(_), None) => None,
-        (None, _) => None,
-    };
-
-    next_notional.and_then(|value| {
-        if value == 0 {
-            return None;
-        }
-        Some(ActiveExposure {
-            strategy_id: strategy_id.to_string(),
-            protocol: key.protocol.clone(),
-            chain_id: key.chain_id,
-            asset_symbol,
-            notional_wei: Some(value),
-            updated_at_ns: now_ns,
-        })
-    })
+) -> Result<Option<ActiveExposure>, String> {
+    let existing = stable::active_exposure(strategy_id)
+        .ok_or_else(|| "strategy exposure missing for exit".to_string())?;
+    let groups = grouped_asset_effects(plan)?;
+    let credits = groups
+        .iter()
+        .filter(|(_, amounts)| amounts.1 > U256::ZERO)
+        .collect::<Vec<_>>();
+    if credits.len() != 1 {
+        return Err("strategy exposure cannot represent multiple credit asset groups".to_string());
+    }
+    let (key, (_, amount)) = credits[0];
+    let effect = effect_for_key(plan, key).ok_or_else(|| "missing grouped effect".to_string())?;
+    if existing.chain_id != key.chain_id
+        || existing
+            .asset_address
+            .as_ref()
+            .map(|value| value.to_ascii_lowercase())
+            != key.asset_address
+        || existing.decimals != Some(key.decimals)
+    {
+        return Err("strategy exposure asset identity mismatch".to_string());
+    }
+    let prior = parse_u256_decimal(
+        existing
+            .amount_raw
+            .as_deref()
+            .ok_or_else(|| "legacy exposure amount is ambiguous".to_string())?,
+    )?;
+    let value = prior
+        .checked_sub(*amount)
+        .ok_or_else(|| "strategy exit exceeds exposure".to_string())?;
+    if value == U256::ZERO {
+        return Ok(None);
+    }
+    Ok(Some(ActiveExposure {
+        strategy_id: strategy_id.to_string(),
+        protocol: plan.key.protocol.clone(),
+        chain_id: plan.key.chain_id,
+        asset_symbol: effect.asset_symbol.clone(),
+        notional_wei: if effect.asset_address.is_none() && effect.decimals == 18 {
+            value.try_into().ok()
+        } else {
+            None
+        },
+        asset_address: existing.asset_address.clone(),
+        decimals: Some(effect.decimals),
+        amount_raw: Some(value.to_string()),
+        updated_at_ns: now_ns,
+    }))
 }
 
 fn is_enter_or_exit_action(action_id: &str) -> bool {
     action_id.starts_with("enter_") || action_id.starts_with("exit_")
-}
-
-fn parse_strategy_notional_wei(args_json: &str) -> Option<u128> {
-    let value: Value = serde_json::from_str(args_json).ok()?;
-    for candidate in [
-        "notional_wei",
-        "amount_wei",
-        "assets",
-        "amount",
-        "value_wei",
-    ] {
-        if let Some(found) = find_scalar_value(&value, candidate) {
-            if let Some(parsed) = parse_u128_value(found) {
-                return Some(parsed);
-            }
-        }
-    }
-    None
-}
-
-fn parse_strategy_asset_symbol(args_json: &str, fallback: &str) -> String {
-    let value: Value = match serde_json::from_str(args_json) {
-        Ok(value) => value,
-        Err(_) => return fallback.to_string(),
-    };
-    for candidate in ["asset_symbol", "assetSymbol", "symbol"] {
-        if let Some(found) = find_scalar_value(&value, candidate) {
-            if let Some(text) = found.as_str() {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_string();
-                }
-            }
-        }
-    }
-    fallback.to_string()
-}
-
-fn find_scalar_value<'a>(value: &'a Value, dotted_key: &str) -> Option<&'a Value> {
-    let segments = dotted_key.split('.').collect::<Vec<_>>();
-    find_scalar_value_recursive(value, &segments)
-}
-
-fn find_scalar_value_recursive<'a>(value: &'a Value, segments: &[&str]) -> Option<&'a Value> {
-    if segments.is_empty() {
-        return Some(value);
-    }
-    match value {
-        Value::Object(map) => {
-            let head = segments[0];
-            if let Some(next) = map.get(head) {
-                if let Some(found) = find_scalar_value_recursive(next, &segments[1..]) {
-                    return Some(found);
-                }
-            }
-            for child in map.values() {
-                if let Some(found) = find_scalar_value_recursive(child, segments) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(entries) => entries
-            .iter()
-            .find_map(|entry| find_scalar_value_recursive(entry, segments)),
-        _ => None,
-    }
-}
-
-fn parse_u128_value(value: &Value) -> Option<u128> {
-    match value {
-        Value::Number(number) => number.as_u64().map(u128::from),
-        Value::String(text) => {
-            let trimmed = text.trim();
-            if let Some(hex) = trimmed.strip_prefix("0x") {
-                u128::from_str_radix(hex, 16).ok()
-            } else {
-                trimmed.parse::<u128>().ok()
-            }
-        }
-        _ => None,
-    }
 }
 
 fn parse_optional_hex_u128(raw: Option<&str>) -> Option<u128> {
@@ -5037,9 +5343,10 @@ mod tests {
     use super::*;
     use crate::domain::types::{
         AbiArtifact, AbiArtifactKey, AbiFunctionSpec, AbiTypeSpec, ActionSpec, AgentState,
-        ContractRoleBinding, RoomContentType, RoomMessage, SpawnBootstrapView, StrategyTemplate,
-        StrategyTemplateKey, SurvivalOperationClass, SurvivalTier, TemplateActivationState,
-        TemplateStatus, ToolFailureKind,
+        ContractRoleBinding, RoomContentType, RoomMessage, SpawnBootstrapView,
+        StrategyAssetDirection, StrategyAssetEffect, StrategyTemplate, StrategyTemplateKey,
+        SurvivalOperationClass, SurvivalTier, TemplateActivationState, TemplateStatus,
+        ToolFailureKind,
     };
     use crate::features::cycle_topup::TopUpStage;
     use crate::storage::stable;
@@ -5220,6 +5527,306 @@ mod tests {
         assert!(error.contains("moving_window_seconds=18"));
     }
 
+    fn effect_plan(effect: StrategyAssetEffect) -> ExecutionPlan {
+        ExecutionPlan {
+            key: sample_strategy_key(),
+            action_id: "enter_supply".to_string(),
+            calls: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            asset_effects: vec![effect],
+            risk_checks: vec![],
+        }
+    }
+
+    #[test]
+    fn projected_usdc_balance_rejects_underflow_and_preserves_exact_floor() {
+        stable::init_storage();
+        stable::set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            usdc_contract_address: Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string()),
+            usdc_decimals: 6,
+            ..Default::default()
+        });
+        let effect = StrategyAssetEffect {
+            chain_id: 8453,
+            asset_address: Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string()),
+            asset_symbol: "USDC".to_string(),
+            decimals: 6,
+            amount_raw: "40".to_string(),
+            direction: StrategyAssetDirection::Debit,
+        };
+        assert_eq!(
+            projected_usdc_balance(&effect_plan(effect.clone()), U256::from(100u8)).unwrap(),
+            U256::from(60u8)
+        );
+        assert!(
+            projected_usdc_balance(&effect_plan(effect), U256::from(39u8))
+                .unwrap_err()
+                .contains("asset_debit_exceeds_balance")
+        );
+        let credit = StrategyAssetEffect {
+            chain_id: 8453,
+            asset_address: Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string()),
+            asset_symbol: "USDC".to_string(),
+            decimals: 6,
+            amount_raw: "20".to_string(),
+            direction: StrategyAssetDirection::Credit,
+        };
+        let debit = StrategyAssetEffect {
+            amount_raw: "90".to_string(),
+            direction: StrategyAssetDirection::Debit,
+            ..credit.clone()
+        };
+        let mut plan = effect_plan(credit);
+        plan.asset_effects.push(debit);
+        assert_eq!(
+            projected_usdc_balance(&plan, U256::from(100u8)).unwrap(),
+            U256::from(30u8)
+        );
+
+        for (chain_id, decimals) in [(1, 6), (8453, 18)] {
+            for direction in [
+                StrategyAssetDirection::Debit,
+                StrategyAssetDirection::Credit,
+            ] {
+                let invalid = StrategyAssetEffect {
+                    chain_id,
+                    decimals,
+                    amount_raw: "1".to_string(),
+                    direction,
+                    ..plan.asset_effects[0].clone()
+                };
+                let error = projected_usdc_balance(&effect_plan(invalid), U256::from(100u8))
+                    .expect_err("same-address non-Base-USDC identity must fail closed");
+                assert!(error.contains("invalid_base_usdc_asset_identity"));
+            }
+        }
+
+        let mut wrong_plan_chain = effect_plan(plan.asset_effects[0].clone());
+        wrong_plan_chain.key.chain_id = 1;
+        let error = projected_usdc_balance(&wrong_plan_chain, U256::from(100u8))
+            .expect_err("USDC effect on a non-Base plan must fail closed");
+        assert!(error.contains("invalid_base_usdc_asset_identity"));
+    }
+
+    #[test]
+    fn unsupported_erc20_balance_source_fails_closed() {
+        stable::init_storage();
+        let policy = AutonomyPolicy::conservative_default(1);
+        let effect = StrategyAssetEffect {
+            chain_id: 8453,
+            asset_address: Some("0x2222222222222222222222222222222222222222".to_string()),
+            asset_symbol: "OTHER".to_string(),
+            decimals: 6,
+            amount_raw: "1".to_string(),
+            direction: StrategyAssetDirection::Debit,
+        };
+        assert!(known_asset_balance(&policy, &effect)
+            .unwrap_err()
+            .contains("unsupported_asset_balance_source"));
+    }
+
+    #[test]
+    fn effect_grouping_includes_chain_and_native_identity_and_aggregates() {
+        let native = StrategyAssetEffect {
+            chain_id: 8453,
+            asset_address: None,
+            asset_symbol: "ETH".to_string(),
+            decimals: 18,
+            amount_raw: "7".to_string(),
+            direction: StrategyAssetDirection::Debit,
+        };
+        let mut plan = effect_plan(native.clone());
+        plan.asset_effects.push(StrategyAssetEffect {
+            amount_raw: "5".to_string(),
+            ..native.clone()
+        });
+        plan.asset_effects.push(StrategyAssetEffect {
+            chain_id: 1,
+            amount_raw: "3".to_string(),
+            ..native
+        });
+        let grouped = grouped_asset_effects(&plan).unwrap();
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(
+            grouped
+                .get(&AssetGroupKey {
+                    chain_id: 8453,
+                    asset_address: None,
+                    decimals: 18
+                })
+                .unwrap()
+                .0,
+            U256::from(12u8)
+        );
+    }
+
+    fn calldata_with_words(words: &[U256]) -> String {
+        format!(
+            "0x12345678{}",
+            words
+                .iter()
+                .map(|word| format!("{word:064x}"))
+                .collect::<String>()
+        )
+    }
+
+    fn address_word(address: &str) -> U256 {
+        U256::from_str_radix(address.trim_start_matches("0x"), 16).unwrap()
+    }
+
+    #[test]
+    fn curated_static_risk_check_indices_and_roles_are_evaluated() {
+        stable::init_storage();
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let usdc = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+        let pool = "0x2222222222222222222222222222222222222222";
+        let market = "0x3333333333333333333333333333333333333333";
+        let oracle = "0x4444444444444444444444444444444444444444";
+        stable::set_evm_address(Some(wallet.to_string())).unwrap();
+        stable::set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            usdc_contract_address: Some(usdc.to_string()),
+            usdc_decimals: 6,
+            ..Default::default()
+        });
+        let key = StrategyTemplateKey {
+            protocol: "aave-v3".to_string(),
+            primitive: "lend".to_string(),
+            chain_id: 8453,
+            template_id: "risk-check-test".to_string(),
+        };
+        registry::upsert_template(StrategyTemplate {
+            key: key.clone(),
+            status: TemplateStatus::Active,
+            contract_roles: vec![
+                ContractRoleBinding {
+                    role: "usdc".to_string(),
+                    address: usdc.to_string(),
+                    source_ref: "test".to_string(),
+                    codehash: None,
+                },
+                ContractRoleBinding {
+                    role: "aave_pool".to_string(),
+                    address: pool.to_string(),
+                    source_ref: "test".to_string(),
+                    codehash: None,
+                },
+                ContractRoleBinding {
+                    role: "m_usdc".to_string(),
+                    address: market.to_string(),
+                    source_ref: "test".to_string(),
+                    codehash: None,
+                },
+                ContractRoleBinding {
+                    role: "oracle".to_string(),
+                    address: oracle.to_string(),
+                    source_ref: "test".to_string(),
+                    codehash: None,
+                },
+            ],
+            actions: vec![],
+            constraints_json: "{}".to_string(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+        })
+        .unwrap();
+        let effect = StrategyAssetEffect {
+            chain_id: 8453,
+            asset_address: Some(usdc.to_string()),
+            asset_symbol: "USDC".to_string(),
+            decimals: 6,
+            amount_raw: "1".to_string(),
+            direction: StrategyAssetDirection::Debit,
+        };
+        let mut plan = effect_plan(effect);
+        plan.key = key;
+        plan.calls = vec![crate::domain::types::StrategyExecutionCall {
+            role: "usdc".to_string(),
+            to: usdc.to_string(),
+            value_wei: "0".to_string(),
+            data: calldata_with_words(&[address_word(pool)]),
+        }];
+        plan.risk_checks = vec![
+            "spender_equals_aave_pool".to_string(),
+            "asset_equals_base_usdc".to_string(),
+        ];
+        assert!(evaluate_static_risk_checks(&plan).1.is_empty());
+        plan.calls[0].role = "aave_pool".to_string();
+        plan.calls[0].to = pool.to_string();
+        plan.calls[0].data = calldata_with_words(&[
+            address_word(usdc),
+            U256::from(1u8),
+            address_word(wallet),
+            U256::ZERO,
+        ]);
+        plan.risk_checks = vec![
+            "asset_equals_base_usdc".to_string(),
+            "on_behalf_of_equals_automaton_wallet".to_string(),
+            "referral_code_zero".to_string(),
+        ];
+        assert!(evaluate_static_risk_checks(&plan).1.is_empty());
+        plan.calls[0].data =
+            calldata_with_words(&[address_word(usdc), U256::from(1u8), address_word(wallet)]);
+        plan.risk_checks = vec!["withdraw_receiver_equals_automaton_wallet".to_string()];
+        assert!(evaluate_static_risk_checks(&plan).1.is_empty());
+        plan.calls[0].role = "usdc".to_string();
+        plan.calls[0].to = usdc.to_string();
+        plan.calls[0].data = calldata_with_words(&[address_word(market)]);
+        plan.risk_checks = vec![
+            "spender_equals_moonwell_usdc_market".to_string(),
+            "asset_equals_base_usdc".to_string(),
+        ];
+        assert!(evaluate_static_risk_checks(&plan).1.is_empty());
+        plan.calls[0].role = "m_usdc".to_string();
+        plan.calls[0].to = market.to_string();
+        plan.risk_checks = vec!["market_equals_moonwell_usdc".to_string()];
+        assert!(evaluate_static_risk_checks(&plan).1.is_empty());
+        plan.calls[0].data = calldata_with_words(&[
+            address_word(usdc),
+            U256::ZERO,
+            address_word(oracle),
+            U256::ZERO,
+            U256::from(860_000_000_000_000_000u128),
+        ]);
+        plan.risk_checks = vec![
+            "oracle_address_matches_template".to_string(),
+            "lltv_equals_0.86e18".to_string(),
+        ];
+        assert!(evaluate_static_risk_checks(&plan).1.is_empty());
+    }
+
+    #[test]
+    fn exposure_persistence_preserves_u256_native_amount_and_rejects_multiple_assets() {
+        stable::init_storage();
+        let huge = U256::MAX.to_string();
+        let native = StrategyAssetEffect {
+            chain_id: 8453,
+            asset_address: None,
+            asset_symbol: "ETH".to_string(),
+            decimals: 18,
+            amount_raw: huge.clone(),
+            direction: StrategyAssetDirection::Debit,
+        };
+        let plan = effect_plan(native);
+        let exposure = update_exposure_after_enter("native", &plan, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exposure.amount_raw.as_deref(), Some(huge.as_str()));
+        assert_eq!(exposure.notional_wei, None);
+        let mut multiple = plan;
+        multiple.asset_effects.push(StrategyAssetEffect {
+            chain_id: 8453,
+            asset_address: Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string()),
+            asset_symbol: "USDC".to_string(),
+            decimals: 6,
+            amount_raw: "1".to_string(),
+            direction: StrategyAssetDirection::Debit,
+        });
+        assert!(update_exposure_after_enter("multiple", &multiple, 1)
+            .unwrap_err()
+            .contains("multiple debit asset groups"));
+    }
+
     fn configure_factory_room_access() {
         stable::set_spawn_bootstrap_metadata(SpawnBootstrapView {
             contract_version: None,
@@ -5284,7 +5891,7 @@ mod tests {
                 call_sequence: vec![function.clone()],
                 preconditions: vec!["allowance_ok".to_string()],
                 postconditions: vec!["balance_delta_positive".to_string()],
-                risk_checks: vec!["max_notional".to_string()],
+                risk_checks: vec![],
             }],
             constraints_json: r#"{"max_calls":1,"max_total_value_wei":"100","template_budget_wei":"100","required_postconditions":["balance_delta_positive"]}"#.to_string(),
             created_at_ns: 1,
@@ -5397,24 +6004,27 @@ mod tests {
                 address: "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb".to_string(),
                 source_ref: "https://docs.morpho.org/get-started/resources/addresses/".to_string(),
                 codehash: None,
-            }],
+            }, ContractRoleBinding { role: "usdc".to_string(), address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_string(), source_ref: "test".to_string(), codehash: None }],
             actions: vec![
                 ActionSpec {
                     action_id: "enter_supply".to_string(),
                     call_sequence: vec![function.clone()],
                     preconditions: vec!["allowance_ok".to_string()],
                     postconditions: vec!["position_opened".to_string()],
-                    risk_checks: vec!["max_notional".to_string()],
+                    risk_checks: vec![],
                 },
                 ActionSpec {
                     action_id: "exit_supply".to_string(),
                     call_sequence: vec![function.clone()],
                     preconditions: vec!["position_opened".to_string()],
                     postconditions: vec!["position_closed".to_string()],
-                    risk_checks: vec!["max_notional".to_string()],
+                    risk_checks: vec![],
                 },
             ],
-            constraints_json: "{}".to_string(),
+            constraints_json: serde_json::json!({"asset_effects":{
+                "enter_supply":[{"asset_role":"usdc","asset_symbol":"USDC","decimals":6,"direction":"Debit","amount_path":"/calls/0/args/1"}],
+                "exit_supply":[{"asset_role":"usdc","asset_symbol":"USDC","decimals":6,"direction":"Credit","amount_path":"/calls/0/args/1"}]
+            }}).to_string(),
             created_at_ns: 1,
             updated_at_ns: 1,
         })
@@ -6714,7 +7324,7 @@ mod tests {
                         "value_wei": "0",
                         "args": {
                             "marketParams": {
-                                "loanToken": "0x4200000000000000000000000000000000000006",
+                                "loanToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
                                 "collateralToken": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
                                 "irm": "0x46415998764C29aB2a25CbeA6E5D2F226b40b5f0",
                                 "lltv": "860000000000000000"
@@ -6844,6 +7454,15 @@ mod tests {
         .expect("evm address should set");
         seed_strategy_template_and_artifact();
         seed_morpho_strategy_template_and_artifact();
+        stable::set_wallet_balance_snapshot(crate::domain::types::WalletBalanceSnapshot {
+            eth_balance_wei_hex: Some("0xde0b6b3a7640000".to_string()),
+            usdc_balance_raw_hex: Some("0x3b9aca00".to_string()),
+            usdc_decimals: 6,
+            usdc_contract_address: Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".to_string()),
+            last_synced_at_ns: Some(20_000_000_000),
+            last_synced_block: Some(1),
+            last_error: None,
+        });
         for class in [
             SurvivalOperationClass::ThresholdSign,
             SurvivalOperationClass::EvmBroadcast,
@@ -7030,7 +7649,7 @@ mod tests {
                     "value_wei": "0",
                     "args": {
                         "marketParams": {
-                            "loanToken": "0x4200000000000000000000000000000000000006",
+                            "loanToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
                             "collateralToken": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
                             "oracle": "0x7777777777777777777777777777777777777777",
                             "irm": "0x46415998764C29aB2a25CbeA6E5D2F226b40b5f0",
@@ -7065,12 +7684,14 @@ mod tests {
         ));
         assert_eq!(morpho_records.len(), 2);
         assert!(morpho_records[0].success);
-        assert!(morpho_records[1].success);
+        assert!(morpho_records[1].success, "{morpho_records:?}");
         let exposure = stable::active_exposure(&morpho_strategy_id)
             .expect("enter execution should persist exposure");
         assert_eq!(exposure.protocol, sample_morpho_strategy_key().protocol);
         assert_eq!(exposure.chain_id, sample_morpho_strategy_key().chain_id);
-        assert_eq!(exposure.notional_wei, Some(1_000_000));
+        assert_eq!(exposure.notional_wei, None);
+        assert_eq!(exposure.amount_raw.as_deref(), Some("1000000"));
+        assert_eq!(exposure.decimals, Some(6));
         assert!(!exposure.asset_symbol.trim().is_empty());
     }
 

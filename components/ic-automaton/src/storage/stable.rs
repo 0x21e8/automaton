@@ -6737,8 +6737,11 @@ mod tests {
             strategy_id: "moonwell-enter".to_string(),
             protocol: "moonwell".to_string(),
             chain_id: 8453,
-            asset_symbol: "USDC".to_string(),
+            asset_symbol: "ETH".to_string(),
             notional_wei: Some(50_000_000_000_000_000),
+            asset_address: None,
+            decimals: Some(18),
+            amount_raw: Some("50000000000000000".to_string()),
             updated_at_ns: 1_100,
         })
         .expect("exposure should store");

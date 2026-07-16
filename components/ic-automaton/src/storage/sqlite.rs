@@ -4021,8 +4021,11 @@ mod tests {
             strategy_id: "aave-enter".to_string(),
             protocol: "aave".to_string(),
             chain_id: 8453,
-            asset_symbol: "USDC".to_string(),
+            asset_symbol: "ETH".to_string(),
             notional_wei: Some(123_000_000_000_000_000),
+            asset_address: None,
+            decimals: Some(18),
+            amount_raw: Some("123000000000000000".to_string()),
             updated_at_ns: 100,
         };
         upsert_active_exposure(&exposure).expect("exposure should persist");
