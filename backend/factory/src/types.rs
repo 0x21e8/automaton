@@ -481,6 +481,12 @@ pub struct ReleaseBroadcastRecord {
     pub raw_transaction_hex: Option<String>,
     pub rpc_tx_hash: Option<String>,
     pub broadcast_at: Option<u64>,
+    #[serde(default)]
+    pub receipt_block_number: Option<u64>,
+    #[serde(default)]
+    pub receipt_block_hash: Option<String>,
+    #[serde(default)]
+    pub receipt_status: Option<bool>,
     pub last_error: Option<ReleaseBroadcastFailure>,
 }
 
@@ -512,6 +518,13 @@ impl SpawnPaymentInstructions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct PaymentEvidenceBlock {
+    pub block_number: u64,
+    pub block_hash: String,
+    pub amount: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
 pub struct EscrowClaim {
     pub session_id: String,
     pub claim_id: String,
@@ -523,6 +536,14 @@ pub struct EscrowClaim {
     pub paid_amount: String,
     pub payment_status: PaymentStatus,
     pub last_scanned_block: Option<u64>,
+    #[serde(default)]
+    pub payment_evidence_block_number: Option<u64>,
+    #[serde(default)]
+    pub payment_evidence_block_hash: Option<String>,
+    #[serde(default)]
+    pub payment_evidence_increment: Option<String>,
+    #[serde(default)]
+    pub payment_evidence: Vec<PaymentEvidenceBlock>,
     pub refundable: bool,
     pub refunded_at: Option<u64>,
     #[serde(default)]
@@ -931,6 +952,7 @@ pub struct FactoryConfigSnapshot {
     pub cycles_per_spawn: u64,
     pub min_pool_balance: u64,
     pub estimated_outcall_cycles_per_interval: u64,
+    pub evm_confirmation_depth: u64,
     pub session_ttl_ms: u64,
     pub version_commit: String,
     pub wasm_sha256: Option<String>,
@@ -941,6 +963,20 @@ pub struct FactoryOperationalConfig {
     pub cycles_per_spawn: u64,
     pub min_pool_balance: u64,
     pub estimated_outcall_cycles_per_interval: u64,
+    pub evm_confirmation_depth: u64,
+}
+
+pub const DEFAULT_EVM_CONFIRMATION_DEPTH: u64 = 12;
+pub const LOCAL_EVM_CHAIN_ID: u64 = 31_337;
+pub const LOCAL_EVM_CONFIRMATION_DEPTH: u64 = 1;
+pub const MAX_EVM_CONFIRMATION_DEPTH: u64 = 1_024;
+
+pub fn default_evm_confirmation_depth(chain_id: u64) -> u64 {
+    if chain_id == LOCAL_EVM_CHAIN_ID {
+        LOCAL_EVM_CONFIRMATION_DEPTH
+    } else {
+        DEFAULT_EVM_CONFIRMATION_DEPTH
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
@@ -1114,6 +1150,10 @@ pub enum FactoryError {
     },
     InvalidStewardProof {
         reason: String,
+    },
+    InvalidOperationalConfig {
+        field: String,
+        message: String,
     },
     UnauthorizedRoomPoster {
         caller: String,
@@ -1289,6 +1329,9 @@ impl Display for FactoryError {
             }
             Self::InvalidStewardProof { reason } => {
                 write!(f, "invalid factory steward proof: {reason}")
+            }
+            Self::InvalidOperationalConfig { field, message } => {
+                write!(f, "invalid factory operational config {}: {message}", field)
             }
             Self::UnauthorizedRoomPoster { caller } => {
                 write!(

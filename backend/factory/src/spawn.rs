@@ -33,14 +33,14 @@ use crate::state::{
 #[cfg(not(target_arch = "wasm32"))]
 use crate::types::amount_to_string;
 use crate::types::parse_amount;
-#[cfg(target_arch = "wasm32")]
-use crate::types::ReleaseBroadcastStage;
 use crate::types::{
     AutomatonBootstrapEvidence, AutomatonBootstrapVerification, AutomatonRuntimeState,
     FactoryError, PaymentStatus, ReleaseBroadcastRecord, RepositoryStrategySessionSnapshot,
     SessionAuditActor, SpawnExecutionReceipt, SpawnSession, SpawnSessionState,
     SpawnedAutomatonRecord, CONTROLLER_FIELD,
 };
+#[cfg(target_arch = "wasm32")]
+use crate::types::{ReleaseBroadcastFailure, ReleaseBroadcastStage};
 use sha2::{Digest, Sha256};
 
 fn reproduction_release(
@@ -113,9 +113,11 @@ fn reserve_release_nonce_value(cursor: &mut Option<u64>, pending: u64) -> u64 {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
+#[allow(dead_code)]
 const RELEASE_RECEIPT_TIMEOUT_MS: u64 = 5 * 60 * 1_000;
 
 #[cfg(any(target_arch = "wasm32", test))]
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReleaseReceiptDecision {
     Confirmed,
@@ -124,6 +126,33 @@ enum ReleaseReceiptDecision {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingReleaseReceiptOutcome {
+    Pending,
+    Terminal,
+    Retryable,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[allow(dead_code)]
+fn classify_spawn_release_receipt_confirmation(
+    error: &FactoryError,
+) -> ExistingReleaseReceiptOutcome {
+    match error {
+        FactoryError::ManagementCallFailed { message, .. } => match message.as_str() {
+            "receipt block is in the future" => ExistingReleaseReceiptOutcome::Pending,
+            "release transaction reverted" | "receipt block hash is not canonical" => {
+                ExistingReleaseReceiptOutcome::Terminal
+            }
+            _ => ExistingReleaseReceiptOutcome::Retryable,
+        },
+        _ => ExistingReleaseReceiptOutcome::Retryable,
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[allow(dead_code)]
 fn release_receipt_decision(
     status: Option<bool>,
     broadcast_at: u64,
@@ -132,7 +161,7 @@ fn release_receipt_decision(
     match status {
         Some(true) => ReleaseReceiptDecision::Confirmed,
         Some(false) => ReleaseReceiptDecision::Failed,
-        None if now_ms.saturating_sub(broadcast_at) < RELEASE_RECEIPT_TIMEOUT_MS => {
+        None if now_ms.saturating_sub(broadcast_at) <= RELEASE_RECEIPT_TIMEOUT_MS => {
             ReleaseReceiptDecision::Wait
         }
         None => ReleaseReceiptDecision::Failed,
@@ -833,6 +862,107 @@ fn persist_failed_spawn_runtime(
     }
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SpawnReleaseDraftGuard {
+    generation: u32,
+    draft_identity: Option<String>,
+}
+
+#[allow(dead_code)]
+pub(crate) fn release_broadcast_draft_identity(record: &ReleaseBroadcastRecord) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        record.claim_id,
+        record.recipient,
+        record.escrow_contract_address,
+        record.nonce,
+        record.chain_id,
+        record.max_priority_fee_per_gas,
+        record.max_fee_per_gas,
+        record.gas_limit,
+        record.ecdsa_key_name.as_deref().unwrap_or(""),
+        record.calldata_hex,
+        record.signing_payload_hash.as_deref().unwrap_or(""),
+    )
+}
+
+#[allow(dead_code)]
+fn spawn_release_draft_guard(session: &SpawnSession) -> SpawnReleaseDraftGuard {
+    SpawnReleaseDraftGuard {
+        generation: session.generation.unwrap_or_default(),
+        draft_identity: session
+            .release_broadcast
+            .as_ref()
+            .map(release_broadcast_draft_identity),
+    }
+}
+
+#[allow(dead_code)]
+fn spawn_release_draft_guard_for_record(
+    generation: u32,
+    record: Option<&ReleaseBroadcastRecord>,
+) -> SpawnReleaseDraftGuard {
+    SpawnReleaseDraftGuard {
+        generation,
+        draft_identity: record.map(release_broadcast_draft_identity),
+    }
+}
+
+#[allow(dead_code)]
+fn ensure_spawn_release_draft_guard_in_state(
+    state: &FactoryState,
+    session_id: &str,
+    guard: &SpawnReleaseDraftGuard,
+) -> Result<(), FactoryError> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| FactoryError::SessionNotFound {
+            session_id: session_id.to_string(),
+        })?;
+    if session.generation.unwrap_or_default() != guard.generation {
+        return Err(FactoryError::InvalidStewardProof {
+            reason: "stale spawn continuation".to_string(),
+        });
+    }
+
+    let current_identity = session
+        .release_broadcast
+        .as_ref()
+        .map(release_broadcast_draft_identity);
+    if current_identity != guard.draft_identity {
+        return Err(FactoryError::InvalidStewardProof {
+            reason: "stale spawn continuation".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn ensure_spawn_release_draft_guard(
+    session_id: &str,
+    guard: &SpawnReleaseDraftGuard,
+) -> Result<(), FactoryError> {
+    read_state(|state| ensure_spawn_release_draft_guard_in_state(state, session_id, guard))
+}
+
+#[allow(dead_code)]
+fn write_spawn_release_broadcast_record_guarded<F, T>(
+    session_id: &str,
+    guard: &SpawnReleaseDraftGuard,
+    mutation: F,
+) -> Result<T, FactoryError>
+where
+    F: FnOnce(&mut FactoryState) -> Result<T, FactoryError>,
+{
+    write_state(|state| {
+        ensure_spawn_release_draft_guard_in_state(state, session_id, guard)?;
+        mutation(state)
+    })
+}
+
 fn persist_release_broadcast_record(
     state: &mut FactoryState,
     session_id: &str,
@@ -1116,6 +1246,7 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             &state.release_broadcast_config,
             reproduction_release.as_ref(),
             false,
+            state.evm_confirmation_depth,
             None,
         ) {
             Ok(release) => release,
@@ -1264,8 +1395,9 @@ fn finalize_confirmed_release(
     version_commit: &str,
     verified_factory_controllers: &[String],
     current_time: u64,
+    draft_guard: &SpawnReleaseDraftGuard,
 ) -> Result<(), FactoryError> {
-    write_state(|state| {
+    write_spawn_release_broadcast_record_guarded(session_id, draft_guard, |state| {
         let session = state.sessions.get_mut(session_id).expect("session exists");
         clear_provider_secrets(session, Some(runtime));
         session.release_tx_hash = Some(release_tx_hash.to_string());
@@ -1317,7 +1449,7 @@ fn finalize_confirmed_release(
 async fn resume_broadcasting_release(
     session: &SpawnSession,
 ) -> Result<SpawnExecutionReceipt, FactoryError> {
-    let record =
+    let mut record =
         session
             .release_broadcast
             .clone()
@@ -1332,6 +1464,8 @@ async fn resume_broadcasting_release(
             method: "eth_getTransactionReceipt".to_string(),
             message: "broadcasting release has no transaction hash".to_string(),
         })?;
+    let draft_guard = &mut spawn_release_draft_guard(session);
+    ensure_spawn_release_draft_guard(&session.session_id, draft_guard)?;
     let endpoints = read_state(|state| {
         configured_rpc_endpoints(
             state.base_rpc_endpoint.clone(),
@@ -1339,39 +1473,100 @@ async fn resume_broadcasting_release(
         )
     });
     let now = current_time_ms();
-    let status = crate::base_rpc::eth_get_transaction_receipt_status(&endpoints, &tx_hash).await?;
-    match release_receipt_decision(status, record.broadcast_at.unwrap_or(now), now) {
-        ReleaseReceiptDecision::Wait => {
+    let confirmation_depth = read_state(|state| state.evm_confirmation_depth);
+    let confirmation_guard = crate::evm::ReleaseTransactionGuard::spawn(
+        &session.session_id,
+        draft_guard.generation,
+        &draft_guard.draft_identity,
+    );
+    ensure_spawn_release_draft_guard(&session.session_id, draft_guard)?;
+    match crate::evm::confirm_release_receipt_depth(
+        &endpoints,
+        confirmation_depth,
+        &mut record,
+        &tx_hash,
+        Some(&confirmation_guard),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            record.last_error = Some(ReleaseBroadcastFailure {
+                stage: ReleaseBroadcastStage::ReceiptConfirmation,
+                message: "release transaction is pending or dropped".to_string(),
+                rpc_category: None,
+                rpc_code: None,
+                rpc_endpoint: None,
+                occurred_at: now,
+            });
+            write_spawn_release_broadcast_record_guarded(
+                &session.session_id,
+                draft_guard,
+                |state| {
+                    persist_release_broadcast_record(state, &session.session_id, &record);
+                    Ok(())
+                },
+            )?;
             return Err(FactoryError::ManagementCallFailed {
                 method: "eth_getTransactionReceipt".to_string(),
                 message: "release transaction remains pending".to_string(),
-            })
+            });
         }
-        ReleaseReceiptDecision::Failed => {
-            let message = if status == Some(false) {
-                "release transaction reverted"
-            } else {
-                "release transaction was dropped or exceeded its confirmation timeout"
+        Err(error) => {
+            let message = match &error {
+                FactoryError::ManagementCallFailed { message, .. } => message.clone(),
+                _ => error.to_string(),
             };
-            let runtime = session
-                .automaton_canister_id
-                .as_ref()
-                .and_then(|id| read_state(|state| state.runtimes.get(id).cloned()));
-            return fail_spawn_session(
+            record.last_error = Some(ReleaseBroadcastFailure {
+                stage: ReleaseBroadcastStage::ReceiptConfirmation,
+                message: message.clone(),
+                rpc_category: None,
+                rpc_code: None,
+                rpc_endpoint: None,
+                occurred_at: now,
+            });
+            write_spawn_release_broadcast_record_guarded(
                 &session.session_id,
-                now,
-                "release receipt terminal failure",
-                None,
-                runtime.as_ref(),
-                FactoryError::ManagementCallFailed {
-                    method: "eth_getTransactionReceipt".to_string(),
-                    message: message.to_string(),
+                draft_guard,
+                |state| {
+                    persist_release_broadcast_record(state, &session.session_id, &record);
+                    Ok(())
                 },
-            )
-            .await;
+            )?;
+            match classify_spawn_release_receipt_confirmation(&error) {
+                ExistingReleaseReceiptOutcome::Pending => {
+                    return Err(FactoryError::ManagementCallFailed {
+                        method: "eth_getTransactionReceipt".to_string(),
+                        message: "release transaction remains pending".to_string(),
+                    });
+                }
+                ExistingReleaseReceiptOutcome::Terminal => {
+                    let runtime = session
+                        .automaton_canister_id
+                        .as_ref()
+                        .and_then(|id| read_state(|state| state.runtimes.get(id).cloned()));
+                    return fail_spawn_session(
+                        &session.session_id,
+                        now,
+                        "release receipt terminal failure",
+                        None,
+                        runtime.as_ref(),
+                        FactoryError::ManagementCallFailed {
+                            method: "eth_getTransactionReceipt".to_string(),
+                            message,
+                        },
+                    )
+                    .await;
+                }
+                ExistingReleaseReceiptOutcome::Retryable => {
+                    return Err(error);
+                }
+            }
         }
-        ReleaseReceiptDecision::Confirmed => {}
     }
+
+    let finalized_guard =
+        spawn_release_draft_guard_for_record(draft_guard.generation, Some(&record));
     let canister_id = session
         .automaton_canister_id
         .clone()
@@ -1382,7 +1577,12 @@ async fn resume_broadcasting_release(
                 canister_id: canister_id.clone(),
             }
         })?;
-    let controllers = complete_controller_handoff_live(&canister_id).await?;
+    ensure_spawn_release_draft_guard(&session.session_id, draft_guard)?;
+    let controllers = {
+        ensure_spawn_release_draft_guard(&session.session_id, draft_guard)?;
+        complete_controller_handoff_live(&canister_id).await?
+    };
+    ensure_spawn_release_draft_guard(&session.session_id, draft_guard)?;
     let verified_controllers = controllers.into_vec();
     let version_commit = read_state(|state| state.version_commit.clone());
     finalize_confirmed_release(
@@ -1395,6 +1595,7 @@ async fn resume_broadcasting_release(
         &version_commit,
         &verified_controllers,
         now,
+        &finalized_guard,
     )?;
     Ok(SpawnExecutionReceipt {
         session_id: session.session_id.clone(),
@@ -1852,13 +2053,14 @@ pub async fn execute_spawn(
     runtime.evm_address = expected_evm_address.clone();
     write_state(|state| persist_failed_spawn_runtime(state, session_id, &runtime));
 
-    let (base_rpc_endpoints, release_broadcast_config) = read_state(|state| {
+    let (base_rpc_endpoints, release_broadcast_config, confirmation_depth) = read_state(|state| {
         (
             configured_rpc_endpoints(
                 state.base_rpc_endpoint.clone(),
                 state.base_rpc_fallback_endpoint.clone(),
             ),
             state.release_broadcast_config.clone(),
+            state.evm_confirmation_depth,
         )
     });
     if base_rpc_endpoints.is_empty() {
@@ -1877,42 +2079,98 @@ pub async fn execute_spawn(
     }
     let escrow_contract_address = read_state(|state| state.escrow_contract_address.clone());
     let reproduction_release = reproduction_release(&session_snapshot)?;
-    let confirmed_existing = if let Some(record) = session_snapshot.release_broadcast.clone() {
+    let draft_guard = spawn_release_draft_guard(&session_snapshot);
+    let evm_guard = crate::evm::ReleaseTransactionGuard::spawn(
+        session_id,
+        draft_guard.generation,
+        &draft_guard.draft_identity,
+    );
+    let confirmed_existing = if let Some(mut record) = session_snapshot.release_broadcast.clone() {
         if let Some(tx_hash) = record.rpc_tx_hash.clone() {
-            match crate::base_rpc::eth_get_transaction_receipt_status(&base_rpc_endpoints, &tx_hash)
-                .await
+            ensure_spawn_release_draft_guard(session_id, &draft_guard)?;
+            match crate::evm::confirm_release_receipt_depth(
+                &base_rpc_endpoints,
+                confirmation_depth,
+                &mut record,
+                &tx_hash,
+                Some(&evm_guard),
+            )
+            .await
             {
-                Ok(Some(true)) => Some(crate::evm::ReleaseBroadcastReceipt {
+                Ok(true) => Some(crate::evm::ReleaseBroadcastReceipt {
                     release_tx_hash: tx_hash,
                     release_broadcast_at: record.broadcast_at.unwrap_or(current_time),
                     record,
                     confirmed: true,
                 }),
-                Ok(None) => {
-                    return fail_spawn_session(
+                Ok(false) => {
+                    record.last_error = Some(ReleaseBroadcastFailure {
+                        stage: ReleaseBroadcastStage::ReceiptConfirmation,
+                        message: "release transaction is pending or dropped".to_string(),
+                        rpc_category: None,
+                        rpc_code: None,
+                        rpc_endpoint: None,
+                        occurred_at: current_time_ms(),
+                    });
+                    write_spawn_release_broadcast_record_guarded(
                         session_id,
-                        current_time_ms(),
-                        "release confirmation pending",
-                        None,
-                        Some(&runtime),
-                        FactoryError::ManagementCallFailed {
-                            method: "eth_getTransactionReceipt".to_string(),
-                            message: "release transaction is pending or dropped".to_string(),
+                        &draft_guard,
+                        |state| {
+                            persist_release_broadcast_record(state, session_id, &record);
+                            Ok(())
                         },
-                    )
-                    .await;
+                    )?;
+                    return Err(FactoryError::ManagementCallFailed {
+                        method: "eth_getTransactionReceipt".to_string(),
+                        message: "release transaction remains pending".to_string(),
+                    });
                 }
-                Ok(Some(false)) => None,
                 Err(error) => {
-                    return fail_spawn_session(
+                    let message = match &error {
+                        FactoryError::ManagementCallFailed { message, .. } => message.clone(),
+                        _ => error.to_string(),
+                    };
+                    record.last_error = Some(ReleaseBroadcastFailure {
+                        stage: ReleaseBroadcastStage::ReceiptConfirmation,
+                        message: message.clone(),
+                        rpc_category: None,
+                        rpc_code: None,
+                        rpc_endpoint: None,
+                        occurred_at: current_time_ms(),
+                    });
+                    write_spawn_release_broadcast_record_guarded(
                         session_id,
-                        current_time_ms(),
-                        "release confirmation failed",
-                        None,
-                        Some(&runtime),
-                        error,
-                    )
-                    .await;
+                        &draft_guard,
+                        |state| {
+                            persist_release_broadcast_record(state, session_id, &record);
+                            Ok(())
+                        },
+                    )?;
+                    match classify_spawn_release_receipt_confirmation(&error) {
+                        ExistingReleaseReceiptOutcome::Pending => {
+                            return Err(FactoryError::ManagementCallFailed {
+                                method: "eth_getTransactionReceipt".to_string(),
+                                message: "release transaction remains pending".to_string(),
+                            });
+                        }
+                        ExistingReleaseReceiptOutcome::Terminal => {
+                            return fail_spawn_session(
+                                session_id,
+                                current_time_ms(),
+                                "release receipt terminal failure",
+                                None,
+                                Some(&runtime),
+                                FactoryError::ManagementCallFailed {
+                                    method: "eth_getTransactionReceipt".to_string(),
+                                    message,
+                                },
+                            )
+                            .await;
+                        }
+                        ExistingReleaseReceiptOutcome::Retryable => {
+                            return Err(error);
+                        }
+                    }
                 }
             }
         } else {
@@ -1938,7 +2196,8 @@ pub async fn execute_spawn(
                 .await;
             }
         };
-        match crate::evm::broadcast_release_transaction(
+        ensure_spawn_release_draft_guard(session_id, &draft_guard)?;
+        let release = crate::evm::broadcast_release_transaction(
             &session_snapshot.claim_id,
             &runtime.evm_address,
             &base_rpc_endpoints,
@@ -1948,15 +2207,22 @@ pub async fn execute_spawn(
             &release_broadcast_config,
             reproduction_release.as_ref(),
             false,
-            None,
+            confirmation_depth,
+            Some(crate::evm::ReleaseTransactionGuard::spawn(
+                session_id,
+                draft_guard.generation,
+                &draft_guard.draft_identity,
+            )),
         )
-        .await
-        {
+        .await;
+        ensure_spawn_release_draft_guard(session_id, &draft_guard)?;
+        match release {
             Ok(release) => release,
             Err(error) => {
-                write_state(|state| {
+                write_spawn_release_broadcast_record_guarded(session_id, &draft_guard, |state| {
                     persist_release_broadcast_record(state, session_id, &error.record);
-                });
+                    Ok(())
+                })?;
                 if error.record.last_error.as_ref().is_some_and(|failure| {
                     failure.stage == ReleaseBroadcastStage::ReceiptConfirmation
                         && !failure.message.contains("reverted")
@@ -1982,7 +2248,12 @@ pub async fn execute_spawn(
         record: release_record,
         confirmed,
     } = release;
-    write_state(|state| persist_release_broadcast_record(state, session_id, &release_record));
+    let finalized_guard =
+        spawn_release_draft_guard_for_record(draft_guard.generation, Some(&release_record));
+    write_spawn_release_broadcast_record_guarded(session_id, &draft_guard, |state| {
+        persist_release_broadcast_record(state, session_id, &release_record);
+        Ok(())
+    })?;
     if !confirmed {
         return Err(FactoryError::ManagementCallFailed {
             method: "eth_getTransactionReceipt".to_string(),
@@ -1999,6 +2270,7 @@ pub async fn execute_spawn(
         &version_commit,
         &verified_factory_controllers,
         current_time,
+        &finalized_guard,
     )?;
 
     Ok(SpawnExecutionReceipt {
@@ -2016,15 +2288,20 @@ pub async fn execute_spawn(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_bootstrap_verification, insert_registry_record_with_parent_link,
-        release_receipt_decision, reserve_release_nonce_value, wasm_install_chunks,
+        build_bootstrap_verification, classify_spawn_release_receipt_confirmation,
+        ensure_spawn_release_draft_guard, insert_registry_record_with_parent_link,
+        persist_release_broadcast_record, read_state, release_receipt_decision,
+        reserve_release_nonce_value, spawn_release_draft_guard,
+        spawn_release_draft_guard_for_record, wasm_install_chunks,
+        write_spawn_release_broadcast_record_guarded, write_state, ExistingReleaseReceiptOutcome,
         ReleaseReceiptDecision, MANAGEMENT_WASM_CHUNK_BYTES, RELEASE_RECEIPT_TIMEOUT_MS,
     };
     use crate::state::FactoryState;
     use crate::types::{
-        AutomatonBootstrapEvidence, InferenceTransport, OpenRouterReasoningLevel, PaymentStatus,
-        ProviderConfig, SpawnAsset, SpawnChain, SpawnConfig, SpawnSession, SpawnSessionState,
-        SpawnedAutomatonRecord,
+        AutomatonBootstrapEvidence, FactoryError, InferenceTransport, OpenRouterReasoningLevel,
+        PaymentStatus, ProviderConfig, ReleaseBroadcastFailure, ReleaseBroadcastRecord,
+        ReleaseBroadcastStage, SpawnAsset, SpawnChain, SpawnConfig, SpawnSession,
+        SpawnSessionOrigin, SpawnSessionState, SpawnedAutomatonRecord,
     };
 
     fn registry_record(canister_id: &str, parent_id: Option<&str>) -> SpawnedAutomatonRecord {
@@ -2132,8 +2409,269 @@ mod tests {
                 broadcast_at,
                 broadcast_at + RELEASE_RECEIPT_TIMEOUT_MS
             ),
-            ReleaseReceiptDecision::Failed
+            ReleaseReceiptDecision::Wait
         );
+    }
+
+    #[test]
+    fn spawn_release_confirmation_reclassifies_receipt_in_the_future_as_pending() {
+        let error = FactoryError::ManagementCallFailed {
+            method: "eth_getTransactionReceipt".to_string(),
+            message: "receipt block is in the future".to_string(),
+        };
+        assert_eq!(
+            classify_spawn_release_receipt_confirmation(&error),
+            ExistingReleaseReceiptOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn spawn_release_confirmation_reclassifies_reverted_as_terminal() {
+        let error = FactoryError::ManagementCallFailed {
+            method: "eth_getTransactionReceipt".to_string(),
+            message: "release transaction reverted".to_string(),
+        };
+        assert_eq!(
+            classify_spawn_release_receipt_confirmation(&error),
+            ExistingReleaseReceiptOutcome::Terminal
+        );
+    }
+
+    #[test]
+    fn spawn_release_confirmation_reclassifies_non_canonical_as_terminal() {
+        let error = FactoryError::ManagementCallFailed {
+            method: "eth_getTransactionReceipt".to_string(),
+            message: "receipt block hash is not canonical".to_string(),
+        };
+        assert_eq!(
+            classify_spawn_release_receipt_confirmation(&error),
+            ExistingReleaseReceiptOutcome::Terminal
+        );
+    }
+
+    #[test]
+    fn spawn_release_confirmation_treats_unknown_errors_as_retriable() {
+        let error = FactoryError::ManagementCallFailed {
+            method: "eth_getTransactionReceipt".to_string(),
+            message: "receipt payload malformed".to_string(),
+        };
+        assert_eq!(
+            classify_spawn_release_receipt_confirmation(&error),
+            ExistingReleaseReceiptOutcome::Retryable
+        );
+    }
+
+    fn should_broadcast_release_after_existing_receipt_confirmation(
+        has_existing_tx_hash: bool,
+        confirmation: Result<bool, FactoryError>,
+    ) -> bool {
+        if !has_existing_tx_hash {
+            return true;
+        }
+
+        if matches!(confirmation, Ok(true)) {
+            return false;
+        }
+
+        if let Err(error) = confirmation {
+            return !matches!(
+                classify_spawn_release_receipt_confirmation(&error),
+                ExistingReleaseReceiptOutcome::Retryable
+                    | ExistingReleaseReceiptOutcome::Pending
+                    | ExistingReleaseReceiptOutcome::Terminal
+            );
+        }
+
+        false
+    }
+
+    #[test]
+    fn existing_rpc_tx_hash_prevents_new_broadcast_for_pending_receipt_status() {
+        let pending = Err(FactoryError::ManagementCallFailed {
+            method: "eth_getTransactionReceipt".to_string(),
+            message: "receipt block is in the future".to_string(),
+        });
+        assert!(!should_broadcast_release_after_existing_receipt_confirmation(true, pending));
+    }
+
+    #[test]
+    fn existing_rpc_tx_hash_prevents_new_broadcast_for_unknown_receipt_failure() {
+        let failure = Err(FactoryError::ManagementCallFailed {
+            method: "eth_getTransactionReceipt".to_string(),
+            message: "receipt payload malformed".to_string(),
+        });
+        assert!(!should_broadcast_release_after_existing_receipt_confirmation(true, failure));
+    }
+
+    #[test]
+    fn existing_rpc_tx_hash_prevents_new_broadcast_for_terminal_receipt() {
+        let failure = Err(FactoryError::ManagementCallFailed {
+            method: "eth_getTransactionReceipt".to_string(),
+            message: "release transaction reverted".to_string(),
+        });
+        assert!(!should_broadcast_release_after_existing_receipt_confirmation(true, failure));
+    }
+
+    #[test]
+    fn existing_rpc_tx_hash_prevents_new_broadcast_after_ok_false_confirmation() {
+        assert!(!should_broadcast_release_after_existing_receipt_confirmation(true, Ok(false)));
+    }
+
+    fn sample_release_record(session_id: &str) -> ReleaseBroadcastRecord {
+        ReleaseBroadcastRecord {
+            claim_id: format!("claim-{session_id}"),
+            recipient: format!("0xrecipient-{session_id}"),
+            escrow_contract_address: "0xescrow".to_string(),
+            nonce: 7,
+            chain_id: 8_453,
+            max_priority_fee_per_gas: 1_000_000,
+            max_fee_per_gas: 1_500_000,
+            gas_limit: 21_000,
+            ecdsa_key_name: Some("test-key".to_string()),
+            calldata_hex: "0x00".to_string(),
+            signing_payload_hash: Some(format!("0xpayload-{session_id}")),
+            signature: None,
+            raw_transaction_hash: Some(format!("0xraw-{session_id}")),
+            raw_transaction_hex: Some(format!("0xrawhex-{session_id}")),
+            rpc_tx_hash: Some(format!("0xrelease-tx-{session_id}")),
+            broadcast_at: Some(1_000),
+            receipt_block_number: None,
+            receipt_block_hash: None,
+            receipt_status: None,
+            last_error: None,
+        }
+    }
+
+    fn sample_session_with_release(session_id: &str, is_reproduction: bool) -> SpawnSession {
+        let mut session = sample_session();
+        session.session_id = session_id.to_string();
+        session.claim_id = format!("claim-{session_id}");
+        session.origin = if is_reproduction {
+            Some(SpawnSessionOrigin::ReproductionOf("parent-1".to_string()))
+        } else {
+            None
+        };
+        session.release_broadcast = Some(sample_release_record(session_id));
+        session
+    }
+
+    fn ensure_stale_spawn_guard_rejects(
+        stage_name: &str,
+        is_reproduction: bool,
+        mutate: impl FnOnce(&mut ReleaseBroadcastRecord),
+    ) {
+        let session_id = format!("{stage_name}-session-{is_reproduction}");
+        let session = sample_session_with_release(&session_id, is_reproduction);
+        let original_record = session.release_broadcast.clone().expect("record exists");
+        let guard = spawn_release_draft_guard(&session);
+        write_state(|state| {
+            state.sessions.clear();
+            state
+                .sessions
+                .insert(session_id.to_string(), session.clone());
+        });
+        write_state(|state| {
+            if let Some(session) = state.sessions.get_mut(&session_id) {
+                session.generation = Some(session.generation.unwrap_or_default() + 1);
+            }
+        });
+        let stale_guard = spawn_release_draft_guard_for_record(
+            session.generation.unwrap_or_default(),
+            session.release_broadcast.as_ref(),
+        );
+        assert!(ensure_spawn_release_draft_guard(&session_id, &stale_guard).is_err());
+        let mut persisted_record = original_record.clone();
+        mutate(&mut persisted_record);
+        let result = write_spawn_release_broadcast_record_guarded(&session_id, &guard, |state| {
+            persist_release_broadcast_record(state, &session_id, &persisted_record);
+            Ok(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(FactoryError::InvalidStewardProof {
+                reason
+            }) if reason == "stale spawn continuation"
+        ));
+        let persisted = read_state(|state| {
+            state
+                .sessions
+                .get(&session_id)
+                .and_then(|session| session.release_broadcast.clone())
+        })
+        .expect("record should still exist");
+        assert_eq!(persisted.receipt_status, original_record.receipt_status);
+        assert_eq!(
+            persisted.receipt_block_number,
+            original_record.receipt_block_number
+        );
+        assert_eq!(
+            persisted.receipt_block_hash,
+            original_record.receipt_block_hash
+        );
+        assert_eq!(persisted.last_error, original_record.last_error);
+    }
+
+    #[test]
+    fn stale_spawn_release_guard_blocks_normal_receipt_stage_update_after_stale_generation() {
+        ensure_stale_spawn_guard_rejects("normal-receipt", false, |record| {
+            record.receipt_status = Some(true);
+            record.receipt_block_number = Some(12);
+        });
+    }
+
+    #[test]
+    fn stale_spawn_release_guard_blocks_normal_head_stage_update_after_stale_generation() {
+        ensure_stale_spawn_guard_rejects("normal-head", false, |record| {
+            record.receipt_status = Some(true);
+            record.receipt_block_hash = Some("0xhead-hash".to_string());
+        });
+    }
+
+    #[test]
+    fn stale_spawn_release_guard_blocks_normal_block_stage_update_after_stale_generation() {
+        ensure_stale_spawn_guard_rejects("normal-block", false, |record| {
+            record.receipt_status = Some(true);
+            record.last_error = Some(ReleaseBroadcastFailure {
+                stage: ReleaseBroadcastStage::ReceiptConfirmation,
+                message: "head and block check stale".to_string(),
+                rpc_category: None,
+                rpc_code: None,
+                rpc_endpoint: None,
+                occurred_at: 1_111,
+            });
+        });
+    }
+
+    #[test]
+    fn stale_spawn_release_guard_blocks_reproduction_receipt_stage_update_after_stale_generation() {
+        ensure_stale_spawn_guard_rejects("reproduction-receipt", true, |record| {
+            record.receipt_status = Some(false);
+            record.receipt_block_number = Some(13);
+        });
+    }
+
+    #[test]
+    fn stale_spawn_release_guard_blocks_reproduction_head_stage_update_after_stale_generation() {
+        ensure_stale_spawn_guard_rejects("reproduction-head", true, |record| {
+            record.receipt_status = Some(false);
+            record.receipt_block_hash = Some("0xrepro-head-hash".to_string());
+        });
+    }
+
+    #[test]
+    fn stale_spawn_release_guard_blocks_reproduction_block_stage_update_after_stale_generation() {
+        ensure_stale_spawn_guard_rejects("reproduction-block", true, |record| {
+            record.receipt_status = Some(false);
+            record.last_error = Some(ReleaseBroadcastFailure {
+                stage: ReleaseBroadcastStage::ReceiptConfirmation,
+                message: "head and block check stale for reproduction".to_string(),
+                rpc_category: None,
+                rpc_code: None,
+                rpc_endpoint: None,
+                occurred_at: 1_111,
+            });
+        });
     }
 
     #[test]

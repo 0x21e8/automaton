@@ -85,11 +85,28 @@ pub fn set_operational_config(
     caller: &str,
     config: FactoryOperationalConfig,
 ) -> Result<FactoryOperationalConfig, FactoryError> {
+    if config.evm_confirmation_depth == 0 {
+        return Err(FactoryError::InvalidOperationalConfig {
+            field: "evm_confirmation_depth".to_string(),
+            message: "must be greater than zero".to_string(),
+        });
+    }
+    if config.evm_confirmation_depth > crate::types::MAX_EVM_CONFIRMATION_DEPTH {
+        return Err(FactoryError::InvalidOperationalConfig {
+            field: "evm_confirmation_depth".to_string(),
+            message: format!(
+                "exceeds maximum supported confirmation depth {}",
+                crate::types::MAX_EVM_CONFIRMATION_DEPTH
+            ),
+        });
+    }
+
     write_state(|state| -> Result<(), FactoryError> {
         ensure_admin_in_state(state, caller)?;
         state.cycles_per_spawn = config.cycles_per_spawn;
         state.min_pool_balance = config.min_pool_balance;
         state.estimated_outcall_cycles_per_interval = config.estimated_outcall_cycles_per_interval;
+        state.evm_confirmation_depth = config.evm_confirmation_depth;
         Ok(())
     })?;
 
@@ -177,6 +194,7 @@ pub fn get_factory_config(caller: &str) -> Result<FactoryConfigSnapshot, Factory
             cycles_per_spawn: state.cycles_per_spawn,
             min_pool_balance: state.min_pool_balance,
             estimated_outcall_cycles_per_interval: state.estimated_outcall_cycles_per_interval,
+            evm_confirmation_depth: state.evm_confirmation_depth,
             session_ttl_ms: state.session_ttl_ms,
             version_commit: state.version_commit.clone(),
             wasm_sha256: state.wasm_sha256.clone(),

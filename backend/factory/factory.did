@@ -111,9 +111,13 @@ type EscrowClaim = record {
   created_at : nat64;
   payment_status : PaymentStatus;
   refundable : bool;
+  payment_evidence : vec PaymentEvidenceBlock;
+  payment_evidence_block_hash : opt text;
   refunded_at : opt nat64;
   refund_broadcast : opt ReleaseBroadcastRecord;
   payment_address : text;
+  payment_evidence_increment : opt text;
+  payment_evidence_block_number : opt nat64;
   last_scanned_block : opt nat64;
 };
 type FactoryArtifactSnapshot = record {
@@ -123,6 +127,7 @@ type FactoryArtifactSnapshot = record {
   version_commit : opt text;
 };
 type FactoryConfigSnapshot = record {
+  evm_confirmation_depth : nat64;
   base_rpc_fallback_endpoint : opt text;
   escrow_contract_address : text;
   session_ttl_ms : nat64;
@@ -171,6 +176,7 @@ type FactoryError = variant {
   ManagementCallFailed : record { method : text; message : text };
   InvalidChildRuntimeConfig : record { field : text; message : text };
   InvalidDeathReport : record { reason : text };
+  InvalidOperationalConfig : record { field : text; message : text };
   SessionNotFound : record { session_id : text };
   InvalidStewardProof : record { reason : text };
   RepositoryStrategyAlreadyExists : record { strategy_id : text };
@@ -251,6 +257,7 @@ type FactoryInitArgs = record {
   admin_principals : vec principal;
 };
 type FactoryOperationalConfig = record {
+  evm_confirmation_depth : nat64;
   cycles_per_spawn : nat64;
   estimated_outcall_cycles_per_interval : nat64;
   min_pool_balance : nat64;
@@ -333,6 +340,11 @@ type ListRepositoryStrategiesResponse = record {
 };
 type MemoryDowryFact = record { key : text; value : text };
 type OpenRouterReasoningLevel = variant { Low; High; Medium; Default };
+type PaymentEvidenceBlock = record {
+  block_hash : text;
+  block_number : nat64;
+  amount : text;
+};
 type PaymentStatus = variant { Refunded; Paid; Unpaid; Partial };
 type PostRoomMessageRequest = record {
   body : text;
@@ -372,6 +384,7 @@ type ReleaseBroadcastFailure = record {
   rpc_category : opt RpcFailureCategory;
 };
 type ReleaseBroadcastRecord = record {
+  receipt_status : opt bool;
   last_error : opt ReleaseBroadcastFailure;
   signature : opt ReleaseSignatureRecord;
   rpc_tx_hash : opt text;
@@ -388,6 +401,8 @@ type ReleaseBroadcastRecord = record {
   signing_payload_hash : opt text;
   gas_limit : nat64;
   raw_transaction_hash : opt text;
+  receipt_block_number : opt nat64;
+  receipt_block_hash : opt text;
   calldata_hex : text;
 };
 type ReleaseBroadcastStage = variant {

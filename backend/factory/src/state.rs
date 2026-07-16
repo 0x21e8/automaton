@@ -11,11 +11,11 @@ use ic_stable_structures::{
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    AutomatonChildRuntimeConfig, AutomatonRuntimeState, CreationCostQuote, EscrowClaim,
-    FactoryError, FactoryInitArgs, FeeConfig, PendingArtifactUpload, ReleaseBroadcastConfig,
-    RepositoryStrategyRecord, RoomMessage, RoomState, SchedulerJob, SchedulerRuntime,
-    SessionAuditActor, SessionAuditEntry, SpawnProviderSecrets, SpawnSession, SpawnSessionState,
-    SpawnedAutomatonRecord,
+    default_evm_confirmation_depth, AutomatonChildRuntimeConfig, AutomatonRuntimeState,
+    CreationCostQuote, EscrowClaim, FactoryError, FactoryInitArgs, FeeConfig,
+    PendingArtifactUpload, ReleaseBroadcastConfig, RepositoryStrategyRecord, RoomMessage,
+    RoomState, SchedulerJob, SchedulerRuntime, SessionAuditActor, SessionAuditEntry,
+    SpawnProviderSecrets, SpawnSession, SpawnSessionState, SpawnedAutomatonRecord,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
@@ -39,6 +39,10 @@ const ROOM_STATE_MEMORY_ID: u8 = 9;
 const ROOM_MESSAGES_MEMORY_ID: u8 = 10;
 const STRATEGY_REPOSITORY_MEMORY_ID: u8 = 11;
 const SPAWN_PROVIDER_SECRETS_MEMORY_ID: u8 = 12;
+
+fn resolve_evm_confirmation_depth(chain_id: u64, explicit_depth: Option<u64>) -> u64 {
+    explicit_depth.unwrap_or_else(|| default_evm_confirmation_depth(chain_id))
+}
 
 type StableMemory<M> = VirtualMemory<M>;
 
@@ -99,6 +103,7 @@ pub struct FactoryState {
     pub cycles_per_spawn: u64,
     pub min_pool_balance: u64,
     pub estimated_outcall_cycles_per_interval: u64,
+    pub evm_confirmation_depth: u64,
     pub wasm_bytes: Option<Vec<u8>>,
     pub wasm_sha256: Option<String>,
     pub pending_artifact_upload: Option<PendingArtifactUpload>,
@@ -157,6 +162,8 @@ struct FactoryStableConfig {
     cycles_per_spawn: u64,
     min_pool_balance: u64,
     estimated_outcall_cycles_per_interval: u64,
+    #[serde(default)]
+    evm_confirmation_depth: Option<u64>,
     wasm_bytes: Option<Vec<u8>>,
     wasm_sha256: Option<String>,
     pending_artifact_upload: Option<PendingArtifactUpload>,
@@ -214,6 +221,9 @@ impl Default for FactoryState {
             cycles_per_spawn: 0,
             min_pool_balance: 0,
             estimated_outcall_cycles_per_interval: 0,
+            evm_confirmation_depth: default_evm_confirmation_depth(
+                ReleaseBroadcastConfig::default().chain_id,
+            ),
             wasm_bytes: None,
             wasm_sha256: None,
             pending_artifact_upload: None,
@@ -255,6 +265,7 @@ impl From<&FactoryState> for FactoryStableConfig {
             cycles_per_spawn: value.cycles_per_spawn,
             min_pool_balance: value.min_pool_balance,
             estimated_outcall_cycles_per_interval: value.estimated_outcall_cycles_per_interval,
+            evm_confirmation_depth: Some(value.evm_confirmation_depth),
             wasm_bytes: value.wasm_bytes.clone(),
             wasm_sha256: value.wasm_sha256.clone(),
             pending_artifact_upload: value.pending_artifact_upload.clone(),
@@ -280,6 +291,8 @@ impl FactoryStableConfig {
         scheduler_runtime: SchedulerRuntime,
         audit_log: BTreeMap<String, Vec<SessionAuditEntry>>,
     ) -> FactoryState {
+        let release_broadcast_chain_id = self.release_broadcast_config.chain_id;
+
         FactoryState {
             repository_strategies,
             sessions,
@@ -313,6 +326,10 @@ impl FactoryStableConfig {
             cycles_per_spawn: self.cycles_per_spawn,
             min_pool_balance: self.min_pool_balance,
             estimated_outcall_cycles_per_interval: self.estimated_outcall_cycles_per_interval,
+            evm_confirmation_depth: resolve_evm_confirmation_depth(
+                release_broadcast_chain_id,
+                self.evm_confirmation_depth,
+            ),
             wasm_bytes: self.wasm_bytes,
             wasm_sha256: self.wasm_sha256,
             pending_artifact_upload: self.pending_artifact_upload,
@@ -749,6 +766,11 @@ pub fn apply_factory_init_args(args: FactoryInitArgs, init_caller: Option<String
             .collect();
     }
 
+    state.evm_confirmation_depth = resolve_evm_confirmation_depth(
+        state.release_broadcast_config.chain_id,
+        state.child_runtime.evm_confirmation_depth,
+    );
+
     state
 }
 
@@ -964,5 +986,86 @@ mod genesis_migration_tests {
             candid::decode_one(&candid::encode_one(legacy_evidence).unwrap()).unwrap();
         assert_eq!(decoded.bootstrap_constitution_hash, None);
         assert!(decoded.bootstrap_constitution.is_some());
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod confirmation_default_tests {
+    use super::*;
+    use crate::types::{
+        AutomatonChildRuntimeConfig, FactoryInitArgs, DEFAULT_EVM_CONFIRMATION_DEPTH,
+        LOCAL_EVM_CHAIN_ID, LOCAL_EVM_CONFIRMATION_DEPTH,
+    };
+
+    #[test]
+    fn confirmation_local_chain_defaults_to_depth_one_when_unset() {
+        assert_eq!(
+            resolve_evm_confirmation_depth(LOCAL_EVM_CHAIN_ID, None),
+            LOCAL_EVM_CONFIRMATION_DEPTH
+        );
+        assert_eq!(
+            resolve_evm_confirmation_depth(8_453, None),
+            DEFAULT_EVM_CONFIRMATION_DEPTH
+        );
+    }
+
+    #[test]
+    fn confirmation_explicit_depth_wins_over_chain_default() {
+        assert_eq!(
+            resolve_evm_confirmation_depth(LOCAL_EVM_CHAIN_ID, Some(12)),
+            12
+        );
+        assert_eq!(resolve_evm_confirmation_depth(8_453, Some(18)), 18);
+    }
+
+    #[test]
+    fn confirmation_factory_init_args_applies_chain_specific_default_depth() {
+        let local_state = apply_factory_init_args(
+            FactoryInitArgs {
+                child_runtime: Some(AutomatonChildRuntimeConfig {
+                    evm_chain_id: Some(LOCAL_EVM_CHAIN_ID),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+
+        let prod_state = apply_factory_init_args(
+            FactoryInitArgs {
+                child_runtime: Some(AutomatonChildRuntimeConfig {
+                    evm_chain_id: Some(8_453),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert_eq!(
+            local_state.evm_confirmation_depth,
+            LOCAL_EVM_CONFIRMATION_DEPTH
+        );
+        assert_eq!(
+            prod_state.evm_confirmation_depth,
+            DEFAULT_EVM_CONFIRMATION_DEPTH
+        );
+    }
+
+    #[test]
+    fn confirmation_factory_init_args_explicit_depth_has_precedence() {
+        let local_state = apply_factory_init_args(
+            FactoryInitArgs {
+                child_runtime: Some(AutomatonChildRuntimeConfig {
+                    evm_chain_id: Some(LOCAL_EVM_CHAIN_ID),
+                    evm_confirmation_depth: Some(21),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert_eq!(local_state.evm_confirmation_depth, 21);
     }
 }

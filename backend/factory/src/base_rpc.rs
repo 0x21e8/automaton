@@ -15,6 +15,7 @@ pub struct BaseDepositLog {
     pub claim_id: String,
     pub amount: String,
     pub block_number: u64,
+    pub block_hash: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,24 +49,69 @@ struct JsonRpcErrorBody {
     message: String,
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
 #[derive(Deserialize)]
 struct TransactionReceipt {
     status: String,
+    #[serde(rename = "blockNumber")]
+    block_number: String,
+    #[serde(rename = "blockHash")]
+    block_hash: String,
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
-fn parse_transaction_receipt_status(result: &serde_json::Value) -> Result<Option<bool>, String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionReceiptObservation {
+    pub status: bool,
+    pub block_number: u64,
+    pub block_hash: String,
+}
+
+fn validate_hex_32_byte_hash(value: &str) -> Result<String, String> {
+    if !value.starts_with("0x") {
+        return Err("invalid hex value: missing 0x prefix".to_string());
+    }
+
+    if value.len() != 66 {
+        return Err("invalid hex value: expected 0x plus 64 hex chars".to_string());
+    }
+
+    let hex = &value[2..];
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid hex value: not valid hex".to_string());
+    }
+
+    Ok(value.to_lowercase())
+}
+
+fn parse_transaction_receipt_observation(
+    result: &serde_json::Value,
+) -> Result<Option<TransactionReceiptObservation>, String> {
     if result.is_null() {
         return Ok(None);
     }
     let receipt: TransactionReceipt =
         serde_json::from_value(result.clone()).map_err(|error| error.to_string())?;
-    match receipt.status.as_str() {
-        "0x0" => Ok(Some(false)),
-        "0x1" => Ok(Some(true)),
-        status => Err(format!("invalid transaction receipt status: {status}")),
-    }
+
+    let status = match receipt.status.as_str() {
+        "0x0" => false,
+        "0x1" => true,
+        status => {
+            return Err(format!("invalid transaction receipt status: {status}"));
+        }
+    };
+
+    let block_hash = validate_hex_32_byte_hash(&receipt.block_hash)
+        .map_err(|error| format!("invalid transaction receipt block hash: {error}"))?;
+
+    Ok(Some(TransactionReceiptObservation {
+        status,
+        block_number: parse_hex_u64(&receipt.block_number).map_err(|error| error.to_string())?,
+        block_hash,
+    }))
+}
+
+#[cfg(test)]
+fn parse_transaction_receipt_status(result: &serde_json::Value) -> Result<Option<bool>, String> {
+    Ok(parse_transaction_receipt_observation(result)?.map(|receipt| receipt.status))
 }
 
 #[derive(Serialize)]
@@ -85,8 +131,15 @@ struct EthLogTopics<'a>(String, Vec<&'a str>);
 struct EthLogEntry {
     #[serde(rename = "blockNumber")]
     block_number: String,
+    #[serde(rename = "blockHash")]
+    block_hash: Option<String>,
     data: String,
     topics: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct BlockByNumberResponse {
+    hash: Option<String>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -103,6 +156,15 @@ fn parse_hex_u64(value: &str) -> Result<u64, FactoryError> {
     })
 }
 
+fn canonical_block_hash(value: &serde_json::Value) -> Result<String, String> {
+    let block: BlockByNumberResponse =
+        serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+
+    let hash = block
+        .hash
+        .ok_or_else(|| "missing block hash in result".to_string())?;
+    validate_hex_32_byte_hash(&hash)
+}
 fn parse_hex_u128(value: &str) -> Result<u128, FactoryError> {
     let trimmed = value.strip_prefix("0x").unwrap_or(value);
     if trimmed.is_empty() {
@@ -236,7 +298,7 @@ pub async fn eth_get_transaction_count(
 pub async fn eth_get_transaction_receipt_status(
     endpoints: &[String],
     tx_hash: &str,
-) -> Result<Option<bool>, FactoryError> {
+) -> Result<Option<TransactionReceiptObservation>, FactoryError> {
     let request = JsonRpcRequest {
         jsonrpc: "2.0",
         id: 1,
@@ -291,7 +353,7 @@ pub async fn eth_get_transaction_receipt_status(
                     ));
                     continue;
                 };
-                return parse_transaction_receipt_status(result).map_err(|error| {
+                return parse_transaction_receipt_observation(result).map_err(|error| {
                     rpc_request_failed(
                         endpoint,
                         "eth_getTransactionReceipt",
@@ -471,10 +533,26 @@ fn parse_deposit_logs(
             data_hex
         };
 
+        let block_hash = entry
+            .block_hash
+            .ok_or_else(|| FactoryError::ManagementCallFailed {
+                method: "eth_getLogs".to_string(),
+                message: "missing block hash for deposit log".to_string(),
+            })
+            .and_then(|hash| {
+                validate_hex_32_byte_hash(&hash).map_err(|error| {
+                    FactoryError::ManagementCallFailed {
+                        method: "eth_getLogs".to_string(),
+                        message: format!("invalid block hash for deposit log: {error}"),
+                    }
+                })
+            })?;
+
         logs.push(BaseDepositLog {
             claim_id: entry.topics[1].clone(),
             amount: parse_hex_u128(&format!("0x{amount_hex}"))?.to_string(),
             block_number: parse_hex_u64(&entry.block_number)?,
+            block_hash,
         });
     }
 
@@ -543,12 +621,21 @@ async fn rpc_request_once(
 
 #[cfg(not(target_arch = "wasm32"))]
 fn mock_success_body(operation: &str, default_string_result: Option<&str>) -> Vec<u8> {
+    let canonical_hash = format!("0x{:064x}", 0x59_u128);
     match operation {
-        "eth_blockNumber" => br#"{"jsonrpc":"2.0","id":1,"result":"0x0"}"#.to_vec(),
+        "eth_blockNumber" => br#"{"jsonrpc":"2.0","id":1,"result":"0x64"}"#.to_vec(),
         "eth_getLogs" => br#"{"jsonrpc":"2.0","id":1,"result":[]}"#.to_vec(),
         "eth_sendRawTransaction" => format!(
             r#"{{"jsonrpc":"2.0","id":1,"result":"{}"}}"#,
             default_string_result.unwrap_or("0x0")
+        )
+        .into_bytes(),
+        "eth_getTransactionReceipt" => format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"0x1","blockNumber":"0x59","blockHash":"{canonical_hash}"}}}}"#
+        )
+        .into_bytes(),
+        "eth_getBlockByNumber" => format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"hash":"{canonical_hash}"}}}}"#
         )
         .into_bytes(),
         _ => br#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_vec(),
@@ -566,9 +653,17 @@ fn parse_mock_deposit_log_endpoint(endpoint: &str) -> Option<(String, u128, u64)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn parse_mock_block_by_number_request(request_body: &[u8]) -> Option<u64> {
+    let request: serde_json::Value = serde_json::from_slice(request_body).ok()?;
+    let block_number = request.get("params")?.as_array()?.first()?.as_str()?;
+    parse_hex_u64(block_number).ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn mock_deposit_log_body(claim_id: &str, amount: u128, block_number: u64) -> Vec<u8> {
+    let block_hash = format!("0x{block_number:064x}");
     format!(
-        r#"{{"jsonrpc":"2.0","id":1,"result":[{{"blockNumber":"0x{block_number:x}","data":"0x{amount:064x}","topics":["0xevent","{claim_id}"]}}]}}"#
+        r#"{{"jsonrpc":"2.0","id":1,"result":[{{"blockNumber":"0x{block_number:x}","blockHash":"{block_hash}","data":"0x{amount:064x}","topics":["0xevent","{claim_id}"]}}]}}"#
     )
     .into_bytes()
 }
@@ -581,12 +676,42 @@ fn rpc_request_once(
     operation: &str,
     default_string_result: Option<&str>,
 ) -> Result<Vec<u8>, FactoryError> {
-    let request = build_http_request_args(endpoint, request_body, max_response_bytes);
+    let request = build_http_request_args(endpoint, request_body.clone(), max_response_bytes);
     ensure_http_request_cycles(operation, &request)?;
 
     let body = match endpoint {
+        endpoint if endpoint == "mock://pending-receipt" && operation == "eth_getTransactionReceipt" => {
+            br#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_vec()
+        }
+        endpoint if endpoint == "mock://reverted-receipt" && operation == "eth_getTransactionReceipt" => {
+            let malformed_hash = format!("0x{:064x}", 0x2a_u128);
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"0x0","blockNumber":"0x59","blockHash":"{malformed_hash}"}}}}"#
+            );
+            body.into_bytes()
+        }
+        endpoint if endpoint == "mock://future-receipt" && operation == "eth_getTransactionReceipt" => {
+            let canonical_hash = format!("0x{:064x}", 0x59_u128);
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"0x1","blockNumber":"0x65","blockHash":"{canonical_hash}"}}}}"#
+            );
+            body.into_bytes()
+        }
+        endpoint if endpoint == "mock://reorg-receipt" && operation == "eth_getTransactionReceipt" => {
+            br#"{"jsonrpc":"2.0","id":1,"result":{"status":"0x1","blockNumber":"0x59","blockHash":"0x1111111111111111111111111111111111111111111111111111111111111111"}}"#.to_vec()
+        }
+        endpoint if endpoint == "mock://malformed-receipt-hash" && operation == "eth_getTransactionReceipt" => {
+            br#"{"jsonrpc":"2.0","id":1,"result":{"status":"0x1","blockNumber":"0x59","blockHash":"0x123"}}"#.to_vec()
+        }
+        endpoint if endpoint == "mock://malformed-block-hash" && operation == "eth_getBlockByNumber" => {
+            br#"{"jsonrpc":"2.0","id":1,"result":{"hash":"0x123"}}"#.to_vec()
+        }
         "mock://success" => mock_success_body(operation, default_string_result),
-        "mock://success/deposit-log" if operation == "eth_getLogs" => br#"{"jsonrpc":"2.0","id":1,"result":[{"blockNumber":"0x2a","data":"0x0000000000000000000000000000000000000000000000000000000003938700","topics":["0xevent","0x1111111111111111111111111111111111111111111111111111111111111111"]}]}"#.to_vec(),
+        "mock://success/deposit-log" if operation == "eth_getLogs" => mock_deposit_log_body(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            0x3938700,
+            0x2a,
+        ),
         "mock://error/rate-limit" => br#"{"jsonrpc":"2.0","id":1,"error":{"code":429,"message":"rate limit exceeded"}}"#.to_vec(),
         "mock://error/upstream-unavailable" => br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"upstream unavailable"}}"#.to_vec(),
         "mock://error/malformed-json" => b"{not valid json".to_vec(),
@@ -606,10 +731,25 @@ fn rpc_request_once(
         }
         _ if operation == "eth_blockNumber" => {
             if let Some((_, _, block_number)) = parse_mock_deposit_log_endpoint(endpoint) {
-                format!(r#"{{"jsonrpc":"2.0","id":1,"result":"0x{block_number:x}"}}"#).into_bytes()
+                format!(r#"{{"jsonrpc":"2.0","id":1,"result":"0x{block_number:x}"}}"#)
+                    .into_bytes()
             } else {
                 mock_success_body(operation, default_string_result)
             }
+        }
+        _ if endpoint.starts_with("mock://success/deposit-log/") && operation == "eth_getBlockByNumber" => {
+            let Some(block_number) = parse_mock_block_by_number_request(&request_body) else {
+                return Err(classify_transport_failure(
+                    endpoint,
+                    operation,
+                    "invalid mock eth_getBlockByNumber body",
+                ));
+            };
+            let canonical_hash = format!("0x{:064x}", block_number);
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"hash":"{canonical_hash}"}}}}"#
+            );
+            body.into_bytes()
         }
         _ => mock_success_body(operation, default_string_result),
     };
@@ -702,6 +842,137 @@ pub fn eth_block_number(endpoints: &[String]) -> Result<u64, FactoryError> {
         rpc_request_failed(
             "<none>",
             "eth_blockNumber",
+            RpcFailureCategory::Transport,
+            None,
+            "no RPC endpoints configured",
+        )
+    }))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn eth_get_block_hash_by_number(
+    endpoints: &[String],
+    block_number: u64,
+) -> Result<String, FactoryError> {
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_getBlockByNumber",
+        params: vec![format!("0x{:x}", block_number), "false".to_string()],
+    };
+    let body = build_request_body(&request)?;
+    let mut last_error = None;
+
+    for endpoint in endpoints {
+        match rpc_request_once(
+            endpoint,
+            body.clone(),
+            BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
+            "eth_getBlockByNumber",
+        )
+        .await
+        {
+            Ok(body) => match serde_json::from_slice::<serde_json::Value>(&body) {
+                Ok(value) => match value
+                    .get("result")
+                    .ok_or_else(|| FactoryError::ManagementCallFailed {
+                        method: "eth_getBlockByNumber".to_string(),
+                        message: "missing json-rpc result".to_string(),
+                    })
+                    .and_then(|result| {
+                        canonical_block_hash(result).map_err(|error| {
+                            FactoryError::ManagementCallFailed {
+                                method: "eth_getBlockByNumber".to_string(),
+                                message: error,
+                            }
+                        })
+                    }) {
+                    Ok(hash) => return Ok(hash),
+                    Err(error) => last_error = Some(error),
+                },
+                Err(error) => {
+                    last_error = Some(rpc_request_failed(
+                        endpoint,
+                        "eth_getBlockByNumber",
+                        RpcFailureCategory::MalformedResponse,
+                        None,
+                        error.to_string(),
+                    ))
+                }
+            },
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        rpc_request_failed(
+            "<none>",
+            "eth_getBlockByNumber",
+            RpcFailureCategory::Transport,
+            None,
+            "no RPC endpoints configured",
+        )
+    }))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn eth_get_block_hash_by_number(
+    endpoints: &[String],
+    block_number: u64,
+) -> Result<String, FactoryError> {
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_getBlockByNumber",
+        params: vec![format!("0x{:x}", block_number), "false".to_string()],
+    };
+    let request_body = build_request_body(&request)?;
+    let mut last_error = None;
+
+    for endpoint in endpoints {
+        match rpc_request_once(
+            endpoint,
+            request_body.clone(),
+            BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
+            "eth_getBlockByNumber",
+            None,
+        ) {
+            Ok(response) => match serde_json::from_slice::<serde_json::Value>(&response) {
+                Ok(value) => match value
+                    .get("result")
+                    .ok_or_else(|| FactoryError::ManagementCallFailed {
+                        method: "eth_getBlockByNumber".to_string(),
+                        message: "missing json-rpc result".to_string(),
+                    })
+                    .and_then(|result| {
+                        canonical_block_hash(result).map_err(|error| {
+                            FactoryError::ManagementCallFailed {
+                                method: "eth_getBlockByNumber".to_string(),
+                                message: error,
+                            }
+                        })
+                    }) {
+                    Ok(hash) => return Ok(hash),
+                    Err(error) => last_error = Some(error),
+                },
+                Err(error) => {
+                    last_error = Some(rpc_request_failed(
+                        endpoint,
+                        "eth_getBlockByNumber",
+                        RpcFailureCategory::MalformedResponse,
+                        None,
+                        error.to_string(),
+                    ))
+                }
+            },
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        rpc_request_failed(
+            "<none>",
+            "eth_getBlockByNumber",
             RpcFailureCategory::Transport,
             None,
             "no RPC endpoints configured",
@@ -864,6 +1135,85 @@ pub async fn eth_send_raw_transaction(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub fn eth_get_transaction_receipt_status(
+    endpoints: &[String],
+    tx_hash: &str,
+) -> Result<Option<TransactionReceiptObservation>, FactoryError> {
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_getTransactionReceipt",
+        params: [tx_hash],
+    };
+    let body = build_request_body(&request)?;
+    let mut last_error = None;
+
+    for endpoint in endpoints {
+        match rpc_request_once(
+            endpoint,
+            body.clone(),
+            BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
+            "eth_getTransactionReceipt",
+            None,
+        ) {
+            Ok(response) => match serde_json::from_slice::<serde_json::Value>(&response) {
+                Ok(value) => {
+                    if let Some(error) = value.get("error") {
+                        last_error = Some(rpc_request_failed(
+                            endpoint,
+                            "eth_getTransactionReceipt",
+                            RpcFailureCategory::Upstream,
+                            None,
+                            error.to_string(),
+                        ));
+                        continue;
+                    }
+                    let Some(result) = value.get("result") else {
+                        last_error = Some(rpc_request_failed(
+                            endpoint,
+                            "eth_getTransactionReceipt",
+                            RpcFailureCategory::MalformedResponse,
+                            None,
+                            "missing json-rpc result",
+                        ));
+                        continue;
+                    };
+                    return parse_transaction_receipt_observation(result).map_err(|error| {
+                        rpc_request_failed(
+                            endpoint,
+                            "eth_getTransactionReceipt",
+                            RpcFailureCategory::MalformedResponse,
+                            None,
+                            error,
+                        )
+                    });
+                }
+                Err(error) => {
+                    last_error = Some(rpc_request_failed(
+                        endpoint,
+                        "eth_getTransactionReceipt",
+                        RpcFailureCategory::MalformedResponse,
+                        None,
+                        error.to_string(),
+                    ));
+                }
+            },
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        rpc_request_failed(
+            "<none>",
+            "eth_getTransactionReceipt",
+            RpcFailureCategory::Transport,
+            None,
+            "no RPC endpoints configured",
+        )
+    }))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn eth_send_raw_transaction(
     endpoints: &[String],
     raw_tx_hex: &str,
@@ -913,9 +1263,10 @@ pub fn eth_send_raw_transaction(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{
-        configured_rpc_endpoints, eth_block_number, eth_get_deposited_logs,
-        eth_send_raw_transaction, parse_transaction_receipt_status, BaseDepositLog,
-        PaymentScanPlan,
+        configured_rpc_endpoints, eth_block_number, eth_get_block_hash_by_number,
+        eth_get_deposited_logs, eth_send_raw_transaction, parse_deposit_logs,
+        parse_transaction_receipt_status, PaymentScanPlan,
+        BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
     };
     use crate::state::{restore_state, set_mock_canister_balance};
     use crate::types::{FactoryError, RpcFailureCategory};
@@ -928,17 +1279,67 @@ mod tests {
             None
         );
         assert_eq!(
-            parse_transaction_receipt_status(&serde_json::json!({ "status": "0x1" })).unwrap(),
+            parse_transaction_receipt_status(&serde_json::json!({
+                "status": "0x1",
+                "blockNumber": "0x123",
+                "blockHash": "0x1111111111111111111111111111111111111111111111111111111111111111"
+            }))
+            .unwrap(),
             Some(true)
         );
         assert_eq!(
-            parse_transaction_receipt_status(&serde_json::json!({ "status": "0x0" })).unwrap(),
+            parse_transaction_receipt_status(&serde_json::json!({
+                "status": "0x0",
+                "blockNumber": "0x123",
+                "blockHash": "0x1111111111111111111111111111111111111111111111111111111111111111"
+            }))
+            .unwrap(),
             Some(false)
         );
+        assert!(parse_transaction_receipt_status(&serde_json::json!({ "status": "0x1" })).is_err());
         assert!(parse_transaction_receipt_status(&serde_json::json!({ "status": "0x2" })).is_err());
         assert!(
             parse_transaction_receipt_status(&serde_json::json!({ "status": "success" })).is_err()
         );
+    }
+
+    #[test]
+    fn confirmation_rejects_malformed_transaction_receipt_hash_formats() {
+        assert!(parse_transaction_receipt_status(&serde_json::json!({
+            "status": "0x1",
+            "blockNumber": "0x123",
+            "blockHash": "0x123"
+        }))
+        .is_err());
+
+        assert!(parse_transaction_receipt_status(&serde_json::json!({
+            "status": "0x1",
+            "blockNumber": "0x123",
+            "blockHash": "0xzzzz11111111111111111111111111111111111111111111111111111111111111"
+        }))
+        .is_err());
+
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":[{"blockNumber":"0x2a","blockHash":"0x123","data":"0x00","topics":["0xevent","0x1111111111111111111111111111111111111111111111111111111111111111"]}]}"#;
+        assert!(parse_deposit_logs(
+            "mock://success",
+            body,
+            BASE_RPC_CONTROL_PLANE_MAX_RESPONSE_BYTES,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn confirmation_rejects_invalid_block_hash_from_block_lookup() {
+        let error = eth_get_block_hash_by_number(&["mock://malformed-block-hash".to_string()], 0)
+            .expect_err("malformed block hash should reject");
+
+        assert!(matches!(
+            error,
+            FactoryError::ManagementCallFailed {
+                ref method,
+                ..
+            } if method == "eth_getBlockByNumber"
+        ));
     }
 
     fn assert_rpc_request_failed(
@@ -980,7 +1381,7 @@ mod tests {
         ];
 
         let block_number = eth_block_number(&endpoints).expect("fallback should succeed");
-        assert_eq!(block_number, 0);
+        assert_eq!(block_number, 100);
     }
 
     #[test]
@@ -1111,14 +1512,16 @@ mod tests {
 
         let logs =
             eth_get_deposited_logs(&endpoints, "0xEscrow", &plan).expect("typed logs should parse");
+        assert_eq!(logs.len(), 1);
         assert_eq!(
-            logs,
-            vec![BaseDepositLog {
-                claim_id: "0x1111111111111111111111111111111111111111111111111111111111111111"
-                    .to_string(),
-                amount: "60000000".to_string(),
-                block_number: 42,
-            }]
+            logs[0].claim_id,
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        assert_eq!(logs[0].amount, "60000000");
+        assert_eq!(logs[0].block_number, 42);
+        assert_eq!(
+            logs[0].block_hash,
+            "0x000000000000000000000000000000000000000000000000000000000000002a".to_string()
         );
     }
 

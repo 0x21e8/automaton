@@ -773,6 +773,8 @@ mod tests {
             claim_id: derive_claim_id(session_id),
             amount: amount.to_string(),
             block_number,
+            block_hash: "0x0000000000000000000000000000000000000000000000000000000000000059"
+                .to_string(),
         }
     }
 
@@ -1943,6 +1945,7 @@ mod tests {
             cycles_per_spawn: 2_000_000_000_000,
             min_pool_balance: 500_000_000_000,
             estimated_outcall_cycles_per_interval: 123_456_789,
+            evm_confirmation_depth: 12,
         };
         let updated =
             set_operational_config("admin", config.clone()).expect("operational config updates");
@@ -1955,6 +1958,31 @@ mod tests {
             factory_config.estimated_outcall_cycles_per_interval,
             config.estimated_outcall_cycles_per_interval
         );
+        assert_eq!(
+            factory_config.evm_confirmation_depth,
+            config.evm_confirmation_depth
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_operational_confirmation_depth() {
+        reset_factory_state();
+
+        let error = set_operational_config(
+            "admin",
+            FactoryOperationalConfig {
+                cycles_per_spawn: 1,
+                min_pool_balance: 1,
+                estimated_outcall_cycles_per_interval: 1,
+                evm_confirmation_depth: 0,
+            },
+        )
+        .expect_err("zero confirmation depth should be invalid");
+
+        assert!(matches!(
+            error,
+            super::FactoryError::InvalidOperationalConfig { .. }
+        ));
     }
 
     #[test]
@@ -2597,7 +2625,7 @@ mod tests {
 
         let plan = next_payment_scan_plan(12_250).expect("scan plan should exist");
         assert_eq!(plan.from_block, 12_001);
-        assert_eq!(plan.to_block, 12_250);
+        assert_eq!(plan.to_block, 12_239);
         assert_eq!(plan.claim_ids.len(), 2);
         assert!(plan.claim_ids.contains(&first.session.claim_id));
         assert!(plan.claim_ids.contains(&second.session.claim_id));
@@ -2684,7 +2712,7 @@ mod tests {
             state.base_rpc_endpoint = Some(mock_deposit_log_endpoint(
                 &response.session.claim_id,
                 "75000000",
-                42,
+                100,
             ));
         });
 
@@ -3059,6 +3087,9 @@ mod tests {
 
         let response = create_spawn_session(sample_request("75000000"), 9_000)
             .expect("session should be created");
+        write_state(|state| {
+            state.base_rpc_endpoint = None;
+        });
         reconcile_escrow_payments(
             &[base_deposit_log(
                 &response.session.session_id,
@@ -3069,6 +3100,9 @@ mod tests {
             10_000,
         )
         .expect("claim should become paid");
+        write_state(|state| {
+            state.base_rpc_endpoint = Some("mock://error/rate-limit".to_string());
+        });
 
         let error =
             execute_spawn(&response.session.session_id, 11_000).expect_err("broadcast should fail");
@@ -3741,6 +3775,9 @@ mod tests {
 
         let response = create_spawn_session(sample_request("75000000"), 21_000)
             .expect("session should be created");
+        write_state(|state| {
+            state.base_rpc_endpoint = None;
+        });
         reconcile_escrow_payments(
             &[base_deposit_log(
                 &response.session.session_id,
@@ -3751,6 +3788,9 @@ mod tests {
             21_500,
         )
         .expect("claim should become paid");
+        write_state(|state| {
+            state.base_rpc_endpoint = Some("https://base.example".to_string());
+        });
 
         let first_reports = run_scheduler_tick(22_000);
         let first_snapshot = snapshot_state();
@@ -3816,6 +3856,9 @@ mod tests {
 
         let response = create_spawn_session(sample_request("75000000"), 12_000)
             .expect("session should be created");
+        write_state(|state| {
+            state.base_rpc_endpoint = None;
+        });
         reconcile_escrow_payments(
             &[base_deposit_log(
                 &response.session.session_id,
@@ -3826,6 +3869,9 @@ mod tests {
             13_000,
         )
         .expect("claim should become paid");
+        write_state(|state| {
+            state.base_rpc_endpoint = Some("https://base.example".to_string());
+        });
 
         let error = execute_spawn(&response.session.session_id, 14_000)
             .expect_err("spawn should fail early on insufficient cycles");
@@ -3854,6 +3900,9 @@ mod tests {
 
         let response = create_spawn_session(sample_request("75000000"), 12_000)
             .expect("session should be created");
+        write_state(|state| {
+            state.base_rpc_endpoint = None;
+        });
         reconcile_escrow_payments(
             &[base_deposit_log(
                 &response.session.session_id,
@@ -3864,6 +3913,9 @@ mod tests {
             13_000,
         )
         .expect("claim should become paid");
+        write_state(|state| {
+            state.base_rpc_endpoint = Some("mock://success".to_string());
+        });
 
         let error = execute_spawn(&response.session.session_id, 14_000)
             .expect_err("spawn should fail on follow-up affordability");

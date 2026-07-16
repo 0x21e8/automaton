@@ -52,23 +52,115 @@ struct UnsignedEip1559Transaction {
     data: Vec<u8>,
 }
 
-fn ensure_refund_guard(guard: Option<(&str, u64)>) -> Result<(), FactoryError> {
-    let Some((session_id, generation)) = guard else {
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum ReleaseTransactionGuard {
+    Refund {
+        session_id: String,
+        generation: u64,
+    },
+    Spawn {
+        session_id: String,
+        generation: u32,
+        draft_identity: Option<String>,
+    },
+}
+
+impl ReleaseTransactionGuard {
+    pub(crate) fn refund(session_id: &str, generation: u64) -> Self {
+        Self::Refund {
+            session_id: session_id.to_string(),
+            generation,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn spawn(
+        session_id: &str,
+        generation: u32,
+        draft_identity: &Option<String>,
+    ) -> Self {
+        Self::Spawn {
+            session_id: session_id.to_string(),
+            generation,
+            draft_identity: draft_identity.clone(),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn as_refund_lease(&self) -> Option<(&str, u64)> {
+        match self {
+            Self::Refund {
+                session_id,
+                generation,
+            } => Some((session_id.as_str(), *generation)),
+            Self::Spawn { .. } => None,
+        }
+    }
+}
+
+fn ensure_release_transaction_guard(
+    guard: Option<&ReleaseTransactionGuard>,
+) -> Result<(), FactoryError> {
+    let Some(guard) = guard else {
         return Ok(());
     };
-    read_state(|state| {
-        if state
-            .steward_refund_leases
-            .get(session_id)
-            .is_some_and(|lease| lease.generation == generation)
-        {
+
+    read_state(|state| match guard {
+        ReleaseTransactionGuard::Refund {
+            session_id,
+            generation,
+        } => {
+            if state
+                .steward_refund_leases
+                .get(session_id.as_str())
+                .is_some_and(|lease| lease.generation == *generation)
+            {
+                Ok(())
+            } else {
+                Err(FactoryError::InvalidStewardProof {
+                    reason: "stale refund command continuation".to_string(),
+                })
+            }
+        }
+        ReleaseTransactionGuard::Spawn {
+            session_id,
+            generation,
+            draft_identity,
+        } => {
+            let session =
+                state
+                    .sessions
+                    .get(session_id)
+                    .ok_or_else(|| FactoryError::SessionNotFound {
+                        session_id: session_id.to_string(),
+                    })?;
+            if session.generation.unwrap_or_default() != *generation {
+                return Err(FactoryError::InvalidStewardProof {
+                    reason: "stale spawn continuation".to_string(),
+                });
+            }
+            let current_identity = session
+                .release_broadcast
+                .as_ref()
+                .map(crate::spawn::release_broadcast_draft_identity);
+            if &current_identity != draft_identity {
+                return Err(FactoryError::InvalidStewardProof {
+                    reason: "stale spawn continuation".to_string(),
+                });
+            }
             Ok(())
-        } else {
-            Err(FactoryError::InvalidStewardProof {
-                reason: "stale refund command continuation".to_string(),
-            })
         }
     })
+}
+
+#[allow(dead_code)]
+fn ensure_refund_guard(guard: Option<(&str, u64)>) -> Result<(), FactoryError> {
+    let guard = guard.map(|(session_id, generation)| ReleaseTransactionGuard::Refund {
+        session_id: session_id.to_string(),
+        generation,
+    });
+    ensure_release_transaction_guard(guard.as_ref())
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -363,10 +455,147 @@ fn build_release_broadcast_record(plan: &ReleaseTransactionPlan) -> ReleaseBroad
         raw_transaction_hex: None,
         rpc_tx_hash: None,
         broadcast_at: None,
+        receipt_block_number: None,
+        receipt_block_hash: None,
+        receipt_status: None,
         last_error: None,
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn confirm_release_receipt_depth(
+    base_rpc_endpoints: &[String],
+    depth: u64,
+    record: &mut ReleaseBroadcastRecord,
+    tx_hash: &str,
+    guard: Option<&ReleaseTransactionGuard>,
+) -> Result<bool, FactoryError> {
+    ensure_release_transaction_guard(guard)?;
+    let latest_block = crate::base_rpc::eth_block_number(base_rpc_endpoints)?;
+    ensure_release_transaction_guard(guard)?;
+    let receipt = crate::base_rpc::eth_get_transaction_receipt_status(base_rpc_endpoints, tx_hash)?;
+    ensure_release_transaction_guard(guard)?;
+    match receipt {
+        Some(receipt) => {
+            record.receipt_block_number = Some(receipt.block_number);
+            record.receipt_block_hash = Some(receipt.block_hash.clone());
+            record.receipt_status = Some(receipt.status);
+            if !receipt.status {
+                return Err(FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: "release transaction reverted".to_string(),
+                });
+            }
+            if latest_block < receipt.block_number {
+                return Err(FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: "receipt block is in the future".to_string(),
+                });
+            }
+
+            let canonical_block_hash = crate::base_rpc::eth_get_block_hash_by_number(
+                base_rpc_endpoints,
+                receipt.block_number,
+            )?;
+            ensure_release_transaction_guard(guard)?;
+            if !canonical_block_hash.eq_ignore_ascii_case(&receipt.block_hash) {
+                return Err(FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: "receipt block hash is not canonical".to_string(),
+                });
+            }
+
+            let confirmations = latest_block
+                .checked_sub(receipt.block_number)
+                .and_then(|distance| distance.checked_add(1))
+                .ok_or_else(|| FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: "latest block number overflow while confirming receipt".to_string(),
+                })?;
+
+            if confirmations < depth {
+                return Ok(false);
+            }
+
+            Ok(true)
+        }
+        None => {
+            record.receipt_block_number = None;
+            record.receipt_block_hash = None;
+            record.receipt_status = None;
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn confirm_release_receipt_depth(
+    base_rpc_endpoints: &[String],
+    depth: u64,
+    record: &mut ReleaseBroadcastRecord,
+    tx_hash: &str,
+    guard: Option<&ReleaseTransactionGuard>,
+) -> Result<bool, FactoryError> {
+    ensure_release_transaction_guard(guard)?;
+    let latest_block = crate::base_rpc::eth_block_number(base_rpc_endpoints).await?;
+    ensure_release_transaction_guard(guard)?;
+    let receipt =
+        crate::base_rpc::eth_get_transaction_receipt_status(base_rpc_endpoints, tx_hash).await?;
+    ensure_release_transaction_guard(guard)?;
+    match receipt {
+        Some(receipt) => {
+            record.receipt_block_number = Some(receipt.block_number);
+            record.receipt_block_hash = Some(receipt.block_hash.clone());
+            record.receipt_status = Some(receipt.status);
+            if !receipt.status {
+                return Err(FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: "release transaction reverted".to_string(),
+                });
+            }
+            if latest_block < receipt.block_number {
+                return Err(FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: "receipt block is in the future".to_string(),
+                });
+            }
+
+            ensure_release_transaction_guard(guard)?;
+            let canonical_block_hash = crate::base_rpc::eth_get_block_hash_by_number(
+                base_rpc_endpoints,
+                receipt.block_number,
+            )
+            .await?;
+            ensure_release_transaction_guard(guard)?;
+            if !canonical_block_hash.eq_ignore_ascii_case(&receipt.block_hash) {
+                return Err(FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: "receipt block hash is not canonical".to_string(),
+                });
+            }
+
+            let confirmations = latest_block
+                .checked_sub(receipt.block_number)
+                .and_then(|distance| distance.checked_add(1))
+                .ok_or_else(|| FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: "latest block number overflow while confirming receipt".to_string(),
+                })?;
+
+            if confirmations < depth {
+                return Ok(false);
+            }
+
+            Ok(true)
+        }
+        None => {
+            record.receipt_block_number = None;
+            record.receipt_block_hash = None;
+            record.receipt_status = None;
+            Ok(false)
+        }
+    }
+}
 pub(crate) fn build_refund_transaction_draft(
     claim_id: &str,
     recipient: &str,
@@ -768,7 +997,8 @@ async fn broadcast_and_confirm_persisted_refund(
     base_rpc_endpoints: &[String],
     mut record: ReleaseBroadcastRecord,
     now_ms: u64,
-    guard: Option<(&str, u64)>,
+    confirmation_depth: u64,
+    guard: Option<ReleaseTransactionGuard>,
 ) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
     let raw_tx_hex = record.raw_transaction_hex.clone().ok_or_else(|| {
         release_broadcast_error(
@@ -816,8 +1046,19 @@ async fn broadcast_and_confirm_persisted_refund(
         ));
     }
 
+    let refund_guard = guard
+        .as_ref()
+        .and_then(ReleaseTransactionGuard::as_refund_lease);
+    ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RpcBroadcast,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
     let rpc_result = base_rpc::eth_send_raw_transaction(base_rpc_endpoints, &raw_tx_hex).await;
-    ensure_refund_guard(guard).map_err(|error| {
+    ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
         release_broadcast_error(
             ReleaseBroadcastStage::RpcBroadcast,
             record.clone(),
@@ -848,7 +1089,7 @@ async fn broadcast_and_confirm_persisted_refund(
     }
     record.rpc_tx_hash = Some(rpc_hash.clone());
     record.broadcast_at = Some(now_ms);
-    persist_refund_transaction_record_guarded(&record.claim_id, &record, guard).map_err(
+    persist_refund_transaction_record_guarded(&record.claim_id, &record, refund_guard).map_err(
         |error| {
             release_broadcast_error(
                 ReleaseBroadcastStage::RpcBroadcast,
@@ -859,38 +1100,40 @@ async fn broadcast_and_confirm_persisted_refund(
         },
     )?;
 
-    let receipt_result =
-        base_rpc::eth_get_transaction_receipt_status(base_rpc_endpoints, &rpc_hash).await;
-    ensure_refund_guard(guard).map_err(|error| {
-        release_broadcast_error(
-            ReleaseBroadcastStage::ReceiptConfirmation,
-            record.clone(),
-            error,
-            now_ms,
-        )
-    })?;
-    let confirmed = match receipt_result {
-        Ok(Some(true)) => true,
-        Ok(Some(false)) => {
-            return Err(release_broadcast_error(
+    let confirmed = {
+        ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
+            release_broadcast_error(
                 ReleaseBroadcastStage::ReceiptConfirmation,
-                record,
-                FactoryError::ManagementCallFailed {
-                    method: "eth_getTransactionReceipt".to_string(),
-                    message: "refund transaction reverted".to_string(),
-                },
-                now_ms,
-            ));
-        }
-        Ok(None) => false,
-        Err(error) => {
-            return Err(release_broadcast_error(
-                ReleaseBroadcastStage::ReceiptConfirmation,
-                record,
+                record.clone(),
                 error,
                 now_ms,
-            ));
-        }
+            )
+        })?;
+        let confirmed = confirm_release_receipt_depth(
+            base_rpc_endpoints,
+            confirmation_depth,
+            &mut record,
+            &rpc_hash,
+            guard.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::ReceiptConfirmation,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+        ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::ReceiptConfirmation,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+        confirmed
     };
     Ok(ReleaseBroadcastReceipt {
         release_tx_hash: rpc_hash,
@@ -905,7 +1148,8 @@ pub(crate) async fn resume_persisted_refund_transaction(
     base_rpc_endpoints: &[String],
     mut record: ReleaseBroadcastRecord,
     now_ms: u64,
-    guard: Option<(&str, u64)>,
+    confirmation_depth: u64,
+    guard: Option<ReleaseTransactionGuard>,
 ) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
     if record.raw_transaction_hex.is_none() {
         let raw = reconstruct_legacy_refund_raw_transaction(&record).map_err(|error| {
@@ -917,18 +1161,20 @@ pub(crate) async fn resume_persisted_refund_transaction(
             )
         })?;
         record.raw_transaction_hex = Some(raw);
-        persist_refund_transaction_record_guarded(&record.claim_id, &record, guard).map_err(
-            |error| {
+        let refund_guard = guard
+            .as_ref()
+            .and_then(ReleaseTransactionGuard::as_refund_lease);
+        persist_refund_transaction_record_guarded(&record.claim_id, &record, refund_guard)
+            .map_err(|error| {
                 release_broadcast_error(
                     ReleaseBroadcastStage::RawTransactionConstruction,
                     record.clone(),
                     error,
                     now_ms,
                 )
-            },
-        )?;
+            })?;
     }
-    ensure_refund_guard(guard).map_err(|error| {
+    ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
         release_broadcast_error(
             ReleaseBroadcastStage::RpcBroadcast,
             record.clone(),
@@ -936,7 +1182,23 @@ pub(crate) async fn resume_persisted_refund_transaction(
             now_ms,
         )
     })?;
-    broadcast_and_confirm_persisted_refund(base_rpc_endpoints, record, now_ms, guard).await
+    let receipt = broadcast_and_confirm_persisted_refund(
+        base_rpc_endpoints,
+        record.clone(),
+        now_ms,
+        confirmation_depth,
+        guard.clone(),
+    )
+    .await;
+    ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RpcBroadcast,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    receipt
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -945,6 +1207,7 @@ pub(crate) fn resume_persisted_refund_transaction(
     base_rpc_endpoints: &[String],
     mut record: ReleaseBroadcastRecord,
     now_ms: u64,
+    confirmation_depth: u64,
     guard: Option<(&str, u64)>,
 ) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
     if record.raw_transaction_hex.is_none() {
@@ -1050,11 +1313,29 @@ pub(crate) fn resume_persisted_refund_transaction(
             )
         },
     )?;
+    let confirmation_guard = guard
+        .as_ref()
+        .map(|(session_id, generation)| ReleaseTransactionGuard::refund(session_id, *generation));
+    let confirmed = confirm_release_receipt_depth(
+        base_rpc_endpoints,
+        confirmation_depth,
+        &mut record,
+        &rpc_hash,
+        confirmation_guard.as_ref(),
+    )
+    .map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::ReceiptConfirmation,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
     Ok(ReleaseBroadcastReceipt {
         release_tx_hash: rpc_hash,
         release_broadcast_at: now_ms,
         record,
-        confirmed: true,
+        confirmed,
     })
 }
 
@@ -1070,7 +1351,8 @@ pub(crate) async fn broadcast_release_transaction(
     config: &ReleaseBroadcastConfig,
     reproduction: Option<&ReproductionRelease>,
     refund: bool,
-    refund_guard: Option<(&str, u64)>,
+    confirmation_depth: u64,
+    guard: Option<ReleaseTransactionGuard>,
 ) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
     use ic_cdk::management_canister::{ecdsa_public_key, sign_with_ecdsa};
 
@@ -1123,6 +1405,9 @@ pub(crate) async fn broadcast_release_transaction(
                     raw_transaction_hex: None,
                     rpc_tx_hash: None,
                     broadcast_at: None,
+                    receipt_block_number: None,
+                    receipt_block_hash: None,
+                    receipt_status: None,
                     last_error: None,
                 },
                 error,
@@ -1143,7 +1428,7 @@ pub(crate) async fn broadcast_release_transaction(
     let prehash = keccak256(&signing_payload);
     record.signing_payload_hash = Some(keccak_hex(&signing_payload));
 
-    ensure_refund_guard(refund_guard).map_err(|error| {
+    ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
         release_broadcast_error(
             ReleaseBroadcastStage::PublicKeyLookup,
             record.clone(),
@@ -1154,7 +1439,7 @@ pub(crate) async fn broadcast_release_transaction(
 
     let public_key_result =
         ecdsa_public_key(&factory_public_key_argument(&config.ecdsa_key_name)).await;
-    ensure_refund_guard(refund_guard).map_err(|error| {
+    ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
         release_broadcast_error(
             ReleaseBroadcastStage::PublicKeyLookup,
             record.clone(),
@@ -1185,7 +1470,7 @@ pub(crate) async fn broadcast_release_transaction(
     })?;
 
     let signing_call_result = sign_with_ecdsa(&signing_request).await;
-    ensure_refund_guard(refund_guard).map_err(|error| {
+    ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
         release_broadcast_error(
             ReleaseBroadcastStage::Signing,
             record.clone(),
@@ -1237,9 +1522,12 @@ pub(crate) async fn broadcast_release_transaction(
     let raw_tx_hex = hex_encode_prefixed(&raw_tx);
     record.raw_transaction_hash = Some(keccak_hex(&raw_tx));
     record.raw_transaction_hex = Some(raw_tx_hex.clone());
+    let refund_guard = guard
+        .as_ref()
+        .and_then(ReleaseTransactionGuard::as_refund_lease);
 
     if refund {
-        ensure_refund_guard(refund_guard).map_err(|error| {
+        ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
             release_broadcast_error(
                 ReleaseBroadcastStage::RawTransactionConstruction,
                 record.clone(),
@@ -1257,7 +1545,7 @@ pub(crate) async fn broadcast_release_transaction(
                 )
             },
         )?;
-        ensure_refund_guard(refund_guard).map_err(|error| {
+        ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
             release_broadcast_error(
                 ReleaseBroadcastStage::RpcBroadcast,
                 record.clone(),
@@ -1269,11 +1557,20 @@ pub(crate) async fn broadcast_release_transaction(
             base_rpc_endpoints,
             record,
             now_ms,
-            refund_guard,
+            confirmation_depth,
+            guard,
         )
         .await;
     }
 
+    ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RpcBroadcast,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
     let rpc_hash = base_rpc::eth_send_raw_transaction(base_rpc_endpoints, &raw_tx_hex)
         .await
         .map_err(|error| {
@@ -1284,33 +1581,51 @@ pub(crate) async fn broadcast_release_transaction(
                 now_ms,
             )
         })?;
+    ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RpcBroadcast,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
     record.rpc_tx_hash = Some(rpc_hash.clone());
     record.broadcast_at = Some(now_ms);
-
-    let confirmed =
-        match base_rpc::eth_get_transaction_receipt_status(base_rpc_endpoints, &rpc_hash).await {
-            Ok(Some(true)) => true,
-            Ok(Some(false)) => {
-                return Err(release_broadcast_error(
-                    ReleaseBroadcastStage::ReceiptConfirmation,
-                    record,
-                    FactoryError::ManagementCallFailed {
-                        method: "eth_getTransactionReceipt".to_string(),
-                        message: "release transaction reverted".to_string(),
-                    },
-                    now_ms,
-                ));
-            }
-            Ok(None) => false,
-            Err(error) => {
-                return Err(release_broadcast_error(
-                    ReleaseBroadcastStage::ReceiptConfirmation,
-                    record,
-                    error,
-                    now_ms,
-                ));
-            }
-        };
+    let confirmed = {
+        ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::ReceiptConfirmation,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+        let confirmed = confirm_release_receipt_depth(
+            base_rpc_endpoints,
+            confirmation_depth,
+            &mut record,
+            &rpc_hash,
+            guard.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::ReceiptConfirmation,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+        ensure_release_transaction_guard(guard.as_ref()).map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::ReceiptConfirmation,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+        confirmed
+    };
 
     Ok(ReleaseBroadcastReceipt {
         release_tx_hash: rpc_hash,
@@ -1333,6 +1648,7 @@ pub(crate) fn broadcast_release_transaction(
     config: &ReleaseBroadcastConfig,
     reproduction: Option<&ReproductionRelease>,
     refund: bool,
+    confirmation_depth: u64,
     refund_guard: Option<(&str, u64)>,
 ) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
     let plan = if refund {
@@ -1382,6 +1698,9 @@ pub(crate) fn broadcast_release_transaction(
                 raw_transaction_hex: None,
                 rpc_tx_hash: None,
                 broadcast_at: None,
+                receipt_block_number: None,
+                receipt_block_hash: None,
+                receipt_status: None,
                 last_error: None,
             },
             error,
@@ -1467,6 +1786,7 @@ pub(crate) fn broadcast_release_transaction(
             base_rpc_endpoints,
             record,
             now_ms,
+            confirmation_depth,
             refund_guard,
         );
     }
@@ -1483,12 +1803,30 @@ pub(crate) fn broadcast_release_transaction(
             })?;
     record.rpc_tx_hash = Some(rpc_hash.clone());
     record.broadcast_at = Some(now_ms);
+    let confirmation_guard = refund_guard
+        .as_ref()
+        .map(|(session_id, generation)| ReleaseTransactionGuard::refund(session_id, *generation));
+    let confirmed = confirm_release_receipt_depth(
+        base_rpc_endpoints,
+        confirmation_depth,
+        &mut record,
+        &rpc_hash,
+        confirmation_guard.as_ref(),
+    )
+    .map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::ReceiptConfirmation,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
 
     Ok(ReleaseBroadcastReceipt {
         release_tx_hash: rpc_hash,
         release_broadcast_at: now_ms,
         record,
-        confirmed: true,
+        confirmed,
     })
 }
 
@@ -1496,10 +1834,14 @@ pub(crate) fn broadcast_release_transaction(
 mod tests {
     use super::{
         broadcast_release_transaction, build_release_broadcast_record, build_release_plan,
-        build_signing_payload, build_unsigned_release_transaction, ReleaseBroadcastStage,
+        build_signed_raw_transaction, build_signing_payload, build_unsigned_release_transaction,
+        confirm_release_receipt_depth, keccak_hex, resume_persisted_refund_transaction,
+        ReleaseBroadcastStage,
     };
     use crate::state::{restore_state, set_mock_canister_balance, snapshot_state};
-    use crate::{FactoryError, FactoryStateSnapshot, ReleaseBroadcastConfig};
+    use crate::{
+        types::hex_encode_prefixed, FactoryError, FactoryStateSnapshot, ReleaseBroadcastConfig,
+    };
 
     #[test]
     fn configured_fees_flow_into_unsigned_release_transactions() {
@@ -1548,6 +1890,7 @@ mod tests {
             &ReleaseBroadcastConfig::default(),
             None,
             false,
+            12,
             None,
         )
         .expect_err("broadcast should fail");
@@ -1583,6 +1926,7 @@ mod tests {
             &ReleaseBroadcastConfig::default(),
             None,
             false,
+            12,
             None,
         )
         .expect("broadcast should succeed");
@@ -1611,6 +1955,7 @@ mod tests {
             &ReleaseBroadcastConfig::default(),
             None,
             false,
+            12,
             None,
         )
         .expect_err("broadcast should fail before signing");
@@ -1625,5 +1970,278 @@ mod tests {
                 if operation == "sign_with_ecdsa"
         ));
         set_mock_canister_balance(u128::MAX);
+    }
+
+    #[test]
+    fn confirms_release_receipt_pending_returns_unconfirmed_with_none_status() {
+        let plan = build_release_plan(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+            7,
+            ReleaseBroadcastConfig::default(),
+        )
+        .expect("plan should build");
+        let mut record = build_release_broadcast_record(&plan);
+
+        let confirmed = confirm_release_receipt_depth(
+            &["mock://pending-receipt".to_string()],
+            12,
+            &mut record,
+            "0xdead",
+            None,
+        )
+        .expect("pending receipt should be handled");
+
+        assert!(!confirmed);
+        assert_eq!(record.receipt_status, None);
+        assert_eq!(record.receipt_block_number, None);
+        assert_eq!(record.receipt_block_hash, None);
+    }
+
+    #[test]
+    fn confirms_release_receipt_reverted_status_is_surface_as_error() {
+        let plan = build_release_plan(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+            7,
+            ReleaseBroadcastConfig::default(),
+        )
+        .expect("plan should build");
+        let mut record = build_release_broadcast_record(&plan);
+
+        let error = confirm_release_receipt_depth(
+            &["mock://reverted-receipt".to_string()],
+            12,
+            &mut record,
+            "0xdead",
+            None,
+        )
+        .expect_err("reverted receipt should return an error");
+
+        assert_eq!(record.receipt_status, Some(false));
+        assert_eq!(record.receipt_block_number, Some(0x59));
+        assert_eq!(
+            record.receipt_block_hash,
+            Some("0x000000000000000000000000000000000000000000000000000000000000002a".to_string())
+        );
+        assert!(matches!(
+            error,
+            FactoryError::ManagementCallFailed {
+                ref method,
+                ref message,
+                ..
+            } if method == "eth_getTransactionReceipt" && message == "release transaction reverted"
+        ));
+    }
+
+    #[test]
+    fn confirmation_depth_exact_and_below_depth_with_same_receipt() {
+        let plan = build_release_plan(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+            7,
+            ReleaseBroadcastConfig::default(),
+        )
+        .expect("plan should build");
+
+        let mut below_depth_record = build_release_broadcast_record(&plan);
+        assert!(!confirm_release_receipt_depth(
+            &["mock://success".to_string()],
+            13,
+            &mut below_depth_record,
+            "0xdead",
+            None,
+        )
+        .expect("below depth should remain unconfirmed"));
+
+        let mut exact_depth_record = build_release_broadcast_record(&plan);
+        assert!(confirm_release_receipt_depth(
+            &["mock://success".to_string()],
+            12,
+            &mut exact_depth_record,
+            "0xdead",
+            None,
+        )
+        .expect("exact depth should confirm"));
+
+        assert_eq!(
+            exact_depth_record.receipt_block_hash,
+            below_depth_record.receipt_block_hash
+        );
+    }
+
+    #[test]
+    fn confirmation_rejects_non_canonical_receipt_before_depth_requirement() {
+        let plan = build_release_plan(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+            7,
+            ReleaseBroadcastConfig::default(),
+        )
+        .expect("plan should build");
+        let mut record = build_release_broadcast_record(&plan);
+
+        let error = confirm_release_receipt_depth(
+            &["mock://reorg-receipt".to_string()],
+            20,
+            &mut record,
+            "0xdead",
+            None,
+        )
+        .expect_err("non-canonical receipt should fail before depth check");
+
+        assert_eq!(record.receipt_block_number, Some(0x59));
+        assert!(matches!(
+            error,
+            FactoryError::ManagementCallFailed {
+                ref message,
+                ..
+            } if message == "receipt block hash is not canonical"
+        ));
+    }
+
+    #[test]
+    fn confirmation_rejects_latest_block_lagging_receipt() {
+        let plan = build_release_plan(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+            7,
+            ReleaseBroadcastConfig::default(),
+        )
+        .expect("plan should build");
+        let mut record = build_release_broadcast_record(&plan);
+
+        let error = confirm_release_receipt_depth(
+            &["mock://future-receipt".to_string()],
+            12,
+            &mut record,
+            "0xdead",
+            None,
+        )
+        .expect_err("future receipt should fail as stale");
+
+        assert_eq!(record.receipt_block_number, Some(0x65));
+        assert!(matches!(
+            error,
+            FactoryError::ManagementCallFailed {
+                ref message,
+                ..
+            } if message == "receipt block is in the future"
+        ));
+    }
+
+    #[test]
+    fn confirmation_handles_extreme_confirmation_depth_without_overflow() {
+        let plan = build_release_plan(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+            7,
+            ReleaseBroadcastConfig::default(),
+        )
+        .expect("plan should build");
+        let mut record = build_release_broadcast_record(&plan);
+
+        assert!(!confirm_release_receipt_depth(
+            &["mock://success".to_string()],
+            u64::MAX,
+            &mut record,
+            "0xdead",
+            None,
+        )
+        .expect("huge depth should remain unconfirmed"));
+    }
+
+    #[test]
+    fn confirmation_rejects_malformed_receipt_hashes() {
+        let plan = build_release_plan(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+            7,
+            ReleaseBroadcastConfig::default(),
+        )
+        .expect("plan should build");
+        let mut record = build_release_broadcast_record(&plan);
+
+        let error = confirm_release_receipt_depth(
+            &["mock://malformed-receipt-hash".to_string()],
+            12,
+            &mut record,
+            "0xdead",
+            None,
+        )
+        .expect_err("malformed hash should fail");
+
+        assert!(matches!(
+            error,
+            FactoryError::RpcRequestFailed {
+                ref operation,
+                ..
+            } if operation == "eth_getTransactionReceipt"
+        ));
+    }
+
+    #[test]
+    fn stale_refund_guard_prevents_release_broadcast_send_for_refund_flow() {
+        let error = broadcast_release_transaction(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            &["mock://success".to_string()],
+            "0x3333333333333333333333333333333333333333",
+            5,
+            9_876,
+            &ReleaseBroadcastConfig::default(),
+            None,
+            true,
+            12,
+            Some(("stale-session", 7)),
+        )
+        .expect_err("stale guard should reject before broadcast");
+
+        assert_eq!(
+            error.record.last_error.as_ref().map(|entry| &entry.stage),
+            Some(&ReleaseBroadcastStage::Signing)
+        );
+    }
+
+    #[test]
+    fn stale_refund_guard_prevents_resumed_refund_broadcast() {
+        let plan = build_release_plan(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+            5,
+            ReleaseBroadcastConfig::default(),
+        )
+        .expect("plan should build");
+        let unsigned_tx =
+            build_unsigned_release_transaction(&plan).expect("unsigned tx should build");
+        let raw_tx = build_signed_raw_transaction(&unsigned_tx, false, &[0x11_u8; 64])
+            .expect("signed tx should build");
+        let raw_tx_hex = hex_encode_prefixed(&raw_tx);
+
+        let mut record = build_release_broadcast_record(&plan);
+        record.raw_transaction_hex = Some(raw_tx_hex);
+        record.raw_transaction_hash = Some(keccak_hex(&raw_tx));
+
+        let error = resume_persisted_refund_transaction(
+            &["mock://success".to_string()],
+            record,
+            9_876,
+            12,
+            Some(("stale-session", 7)),
+        )
+        .expect_err("stale guard should reject resumed broadcast");
+
+        assert_eq!(
+            error.record.last_error.as_ref().map(|entry| &entry.stage),
+            Some(&ReleaseBroadcastStage::RpcBroadcast)
+        );
     }
 }
