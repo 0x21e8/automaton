@@ -145,6 +145,7 @@ jobs:
           build_and_push() {
             local name="$1"
             local dockerfile="$2"
+            shift 2
             local metadata_file="$RUNNER_TEMP/${name}-metadata.json"
             docker buildx build --platform linux/amd64 --push \
               --metadata-file "$metadata_file" \
