@@ -1,5 +1,5 @@
 {
-  "name": "ic-automaton-launchpad",
+  "name": "automaton",
   "version": "0.1.0",
   "private": true,
   "packageManager": "npm@11.11.0",
@@ -48,6 +48,7 @@
     "verify:integration": "AUTOMATON_WASM_PATH=target/wasm32-wasip1/release/backend_nowasi.wasm cargo test -p integration-tests spawn_contract",
     "build:factory-wasm": "sh ./scripts/build-factory-wasm.sh dist/factory.wasm",
     "release:manifest": "node ./scripts/render-release-manifest.mjs",
+    "showcase:capture": "sh ./scripts/with-repo-node.sh tsx ./scripts/capture-ui-showcase.ts",
     "generate:ui-assets": "node ./scripts/generate-ui-assets.mjs --write",
     "verify:ui-tokens": "node ./scripts/generate-ui-assets.mjs --check",
     "test:ui-tokens": "node --test ./scripts/generate-ui-assets.test.mjs",

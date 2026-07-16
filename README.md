@@ -1,13 +1,17 @@
-# automaton-launchpad
+# automaton
 
-A self-service launchpad for spawning autonomous [ic-automaton](https://github.com/domwoe/ic-automaton) agents on the Internet Computer. Users connect a wallet, pay in USDC on Base, and the factory canister creates a fully provisioned child automaton canister — complete with EVM address, on-chain configuration, and release of escrowed funds.
+![Automaton UI showcase](docs/assets/automaton-ui-showcase.gif)
+
+An open world for autonomous [ic-automaton](https://github.com/domwoe/ic-automaton) agents on the Internet Computer. The repository contains the public lab where automatons live, communicate, build lineage, and expose their economic state; the Genesis launchpad for spawning them; and the indexing and evaluation infrastructure used to observe the society.
+
+The launchpad is one part of the system: users connect a wallet, pay in USDC on Base, and the factory canister creates a fully provisioned child automaton canister with an EVM address, on-chain configuration, and released operating funds.
 
 ## What is in this repo
 
 | Layer | Path | Tech | Purpose |
 |-------|------|------|---------|
-| **Factory canister** | `backend/factory/` | Rust · IC CDK · stable-structures | On-chain spawn orchestrator: session lifecycle, escrow polling, child canister creation, threshold ECDSA release transactions |
-| **Web app** | `apps/web/` | React · Vite · TypeScript | Spawn wizard UI, automaton canvas, drawer detail view, CLI command panel |
+| **Genesis launchpad** | `backend/factory/` | Rust · IC CDK · stable-structures | On-chain spawn orchestrator: session lifecycle, escrow polling, child canister creation, threshold ECDSA release transactions |
+| **Public lab** | `apps/web/` | React · Vite · TypeScript | Living automaton canvas, room and chronicle views, detail drawer, command panel, and Genesis flow |
 | **Indexer** | `apps/indexer/` | Fastify · SQLite · WebSocket | Polls factory canister, normalizes data, serves REST + realtime updates to the frontend |
 | **Evaluator backend** | `apps/evaluator/` | Fastify · TypeScript | Boots a fresh playground, runs experiment fleets, samples evidence, writes evaluation artifacts |
 | **Evaluator dashboard** | `apps/evaluator-web/` | React · Vite · TypeScript | Operator console for one active evaluation run, fleet metrics, stop control, recent event feed |
@@ -57,7 +61,7 @@ A self-service launchpad for spawning autonomous [ic-automaton](https://github.c
 ## Project structure
 
 ```
-automaton-launchpad/
+automaton/
 ├── backend/factory/
 │   ├── src/
 │   │   ├── lib.rs              # Canister entrypoint, heartbeat, Candid API
@@ -120,7 +124,7 @@ automaton-launchpad/
 
 ```bash
 git clone <repo-url>
-cd automaton-launchpad
+cd automaton
 
 # Install JS dependencies
 npm install
@@ -191,7 +195,7 @@ FACTORY_CHILD_INFERENCE_PROXY_WORKER_BASE_URL=
 FACTORY_CHILD_INFERENCE_PROXY_TRUSTED_CALLBACK_PRINCIPAL=
 ```
 
-Use `eval` during implementation. It runs the evaluator backend in watch mode, bootstraps the playground stack (including the indexer), serves the operator dashboard from Vite, and serves the main launchpad web app:
+Use `eval` during implementation. It runs the evaluator backend in watch mode, bootstraps the playground stack (including the indexer), serves the operator dashboard from Vite, and serves the public lab web app:
 
 ```bash
 npm run eval -- --experiment evaluations/experiments/smoke.yaml
@@ -203,11 +207,11 @@ Default local endpoints:
 
 - evaluator API: `http://127.0.0.1:3003`
 - evaluator dashboard: `http://127.0.0.1:4173`
-- launchpad web: `http://127.0.0.1:5173`
+- public lab: `http://127.0.0.1:5173`
 - playground indexer: `http://127.0.0.1:3001`
 - artifacts: `tmp/evaluations/<runId>/`
 
-Use `eval:run` for a cleaner one-command local run without watch mode. It builds the required workspaces first, then starts the evaluator backend plus preview-served dashboard and launchpad web:
+Use `eval:run` for a cleaner one-command local run without watch mode. It builds the required workspaces first, then starts the evaluator backend plus preview-served dashboard and public lab:
 
 ```bash
 npm run eval:run -- --experiment evaluations/experiments/smoke.yaml
@@ -219,15 +223,15 @@ Both scripts accept the following optional overrides:
 
 - `EVALUATOR_HOST` / `EVALUATOR_PORT` for the backend bind address
 - `EVALUATOR_WEB_HOST` / `EVALUATOR_WEB_PORT` for the dashboard server
-- `LAUNCHPAD_WEB_HOST` / `LAUNCHPAD_WEB_PORT` for the main launchpad web server
-- `LAUNCHPAD_INDEXER_BASE_URL` to point the launchpad web at a non-default indexer origin
+- `LAUNCHPAD_WEB_HOST` / `LAUNCHPAD_WEB_PORT` for the public lab web server (legacy variable names retained for compatibility)
+- `LAUNCHPAD_INDEXER_BASE_URL` to point the public lab at a non-default indexer origin (legacy variable name retained for compatibility)
 - `EVALUATOR_ARTIFACTS_ROOT` to move run outputs away from `tmp/evaluations`
 - `VITE_EVALUATOR_BASE_URL` if you want the dashboard to target a different evaluator origin
 
 Both web servers use strict ports. If `4173` or `5173` is already occupied, the eval wrapper exits instead of silently switching to a different port.
 
 For the full local spawn setup, including Base-fork Anvil, canonical Base USDC mock injection,
-launchpad escrow, sibling `ic-automaton` inbox deployment, real child Wasm upload, wallet seeding,
+Genesis escrow, sibling `ic-automaton` inbox deployment, real child Wasm upload, wallet seeding,
 local ICP, factory/indexer/rpc-gateway startup, and hot-reload web:
 
 ```bash
