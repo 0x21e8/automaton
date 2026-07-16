@@ -96,28 +96,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: playground-vps
-    env:
-      TAILSCALE_AUTHKEY: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY }}
 
     steps:
-      - name: Install Tailscale
-        if: ${{ env.TAILSCALE_AUTHKEY != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-      - name: Join Tailnet
-        if: ${{ env.TAILSCALE_AUTHKEY != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo tailscale up \
-            --authkey="$TAILSCALE_AUTHKEY" \
-            --hostname="gha-playground-e2e-${GITHUB_RUN_ID}" \
-            --accept-routes=false \
-            --ssh=false
-          tailscale status
+      - name: Connect to playground tailnet
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY }}
+          ping: ${{ vars.PLAYGROUND_VPS_HOST }}
 
       - name: Prepare SSH files
         shell: bash
@@ -146,7 +131,7 @@ jobs:
       - name: Run remote spawn payment e2e
         shell: bash
         env:
-          VPS_HOST: ${{ secrets.PLAYGROUND_VPS_HOST }}
+          VPS_HOST: ${{ vars.PLAYGROUND_VPS_HOST }}
           VPS_PORT: ${{ secrets.PLAYGROUND_VPS_PORT }}
           VPS_USER: ${{ secrets.PLAYGROUND_VPS_USER }}
         run: |
@@ -157,10 +142,3 @@ jobs:
           scp -P "$port" "$RUNNER_TEMP/playground-e2e.env" "${VPS_USER}@${VPS_HOST}:${remote_env}"
           ssh -p "$port" "${VPS_USER}@${VPS_HOST}" \
             "set -euo pipefail; . '${remote_env}'; repo_root=\${PLAYGROUND_VPS_REPO_ROOT:-${repo_root}}; if [ -n \"\${PLAYGROUND_ENV_FILE:-}\" ] && [ -f \"\${PLAYGROUND_ENV_FILE}\" ]; then . \"\${PLAYGROUND_ENV_FILE}\"; fi; cd \"\${repo_root}\"; npm run playground:spawn-payment-e2e; rm -f '${remote_env}'"
-
-      - name: Leave Tailnet
-        if: ${{ always() && env.TAILSCALE_AUTHKEY != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo tailscale logout || true

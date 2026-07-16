@@ -311,7 +311,6 @@ The checked-in workflows in [.github/workflows/deploy-soft.yml](/Users/domwoe/De
 
 Add these environment secrets:
 
-- `PLAYGROUND_VPS_HOST`
 - `PLAYGROUND_VPS_PORT`
 - `PLAYGROUND_VPS_USER`
 - `PLAYGROUND_VPS_KNOWN_HOSTS`
@@ -321,10 +320,11 @@ Add these environment secrets:
 - `PLAYGROUND_CHILD_WASM_URL`
 - `PLAYGROUND_CHILD_WASM_SHA256`
 - `PLAYGROUND_CHILD_VERSION_COMMIT`
-- `PLAYGROUND_TAILSCALE_AUTHKEY` if the workflow should join the Tailnet before SSH
+- `PLAYGROUND_TAILSCALE_AUTHKEY`
 
 Add these environment variables:
 
+- `PLAYGROUND_VPS_HOST` set to the VPS Tailscale IP or MagicDNS hostname
 - `PLAYGROUND_VPS_REPO_ROOT`
 - `PLAYGROUND_FORK_BLOCK_NUMBER` if you want a pinned fork block
 
@@ -336,15 +336,13 @@ The deploy workflows SSH to the VPS, upload a release manifest, and run:
 bash ./scripts/deploy-playground-release.sh --manifest /tmp/<manifest>.json
 ```
 
-Tailnet mode:
+The deploy jobs use `tailscale/github-action` to join the Tailnet and wait until
+`PLAYGROUND_VPS_HOST` responds before running `scp` or `ssh`. Use a tagged,
+reusable, ephemeral auth key for `PLAYGROUND_TAILSCALE_AUTHKEY`; pre-approve the
+key when device approval is enabled.
 
-- set `PLAYGROUND_VPS_HOST` to the VPS Tailscale IP or MagicDNS hostname
-- set `PLAYGROUND_TAILSCALE_AUTHKEY` so the GitHub-hosted runner can join the Tailnet before `scp` and `ssh`
-
-Non-Tailnet mode:
-
-- leave `PLAYGROUND_TAILSCALE_AUTHKEY` unset
-- point `PLAYGROUND_VPS_HOST` at the normal SSH endpoint
+For a custom SSH port, the `PLAYGROUND_VPS_KNOWN_HOSTS` entry must use
+`[PLAYGROUND_VPS_HOST]:PLAYGROUND_VPS_PORT`; for port 22, use the host directly.
 
 No workflow is supposed to `git pull` or rebuild on the VPS.
 
@@ -402,7 +400,7 @@ If GitHub Actions cannot reach the VPS in Tailnet mode:
 
 - check that `PLAYGROUND_TAILSCALE_AUTHKEY` is set in the `playground-vps` environment
 - check that `PLAYGROUND_VPS_HOST` is the VPS Tailscale IP or MagicDNS hostname, not its public IP
-- check `tailscale status` output in the workflow logs before the SSH step
+- check the `Connect to playground tailnet` step's ping result before the SSH step
 - confirm the VPS is already online in the same Tailnet and allows SSH via Tailscale
 
 ## Related Files

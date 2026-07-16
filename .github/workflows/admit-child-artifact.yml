@@ -30,6 +30,13 @@ jobs:
         with:
           name: ${{ needs.build-release.outputs.release_artifact_name }}
           path: ${{ runner.temp }}/release
+
+      - name: Connect to playground tailnet
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY }}
+          ping: ${{ vars.PLAYGROUND_VPS_HOST }}
+
       - name: Prepare SSH files
         shell: bash
         env:
@@ -44,7 +51,7 @@ jobs:
       - name: Stage exact source and admit only the child artifact
         shell: bash
         env:
-          VPS_HOST: ${{ secrets.PLAYGROUND_VPS_HOST }}
+          VPS_HOST: ${{ vars.PLAYGROUND_VPS_HOST }}
           VPS_PORT: ${{ secrets.PLAYGROUND_VPS_PORT }}
           VPS_USER: ${{ secrets.PLAYGROUND_VPS_USER }}
           PLAYGROUND_ENV_FILE: /etc/automaton-playground/playground.env
