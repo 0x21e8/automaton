@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 
@@ -11,12 +11,6 @@ const root = process.cwd();
 const baseUrl = "http://127.0.0.1:5173";
 const frameDir = path.join(root, "tmp", "showcase-frames");
 const outputPath = path.join(root, "docs", "assets", "automaton-ui-showcase.gif");
-const backdropPath = path.join(
-  root,
-  "docs",
-  "assets",
-  "automaton-showcase-backdrop.png"
-);
 
 async function isServerReady() {
   try {
@@ -199,34 +193,7 @@ async function main() {
     });
     page.on("pageerror", (error) => console.error("Browser error:", error));
 
-    const backdrop = (await readFile(backdropPath)).toString("base64");
-    await page.setContent(`
-      <style>
-        * { box-sizing: border-box; }
-        body { margin: 0; overflow: hidden; background: #f0ece4; color: #1a1a1a; }
-        .backdrop { position: fixed; inset: -3%; background: url(data:image/png;base64,${backdrop}) center/cover; }
-        .veil { position: fixed; inset: 0; background: rgba(240,236,228,.12); }
-        .lockup { position: fixed; inset: 0; display: grid; place-content: center; text-align: center; }
-        h1 { margin: 0; font: 400 112px/0.9 Georgia, serif; letter-spacing: -.055em; }
-        p { margin: 26px 0 0; font: 700 14px/1.2 monospace; letter-spacing: .32em; text-transform: uppercase; }
-        .signal { width: 88px; height: 5px; margin: 28px auto 0; background: #e63312; }
-      </style>
-      <div class="backdrop"></div><div class="veil"></div>
-      <main class="lockup"><h1>automaton</h1><p>self-sovereign ai agents</p><div class="signal"></div></main>
-    `);
-
     let frame = 0;
-    for (let index = 0; index < 10; index += 1) {
-      await page.evaluate((progress) => {
-        const lockup = document.querySelector<HTMLElement>(".lockup")!;
-        const backdropElement = document.querySelector<HTMLElement>(".backdrop")!;
-        lockup.style.opacity = String(Math.min(1, progress * 1.8));
-        lockup.style.transform = `scale(${0.96 + progress * 0.04})`;
-        backdropElement.style.transform = `scale(${1.04 - progress * 0.02})`;
-      }, index / 9);
-      await capture(page, frame++);
-    }
-
     await installApiFixtures(page);
     await page.goto(baseUrl, { waitUntil: "networkidle" });
     await page.evaluate(() => document.fonts.ready);
@@ -238,7 +205,7 @@ async function main() {
       .getByText(`${mockAutomatons.length} LIVE`)
       .waitFor({ timeout: 10_000 });
 
-    for (let index = 0; index < 12; index += 1) {
+    for (let index = 0; index < 8; index += 1) {
       await capture(page, frame++);
       await page.waitForTimeout(90);
     }
@@ -268,6 +235,24 @@ async function main() {
       );
       await capture(page, frame++);
       await page.waitForTimeout(75);
+    }
+
+    for (let index = 0; index < 6; index += 1) {
+      await capture(page, frame++);
+      await page.waitForTimeout(90);
+    }
+
+    // The GIF loops forever, so the take must end where it began: glide the
+    // cursor off the canvas so the hover ticker slides out, then hold the
+    // same idle state the capture opened with.
+    const exit = { x: secondTarget.x, y: 44 };
+    for (let index = 1; index <= 5; index += 1) {
+      const progress = index / 5;
+      await page.mouse.move(
+        secondTarget.x + (exit.x - secondTarget.x) * progress,
+        secondTarget.y + (exit.y - secondTarget.y) * progress
+      );
+      await capture(page, frame++);
     }
 
     for (let index = 0; index < 8; index += 1) {

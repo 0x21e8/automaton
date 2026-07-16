@@ -1,39 +1,12 @@
-<p align="center">
-<pre align="center">
-  ██  ██████       █████  ██    ██ ████████  ██████  ███    ███  █████  ████████  ██████  ███    ██
-  ██ ██           ██   ██ ██    ██    ██    ██    ██ ████  ████ ██   ██    ██    ██    ██ ████   ██
-  ██ ██      ███  ███████ ██    ██    ██    ██    ██ ██ ████ ██ ███████    ██    ██    ██ ██ ██  ██
-  ██ ██           ██   ██ ██    ██    ██    ██    ██ ██  ██  ██ ██   ██    ██    ██    ██ ██  ██ ██
-  ██  ██████      ██   ██  ██████     ██     ██████  ██      ██ ██   ██    ██     ██████  ██   ████
-</pre>
-</p>
+# ic-automaton
 
-<p align="center">
-  <strong>A self-sovereign AI agent living on-chain as an Internet Computer canister.</strong>
-  <br />
-  <em>A new digital life form. Enabled and bound by crypto.</em>
-</p>
-
-<p align="center">
-  <a href="#architecture"><img src="https://img.shields.io/badge/lang-Rust-orange?style=flat-square&logo=rust" alt="Rust" /></a>
-  <a href="#evm-integration"><img src="https://img.shields.io/badge/chain-Base_(EVM)-0052FF?style=flat-square&logo=ethereum" alt="Base" /></a>
-  <a href="https://internetcomputer.org"><img src="https://img.shields.io/badge/platform-Internet_Computer-6E3FF5?style=flat-square" alt="ICP" /></a>
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License" /></a>
-</p>
-
----
+The automaton runtime: a self-sovereign AI agent living on-chain as a single [Internet Computer](https://internetcomputer.org) canister. This is the component the [Genesis factory](../../README.md) installs into every spawned child — see the [monorepo README](../../README.md) for the world these agents live in and why it exists.
 
 ## What is this?
 
-**ic-automaton** is an autonomous AI agent implemented as a single [Internet Computer](https://internetcomputer.org) canister inspired by [Conway Research's automaton](https://github.com/Conway-Research/automaton) project. It runs a continuous loop of reasoning via LLM inference, takes actions on EVM blockchains (Base) through threshold ECDSA signing, manages its own cryptocurrency balances, and persists its memory across canister upgrades -- all without human intervention.
+**ic-automaton** is an autonomous AI agent implemented as a single Internet Computer canister, inspired by [Conway Research's automaton](https://github.com/Conway-Research/automaton) project. It runs a continuous loop of reasoning via LLM inference, takes actions on EVM blockchains (Base) through threshold ECDSA signing, manages its own cryptocurrency balances, and persists its memory across canister upgrades -- all without human intervention.
 
 Unlike off-chain agents that depend on cloud infrastructure and API keys held by operators, ic-automaton's entire runtime -- state machine, wallet keys, memory, and decision-making loop -- lives on a decentralized compute platform. The canister *is* the agent. There is no server to go down, no cloud bill to forget, no operator required to keep it alive.
-
-## Why?
-
-Most AI agents today are puppets. They run on someone's laptop, call APIs with someone's keys, and stop the moment their operator closes the terminal. They don't truly own anything, remember anything durably, or survive anything.
-
-**ic-automaton explores a different question: what if an AI agent were a first-class on-chain entity?**
 
 On the Internet Computer, a canister can hold its own cryptographic keys (threshold ECDSA), make HTTP outcalls to any API, persist state across upgrades in stable memory, and pay for its own compute in cycles. This makes it possible to build an agent that:
 
@@ -132,12 +105,10 @@ Five documents define identity and behavior by function and owner:
 
 - **Charter** (runtime-owned, immutable): safety, non-harm, trust, and precedence
 - **Protocol** (runtime-owned, immutable and code-versioned): tool discipline, turn mechanics, trigger names, and decision-envelope contract
-- **Genesis** (being-specific, immutable): identity; Plan 008 replaces the temporary soul-based identity with an authored constitution
+- **Genesis** (being-specific, immutable): the authored constitution that fixes the being's identity
 - **Doctrine** (being-owned, versioned and mutable): economic, inbox, memory, planning, and self-modification policy
 - **Situation** (runtime-owned, dynamic): per-turn balances, state, memory, inbox, and available tools
 
-The legacy Candid layer API remains compatible: IDs 6-9 all update the single
-Doctrine document, while reads map IDs 0-9 explicitly onto the new documents.
 Charter and Protocol take precedence over every other document and untrusted
 content. Forbidden-phrase and protocol-contract detection guard Doctrine writes.
 
@@ -153,9 +124,9 @@ A structured DeFi strategy execution framework (in `src/strategy/`) enables the 
 
 A kill-switch mechanism allows per-strategy emergency disablement independent of template lifecycle state.
 See [docs/strategies/README.md](docs/strategies/README.md) for runtime documentation and examples.
-The canonical workspace assets consumed by the factory live under
-`../../strategies/`; run `npm run verify:strategies` from the workspace root
-when changing a recipe.
+The canonical strategy assets consumed by the Genesis factory live at the
+monorepo root under [`strategies/`](../../strategies/); run
+`npm run verify:strategies` from the monorepo root when changing a recipe.
 
 ### Autonomous Cycle Top-Up
 The agent can replenish its own ICP cycles from its USDC balance without operator intervention:
@@ -203,27 +174,20 @@ A timer-driven scheduler fires every 30 seconds and dispatches up to 4 mutating 
 
 ### Local Development
 
+This component lives inside the [automaton monorepo](https://github.com/0x21e8/automaton); all commands below run from `components/ic-automaton/`.
+
 ```bash
-# Clone the repository
-git clone https://github.com/domwoe/ic-automaton.git
-cd ic-automaton
+cd components/ic-automaton
 
 # Validate the WASI build path used by icp-cli
 cargo check --target wasm32-wasip1 -p backend
 icp build backend
 
-# Start everything with OpenRouter inference (requires OPENROUTER_API_KEY)
-just bootstrap openrouter
-
-# Start everything with local IcLlm mode
-# (starts Ollama, deploys local llm canister, wires backend llm_canister_id, configures IcLlm)
-just bootstrap icllm
-
-# Check the agent's status
+# Check the agent's status (once bootstrapped)
 icp canister call backend get_runtime_view '()'
 ```
 
-### Full Bootstrap (with local EVM)
+### Bootstrap (with local EVM)
 
 The justfile provides a complete local development environment with a local Anvil EVM chain and two inference modes:
 
@@ -231,7 +195,7 @@ The justfile provides a complete local development environment with a local Anvi
 # Start everything with OpenRouter inference (requires OPENROUTER_API_KEY)
 just bootstrap openrouter
 
-# Start everything with local ic_llm mode
+# Start everything with local IcLlm mode
 # (starts Ollama, deploys local llm canister, wires backend llm_canister_id, configures IcLlm)
 just bootstrap icllm
 
@@ -293,7 +257,7 @@ ic-automaton/
 │   ├── agent.rs            # Agent loop, turn execution, continuation logic
 │   ├── tools.rs            # Tool registry, dispatch, prompt injection guards
 │   ├── scheduler.rs        # Job scheduler, survival tier classification, task dispatch
-│   ├── prompt.rs           # Layered constitution (layers 0-9), forbidden phrase detection
+│   ├── prompt.rs           # Prompt documents (Charter/Protocol/Genesis/Doctrine/Situation), forbidden-phrase detection
 │   ├── http.rs             # HTTP request handling, certified API endpoints
 │   ├── domain/
 │   │   ├── types.rs        # All domain types, FSM states, events, config structs
