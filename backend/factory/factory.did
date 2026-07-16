@@ -172,6 +172,7 @@ type FactoryError = variant {
   InvalidChildRuntimeConfig : record { field : text; message : text };
   InvalidDeathReport : record { reason : text };
   SessionNotFound : record { session_id : text };
+  InvalidStewardProof : record { reason : text };
   RepositoryStrategyAlreadyExists : record { strategy_id : text };
   ControllerInvariantViolation : record { canister_id : text };
   InvalidSha256 : record { value : text };
@@ -286,6 +287,30 @@ type FactorySessionHealthCounts = record {
   spawning : nat64;
   payment_detected : nat64;
 };
+type FactoryStewardCommand = variant {
+  RetrySpawnSession : record { session_id : text };
+  ClaimSpawnRefund : record { session_id : text };
+};
+type FactoryStewardCommandResult = variant {
+  Refund : RefundSpawnResponse;
+  Retry : SpawnSessionStatusResponse;
+};
+type FactoryStewardProof = record {
+  signature : text;
+  command_hash : text;
+  chain_id : nat64;
+  address : text;
+  nonce : nat64;
+  expires_at_ns : nat64;
+};
+type FactoryStewardProofTemplate = record {
+  command_hash : text;
+  chain_id : nat64;
+  signing_payload : text;
+  address : text;
+  nonce : nat64;
+  expires_at_ns : nat64;
+};
 type FeeConfig = record { usdc_fee : text; updated_at : nat64 };
 type GetRepositoryStrategyResponse = record {
   updated_at : nat64;
@@ -350,6 +375,8 @@ type ReleaseBroadcastRecord = record {
   last_error : opt ReleaseBroadcastFailure;
   signature : opt ReleaseSignatureRecord;
   rpc_tx_hash : opt text;
+  raw_transaction_hex : opt text;
+  ecdsa_key_name : opt text;
   escrow_contract_address : text;
   claim_id : text;
   max_priority_fee_per_gas : nat64;
@@ -460,19 +487,26 @@ type Result_14 = variant {
 };
 type Result_15 = variant { Ok : RoomMessage; Err : FactoryError };
 type Result_16 = variant {
+  Ok : FactoryStewardProofTemplate;
+  Err : FactoryError;
+};
+type Result_17 = variant {
   Ok : AutomatonChildRuntimeConfig;
   Err : FactoryError;
 };
-type Result_17 = variant { Ok : CreationCostQuote; Err : FactoryError };
-type Result_18 = variant { Ok : FeeConfig; Err : FactoryError };
-type Result_19 = variant { Ok : FactoryOperationalConfig; Err : FactoryError };
+type Result_18 = variant { Ok : CreationCostQuote; Err : FactoryError };
+type Result_19 = variant { Ok : FeeConfig; Err : FactoryError };
 type Result_2 = variant { Ok : ArtifactUploadStatus; Err : FactoryError };
-type Result_20 = variant { Ok : bool; Err : FactoryError };
-type Result_21 = variant { Ok : ReleaseBroadcastConfig; Err : FactoryError };
-type Result_3 = variant { Ok : RefundSpawnResponse; Err : FactoryError };
-type Result_4 = variant { Ok : FactoryArtifactSnapshot; Err : FactoryError };
-type Result_5 = variant { Ok : CreateSpawnSessionResponse; Err : FactoryError };
-type Result_6 = variant { Ok : text; Err : FactoryError };
+type Result_20 = variant { Ok : FactoryOperationalConfig; Err : FactoryError };
+type Result_21 = variant { Ok : bool; Err : FactoryError };
+type Result_22 = variant { Ok : ReleaseBroadcastConfig; Err : FactoryError };
+type Result_3 = variant { Ok : FactoryArtifactSnapshot; Err : FactoryError };
+type Result_4 = variant { Ok : CreateSpawnSessionResponse; Err : FactoryError };
+type Result_5 = variant { Ok : text; Err : FactoryError };
+type Result_6 = variant {
+  Ok : FactoryStewardCommandResult;
+  Err : FactoryError;
+};
 type Result_7 = variant { Ok : FactoryConfigSnapshot; Err : FactoryError };
 type Result_8 = variant { Ok : FactoryRuntimeSnapshot; Err : FactoryError };
 type Result_9 = variant { Ok : ReproductionEligibility; Err : FactoryError };
@@ -699,16 +733,19 @@ service : (opt FactoryInitArgs) -> {
   advance_evaluation_time : (nat64) -> (Result_1);
   append_artifact_chunk : (blob) -> (Result_2);
   begin_artifact_upload : (text, text, nat64) -> (Result_2);
-  claim_spawn_refund : (text) -> (Result_3);
-  commit_artifact_upload : () -> (Result_4);
+  commit_artifact_upload : () -> (Result_3);
   create_reproduction_session : (CreateReproductionSessionRequest) -> (
-      Result_5,
+      Result_4,
     );
-  create_spawn_session : (CreateSpawnSessionRequest) -> (Result_5);
+  create_spawn_session : (CreateSpawnSessionRequest) -> (Result_4);
   deprecate_repository_strategy : (DeprecateRepositoryStrategyRequest) -> (
       Result,
     );
-  derive_factory_evm_address : () -> (Result_6);
+  derive_factory_evm_address : () -> (Result_5);
+  execute_spawn_steward_command : (
+      FactoryStewardCommand,
+      FactoryStewardProof,
+    ) -> (Result_6);
   get_artifact_upload_status : () -> (Result_2) query;
   get_factory_config : () -> (Result_7) query;
   get_factory_health : () -> (FactoryHealthSnapshot) query;
@@ -727,22 +764,22 @@ service : (opt FactoryInitArgs) -> {
   list_room_messages : (opt nat64, opt nat64) -> (Result_13) query;
   list_spawned_automatons : (opt text, nat64) -> (Result_14) query;
   post_room_message : (PostRoomMessageRequest) -> (Result_15);
+  prepare_spawn_steward_command : (FactoryStewardCommand) -> (Result_16) query;
   record_infrastructure_death : (RecordInfrastructureDeathRequest) -> (
       Result_12,
     );
   report_death : (ReportDeathRequest) -> (Result_12);
   retry_session_admin : (text) -> (Result_11);
-  retry_spawn_session : (text) -> (Result_11);
   revoke_repository_strategy : (RevokeRepositoryStrategyRequest) -> (Result);
-  run_evaluation_reproduction : (text, text) -> (Result_6);
-  run_evaluation_seed_memory : (text, text, text) -> (Result_6);
-  run_evaluation_starvation : (text) -> (Result_6);
-  run_evaluation_wallet_balance_sync : (text) -> (Result_6);
-  set_child_runtime_config : (AutomatonChildRuntimeConfig) -> (Result_16);
-  set_creation_cost_quote : (CreationCostQuote) -> (Result_17);
-  set_fee_config : (FeeConfig) -> (Result_18);
-  set_operational_config : (FactoryOperationalConfig) -> (Result_19);
-  set_pause : (bool) -> (Result_20);
-  set_release_broadcast_config : (ReleaseBroadcastConfig) -> (Result_21);
-  update_artifact : (blob, text, text) -> (Result_4);
+  run_evaluation_reproduction : (text, text) -> (Result_5);
+  run_evaluation_seed_memory : (text, text, text) -> (Result_5);
+  run_evaluation_starvation : (text) -> (Result_5);
+  run_evaluation_wallet_balance_sync : (text) -> (Result_5);
+  set_child_runtime_config : (AutomatonChildRuntimeConfig) -> (Result_17);
+  set_creation_cost_quote : (CreationCostQuote) -> (Result_18);
+  set_fee_config : (FeeConfig) -> (Result_19);
+  set_operational_config : (FactoryOperationalConfig) -> (Result_20);
+  set_pause : (bool) -> (Result_21);
+  set_release_broadcast_config : (ReleaseBroadcastConfig) -> (Result_22);
+  update_artifact : (blob, text, text) -> (Result_3);
 }

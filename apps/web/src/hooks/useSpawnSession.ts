@@ -98,7 +98,7 @@ export function derivePaymentInstructions(
   };
 }
 
-export function useSpawnSession() {
+export function useSpawnSession(wallet: { address: string | null; request: <T = unknown>(args: { method: string; params?: unknown[] }) => Promise<T> }) {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [quote, setQuote] = useState<SpawnQuote | null>(null);
   const [detail, setDetail] = useState<SpawnSessionDetail | null>(null);
@@ -237,7 +237,8 @@ export function useSpawnSession() {
       setError(null);
 
       try {
-        await retrySpawnSession(sessionId);
+        if (wallet.address === null) throw new Error("Connect the steward wallet before retrying.");
+        await retrySpawnSession(sessionId, wallet.address, wallet.request);
         setRefreshToken((current) => current + 1);
         return await refresh(sessionId);
       } catch (nextError: unknown) {
@@ -256,7 +257,8 @@ export function useSpawnSession() {
       setError(null);
 
       try {
-        await refundSpawnSession(sessionId);
+        if (wallet.address === null) throw new Error("Connect the steward wallet before claiming a refund.");
+        await refundSpawnSession(sessionId, wallet.address, wallet.request);
         setRefreshToken((current) => current + 1);
         return await refresh(sessionId);
       } catch (nextError: unknown) {

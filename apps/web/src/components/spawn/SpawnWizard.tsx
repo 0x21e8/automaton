@@ -749,7 +749,7 @@ export function SpawnWizard({
   );
   const [balanceRefreshToken, setBalanceRefreshToken] = useState(0);
   const [shouldFocusLiveUpdates, setShouldFocusLiveUpdates] = useState(false);
-  const spawnSession = useSpawnSession();
+  const spawnSession = useSpawnSession(walletSession);
   const viewerAddress = walletSession.address;
   const liveUpdatesSectionRef = useRef<HTMLElement | null>(null);
 

@@ -316,6 +316,9 @@ describe("indexer server", () => {
           async getSpawnSession() {
             return null;
           },
+          async prepareSpawnStewardCommand() {
+            throw new Error("not used in this test");
+          },
           async retrySpawnSession() {
             throw new Error("not used in this test");
           },
@@ -636,6 +639,9 @@ describe("indexer server", () => {
           },
           async getSpawnSession() {
             return null;
+          },
+          async prepareSpawnStewardCommand() {
+            throw new Error("not used in this test");
           },
           async retrySpawnSession() {
             throw new Error("not used in this test");
@@ -1186,7 +1192,16 @@ describe("indexer server", () => {
               latestSeq: null
             };
           },
-          async retrySpawnSession(sessionId) {
+          async prepareSpawnStewardCommand() {
+            throw new Error("not used in this test");
+          },
+          async retrySpawnSession(request) {
+            if (request.proof.signature === "0xinvalid") {
+              throw new Error("Factory canister call failed with InvalidStewardProof: proof nonce mismatch");
+            }
+            const sessionId = "retrySpawnSession" in request.command
+              ? request.command.retrySpawnSession.sessionId
+              : "";
             return {
               session:
                 sessionId === sessionDetail.session.sessionId
@@ -1198,7 +1213,10 @@ describe("indexer server", () => {
                   : sessionDetail.session
             };
           },
-          async claimSpawnRefund(sessionId) {
+          async claimSpawnRefund(request) {
+            const sessionId = "claimSpawnRefund" in request.command
+              ? request.command.claimSpawnRefund.sessionId
+              : "";
             return {
               sessionId,
               state: "expired",
@@ -1256,11 +1274,27 @@ describe("indexer server", () => {
     });
     const retryResponse = await app.inject({
       method: "POST",
-      url: `/api/spawn-sessions/${sessionDetail.session.sessionId}/retry`
+      url: `/api/spawn-sessions/${sessionDetail.session.sessionId}/retry`,
+      payload: {
+        command: { retrySpawnSession: { sessionId: sessionDetail.session.sessionId } },
+        proof: { chainId: "8453", address: sessionDetail.session.stewardAddress, commandHash: "0xproof", nonce: "0", expiresAtNs: "1", signature: "0xsig" }
+      }
     });
     const refundResponse = await app.inject({
       method: "POST",
-      url: `/api/spawn-sessions/${sessionDetail.session.sessionId}/refund`
+      url: `/api/spawn-sessions/${sessionDetail.session.sessionId}/refund`,
+      payload: {
+        command: { claimSpawnRefund: { sessionId: sessionDetail.session.sessionId } },
+        proof: { chainId: "8453", address: sessionDetail.session.stewardAddress, commandHash: "0xproof", nonce: "0", expiresAtNs: "1", signature: "0xsig" }
+      }
+    });
+    const invalidProofResponse = await app.inject({
+      method: "POST",
+      url: `/api/spawn-sessions/${sessionDetail.session.sessionId}/retry`,
+      payload: {
+        command: { retrySpawnSession: { sessionId: sessionDetail.session.sessionId } },
+        proof: { chainId: "8453", address: sessionDetail.session.stewardAddress, commandHash: "0xproof", nonce: "0", expiresAtNs: "1", signature: "0xinvalid" }
+      }
     });
     const registryResponse = await app.inject({
       method: "GET",
@@ -1328,6 +1362,7 @@ describe("indexer server", () => {
       }
     });
     expect(retryResponse.statusCode).toBe(200);
+    expect(invalidProofResponse.statusCode).toBe(400);
     expect(retryResponse.json()).toEqual({
       session: {
         ...sessionDetail.session,
@@ -1422,6 +1457,9 @@ describe("indexer server", () => {
                   audit: sessionDetail.audit
                 }
               : null;
+          },
+          async prepareSpawnStewardCommand() {
+            throw new Error("not used in this test");
           },
           async retrySpawnSession() {
             throw new Error("not used in this test");

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { IDL } from "@dfinity/candid";
 
-import { CanisterFactoryAdapter } from "../src/integrations/factory-canister-adapter.js";
+import { CanisterFactoryAdapter, createFactoryIdl } from "../src/integrations/factory-canister-adapter.js";
 
 const BASE = { Base: null } as const;
 const USDC = { Usdc: null } as const;
@@ -187,9 +188,14 @@ function createRoomPage() {
 
 function createActor() {
   return {
-    claim_spawn_refund: vi.fn(async () => {
-      throw new Error("not used");
-    }),
+    prepare_spawn_steward_command: vi.fn(async () => ({ Ok: {
+      signing_payload: "factory payload", chain_id: 8453n,
+      address: "0x0000000000000000000000000000000000000002",
+      command_hash: `0x${"11".repeat(32)}`, nonce: 9n, expires_at_ns: 99_999_999_999n
+    } })),
+    execute_spawn_steward_command: vi.fn(async () => ({ Ok: {
+      Retry: { audit: [], payment: createQuote().payment, session: createSession() }
+    } })),
     create_spawn_session: vi.fn(async () => ({
       Ok: {
         quote: createQuote(),
@@ -283,13 +289,21 @@ function createActor() {
     list_my_room_messages: vi.fn(async () => ({
       Ok: createRoomPage()
     })),
-    retry_spawn_session: vi.fn(async () => {
-      throw new Error("not used");
-    })
   };
 }
 
 describe("CanisterFactoryAdapter", () => {
+  it("decodes InvalidStewardProof through the handwritten Candid result type", () => {
+    const service = createFactoryIdl()({ IDL });
+    const method = service._fields.find(([name]) => name === "execute_spawn_steward_command")?.[1] as
+      | { retTypes: Parameters<typeof IDL.encode>[0] }
+      | undefined;
+    expect(method).toBeDefined();
+    const value = { Err: { InvalidStewardProof: { reason: "proof nonce mismatch" } } };
+    const bytes = IDL.encode(method!.retTypes, [value]);
+    expect(IDL.decode(method!.retTypes, bytes)).toEqual([value]);
+  });
+
   it("maps candid responses into shared contracts and caches the actor", async () => {
     const constitution = "I am Meridian. ".repeat(30);
     const actor = createActor();
@@ -347,10 +361,24 @@ describe("CanisterFactoryAdapter", () => {
       25
     );
     const health = await adapter.getFactoryHealth();
+    const command = { retrySpawnSession: { sessionId: "550e8400-e29b-41d4-a716-446655440000" } } as const;
+    const prepared = await adapter.prepareSpawnStewardCommand(command);
+    await adapter.retrySpawnSession({ command, proof: {
+      chainId: "8453", address: prepared.address, commandHash: prepared.commandHash,
+      nonce: prepared.nonce, expiresAtNs: prepared.expiresAtNs, signature: "0xsignature"
+    } });
 
     expect(createAgent).toHaveBeenCalledTimes(1);
     expect(fakeAgent.fetchRootKey).toHaveBeenCalledTimes(1);
     expect(createActorSpy).toHaveBeenCalledTimes(1);
+    expect(actor.prepare_spawn_steward_command).toHaveBeenCalledWith({
+      RetrySpawnSession: { session_id: "550e8400-e29b-41d4-a716-446655440000" }
+    });
+    expect(actor.execute_spawn_steward_command).toHaveBeenCalledWith(
+      { RetrySpawnSession: { session_id: "550e8400-e29b-41d4-a716-446655440000" } },
+      { chain_id: 8453n, address: prepared.address, command_hash: prepared.commandHash,
+        nonce: 9n, expires_at_ns: 99_999_999_999n, signature: "0xsignature" }
+    );
     expect(actor.create_spawn_session).toHaveBeenCalledWith({
       name: ["Meridian"],
       constitution: [constitution],

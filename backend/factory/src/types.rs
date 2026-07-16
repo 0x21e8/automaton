@@ -107,6 +107,48 @@ pub enum SpawnChain {
     Base,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub enum FactoryStewardCommand {
+    RetrySpawnSession { session_id: String },
+    ClaimSpawnRefund { session_id: String },
+}
+
+impl FactoryStewardCommand {
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::RetrySpawnSession { session_id } | Self::ClaimSpawnRefund { session_id } => {
+                session_id
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct FactoryStewardProof {
+    pub chain_id: u64,
+    pub address: String,
+    pub command_hash: String,
+    pub nonce: u64,
+    pub expires_at_ns: u64,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct FactoryStewardProofTemplate {
+    pub signing_payload: String,
+    pub chain_id: u64,
+    pub address: String,
+    pub command_hash: String,
+    pub nonce: u64,
+    pub expires_at_ns: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub enum FactoryStewardCommandResult {
+    Retry(Box<SpawnSessionStatusResponse>),
+    Refund(RefundSpawnResponse),
+}
+
 impl SpawnChain {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -429,10 +471,14 @@ pub struct ReleaseBroadcastRecord {
     pub max_priority_fee_per_gas: u64,
     pub max_fee_per_gas: u64,
     pub gas_limit: u64,
+    #[serde(default)]
+    pub ecdsa_key_name: Option<String>,
     pub calldata_hex: String,
     pub signing_payload_hash: Option<String>,
     pub signature: Option<ReleaseSignatureRecord>,
     pub raw_transaction_hash: Option<String>,
+    #[serde(default)]
+    pub raw_transaction_hex: Option<String>,
     pub rpc_tx_hash: Option<String>,
     pub broadcast_at: Option<u64>,
     pub last_error: Option<ReleaseBroadcastFailure>,
@@ -1066,6 +1112,9 @@ pub enum FactoryError {
         caller: String,
         session_id: String,
     },
+    InvalidStewardProof {
+        reason: String,
+    },
     UnauthorizedRoomPoster {
         caller: String,
     },
@@ -1237,6 +1286,9 @@ impl Display for FactoryError {
                     f,
                     "caller is not the steward for session {session_id}: {caller}"
                 )
+            }
+            Self::InvalidStewardProof { reason } => {
+                write!(f, "invalid factory steward proof: {reason}")
             }
             Self::UnauthorizedRoomPoster { caller } => {
                 write!(

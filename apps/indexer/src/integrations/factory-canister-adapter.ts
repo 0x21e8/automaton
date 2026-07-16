@@ -8,6 +8,9 @@ import { IDL } from "@dfinity/candid";
 import type {
   CreateSpawnSessionRequest,
   CreateSpawnSessionResponse,
+  FactoryStewardCommand,
+  FactoryStewardExecutionRequest,
+  FactoryStewardProofTemplate,
   PaymentStatus,
   RepositoryStrategyGetResponse,
   RepositoryStrategyListResponse,
@@ -313,7 +316,8 @@ type CandidResult<T> = {
 };
 
 interface FactoryCanisterActor {
-  claim_spawn_refund: ActorMethod<[string], CandidResult<CandidRefundSpawnResponse>>;
+  prepare_spawn_steward_command: ActorMethod<[CandidFactoryStewardCommand], CandidResult<CandidFactoryStewardProofTemplate>>;
+  execute_spawn_steward_command: ActorMethod<[CandidFactoryStewardCommand, CandidFactoryStewardProof], CandidResult<CandidFactoryStewardCommandResult>>;
   create_spawn_session: ActorMethod<
     [CandidCreateSpawnSessionRequest],
     CandidResult<{
@@ -345,16 +349,44 @@ interface FactoryCanisterActor {
     [Optional<string>, bigint],
     CandidResult<CandidSpawnedAutomatonRegistryPage>
   >;
-  retry_spawn_session: ActorMethod<[string], CandidResult<CandidSpawnSessionStatusResponse>>;
 }
 
-function createFactoryIdl() {
+type CandidFactoryStewardCommand =
+  | { RetrySpawnSession: { session_id: string } }
+  | { ClaimSpawnRefund: { session_id: string } };
+interface CandidFactoryStewardProof { chain_id: bigint; address: string; command_hash: string; nonce: bigint; expires_at_ns: bigint; signature: string }
+interface CandidFactoryStewardProofTemplate extends Omit<CandidFactoryStewardProof, "signature"> { signing_payload: string }
+type CandidFactoryStewardCommandResult =
+  | { Retry: CandidSpawnSessionStatusResponse }
+  | { Refund: CandidRefundSpawnResponse };
+
+export function createFactoryIdl() {
   return ({ IDL: candid }: { IDL: typeof IDL }) => {
     const SpawnAsset = candid.Variant({
       Usdc: candid.Null
     });
     const SpawnChain = candid.Variant({
       Base: candid.Null
+    });
+    const FactoryStewardCommand = candid.Variant({
+      RetrySpawnSession: candid.Record({ session_id: candid.Text }),
+      ClaimSpawnRefund: candid.Record({ session_id: candid.Text })
+    });
+    const FactoryStewardProof = candid.Record({
+      chain_id: candid.Nat64,
+      address: candid.Text,
+      command_hash: candid.Text,
+      nonce: candid.Nat64,
+      expires_at_ns: candid.Nat64,
+      signature: candid.Text
+    });
+    const FactoryStewardProofTemplate = candid.Record({
+      signing_payload: candid.Text,
+      chain_id: candid.Nat64,
+      address: candid.Text,
+      command_hash: candid.Text,
+      nonce: candid.Nat64,
+      expires_at_ns: candid.Nat64
     });
     const ProviderConfig = candid.Record({
       inference_transport: candid.Variant({
@@ -656,6 +688,7 @@ function createFactoryIdl() {
       ControllerInvariantViolation: candid.Record({ canister_id: candid.Text }),
       FactoryPaused: candid.Record({ pause: candid.Bool }),
       UnauthorizedSteward: candid.Record({ session_id: candid.Text, caller: candid.Text }),
+      InvalidStewardProof: candid.Record({ reason: candid.Text }),
       PaymentNotSettled: candid.Record({ status: PaymentStatus, session_id: candid.Text }),
       SessionNotRefundable: candid.Record({
         session_id: candid.Text,
@@ -684,10 +717,6 @@ function createFactoryIdl() {
         quote: SpawnQuote,
         session: SpawnSession
       }),
-      Err: FactoryError
-    });
-    const ResultRefund = candid.Variant({
-      Ok: RefundSpawnResponse,
       Err: FactoryError
     });
     const ResultRecord = candid.Variant({
@@ -732,9 +761,13 @@ function createFactoryIdl() {
       reason: candid.Opt(candid.Text)
     });
     const ResultReproductionEligibility = candid.Variant({ Ok: ReproductionEligibility, Err: FactoryError });
+    const FactoryStewardCommandResult = candid.Variant({ Retry: SpawnSessionStatusResponse, Refund: RefundSpawnResponse });
+    const ResultStewardTemplate = candid.Variant({ Ok: FactoryStewardProofTemplate, Err: FactoryError });
+    const ResultStewardExecution = candid.Variant({ Ok: FactoryStewardCommandResult, Err: FactoryError });
 
     return candid.Service({
-      claim_spawn_refund: candid.Func([candid.Text], [ResultRefund], []),
+      prepare_spawn_steward_command: candid.Func([FactoryStewardCommand], [ResultStewardTemplate], ["query"]),
+      execute_spawn_steward_command: candid.Func([FactoryStewardCommand, FactoryStewardProof], [ResultStewardExecution], []),
       create_spawn_session: candid.Func([CreateSpawnSessionRequest], [ResultCreate], []),
       create_reproduction_session: candid.Func([CreateReproductionSessionRequest], [ResultCreate], []),
       get_reproduction_eligibility: candid.Func([], [ResultReproductionEligibility], ["query"]),
@@ -771,8 +804,7 @@ function createFactoryIdl() {
         [candid.Opt(candid.Text), candid.Nat64],
         [ResultRegistryPage],
         ["query"]
-      ),
-      retry_spawn_session: candid.Func([candid.Text], [ResultSession], [])
+      )
     });
   };
 }
@@ -787,6 +819,35 @@ function expectOk<T>(result: CandidResult<T>): T {
   }
 
   throw new Error(formatFactoryError(result.Err ?? { Unknown: null }));
+}
+
+function mapStewardCommand(command: FactoryStewardCommand): CandidFactoryStewardCommand {
+  if ("retrySpawnSession" in command) {
+    return { RetrySpawnSession: { session_id: command.retrySpawnSession.sessionId } };
+  }
+  return { ClaimSpawnRefund: { session_id: command.claimSpawnRefund.sessionId } };
+}
+
+function mapStewardProof(request: FactoryStewardExecutionRequest): CandidFactoryStewardProof {
+  return {
+    chain_id: BigInt(request.proof.chainId),
+    address: request.proof.address,
+    command_hash: request.proof.commandHash,
+    nonce: BigInt(request.proof.nonce),
+    expires_at_ns: BigInt(request.proof.expiresAtNs),
+    signature: request.proof.signature
+  };
+}
+
+function mapStewardTemplate(value: CandidFactoryStewardProofTemplate): FactoryStewardProofTemplate {
+  return {
+    signingPayload: value.signing_payload,
+    chainId: value.chain_id.toString(),
+    address: value.address,
+    commandHash: value.command_hash,
+    nonce: value.nonce.toString(),
+    expiresAtNs: value.expires_at_ns.toString()
+  };
 }
 
 function isFactoryErrorVariant(
@@ -1426,16 +1487,23 @@ export class CanisterFactoryAdapter implements FactoryAdapter {
     return mapSessionStatus(expectOk(response));
   }
 
-  async retrySpawnSession(sessionId: string): Promise<RetrySpawnResponse> {
+  async prepareSpawnStewardCommand(command: FactoryStewardCommand): Promise<FactoryStewardProofTemplate> {
     const actor = await this.getActor();
-    return {
-      session: mapSessionStatus(expectOk(await actor.retry_spawn_session(sessionId))).session
-    };
+    return mapStewardTemplate(expectOk(await actor.prepare_spawn_steward_command(mapStewardCommand(command))));
   }
 
-  async claimSpawnRefund(sessionId: string): Promise<RefundSpawnResponse> {
+  async retrySpawnSession(request: FactoryStewardExecutionRequest): Promise<RetrySpawnResponse> {
     const actor = await this.getActor();
-    return mapRefundResponse(expectOk(await actor.claim_spawn_refund(sessionId)));
+    const result = expectOk(await actor.execute_spawn_steward_command(mapStewardCommand(request.command), mapStewardProof(request)));
+    if (!("Retry" in result)) throw new Error("Factory returned a refund result for retry command");
+    return { session: mapSessionStatus(result.Retry).session };
+  }
+
+  async claimSpawnRefund(request: FactoryStewardExecutionRequest): Promise<RefundSpawnResponse> {
+    const actor = await this.getActor();
+    const result = expectOk(await actor.execute_spawn_steward_command(mapStewardCommand(request.command), mapStewardProof(request)));
+    if (!("Refund" in result)) throw new Error("Factory returned a retry result for refund command");
+    return mapRefundResponse(result.Refund);
   }
 
   async listSpawnedAutomatons(

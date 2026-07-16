@@ -42,9 +42,11 @@ pub use api::admin::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use api::public::{
-    claim_spawn_refund, create_spawn_session, get_spawn_session, get_spawned_automaton,
+    claim_spawn_refund_for_test as claim_spawn_refund, create_spawn_session,
+    execute_spawn_steward_command, get_spawn_session, get_spawned_automaton,
     list_messages_for_automaton, list_my_room_messages, list_room_messages,
-    list_spawned_automatons, post_room_message, report_death, retry_spawn_session,
+    list_spawned_automatons, post_room_message, prepare_spawn_steward_command, report_death,
+    retry_spawn_session_for_test as retry_spawn_session,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use api::repository::{
@@ -78,7 +80,8 @@ pub use types::{
     DeprecateRepositoryStrategyRequest, EscrowClaim, FactoryArtifactSnapshot,
     FactoryConfigSnapshot, FactoryError, FactoryHealthSnapshot, FactoryInitArgs,
     FactoryOperationalConfig, FactoryRuntimeSnapshot, FactorySchedulerHealthSnapshot,
-    FactorySchedulerJobCounts, FactorySessionHealthCounts, FeeConfig,
+    FactorySchedulerJobCounts, FactorySessionHealthCounts, FactoryStewardCommand,
+    FactoryStewardCommandResult, FactoryStewardProof, FactoryStewardProofTemplate, FeeConfig,
     GetRepositoryStrategyResponse, ListRepositoryStrategiesResponse, PaymentStatus,
     PostRoomMessageRequest, ProviderConfig, RecordInfrastructureDeathRequest, RefundSpawnResponse,
     ReleaseBroadcastConfig, ReleaseBroadcastFailure, ReleaseBroadcastRecord, ReleaseBroadcastStage,
@@ -473,16 +476,31 @@ fn list_my_room_messages(
 }
 
 #[cfg(target_arch = "wasm32")]
-#[ic_cdk::update]
-fn retry_spawn_session(session_id: String) -> Result<SpawnSessionStatusResponse, FactoryError> {
-    api::public::retry_spawn_session(&ic_cdk::api::msg_caller().to_text(), &session_id, now_ms())
+#[ic_cdk::query]
+fn prepare_spawn_steward_command(
+    command: FactoryStewardCommand,
+) -> Result<FactoryStewardProofTemplate, FactoryError> {
+    api::public::prepare_spawn_steward_command(
+        command,
+        &ic_cdk::api::canister_self().to_text(),
+        ic_cdk::api::time(),
+    )
 }
 
 #[cfg(target_arch = "wasm32")]
 #[ic_cdk::update]
-async fn claim_spawn_refund(session_id: String) -> Result<RefundSpawnResponse, FactoryError> {
-    api::public::claim_spawn_refund(&ic_cdk::api::msg_caller().to_text(), &session_id, now_ms())
-        .await
+async fn execute_spawn_steward_command(
+    command: FactoryStewardCommand,
+    proof: FactoryStewardProof,
+) -> Result<FactoryStewardCommandResult, FactoryError> {
+    api::public::execute_spawn_steward_command(
+        command,
+        proof,
+        &ic_cdk::api::canister_self().to_text(),
+        ic_cdk::api::time(),
+        now_ms(),
+    )
+    .await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -667,13 +685,14 @@ mod tests {
         add_repository_strategy, append_artifact_chunk, apply_factory_init_args,
         authorize_evaluation_target, auto_run_spawn_scheduler, begin_artifact_upload,
         bootstrap_status, claim_spawn_refund, commit_artifact_upload, create_spawn_session,
-        deprecate_repository_strategy, derive_claim_id, execute_spawn, expire_spawn_session,
-        get_artifact_upload_status, get_escrow_claim, get_factory_config, get_factory_health,
-        get_factory_runtime, get_repository_strategy, get_session_admin, get_spawn_session,
-        get_spawned_automaton, insert_spawned_automaton_record, list_messages_for_automaton,
-        list_my_room_messages, list_repository_strategies, list_room_messages,
-        list_spawned_automatons, load_spawn_provider_secrets, mark_session_failed,
-        next_payment_scan_plan, post_room_message, read_state, reconcile_escrow_payments,
+        deprecate_repository_strategy, derive_claim_id, execute_spawn,
+        execute_spawn_steward_command, expire_spawn_session, get_artifact_upload_status,
+        get_escrow_claim, get_factory_config, get_factory_health, get_factory_runtime,
+        get_repository_strategy, get_session_admin, get_spawn_session, get_spawned_automaton,
+        insert_spawned_automaton_record, list_messages_for_automaton, list_my_room_messages,
+        list_repository_strategies, list_room_messages, list_spawned_automatons,
+        load_spawn_provider_secrets, mark_session_failed, next_payment_scan_plan,
+        post_room_message, prepare_spawn_steward_command, read_state, reconcile_escrow_payments,
         record_infrastructure_death, report_death, restore_state, retry_session_admin,
         retry_spawn_session, revoke_repository_strategy, set_child_runtime_config,
         set_creation_cost_quote, set_fee_config, set_mock_canister_balance, set_operational_config,
@@ -689,14 +708,21 @@ mod tests {
         SpawnChain, SpawnConfig, SpawnProviderSecrets, SpawnSessionState, SpawnedAutomatonRecord,
         MAX_ROOM_BODY_BYTES, MAX_ROOM_MESSAGES_RETAINED,
     };
+    use crate::api::public::authorize_and_consume;
     use crate::base_rpc::BaseDepositLog;
     use crate::scheduler::{
         enqueue_payment_poll, lease_due_jobs_for_test, run_scheduler_tick, spawn_job_id,
         PAYMENT_POLL_JOB_ID,
     };
-    use crate::types::{InferenceTransport, OpenRouterReasoningLevel};
-    use candid::Principal;
+    use crate::types::{
+        FactoryStewardCommand, FactoryStewardCommandResult, FactoryStewardProof,
+        InferenceTransport, OpenRouterReasoningLevel,
+    };
+    use candid::{CandidType, Principal};
+    use k256::ecdsa::SigningKey;
+    use serde::Deserialize;
     use sha2::{Digest, Sha256};
+    use sha3::Keccak256;
 
     fn reset_factory_state() {
         restore_state(Default::default());
@@ -1387,19 +1413,473 @@ mod tests {
             super::FactoryError::UnauthorizedAdmin { .. }
         ));
 
-        let retry_error = retry_spawn_session("not-steward", &response.session.session_id, 13_000)
-            .expect_err("non-steward retry should be rejected");
-        assert!(matches!(
-            retry_error,
-            super::FactoryError::UnauthorizedSteward { .. }
-        ));
+        assert_eq!(response.session.steward_address, "0xsteward");
+    }
 
-        let refund_error = claim_spawn_refund("not-steward", &response.session.session_id, 14_000)
-            .expect_err("non-steward refund should be rejected");
+    fn steward_test_key() -> SigningKey {
+        let bytes = [7u8; 32];
+        SigningKey::from_bytes((&bytes).into()).expect("test signing key")
+    }
+
+    fn steward_test_address(key: &SigningKey) -> String {
+        let point = key.verifying_key().to_encoded_point(false);
+        let digest = Keccak256::digest(&point.as_bytes()[1..]);
+        format!(
+            "0x{}",
+            digest[12..]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    }
+
+    fn signed_factory_proof(
+        template: &crate::types::FactoryStewardProofTemplate,
+        key: &SigningKey,
+    ) -> FactoryStewardProof {
+        let prefix = format!(
+            "\x19Ethereum Signed Message:\n{}",
+            template.signing_payload.len()
+        );
+        let mut hasher = Keccak256::new();
+        hasher.update(prefix.as_bytes());
+        hasher.update(template.signing_payload.as_bytes());
+        let digest = hasher.finalize();
+        let (signature, recovery_id) = key
+            .sign_prehash_recoverable(&digest)
+            .expect("test proof signs");
+        let mut bytes = [0u8; 65];
+        bytes[..64].copy_from_slice(signature.to_bytes().as_slice());
+        bytes[64] = recovery_id.to_byte() + 27;
+        FactoryStewardProof {
+            chain_id: template.chain_id,
+            address: template.address.clone(),
+            command_hash: template.command_hash.clone(),
+            nonce: template.nonce,
+            expires_at_ns: template.expires_at_ns,
+            signature: format!(
+                "0x{}",
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ),
+        }
+    }
+
+    #[test]
+    fn factory_steward_proofs_are_domain_bound_and_replay_safe() {
+        reset_factory_state();
+        configure_valid_child_runtime();
+        let key = steward_test_key();
+        let mut request = sample_request("75000000");
+        request.steward_address = steward_test_address(&key);
+        let created = create_spawn_session(request, 12_000).expect("session created");
+        write_state(|state| {
+            let session = state
+                .sessions
+                .get_mut(&created.session.session_id)
+                .expect("session");
+            session.state = SpawnSessionState::Spawning;
+            session.payment_status = PaymentStatus::Paid;
+        });
+        mark_session_failed(
+            &created.session.session_id,
+            SessionAuditActor::System,
+            13_000,
+            "test failure",
+        )
+        .expect("session failed");
+        let command = FactoryStewardCommand::RetrySpawnSession {
+            session_id: created.session.session_id.clone(),
+        };
+        let template = prepare_spawn_steward_command(
+            command.clone(),
+            "rrkah-fqaaa-aaaaa-aaaaq-cai",
+            20_000_000_000,
+        )
+        .expect("proof template");
+        let refund_template = prepare_spawn_steward_command(
+            FactoryStewardCommand::ClaimSpawnRefund {
+                session_id: created.session.session_id.clone(),
+            },
+            "rrkah-fqaaa-aaaaa-aaaaq-cai",
+            20_000_000_000,
+        )
+        .expect("refund proof template");
+        assert_eq!(
+            template.command_hash,
+            "0xf8150e1b21780594941f813cb9c22be2dd3abdb5163b52194315566cf14fcdfe"
+        );
+        assert_eq!(
+            refund_template.command_hash,
+            "0x08ca3d653728026bc514519b95f6b1134dbfda42b96418d842c49acfd24e4209"
+        );
+        assert_ne!(template.command_hash, refund_template.command_hash);
+        let mut second_request = sample_request("75000000");
+        second_request.steward_address = steward_test_address(&key);
+        let second = create_spawn_session(second_request, 12_001).expect("second session created");
+        let second_template = prepare_spawn_steward_command(
+            FactoryStewardCommand::RetrySpawnSession {
+                session_id: second.session.session_id,
+            },
+            "rrkah-fqaaa-aaaaa-aaaaq-cai",
+            20_000_000_000,
+        )
+        .expect("second session template");
+        assert_ne!(template.command_hash, second_template.command_hash);
+        let original_address = template.address.clone();
+        let other_key = SigningKey::from_bytes((&[8u8; 32]).into()).expect("other test key");
+        write_state(|state| {
+            state
+                .sessions
+                .get_mut(&created.session.session_id)
+                .expect("session")
+                .steward_address = steward_test_address(&other_key);
+        });
+        assert_ne!(
+            template.signing_payload,
+            prepare_spawn_steward_command(
+                command.clone(),
+                "rrkah-fqaaa-aaaaa-aaaaq-cai",
+                20_000_000_000
+            )
+            .expect("different address template")
+            .signing_payload
+        );
+        write_state(|state| {
+            state
+                .sessions
+                .get_mut(&created.session.session_id)
+                .expect("session")
+                .steward_address = original_address;
+        });
+        assert_ne!(
+            template.signing_payload,
+            prepare_spawn_steward_command(command.clone(), "aaaaa-aa", 20_000_000_000)
+                .expect("other factory template")
+                .signing_payload
+        );
+        assert_ne!(
+            template.signing_payload,
+            prepare_spawn_steward_command(
+                command.clone(),
+                "rrkah-fqaaa-aaaaa-aaaaq-cai",
+                20_000_000_001
+            )
+            .expect("different expiry template")
+            .signing_payload
+        );
+        write_state(|state| {
+            state
+                .steward_command_nonces
+                .insert(created.session.session_id.clone(), 1);
+        });
+        assert_ne!(
+            template.signing_payload,
+            prepare_spawn_steward_command(
+                command.clone(),
+                "rrkah-fqaaa-aaaaa-aaaaq-cai",
+                20_000_000_000
+            )
+            .expect("different nonce template")
+            .signing_payload
+        );
+        write_state(|state| {
+            state
+                .steward_command_nonces
+                .insert(created.session.session_id.clone(), 0);
+            state.child_runtime.evm_chain_id = Some(1);
+            state.release_broadcast_config.chain_id = 1;
+        });
+        assert_ne!(
+            template.signing_payload,
+            prepare_spawn_steward_command(
+                command.clone(),
+                "rrkah-fqaaa-aaaaa-aaaaq-cai",
+                20_000_000_000
+            )
+            .expect("different chain template")
+            .signing_payload
+        );
+        write_state(|state| {
+            state.child_runtime.evm_chain_id = Some(8_453);
+            state.release_broadcast_config.chain_id = 8_453;
+        });
+        let proof = signed_factory_proof(&template, &key);
+        execute_spawn_steward_command(
+            command.clone(),
+            proof.clone(),
+            "aaaaa-aa",
+            20_000_000_001,
+            20_001,
+        )
+        .expect_err("wrong factory binding rejected");
+        for invalid in [
+            FactoryStewardProof {
+                chain_id: 1,
+                ..proof.clone()
+            },
+            FactoryStewardProof {
+                address: steward_test_address(&other_key),
+                ..proof.clone()
+            },
+            FactoryStewardProof {
+                command_hash: format!("0x{}", "00".repeat(32)),
+                ..proof.clone()
+            },
+            FactoryStewardProof {
+                nonce: 1,
+                ..proof.clone()
+            },
+            FactoryStewardProof {
+                expires_at_ns: 19_000_000_000,
+                ..proof.clone()
+            },
+            FactoryStewardProof {
+                expires_at_ns: 999_000_000_000,
+                ..proof.clone()
+            },
+            FactoryStewardProof {
+                signature: "0xdeadbeef".to_string(),
+                ..proof.clone()
+            },
+        ] {
+            execute_spawn_steward_command(
+                command.clone(),
+                invalid,
+                "rrkah-fqaaa-aaaaa-aaaaq-cai",
+                20_000_000_001,
+                20_001,
+            )
+            .expect_err("invalid proof rejected");
+            assert_eq!(
+                read_state(|state| state
+                    .steward_command_nonces
+                    .get(&created.session.session_id)
+                    .copied()
+                    .unwrap_or(0)),
+                0
+            );
+        }
+        let result = execute_spawn_steward_command(
+            command.clone(),
+            proof.clone(),
+            "rrkah-fqaaa-aaaaa-aaaaq-cai",
+            20_000_000_001,
+            20_001,
+        )
+        .expect("valid EOA retry");
+        assert!(matches!(result, FactoryStewardCommandResult::Retry(_)));
+        let replay = execute_spawn_steward_command(
+            command,
+            proof,
+            "rrkah-fqaaa-aaaaa-aaaaq-cai",
+            20_000_000_002,
+            20_002,
+        )
+        .expect_err("replay rejected");
+        assert!(matches!(replay, FactoryError::InvalidStewardProof { .. }));
+        assert_eq!(
+            read_state(|state| state
+                .steward_command_nonces
+                .get(&created.session.session_id)
+                .copied()),
+            Some(1)
+        );
+        let snapshot = snapshot_state();
+        restore_state(snapshot);
+        assert_eq!(
+            read_state(|state| state
+                .steward_command_nonces
+                .get(&created.session.session_id)
+                .copied()),
+            Some(1)
+        );
+        let retry_mutations = get_spawn_session(&created.session.session_id)
+            .expect("session")
+            .audit
+            .into_iter()
+            .filter(|entry| entry.reason == "retry requested by verified EVM steward")
+            .count();
+        assert_eq!(
+            retry_mutations, 1,
+            "same-nonce attempts mutate exactly once"
+        );
+    }
+
+    #[test]
+    fn refund_acceptance_fences_concurrent_calls_and_resumes_after_reload() {
+        reset_factory_state();
+        configure_valid_child_runtime();
+        let key = steward_test_key();
+        let mut request = sample_request("60000000");
+        request.steward_address = steward_test_address(&key);
+        let created = create_spawn_session(request, 20_000).expect("session created");
+        reconcile_escrow_payments(
+            &[base_deposit_log(
+                &created.session.session_id,
+                "59000000",
+                3_000,
+            )],
+            3_000,
+            21_000,
+        )
+        .expect("partial payment");
+        expire_spawn_session(&created.session.session_id, 20_000 + 30 * 60 * 1_000 + 1)
+            .expect("session expired");
+        let command = FactoryStewardCommand::ClaimSpawnRefund {
+            session_id: created.session.session_id.clone(),
+        };
+        let now_ns = 2_000_000_000_000;
+        let first_template =
+            prepare_spawn_steward_command(command.clone(), "rrkah-fqaaa-aaaaa-aaaaq-cai", now_ns)
+                .expect("first template");
+        authorize_and_consume(
+            &command,
+            &signed_factory_proof(&first_template, &key),
+            "rrkah-fqaaa-aaaaa-aaaaq-cai",
+            now_ns + 1,
+            20_000 + 30 * 60 * 1_000 + 2,
+        )
+        .expect("first command accepted before RPC await");
+        let resume_template = prepare_spawn_steward_command(
+            command.clone(),
+            "rrkah-fqaaa-aaaaa-aaaaq-cai",
+            now_ns + 2,
+        )
+        .expect("resume template");
+        let concurrent = authorize_and_consume(
+            &command,
+            &signed_factory_proof(&resume_template, &key),
+            "rrkah-fqaaa-aaaaa-aaaaq-cai",
+            now_ns + 3,
+            20_000 + 30 * 60 * 1_000 + 3,
+        )
+        .expect_err("concurrent call rejected while original awaits");
         assert!(matches!(
-            refund_error,
-            super::FactoryError::UnauthorizedSteward { .. }
+            concurrent,
+            FactoryError::InvalidStewardProof { .. }
         ));
+        assert_eq!(
+            read_state(|state| state.steward_command_nonces[&created.session.session_id]),
+            1
+        );
+        let resume_ms = 20_000 + 30 * 60 * 1_000 + 2 + 60_001;
+        authorize_and_consume(
+            &command,
+            &signed_factory_proof(&resume_template, &key),
+            "rrkah-fqaaa-aaaaa-aaaaq-cai",
+            now_ns + 4,
+            resume_ms,
+        )
+        .expect("expired durable lease resumes in the same runtime");
+        assert_eq!(
+            read_state(|state| state.steward_command_nonces[&created.session.session_id]),
+            1,
+            "resume does not consume another nonce"
+        );
+        let before = snapshot_state();
+        for stale_outcome in ["send success", "receipt error"] {
+            let error = crate::escrow::write_refund_guarded(
+                &created.session.session_id,
+                Some(1),
+                |state| {
+                    state
+                        .escrow_claims
+                        .get_mut(&created.session.session_id)
+                        .expect("claim")
+                        .paid_amount = stale_outcome.to_string();
+                    state
+                        .sessions
+                        .get_mut(&created.session.session_id)
+                        .expect("session")
+                        .payment_status = PaymentStatus::Refunded;
+                    Ok(())
+                },
+            )
+            .expect_err("stale nested RPC completion is fenced");
+            assert!(matches!(error, FactoryError::InvalidStewardProof { .. }));
+        }
+        let after = snapshot_state();
+        assert_eq!(after.escrow_claims, before.escrow_claims);
+        assert_eq!(after.sessions, before.sessions);
+        assert_eq!(
+            after
+                .steward_refund_leases
+                .get(&created.session.session_id)
+                .expect("new lease")
+                .generation,
+            2,
+            "stale success/error cannot clear the takeover lease"
+        );
+    }
+
+    #[derive(Clone, CandidType)]
+    struct LegacyReleaseBroadcastRecord {
+        claim_id: String,
+        recipient: String,
+        escrow_contract_address: String,
+        nonce: u64,
+        chain_id: u64,
+        max_priority_fee_per_gas: u64,
+        max_fee_per_gas: u64,
+        gas_limit: u64,
+        calldata_hex: String,
+        signing_payload_hash: Option<String>,
+        signature: Option<crate::types::ReleaseSignatureRecord>,
+        raw_transaction_hash: Option<String>,
+        rpc_tx_hash: Option<String>,
+        broadcast_at: Option<u64>,
+        last_error: Option<crate::types::ReleaseBroadcastFailure>,
+    }
+
+    #[test]
+    fn legacy_release_broadcast_record_decodes_without_raw_transaction_bytes() {
+        let legacy = LegacyReleaseBroadcastRecord {
+            claim_id: "claim".to_string(),
+            recipient: "0x1111111111111111111111111111111111111111".to_string(),
+            escrow_contract_address: "0x2222222222222222222222222222222222222222".to_string(),
+            nonce: 3,
+            chain_id: 8_453,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 2,
+            gas_limit: 250_000,
+            calldata_hex: "0x01".to_string(),
+            signing_payload_hash: Some(format!("0x{}", "11".repeat(32))),
+            signature: None,
+            raw_transaction_hash: Some(format!("0x{}", "22".repeat(32))),
+            rpc_tx_hash: None,
+            broadcast_at: None,
+            last_error: None,
+        };
+        let bytes = candid::encode_one(legacy).expect("legacy record encodes");
+        let decoded: crate::types::ReleaseBroadcastRecord =
+            candid::decode_one(&bytes).expect("legacy record remains decodable");
+        assert_eq!(decoded.nonce, 3);
+        assert_eq!(decoded.raw_transaction_hex, None);
+    }
+
+    #[test]
+    fn candid_serde_defaults_decode_legacy_missing_refund_fence_collections() {
+        #[derive(CandidType)]
+        struct LegacyConfig {
+            nonce: u64,
+        }
+        #[derive(CandidType, Deserialize)]
+        struct CurrentConfig {
+            nonce: u64,
+            #[serde(default)]
+            steward_command_nonces: Option<std::collections::BTreeMap<String, u64>>,
+            #[serde(default)]
+            steward_refunds_in_flight: Option<std::collections::BTreeSet<String>>,
+        }
+        let bytes = candid::encode_one(LegacyConfig { nonce: 4 }).expect("legacy config encodes");
+        let decoded: CurrentConfig =
+            candid::decode_one(&bytes).expect("missing defaulted collections decode");
+        assert_eq!(decoded.nonce, 4);
+        assert!(decoded.steward_command_nonces.is_none());
+        assert!(decoded.steward_refunds_in_flight.is_none());
     }
 
     #[test]
@@ -3401,14 +3881,17 @@ mod tests {
     #[test]
     fn expires_underfunded_sessions_and_allows_refund() {
         reset_factory_state();
+        configure_valid_child_runtime();
         write_state(|state| {
             state.base_rpc_endpoint = Some("mock://success".to_string());
             state.escrow_contract_address =
                 "0x3333333333333333333333333333333333333333".to_string();
         });
 
-        let response = create_spawn_session(sample_request("60000000"), 20_000)
-            .expect("session should be created");
+        let key = steward_test_key();
+        let mut request = sample_request("60000000");
+        request.steward_address = steward_test_address(&key);
+        let response = create_spawn_session(request, 20_000).expect("session should be created");
         reconcile_escrow_payments(
             &[base_deposit_log(
                 &response.session.session_id,
@@ -3444,12 +3927,24 @@ mod tests {
             SpawnSessionState::Expired
         );
 
-        let refund = claim_spawn_refund(
-            "0xsteward",
-            &response.session.session_id,
+        let command = FactoryStewardCommand::ClaimSpawnRefund {
+            session_id: response.session.session_id.clone(),
+        };
+        let now_ns = (20_000 + 30 * 60 * 1_000 + 2) * 1_000_000;
+        let template =
+            prepare_spawn_steward_command(command.clone(), "rrkah-fqaaa-aaaaa-aaaaq-cai", now_ns)
+                .expect("refund template");
+        let result = execute_spawn_steward_command(
+            command,
+            signed_factory_proof(&template, &key),
+            "rrkah-fqaaa-aaaaa-aaaaq-cai",
+            now_ns,
             20_000 + 30 * 60 * 1_000 + 2,
         )
         .expect("refund should succeed");
+        let FactoryStewardCommandResult::Refund(refund) = result else {
+            panic!("expected refund response")
+        };
         assert_eq!(refund.state, SpawnSessionState::Expired);
         assert_eq!(refund.payment_status, PaymentStatus::Refunded);
         assert!(refund.refund_tx_hash.is_some());
@@ -3507,21 +4002,53 @@ mod tests {
             get_spawn_session(&response.session.session_id).expect("session should load");
         assert_eq!(after_error.session.payment_status, PaymentStatus::Paid);
         assert!(after_error.session.refundable);
-        assert!(get_escrow_claim(&response.session.session_id)
+        let intent = get_escrow_claim(&response.session.session_id)
             .expect("claim should load")
             .refund_broadcast
-            .and_then(|record| record.last_error)
-            .is_some());
+            .expect("signed refund intent persisted before RPC failure");
+        assert!(intent.last_error.is_some());
+        assert!(intent.raw_transaction_hex.is_some());
+        let intent_hash = intent.raw_transaction_hash.clone();
+        let intent_bytes = intent.raw_transaction_hex.clone();
+        let intent_nonce = intent.nonce;
+        assert_eq!(snapshot_state().next_release_nonce, Some(1));
 
-        write_state(|state| state.base_rpc_endpoint = Some("mock://success".to_string()));
+        let mut interrupted = snapshot_state();
+        interrupted
+            .escrow_claims
+            .get_mut(&response.session.session_id)
+            .expect("claim snapshot")
+            .refund_broadcast
+            .as_mut()
+            .expect("signed legacy intent")
+            .raw_transaction_hex = None;
+        restore_state(interrupted);
+
+        write_state(|state| {
+            state.base_rpc_endpoint = Some("mock://success".to_string());
+            state.escrow_contract_address =
+                "0x4444444444444444444444444444444444444444".to_string();
+            state.release_broadcast_config.chain_id = 1;
+            state.release_broadcast_config.max_priority_fee_per_gas = 9;
+            state.release_broadcast_config.max_fee_per_gas = 10;
+            state.release_broadcast_config.gas_limit = 99_999;
+        });
         let first = claim_spawn_refund("0xsteward", &response.session.session_id, 31_003)
-            .expect("confirmed retry should refund");
+            .expect("legacy signed intent should reconstruct and refund");
         let second = claim_spawn_refund("0xsteward", &response.session.session_id, 31_004)
             .expect("refund replay should be idempotent");
         assert_eq!(first.payment_status, PaymentStatus::Refunded);
         assert_eq!(second.refund_tx_hash, first.refund_tx_hash);
         assert_eq!(second.refunded_at, first.refunded_at);
         assert!(first.refund_tx_hash.is_some());
+        let recovered = get_escrow_claim(&response.session.session_id)
+            .expect("claim should load")
+            .refund_broadcast
+            .expect("recovered broadcast record");
+        assert_eq!(recovered.nonce, intent_nonce);
+        assert_eq!(recovered.raw_transaction_hash, intent_hash);
+        assert_eq!(recovered.raw_transaction_hex, intent_bytes);
+        assert_eq!(snapshot_state().next_release_nonce, Some(1));
     }
 
     #[test]

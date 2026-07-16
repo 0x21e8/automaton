@@ -366,6 +366,27 @@ fn persist_refund_broadcast_record(
     }
 }
 
+pub(crate) fn write_refund_guarded<T>(
+    session_id: &str,
+    generation: Option<u64>,
+    mutation: impl FnOnce(&mut FactoryState) -> Result<T, FactoryError>,
+) -> Result<T, FactoryError> {
+    write_state(|state| {
+        if let Some(generation) = generation {
+            if state
+                .steward_refund_leases
+                .get(session_id)
+                .is_none_or(|lease| lease.generation != generation)
+            {
+                return Err(FactoryError::InvalidStewardProof {
+                    reason: "stale refund command continuation".to_string(),
+                });
+            }
+        }
+        mutation(state)
+    })
+}
+
 pub(crate) fn finalize_escrow_refund_in_state(
     state: &mut FactoryState,
     session_id: &str,
@@ -434,42 +455,127 @@ pub(crate) fn finalize_escrow_refund_in_state(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn claim_escrow_refund(
+fn claim_escrow_refund_inner(
     session_id: &str,
     now_ms: u64,
+    generation: Option<u64>,
 ) -> Result<RefundSpawnResponse, FactoryError> {
     if let Some(response) =
         read_state(|state| validate_escrow_refund_in_state(state, session_id, now_ms))?
     {
         return Ok(response);
     }
-    let (claim_id, recipient, endpoints, escrow, config, nonce) = write_state(|state| {
-        let session = state.sessions.get(session_id).expect("refund validated");
-        let nonce = state.next_release_nonce.unwrap_or(0);
-        state.next_release_nonce = Some(nonce.saturating_add(1));
+    let (existing_record, existing_endpoints) = read_state(|state| {
+        let claim = state
+            .escrow_claims
+            .get(session_id)
+            .expect("refund validated");
         (
-            session.claim_id.clone(),
-            session.steward_address.clone(),
+            claim.refund_broadcast.clone(),
             configured_rpc_endpoints(
                 state.base_rpc_endpoint.clone(),
                 state.base_rpc_fallback_endpoint.clone(),
             ),
-            state.escrow_contract_address.clone(),
-            state.release_broadcast_config.clone(),
-            nonce,
         )
     });
+    if let Some(record) = existing_record.as_ref() {
+        if record.raw_transaction_hash.is_some() {
+            if let Some(generation) = generation {
+                ensure_refund_generation(session_id, generation)?;
+            }
+            let receipt = crate::evm::resume_persisted_refund_transaction(
+                &existing_endpoints,
+                record.clone(),
+                now_ms,
+                generation.map(|generation| (session_id, generation)),
+            )
+            .map_err(|error| *error.source)?;
+            let result = write_refund_guarded(session_id, generation, |state| {
+                persist_refund_broadcast_record(state, session_id, receipt.record);
+                finalize_escrow_refund_in_state(state, session_id, now_ms, &receipt.release_tx_hash)
+            });
+            if result.is_ok() {
+                delete_spawn_provider_secrets(session_id);
+            }
+            return result;
+        }
+    }
+    let reserved_draft_nonce = existing_record.as_ref().map(|record| record.nonce);
+    let (claim_id, recipient, endpoints, escrow, config, nonce) =
+        write_refund_guarded(session_id, generation, |state| {
+            let session = state
+                .sessions
+                .get(session_id)
+                .expect("refund validated")
+                .clone();
+            if let Some(record) = existing_record.as_ref() {
+                let config = crate::evm::validate_refund_transaction_draft(
+                    record,
+                    &session.claim_id,
+                    &session.steward_address,
+                    &state.release_broadcast_config.ecdsa_key_name,
+                )?;
+                return Ok((
+                    record.claim_id.clone(),
+                    record.recipient.clone(),
+                    configured_rpc_endpoints(
+                        state.base_rpc_endpoint.clone(),
+                        state.base_rpc_fallback_endpoint.clone(),
+                    ),
+                    record.escrow_contract_address.clone(),
+                    config,
+                    record.nonce,
+                ));
+            }
+            let nonce =
+                reserved_draft_nonce.unwrap_or_else(|| state.next_release_nonce.unwrap_or(0));
+            let draft = crate::evm::build_refund_transaction_draft(
+                &session.claim_id,
+                &session.steward_address,
+                &state.escrow_contract_address,
+                nonce,
+                &state.release_broadcast_config,
+            )
+            .expect("validated refund transaction draft");
+            if reserved_draft_nonce.is_none() {
+                state.next_release_nonce = Some(nonce.saturating_add(1));
+            }
+            persist_refund_broadcast_record(state, session_id, draft);
+            Ok((
+                session.claim_id.clone(),
+                session.steward_address.clone(),
+                configured_rpc_endpoints(
+                    state.base_rpc_endpoint.clone(),
+                    state.base_rpc_fallback_endpoint.clone(),
+                ),
+                state.escrow_contract_address.clone(),
+                state.release_broadcast_config.clone(),
+                nonce,
+            ))
+        })?;
     let receipt = match crate::evm::broadcast_release_transaction(
-        &claim_id, &recipient, &endpoints, &escrow, nonce, now_ms, &config, None, true,
+        &claim_id,
+        &recipient,
+        &endpoints,
+        &escrow,
+        nonce,
+        now_ms,
+        &config,
+        None,
+        true,
+        generation.map(|generation| (session_id, generation)),
     ) {
         Ok(receipt) => receipt,
         Err(error) => {
-            write_state(|state| persist_refund_broadcast_record(state, session_id, error.record));
+            write_refund_guarded(session_id, generation, |state| {
+                persist_refund_broadcast_record(state, session_id, error.record);
+                Ok(())
+            })?;
             return Err(*error.source);
         }
     };
     debug_assert!(receipt.confirmed);
-    let result = write_state(|state| {
+    let result = write_refund_guarded(session_id, generation, |state| {
         persist_refund_broadcast_record(state, session_id, receipt.record);
         finalize_escrow_refund_in_state(state, session_id, now_ms, &receipt.release_tx_hash)
     });
@@ -479,10 +585,31 @@ pub fn claim_escrow_refund(
     result
 }
 
-#[cfg(target_arch = "wasm32")]
-pub async fn claim_escrow_refund(
+#[cfg(not(target_arch = "wasm32"))]
+pub fn claim_escrow_refund(
     session_id: &str,
     now_ms: u64,
+) -> Result<RefundSpawnResponse, FactoryError> {
+    claim_escrow_refund_inner(session_id, now_ms, None)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn claim_escrow_refund_authorized(
+    session_id: &str,
+    now_ms: u64,
+    generation: u64,
+) -> Result<RefundSpawnResponse, FactoryError> {
+    ensure_refund_generation(session_id, generation)?;
+    let result = claim_escrow_refund_inner(session_id, now_ms, Some(generation));
+    ensure_refund_generation(session_id, generation)?;
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn claim_escrow_refund_inner(
+    session_id: &str,
+    now_ms: u64,
+    generation: Option<u64>,
 ) -> Result<RefundSpawnResponse, FactoryError> {
     if let Some(response) =
         read_state(|state| validate_escrow_refund_in_state(state, session_id, now_ms))?
@@ -511,9 +638,17 @@ pub async fn claim_escrow_refund(
     });
     if let Some(record) = claim.refund_broadcast.as_ref() {
         if let Some(tx_hash) = record.rpc_tx_hash.as_ref() {
-            match crate::base_rpc::eth_get_transaction_receipt_status(&endpoints, tx_hash).await? {
+            if let Some(generation) = generation {
+                ensure_refund_generation(session_id, generation)?;
+            }
+            let receipt_result =
+                crate::base_rpc::eth_get_transaction_receipt_status(&endpoints, tx_hash).await;
+            if let Some(generation) = generation {
+                ensure_refund_generation(session_id, generation)?;
+            }
+            match receipt_result? {
                 Some(true) => {
-                    let result = write_state(|state| {
+                    let result = write_refund_guarded(session_id, generation, |state| {
                         finalize_escrow_refund_in_state(state, session_id, now_ms, tx_hash)
                     });
                     if result.is_ok() {
@@ -529,12 +664,86 @@ pub async fn claim_escrow_refund(
                 }
                 Some(false) => {}
             }
+        } else if record.raw_transaction_hash.is_some() {
+            if let Some(generation) = generation {
+                ensure_refund_generation(session_id, generation)?;
+            }
+            let receipt = crate::evm::resume_persisted_refund_transaction(
+                &endpoints,
+                record.clone(),
+                now_ms,
+                generation.map(|generation| (session_id, generation)),
+            )
+            .await
+            .map_err(|error| *error.source)?;
+            write_refund_guarded(session_id, generation, |state| {
+                persist_refund_broadcast_record(state, session_id, receipt.record.clone());
+                Ok(())
+            })?;
+            if !receipt.confirmed {
+                return Err(FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: "refund transaction remains pending".to_string(),
+                });
+            }
+            let result = write_refund_guarded(session_id, generation, |state| {
+                finalize_escrow_refund_in_state(state, session_id, now_ms, &receipt.release_tx_hash)
+            });
+            if result.is_ok() {
+                delete_spawn_provider_secrets(session_id);
+            }
+            return result;
         }
     }
-    let nonce = crate::spawn::reserve_release_nonce(&endpoints).await?;
+    let pending_nonce = crate::spawn::pending_release_nonce(&endpoints).await?;
+    if let Some(generation) = generation {
+        ensure_refund_generation(session_id, generation)?;
+    }
+    let (claim_id, recipient, escrow, config, nonce) =
+        write_refund_guarded(session_id, generation, |state| {
+            if let Some(record) = state
+                .escrow_claims
+                .get(session_id)
+                .and_then(|claim| claim.refund_broadcast.as_ref())
+            {
+                let draft_config = crate::evm::validate_refund_transaction_draft(
+                    record,
+                    &session.claim_id,
+                    &session.steward_address,
+                    &config.ecdsa_key_name,
+                )?;
+                return Ok((
+                    record.claim_id.clone(),
+                    record.recipient.clone(),
+                    record.escrow_contract_address.clone(),
+                    draft_config,
+                    record.nonce,
+                ));
+            }
+            let nonce = state
+                .next_release_nonce
+                .unwrap_or(pending_nonce)
+                .max(pending_nonce);
+            let draft = crate::evm::build_refund_transaction_draft(
+                &session.claim_id,
+                &session.steward_address,
+                &escrow,
+                nonce,
+                &config,
+            )?;
+            state.next_release_nonce = Some(nonce.saturating_add(1));
+            persist_refund_broadcast_record(state, session_id, draft);
+            Ok::<_, FactoryError>((
+                session.claim_id.clone(),
+                session.steward_address.clone(),
+                escrow.clone(),
+                config.clone(),
+                nonce,
+            ))
+        })?;
     let receipt = match crate::evm::broadcast_release_transaction(
-        &session.claim_id,
-        &session.steward_address,
+        &claim_id,
+        &recipient,
         &endpoints,
         &escrow,
         nonce,
@@ -542,27 +751,70 @@ pub async fn claim_escrow_refund(
         &config,
         None,
         true,
+        generation.map(|generation| (session_id, generation)),
     )
     .await
     {
         Ok(receipt) => receipt,
         Err(error) => {
-            write_state(|state| persist_refund_broadcast_record(state, session_id, error.record));
+            write_refund_guarded(session_id, generation, |state| {
+                persist_refund_broadcast_record(state, session_id, error.record);
+                Ok(())
+            })?;
             return Err(*error.source);
         }
     };
-    write_state(|state| persist_refund_broadcast_record(state, session_id, receipt.record.clone()));
+    write_refund_guarded(session_id, generation, |state| {
+        persist_refund_broadcast_record(state, session_id, receipt.record.clone());
+        Ok(())
+    })?;
     if !receipt.confirmed {
         return Err(FactoryError::ManagementCallFailed {
             method: "eth_getTransactionReceipt".to_string(),
             message: "refund transaction remains pending".to_string(),
         });
     }
-    let result = write_state(|state| {
+    let result = write_refund_guarded(session_id, generation, |state| {
         finalize_escrow_refund_in_state(state, session_id, now_ms, &receipt.release_tx_hash)
     });
     if result.is_ok() {
         delete_spawn_provider_secrets(session_id);
     }
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn claim_escrow_refund(
+    session_id: &str,
+    now_ms: u64,
+) -> Result<RefundSpawnResponse, FactoryError> {
+    claim_escrow_refund_inner(session_id, now_ms, None).await
+}
+
+fn ensure_refund_generation(session_id: &str, generation: u64) -> Result<(), FactoryError> {
+    read_state(|state| {
+        if state
+            .steward_refund_leases
+            .get(session_id)
+            .is_some_and(|lease| lease.generation == generation)
+        {
+            Ok(())
+        } else {
+            Err(FactoryError::InvalidStewardProof {
+                reason: "stale refund command continuation".to_string(),
+            })
+        }
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn claim_escrow_refund_authorized(
+    session_id: &str,
+    now_ms: u64,
+    generation: u64,
+) -> Result<RefundSpawnResponse, FactoryError> {
+    ensure_refund_generation(session_id, generation)?;
+    let result = claim_escrow_refund_inner(session_id, now_ms, Some(generation)).await;
+    ensure_refund_generation(session_id, generation)?;
     result
 }

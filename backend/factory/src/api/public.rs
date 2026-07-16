@@ -1,22 +1,34 @@
 use std::collections::{BTreeSet, Bound};
 
-use crate::escrow::{claim_escrow_refund, register_escrow_claim};
+use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+use sha3::{Digest, Keccak256};
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::escrow::claim_escrow_refund;
+use crate::escrow::register_escrow_claim;
+use crate::expiry::expire_session_in_state;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::expiry::expire_spawn_session;
 use crate::init::canonical_deployment_chain_id;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::retry::retry_failed_session;
+use crate::retry::retry_spawn_session_in_state;
 use crate::scheduler::enqueue_payment_poll;
 use crate::session_transitions::{apply_session_event_in_state, SpawnSessionEvent};
 use crate::state::store_spawn_provider_secrets;
 use crate::state::{read_state, write_state, FactoryState};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::types::RefundSpawnResponse;
 use crate::types::{
     amount_to_string, derive_claim_id, hash_quote_terms, parse_amount, CreateSpawnSessionRequest,
-    CreateSpawnSessionResponse, FactoryError, InheritedStrategyStat, MemoryDowryFact,
-    PostRoomMessageRequest, RefundSpawnResponse, RepositoryStrategyRecord,
-    RepositoryStrategySessionSnapshot, RepositoryStrategyStatus, RoomContentType, RoomMessage,
-    RoomMessagePage, RoyaltyAllocation, SessionAuditActor, SpawnPaymentInstructions, SpawnQuote,
-    SpawnSession, SpawnSessionOrigin, SpawnSessionState, SpawnSessionStatusResponse,
-    SpawnedAutomatonRegistryPage, DEFAULT_ROOM_READ_LIMIT, MAX_ROOM_BODY_BYTES, MAX_ROOM_MENTIONS,
-    MAX_ROOM_MESSAGES_RETAINED, MAX_ROOM_READ_LIMIT,
+    CreateSpawnSessionResponse, FactoryError, FactoryStewardCommand, FactoryStewardCommandResult,
+    FactoryStewardProof, FactoryStewardProofTemplate, InheritedStrategyStat, MemoryDowryFact,
+    PostRoomMessageRequest, RepositoryStrategyRecord, RepositoryStrategySessionSnapshot,
+    RepositoryStrategyStatus, RoomContentType, RoomMessage, RoomMessagePage, RoyaltyAllocation,
+    SessionAuditActor, SpawnPaymentInstructions, SpawnQuote, SpawnSession, SpawnSessionOrigin,
+    SpawnSessionState, SpawnSessionStatusResponse, SpawnedAutomatonRegistryPage,
+    DEFAULT_ROOM_READ_LIMIT, MAX_ROOM_BODY_BYTES, MAX_ROOM_MENTIONS, MAX_ROOM_MESSAGES_RETAINED,
+    MAX_ROOM_READ_LIMIT,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -413,7 +425,7 @@ pub(crate) fn create_spawn_session_with_session_id(
             constitution: request.constitution.clone(),
             session_id: session_id.clone(),
             claim_id,
-            steward_address: request.steward_address.clone(),
+            steward_address: request.steward_address.trim().to_ascii_lowercase(),
             chain: request.config.chain.clone(),
             asset: request.asset.clone(),
             gross_amount: request.gross_amount.clone(),
@@ -479,7 +491,100 @@ pub(crate) fn create_spawn_session_with_session_id(
     Ok(CreateSpawnSessionResponse { session, quote })
 }
 
-fn ensure_steward(caller: &str, session_id: &str) -> Result<(), FactoryError> {
+const FACTORY_STEWARD_DOMAIN: &str = "ic-automaton:factory-steward:v1";
+const FACTORY_STEWARD_PROOF_TTL_NS: u64 = 5 * 60 * 1_000_000_000;
+const REFUND_COMMAND_LEASE_MS: u64 = 60_000;
+
+fn invalid_proof(reason: impl Into<String>) -> FactoryError {
+    FactoryError::InvalidStewardProof {
+        reason: reason.into(),
+    }
+}
+
+fn normalize_address(raw: &str) -> Result<String, FactoryError> {
+    let value = raw.trim().to_ascii_lowercase();
+    let body = value
+        .strip_prefix("0x")
+        .ok_or_else(|| invalid_proof("address must be 0x-prefixed"))?;
+    if body.len() != 40 || !body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_proof("address must be 20 bytes of hex"));
+    }
+    Ok(format!("0x{body}"))
+}
+
+fn decode_hex(raw: &str, bytes: usize, field: &str) -> Result<Vec<u8>, FactoryError> {
+    let body = raw
+        .trim()
+        .strip_prefix("0x")
+        .ok_or_else(|| invalid_proof(format!("{field} must be 0x-prefixed")))?;
+    if body.len() != bytes * 2 || !body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_proof(format!(
+            "{field} must be {bytes} bytes of hex"
+        )));
+    }
+    (0..body.len())
+        .step_by(2)
+        .map(|offset| {
+            u8::from_str_radix(&body[offset..offset + 2], 16)
+                .map_err(|_| invalid_proof(format!("invalid {field}")))
+        })
+        .collect()
+}
+
+pub(crate) fn factory_steward_command_hash(command: &FactoryStewardCommand) -> String {
+    let encoded = candid::encode_one(command).expect("factory steward command candid encoding");
+    format!("0x{:x}", Keccak256::digest(encoded))
+}
+
+fn signing_payload(
+    canister_id: &str,
+    chain_id: u64,
+    address: &str,
+    command_hash: &str,
+    nonce: u64,
+    expires_at_ns: u64,
+) -> String {
+    format!("{FACTORY_STEWARD_DOMAIN}\ncanister_id:{canister_id}\nchain_id:{chain_id}\naddress:{address}\ncommand_hash:{command_hash}\nnonce:{nonce}\nexpires_at_ns:{expires_at_ns}")
+}
+
+fn recover_signer(payload: &str, signature: &str) -> Result<String, FactoryError> {
+    let bytes = decode_hex(signature, 65, "signature")?;
+    let recovery = match bytes[64] {
+        0 | 1 => bytes[64],
+        27 | 28 => bytes[64] - 27,
+        value => return Err(invalid_proof(format!("unsupported recovery id {value}"))),
+    };
+    let signature = Signature::from_slice(&bytes[..64])
+        .map_err(|error| invalid_proof(format!("malformed signature: {error}")))?;
+    let prefix = format!("\x19Ethereum Signed Message:\n{}", payload.len());
+    let mut hasher = Keccak256::new();
+    hasher.update(prefix.as_bytes());
+    hasher.update(payload.as_bytes());
+    let digest = hasher.finalize();
+    let key = VerifyingKey::recover_from_prehash(
+        &digest,
+        &signature,
+        RecoveryId::try_from(recovery)
+            .map_err(|error| invalid_proof(format!("invalid recovery id: {error}")))?,
+    )
+    .map_err(|error| invalid_proof(format!("signature recovery failed: {error}")))?;
+    let point = key.to_encoded_point(false);
+    let hash = Keccak256::digest(&point.as_bytes()[1..]);
+    Ok(format!(
+        "0x{}",
+        hash[12..]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+pub fn prepare_spawn_steward_command(
+    command: FactoryStewardCommand,
+    canister_id: &str,
+    now_ns: u64,
+) -> Result<FactoryStewardProofTemplate, FactoryError> {
+    let session_id = command.session_id();
     read_state(|state| {
         let session =
             state
@@ -488,16 +593,242 @@ fn ensure_steward(caller: &str, session_id: &str) -> Result<(), FactoryError> {
                 .ok_or_else(|| FactoryError::SessionNotFound {
                     session_id: session_id.to_string(),
                 })?;
-
-        if session.steward_address == caller {
-            return Ok(());
+        if session.chain != crate::types::SpawnChain::Base {
+            return Err(invalid_proof("unsupported session chain"));
         }
-
-        Err(FactoryError::UnauthorizedSteward {
-            caller: caller.to_string(),
-            session_id: session_id.to_string(),
+        let chain_id =
+            canonical_deployment_chain_id(&state.child_runtime, &state.release_broadcast_config)?;
+        let address = normalize_address(&session.steward_address)?;
+        let nonce = *state.steward_command_nonces.get(session_id).unwrap_or(&0);
+        let expires_at_ns = now_ns
+            .checked_add(FACTORY_STEWARD_PROOF_TTL_NS)
+            .ok_or_else(|| invalid_proof("expiry overflow"))?;
+        let command_hash = factory_steward_command_hash(&command);
+        Ok(FactoryStewardProofTemplate {
+            signing_payload: signing_payload(
+                canister_id,
+                chain_id,
+                &address,
+                &command_hash,
+                nonce,
+                expires_at_ns,
+            ),
+            chain_id,
+            address,
+            command_hash,
+            nonce,
+            expires_at_ns,
         })
     })
+}
+
+pub(crate) fn authorize_and_consume(
+    command: &FactoryStewardCommand,
+    proof: &FactoryStewardProof,
+    canister_id: &str,
+    now_ns: u64,
+    now_ms: u64,
+) -> Result<(Option<SpawnSessionStatusResponse>, Option<u64>), FactoryError> {
+    let session_id = command.session_id();
+    let expected_hash = factory_steward_command_hash(command);
+    let address = normalize_address(&proof.address)?;
+    let (expected_chain_id, expected_address, expected_nonce) = read_state(|state| {
+        let session =
+            state
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| FactoryError::SessionNotFound {
+                    session_id: session_id.to_string(),
+                })?;
+        if session.chain != crate::types::SpawnChain::Base {
+            return Err(invalid_proof("unsupported session chain"));
+        }
+        Ok::<_, FactoryError>((
+            canonical_deployment_chain_id(&state.child_runtime, &state.release_broadcast_config)?,
+            normalize_address(&session.steward_address)?,
+            *state.steward_command_nonces.get(session_id).unwrap_or(&0),
+        ))
+    })?;
+    if proof.chain_id != expected_chain_id {
+        return Err(invalid_proof("chain id mismatch"));
+    }
+    if address != expected_address {
+        return Err(invalid_proof("signer is not the session steward"));
+    }
+    if proof.nonce != expected_nonce {
+        return Err(invalid_proof(format!(
+            "nonce mismatch: expected {expected_nonce}, got {}",
+            proof.nonce
+        )));
+    }
+    if proof.command_hash.to_ascii_lowercase() != expected_hash {
+        return Err(invalid_proof("command hash mismatch"));
+    }
+    if now_ns > proof.expires_at_ns {
+        return Err(invalid_proof("proof expired"));
+    }
+    if proof.expires_at_ns.saturating_sub(now_ns) > FACTORY_STEWARD_PROOF_TTL_NS {
+        return Err(invalid_proof("proof expiry exceeds maximum"));
+    }
+    let payload = signing_payload(
+        canister_id,
+        proof.chain_id,
+        &address,
+        &expected_hash,
+        proof.nonce,
+        proof.expires_at_ns,
+    );
+    if recover_signer(&payload, &proof.signature)? != address {
+        return Err(invalid_proof(
+            "recovered signer does not match proof address",
+        ));
+    }
+    write_state(|state| {
+        let session =
+            state
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| FactoryError::SessionNotFound {
+                    session_id: session_id.to_string(),
+                })?;
+        let chain_id =
+            canonical_deployment_chain_id(&state.child_runtime, &state.release_broadcast_config)?;
+        if session.chain != crate::types::SpawnChain::Base {
+            return Err(invalid_proof("unsupported session chain"));
+        }
+        if proof.chain_id != chain_id {
+            return Err(invalid_proof("chain id mismatch"));
+        }
+        if normalize_address(&session.steward_address)? != address {
+            return Err(invalid_proof("signer is not the session steward"));
+        }
+        let expected_nonce = *state.steward_command_nonces.get(session_id).unwrap_or(&0);
+        if proof.nonce != expected_nonce {
+            return Err(invalid_proof(format!(
+                "nonce mismatch: expected {expected_nonce}, got {}",
+                proof.nonce
+            )));
+        }
+        let refund_resume = matches!(command, FactoryStewardCommand::ClaimSpawnRefund { .. })
+            && state.steward_refunds_in_flight.contains(session_id);
+        let refund_generation = if matches!(command, FactoryStewardCommand::ClaimSpawnRefund { .. })
+        {
+            match state.steward_refund_leases.get(session_id) {
+                Some(lease) if refund_resume && now_ms <= lease.expires_at_ms => {
+                    return Err(invalid_proof(
+                        "refund command is already accepted and awaiting reconciliation",
+                    ));
+                }
+                Some(lease) => Some(
+                    lease
+                        .generation
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_proof("refund generation overflow"))?,
+                ),
+                None => Some(1),
+            }
+        } else {
+            None
+        };
+        match command {
+            FactoryStewardCommand::RetrySpawnSession { .. } => {
+                retry_spawn_session_in_state(
+                    state,
+                    session_id,
+                    SessionAuditActor::User,
+                    now_ms,
+                    "retry requested by verified EVM steward",
+                )?;
+            }
+            FactoryStewardCommand::ClaimSpawnRefund { .. } => {
+                if !refund_resume {
+                    let _ = expire_session_in_state(
+                        state,
+                        session_id,
+                        SessionAuditActor::User,
+                        now_ms,
+                        "refund requested by verified EVM steward",
+                    )?;
+                }
+                let session = state
+                    .sessions
+                    .get(session_id)
+                    .expect("session remains after expiry");
+                let claim = state.escrow_claims.get(session_id).ok_or_else(|| {
+                    FactoryError::EscrowClaimNotFound {
+                        session_id: session_id.to_string(),
+                    }
+                })?;
+                if session.payment_status != crate::types::PaymentStatus::Refunded
+                    && (!matches!(
+                        session.state,
+                        SpawnSessionState::Expired | SpawnSessionState::Failed
+                    ) || !session.refundable
+                        || !claim.refundable)
+                {
+                    return Err(FactoryError::SessionNotRefundable {
+                        session_id: session_id.to_string(),
+                        state: session.state.clone(),
+                        payment_status: session.payment_status.clone(),
+                    });
+                }
+            }
+        }
+        if !refund_resume {
+            state.steward_command_nonces.insert(
+                session_id.to_string(),
+                expected_nonce
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_proof("nonce overflow"))?,
+            );
+        }
+        if matches!(command, FactoryStewardCommand::ClaimSpawnRefund { .. }) && !refund_resume {
+            state
+                .steward_refunds_in_flight
+                .insert(session_id.to_string());
+        }
+        if let Some(generation) = refund_generation {
+            state.steward_refund_leases.insert(
+                session_id.to_string(),
+                crate::state::RefundCommandLease {
+                    generation,
+                    expires_at_ms: now_ms.saturating_add(REFUND_COMMAND_LEASE_MS),
+                },
+            );
+        }
+        if matches!(command, FactoryStewardCommand::RetrySpawnSession { .. }) {
+            let session = state
+                .sessions
+                .get(session_id)
+                .cloned()
+                .expect("session remains after retry");
+            let payment = SpawnPaymentInstructions::from_session(&session, &state.payment_address);
+            let audit = state.audit_log.get(session_id).cloned().unwrap_or_default();
+            Ok((
+                Some(SpawnSessionStatusResponse {
+                    session,
+                    payment,
+                    audit,
+                }),
+                None,
+            ))
+        } else {
+            Ok((None, refund_generation))
+        }
+    })
+}
+
+fn clear_refund_in_flight(session_id: &str, generation: u64) {
+    write_state(|state| {
+        if state
+            .steward_refund_leases
+            .get(session_id)
+            .is_some_and(|lease| lease.generation == generation)
+        {
+            state.steward_refunds_in_flight.remove(session_id);
+            state.steward_refund_leases.remove(session_id);
+        }
+    });
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -538,41 +869,82 @@ pub fn get_spawn_session(session_id: &str) -> Result<SpawnSessionStatusResponse,
     })
 }
 
-pub fn retry_spawn_session(
-    caller: &str,
-    session_id: &str,
+#[cfg(not(target_arch = "wasm32"))]
+pub fn execute_spawn_steward_command(
+    command: FactoryStewardCommand,
+    proof: FactoryStewardProof,
+    canister_id: &str,
+    now_ns: u64,
     now_ms: u64,
-) -> Result<SpawnSessionStatusResponse, FactoryError> {
-    ensure_steward(caller, session_id)?;
-    retry_failed_session(
-        session_id,
-        SessionAuditActor::User,
-        now_ms,
-        "retry requested by steward",
-    )?;
-    get_spawn_session(session_id)
+) -> Result<FactoryStewardCommandResult, FactoryError> {
+    let (result, refund_generation) =
+        authorize_and_consume(&command, &proof, canister_id, now_ns, now_ms)?;
+    match command {
+        FactoryStewardCommand::RetrySpawnSession { .. } => Ok(FactoryStewardCommandResult::Retry(
+            Box::new(result.expect("retry response")),
+        )),
+        FactoryStewardCommand::ClaimSpawnRefund { session_id } => {
+            let generation = refund_generation.expect("refund generation");
+            let result =
+                crate::escrow::claim_escrow_refund_authorized(&session_id, now_ms, generation)
+                    .map(FactoryStewardCommandResult::Refund);
+            clear_refund_in_flight(&session_id, generation);
+            result
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn claim_spawn_refund(
+pub fn claim_spawn_refund_for_test(
     caller: &str,
     session_id: &str,
     now_ms: u64,
 ) -> Result<RefundSpawnResponse, FactoryError> {
-    ensure_steward(caller, session_id)?;
+    let _ = caller;
     let _ = expire_spawn_session(session_id, now_ms)?;
     claim_escrow_refund(session_id, now_ms)
 }
 
 #[cfg(target_arch = "wasm32")]
-pub async fn claim_spawn_refund(
+pub async fn execute_spawn_steward_command(
+    command: FactoryStewardCommand,
+    proof: FactoryStewardProof,
+    canister_id: &str,
+    now_ns: u64,
+    now_ms: u64,
+) -> Result<FactoryStewardCommandResult, FactoryError> {
+    let (result, refund_generation) =
+        authorize_and_consume(&command, &proof, canister_id, now_ns, now_ms)?;
+    match command {
+        FactoryStewardCommand::RetrySpawnSession { .. } => Ok(FactoryStewardCommandResult::Retry(
+            Box::new(result.expect("retry response")),
+        )),
+        FactoryStewardCommand::ClaimSpawnRefund { session_id } => {
+            let generation = refund_generation.expect("refund generation");
+            let result =
+                crate::escrow::claim_escrow_refund_authorized(&session_id, now_ms, generation)
+                    .await
+                    .map(FactoryStewardCommandResult::Refund);
+            clear_refund_in_flight(&session_id, generation);
+            result
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn retry_spawn_session_for_test(
     caller: &str,
     session_id: &str,
     now_ms: u64,
-) -> Result<RefundSpawnResponse, FactoryError> {
-    ensure_steward(caller, session_id)?;
-    let _ = expire_spawn_session(session_id, now_ms)?;
-    claim_escrow_refund(session_id, now_ms).await
+) -> Result<SpawnSessionStatusResponse, FactoryError> {
+    let _ = caller;
+    retry_failed_session(
+        session_id,
+        SessionAuditActor::User,
+        now_ms,
+        "retry requested in test",
+    )?;
+    get_spawn_session(session_id)
 }
 
 pub fn list_spawned_automatons(

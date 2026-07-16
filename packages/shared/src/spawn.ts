@@ -167,17 +167,35 @@ export interface CreateSpawnSessionResponse {
   quote: SpawnQuote;
 }
 
-export interface RetrySpawnRequest {
-  sessionId: string;
+export type FactoryStewardCommand =
+  | { retrySpawnSession: { sessionId: string } }
+  | { claimSpawnRefund: { sessionId: string } };
+
+export interface FactoryStewardProof {
+  chainId: string;
+  address: string;
+  commandHash: string;
+  nonce: string;
+  expiresAtNs: string;
+  signature: string;
 }
+
+export interface FactoryStewardProofTemplate extends Omit<FactoryStewardProof, "signature"> {
+  signingPayload: string;
+}
+
+export interface FactoryStewardExecutionRequest {
+  command: FactoryStewardCommand;
+  proof: FactoryStewardProof;
+}
+
+export type RetrySpawnRequest = FactoryStewardExecutionRequest;
 
 export interface RetrySpawnResponse {
   session: SpawnSession;
 }
 
-export interface RefundSpawnRequest {
-  sessionId: string;
-}
+export type RefundSpawnRequest = FactoryStewardExecutionRequest;
 
 export interface RefundSpawnResponse {
   sessionId: string;

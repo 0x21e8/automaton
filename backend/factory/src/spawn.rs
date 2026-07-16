@@ -93,11 +93,16 @@ fn insert_registry_record_with_parent_link(
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) async fn reserve_release_nonce(endpoints: &[String]) -> Result<u64, FactoryError> {
-    let signer = crate::evm::derive_factory_evm_address().await?;
-    let pending = crate::base_rpc::eth_get_transaction_count(endpoints, &signer).await?;
+    let pending = pending_release_nonce(endpoints).await?;
     Ok(write_state(|state| {
         reserve_release_nonce_value(&mut state.next_release_nonce, pending)
     }))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn pending_release_nonce(endpoints: &[String]) -> Result<u64, FactoryError> {
+    let signer = crate::evm::derive_factory_evm_address().await?;
+    crate::base_rpc::eth_get_transaction_count(endpoints, &signer).await
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -1111,6 +1116,7 @@ pub fn execute_spawn(session_id: &str, now_ms: u64) -> Result<SpawnExecutionRece
             &state.release_broadcast_config,
             reproduction_release.as_ref(),
             false,
+            None,
         ) {
             Ok(release) => release,
             Err(error) => {
@@ -1942,6 +1948,7 @@ pub async fn execute_spawn(
             &release_broadcast_config,
             reproduction_release.as_ref(),
             false,
+            None,
         )
         .await
         {

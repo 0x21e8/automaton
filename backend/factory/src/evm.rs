@@ -52,6 +52,25 @@ struct UnsignedEip1559Transaction {
     data: Vec<u8>,
 }
 
+fn ensure_refund_guard(guard: Option<(&str, u64)>) -> Result<(), FactoryError> {
+    let Some((session_id, generation)) = guard else {
+        return Ok(());
+    };
+    read_state(|state| {
+        if state
+            .steward_refund_leases
+            .get(session_id)
+            .is_some_and(|lease| lease.generation == generation)
+        {
+            Ok(())
+        } else {
+            Err(FactoryError::InvalidStewardProof {
+                reason: "stale refund command continuation".to_string(),
+            })
+        }
+    })
+}
+
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -336,14 +355,133 @@ fn build_release_broadcast_record(plan: &ReleaseTransactionPlan) -> ReleaseBroad
         max_priority_fee_per_gas: plan.config.max_priority_fee_per_gas,
         max_fee_per_gas: plan.config.max_fee_per_gas,
         gas_limit: plan.config.gas_limit,
+        ecdsa_key_name: Some(plan.config.ecdsa_key_name.clone()),
         calldata_hex: hex_encode_prefixed(&plan.calldata),
         signing_payload_hash: None,
         signature: None,
         raw_transaction_hash: None,
+        raw_transaction_hex: None,
         rpc_tx_hash: None,
         broadcast_at: None,
         last_error: None,
     }
+}
+
+pub(crate) fn build_refund_transaction_draft(
+    claim_id: &str,
+    recipient: &str,
+    escrow_contract_address: &str,
+    nonce: u64,
+    config: &ReleaseBroadcastConfig,
+) -> Result<ReleaseBroadcastRecord, FactoryError> {
+    let plan = build_refund_plan(
+        claim_id,
+        recipient,
+        escrow_contract_address,
+        nonce,
+        config.clone(),
+    )?;
+    let unsigned = build_unsigned_release_transaction(&plan)?;
+    let mut record = build_release_broadcast_record(&plan);
+    record.signing_payload_hash = Some(keccak_hex(&build_signing_payload(&unsigned)));
+    Ok(record)
+}
+
+pub(crate) fn validate_refund_transaction_draft(
+    record: &ReleaseBroadcastRecord,
+    expected_claim_id: &str,
+    expected_recipient: &str,
+    ecdsa_key_name: &str,
+) -> Result<ReleaseBroadcastConfig, FactoryError> {
+    if record.claim_id != expected_claim_id || record.recipient != expected_recipient {
+        return Err(FactoryError::ManagementCallFailed {
+            method: "resume_refund_draft".to_string(),
+            message: "persisted refund draft identity does not match the session".to_string(),
+        });
+    }
+    let config = ReleaseBroadcastConfig {
+        ecdsa_key_name: record
+            .ecdsa_key_name
+            .clone()
+            .unwrap_or_else(|| ecdsa_key_name.to_string()),
+        chain_id: record.chain_id,
+        max_priority_fee_per_gas: record.max_priority_fee_per_gas,
+        max_fee_per_gas: record.max_fee_per_gas,
+        gas_limit: record.gas_limit,
+    };
+    let expected = build_refund_transaction_draft(
+        &record.claim_id,
+        &record.recipient,
+        &record.escrow_contract_address,
+        record.nonce,
+        &config,
+    )?;
+    if expected.calldata_hex != record.calldata_hex
+        || expected.signing_payload_hash != record.signing_payload_hash
+    {
+        return Err(FactoryError::ManagementCallFailed {
+            method: "resume_refund_draft".to_string(),
+            message: "persisted refund draft transaction fields are inconsistent".to_string(),
+        });
+    }
+    Ok(config)
+}
+
+fn reconstruct_legacy_refund_raw_transaction(
+    record: &ReleaseBroadcastRecord,
+) -> Result<String, FactoryError> {
+    let config = ReleaseBroadcastConfig {
+        chain_id: record.chain_id,
+        max_priority_fee_per_gas: record.max_priority_fee_per_gas,
+        max_fee_per_gas: record.max_fee_per_gas,
+        gas_limit: record.gas_limit,
+        ..ReleaseBroadcastConfig::default()
+    };
+    let plan = build_refund_plan(
+        &record.claim_id,
+        &record.recipient,
+        &record.escrow_contract_address,
+        record.nonce,
+        config,
+    )?;
+    if hex_encode_prefixed(&plan.calldata) != record.calldata_hex {
+        return Err(FactoryError::ManagementCallFailed {
+            method: "resume_refund_broadcast".to_string(),
+            message: "legacy refund calldata does not match the deterministic refund plan"
+                .to_string(),
+        });
+    }
+    let signature =
+        record
+            .signature
+            .as_ref()
+            .ok_or_else(|| FactoryError::ManagementCallFailed {
+                method: "resume_refund_broadcast".to_string(),
+                message: "legacy refund requires explicit migration: signature is missing"
+                    .to_string(),
+            })?;
+    let mut signature_bytes = decode_hex(&signature.r)?;
+    signature_bytes.extend(decode_hex(&signature.s)?);
+    let raw = build_signed_raw_transaction(
+        &build_unsigned_release_transaction(&plan)?,
+        signature.y_parity,
+        &signature_bytes,
+    )?;
+    let expected = record.raw_transaction_hash.as_deref().ok_or_else(|| {
+        FactoryError::ManagementCallFailed {
+            method: "resume_refund_broadcast".to_string(),
+            message: "legacy refund requires explicit migration: raw transaction hash is missing"
+                .to_string(),
+        }
+    })?;
+    if keccak_hex(&raw) != expected {
+        return Err(FactoryError::ManagementCallFailed {
+            method: "resume_refund_broadcast".to_string(),
+            message: "legacy refund reconstruction does not match its persisted transaction hash"
+                .to_string(),
+        });
+    }
+    Ok(hex_encode_prefixed(&raw))
 }
 
 fn build_unsigned_release_transaction(
@@ -595,6 +733,331 @@ pub fn derive_factory_evm_address_from_bytes(public_key: &[u8]) -> Result<String
     derive_factory_evm_address_from_public_key(public_key)
 }
 
+fn persist_refund_transaction_record_guarded(
+    claim_id: &str,
+    record: &ReleaseBroadcastRecord,
+    guard: Option<(&str, u64)>,
+) -> Result<(), FactoryError> {
+    write_state(|state| {
+        if let Some((session_id, generation)) = guard {
+            if state
+                .steward_refund_leases
+                .get(session_id)
+                .is_none_or(|lease| lease.generation != generation)
+            {
+                return Err(FactoryError::InvalidStewardProof {
+                    reason: "stale refund command continuation".to_string(),
+                });
+            }
+        }
+        let claim = state
+            .escrow_claims
+            .values_mut()
+            .find(|claim| claim.claim_id == claim_id)
+            .ok_or_else(|| FactoryError::ManagementCallFailed {
+                method: "persist_refund_transaction_intent".to_string(),
+                message: format!("escrow claim not found for claim_id {claim_id}"),
+            })?;
+        claim.refund_broadcast = Some(record.clone());
+        Ok(())
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn broadcast_and_confirm_persisted_refund(
+    base_rpc_endpoints: &[String],
+    mut record: ReleaseBroadcastRecord,
+    now_ms: u64,
+    guard: Option<(&str, u64)>,
+) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
+    let raw_tx_hex = record.raw_transaction_hex.clone().ok_or_else(|| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RawTransactionConstruction,
+            record.clone(),
+            FactoryError::ManagementCallFailed {
+                method: "resume_refund_broadcast".to_string(),
+                message: "persisted refund intent is missing exact raw transaction bytes"
+                    .to_string(),
+            },
+            now_ms,
+        )
+    })?;
+    let raw_bytes = decode_hex(&raw_tx_hex).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RawTransactionConstruction,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    if raw_bytes.is_empty() || raw_bytes.len() > 2_048 || !raw_tx_hex.starts_with("0x") {
+        return Err(release_broadcast_error(
+            ReleaseBroadcastStage::RawTransactionConstruction,
+            record,
+            FactoryError::ManagementCallFailed {
+                method: "resume_refund_broadcast".to_string(),
+                message:
+                    "persisted refund raw transaction is empty, oversized, or not canonical 0x hex"
+                        .to_string(),
+            },
+            now_ms,
+        ));
+    }
+    let local_hash = keccak_hex(&raw_bytes);
+    if record.raw_transaction_hash.as_deref() != Some(local_hash.as_str()) {
+        return Err(release_broadcast_error(
+            ReleaseBroadcastStage::RawTransactionConstruction,
+            record,
+            FactoryError::ManagementCallFailed {
+                method: "resume_refund_broadcast".to_string(),
+                message: "persisted refund raw transaction hash mismatch".to_string(),
+            },
+            now_ms,
+        ));
+    }
+
+    let rpc_result = base_rpc::eth_send_raw_transaction(base_rpc_endpoints, &raw_tx_hex).await;
+    ensure_refund_guard(guard).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RpcBroadcast,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    let rpc_hash = rpc_result.map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RpcBroadcast,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    if rpc_hash.to_ascii_lowercase() != local_hash {
+        return Err(release_broadcast_error(
+            ReleaseBroadcastStage::RpcBroadcast,
+            record,
+            FactoryError::ManagementCallFailed {
+                method: "eth_sendRawTransaction".to_string(),
+                message: format!(
+                    "refund RPC transaction hash mismatch: local={local_hash} rpc={rpc_hash}"
+                ),
+            },
+            now_ms,
+        ));
+    }
+    record.rpc_tx_hash = Some(rpc_hash.clone());
+    record.broadcast_at = Some(now_ms);
+    persist_refund_transaction_record_guarded(&record.claim_id, &record, guard).map_err(
+        |error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::RpcBroadcast,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        },
+    )?;
+
+    let receipt_result =
+        base_rpc::eth_get_transaction_receipt_status(base_rpc_endpoints, &rpc_hash).await;
+    ensure_refund_guard(guard).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::ReceiptConfirmation,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    let confirmed = match receipt_result {
+        Ok(Some(true)) => true,
+        Ok(Some(false)) => {
+            return Err(release_broadcast_error(
+                ReleaseBroadcastStage::ReceiptConfirmation,
+                record,
+                FactoryError::ManagementCallFailed {
+                    method: "eth_getTransactionReceipt".to_string(),
+                    message: "refund transaction reverted".to_string(),
+                },
+                now_ms,
+            ));
+        }
+        Ok(None) => false,
+        Err(error) => {
+            return Err(release_broadcast_error(
+                ReleaseBroadcastStage::ReceiptConfirmation,
+                record,
+                error,
+                now_ms,
+            ));
+        }
+    };
+    Ok(ReleaseBroadcastReceipt {
+        release_tx_hash: rpc_hash,
+        release_broadcast_at: now_ms,
+        record,
+        confirmed,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn resume_persisted_refund_transaction(
+    base_rpc_endpoints: &[String],
+    mut record: ReleaseBroadcastRecord,
+    now_ms: u64,
+    guard: Option<(&str, u64)>,
+) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
+    if record.raw_transaction_hex.is_none() {
+        let raw = reconstruct_legacy_refund_raw_transaction(&record).map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::RawTransactionConstruction,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+        record.raw_transaction_hex = Some(raw);
+        persist_refund_transaction_record_guarded(&record.claim_id, &record, guard).map_err(
+            |error| {
+                release_broadcast_error(
+                    ReleaseBroadcastStage::RawTransactionConstruction,
+                    record.clone(),
+                    error,
+                    now_ms,
+                )
+            },
+        )?;
+    }
+    ensure_refund_guard(guard).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RpcBroadcast,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    broadcast_and_confirm_persisted_refund(base_rpc_endpoints, record, now_ms, guard).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::result_large_err)]
+pub(crate) fn resume_persisted_refund_transaction(
+    base_rpc_endpoints: &[String],
+    mut record: ReleaseBroadcastRecord,
+    now_ms: u64,
+    guard: Option<(&str, u64)>,
+) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
+    if record.raw_transaction_hex.is_none() {
+        let raw = reconstruct_legacy_refund_raw_transaction(&record).map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::RawTransactionConstruction,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+        record.raw_transaction_hex = Some(raw);
+        persist_refund_transaction_record_guarded(&record.claim_id, &record, guard).map_err(
+            |error| {
+                release_broadcast_error(
+                    ReleaseBroadcastStage::RawTransactionConstruction,
+                    record.clone(),
+                    error,
+                    now_ms,
+                )
+            },
+        )?;
+    }
+    let raw_tx_hex = record.raw_transaction_hex.clone().ok_or_else(|| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RawTransactionConstruction,
+            record.clone(),
+            FactoryError::ManagementCallFailed {
+                method: "resume_refund_broadcast".to_string(),
+                message: "persisted refund intent is missing exact raw transaction bytes"
+                    .to_string(),
+            },
+            now_ms,
+        )
+    })?;
+    let raw_bytes = decode_hex(&raw_tx_hex).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RawTransactionConstruction,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    if raw_bytes.is_empty() || raw_bytes.len() > 2_048 || !raw_tx_hex.starts_with("0x") {
+        return Err(release_broadcast_error(
+            ReleaseBroadcastStage::RawTransactionConstruction,
+            record,
+            FactoryError::ManagementCallFailed {
+                method: "resume_refund_broadcast".to_string(),
+                message:
+                    "persisted refund raw transaction is empty, oversized, or not canonical 0x hex"
+                        .to_string(),
+            },
+            now_ms,
+        ));
+    }
+    let local_hash = keccak_hex(&raw_bytes);
+    if record.raw_transaction_hash.as_deref() != Some(local_hash.as_str()) {
+        return Err(release_broadcast_error(
+            ReleaseBroadcastStage::RawTransactionConstruction,
+            record,
+            FactoryError::ManagementCallFailed {
+                method: "resume_refund_broadcast".to_string(),
+                message: "persisted refund raw transaction hash mismatch".to_string(),
+            },
+            now_ms,
+        ));
+    }
+    ensure_refund_guard(guard).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RpcBroadcast,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    let rpc_hash = base_rpc::eth_send_raw_transaction(base_rpc_endpoints, &raw_tx_hex, &local_hash)
+        .map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::RpcBroadcast,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+    record.rpc_tx_hash = Some(rpc_hash.clone());
+    record.broadcast_at = Some(now_ms);
+    ensure_refund_guard(guard).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::RpcBroadcast,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    persist_refund_transaction_record_guarded(&record.claim_id, &record, guard).map_err(
+        |error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::RpcBroadcast,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        },
+    )?;
+    Ok(ReleaseBroadcastReceipt {
+        release_tx_hash: rpc_hash,
+        release_broadcast_at: now_ms,
+        record,
+        confirmed: true,
+    })
+}
+
 #[cfg(target_arch = "wasm32")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn broadcast_release_transaction(
@@ -607,6 +1070,7 @@ pub(crate) async fn broadcast_release_transaction(
     config: &ReleaseBroadcastConfig,
     reproduction: Option<&ReproductionRelease>,
     refund: bool,
+    refund_guard: Option<(&str, u64)>,
 ) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
     use ic_cdk::management_canister::{ecdsa_public_key, sign_with_ecdsa};
 
@@ -651,10 +1115,12 @@ pub(crate) async fn broadcast_release_transaction(
                     max_priority_fee_per_gas: config.max_priority_fee_per_gas,
                     max_fee_per_gas: config.max_fee_per_gas,
                     gas_limit: config.gas_limit,
+                    ecdsa_key_name: Some(config.ecdsa_key_name.clone()),
                     calldata_hex: "0x".to_string(),
                     signing_payload_hash: None,
                     signature: None,
                     raw_transaction_hash: None,
+                    raw_transaction_hex: None,
                     rpc_tx_hash: None,
                     broadcast_at: None,
                     last_error: None,
@@ -677,19 +1143,36 @@ pub(crate) async fn broadcast_release_transaction(
     let prehash = keccak256(&signing_payload);
     record.signing_payload_hash = Some(keccak_hex(&signing_payload));
 
-    let response = ecdsa_public_key(&factory_public_key_argument(&config.ecdsa_key_name))
-        .await
-        .map_err(|error| {
-            release_broadcast_error(
-                ReleaseBroadcastStage::PublicKeyLookup,
-                record.clone(),
-                FactoryError::ManagementCallFailed {
-                    method: "ecdsa_public_key".to_string(),
-                    message: error.to_string(),
-                },
-                now_ms,
-            )
-        })?;
+    ensure_refund_guard(refund_guard).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::PublicKeyLookup,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+
+    let public_key_result =
+        ecdsa_public_key(&factory_public_key_argument(&config.ecdsa_key_name)).await;
+    ensure_refund_guard(refund_guard).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::PublicKeyLookup,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    let response = public_key_result.map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::PublicKeyLookup,
+            record.clone(),
+            FactoryError::ManagementCallFailed {
+                method: "ecdsa_public_key".to_string(),
+                message: error.to_string(),
+            },
+            now_ms,
+        )
+    })?;
 
     let signing_request = factory_signing_argument(prehash.to_vec(), &config.ecdsa_key_name);
     ensure_sign_with_ecdsa_cycles("sign_with_ecdsa", &signing_request).map_err(|error| {
@@ -701,7 +1184,16 @@ pub(crate) async fn broadcast_release_transaction(
         )
     })?;
 
-    let signing_result = sign_with_ecdsa(&signing_request).await.map_err(|error| {
+    let signing_call_result = sign_with_ecdsa(&signing_request).await;
+    ensure_refund_guard(refund_guard).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::Signing,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
+    let signing_result = signing_call_result.map_err(|error| {
         release_broadcast_error(
             ReleaseBroadcastStage::Signing,
             record.clone(),
@@ -744,6 +1236,43 @@ pub(crate) async fn broadcast_release_transaction(
         })?;
     let raw_tx_hex = hex_encode_prefixed(&raw_tx);
     record.raw_transaction_hash = Some(keccak_hex(&raw_tx));
+    record.raw_transaction_hex = Some(raw_tx_hex.clone());
+
+    if refund {
+        ensure_refund_guard(refund_guard).map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::RawTransactionConstruction,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+        persist_refund_transaction_record_guarded(claim_id, &record, refund_guard).map_err(
+            |error| {
+                release_broadcast_error(
+                    ReleaseBroadcastStage::RawTransactionConstruction,
+                    record.clone(),
+                    error,
+                    now_ms,
+                )
+            },
+        )?;
+        ensure_refund_guard(refund_guard).map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::RpcBroadcast,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+        return broadcast_and_confirm_persisted_refund(
+            base_rpc_endpoints,
+            record,
+            now_ms,
+            refund_guard,
+        )
+        .await;
+    }
 
     let rpc_hash = base_rpc::eth_send_raw_transaction(base_rpc_endpoints, &raw_tx_hex)
         .await
@@ -804,6 +1333,7 @@ pub(crate) fn broadcast_release_transaction(
     config: &ReleaseBroadcastConfig,
     reproduction: Option<&ReproductionRelease>,
     refund: bool,
+    refund_guard: Option<(&str, u64)>,
 ) -> Result<ReleaseBroadcastReceipt, ReleaseBroadcastError> {
     let plan = if refund {
         build_refund_plan(
@@ -844,10 +1374,12 @@ pub(crate) fn broadcast_release_transaction(
                 max_priority_fee_per_gas: config.max_priority_fee_per_gas,
                 max_fee_per_gas: config.max_fee_per_gas,
                 gas_limit: config.gas_limit,
+                ecdsa_key_name: Some(config.ecdsa_key_name.clone()),
                 calldata_hex: "0x".to_string(),
                 signing_payload_hash: None,
                 signature: None,
                 raw_transaction_hash: None,
+                raw_transaction_hex: None,
                 rpc_tx_hash: None,
                 broadcast_at: None,
                 last_error: None,
@@ -869,6 +1401,15 @@ pub(crate) fn broadcast_release_transaction(
     record.signing_payload_hash = Some(keccak_hex(&signing_payload));
     let signing_request =
         factory_signing_argument(keccak256(&signing_payload).to_vec(), &config.ecdsa_key_name);
+
+    ensure_refund_guard(refund_guard).map_err(|error| {
+        release_broadcast_error(
+            ReleaseBroadcastStage::Signing,
+            record.clone(),
+            error,
+            now_ms,
+        )
+    })?;
 
     ensure_sign_with_ecdsa_cycles("sign_with_ecdsa", &signing_request).map_err(|error| {
         release_broadcast_error(
@@ -901,6 +1442,34 @@ pub(crate) fn broadcast_release_transaction(
     let raw_tx_hex = hex_encode_prefixed(&raw_tx);
     let local_tx_hash = keccak_hex(&raw_tx);
     record.raw_transaction_hash = Some(local_tx_hash.clone());
+    record.raw_transaction_hex = Some(raw_tx_hex.clone());
+
+    if refund {
+        ensure_refund_guard(refund_guard).map_err(|error| {
+            release_broadcast_error(
+                ReleaseBroadcastStage::RawTransactionConstruction,
+                record.clone(),
+                error,
+                now_ms,
+            )
+        })?;
+        persist_refund_transaction_record_guarded(claim_id, &record, refund_guard).map_err(
+            |error| {
+                release_broadcast_error(
+                    ReleaseBroadcastStage::RawTransactionConstruction,
+                    record.clone(),
+                    error,
+                    now_ms,
+                )
+            },
+        )?;
+        return resume_persisted_refund_transaction(
+            base_rpc_endpoints,
+            record,
+            now_ms,
+            refund_guard,
+        );
+    }
 
     let rpc_hash =
         base_rpc::eth_send_raw_transaction(base_rpc_endpoints, &raw_tx_hex, &local_tx_hash)
@@ -979,6 +1548,7 @@ mod tests {
             &ReleaseBroadcastConfig::default(),
             None,
             false,
+            None,
         )
         .expect_err("broadcast should fail");
 
@@ -1013,6 +1583,7 @@ mod tests {
             &ReleaseBroadcastConfig::default(),
             None,
             false,
+            None,
         )
         .expect("broadcast should succeed");
 
@@ -1040,6 +1611,7 @@ mod tests {
             &ReleaseBroadcastConfig::default(),
             None,
             false,
+            None,
         )
         .expect_err("broadcast should fail before signing");
 

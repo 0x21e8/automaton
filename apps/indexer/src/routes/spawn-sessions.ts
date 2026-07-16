@@ -180,7 +180,18 @@ export const spawnSessionRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     const params = request.params as { sessionId: string };
-    return fastify.factoryClient.retrySpawnSession(params.sessionId);
+    const body = request.body as import("@ic-automaton/shared").FactoryStewardExecutionRequest;
+    if (body?.command === undefined || !("retrySpawnSession" in body.command) || body.command.retrySpawnSession.sessionId !== params.sessionId) {
+      reply.code(400);
+      return { ok: false, error: "Retry command session does not match route session" };
+    }
+    try {
+      return await fastify.factoryClient.retrySpawnSession(body);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Factory steward command rejected";
+      if (/InvalidStewardProof|nonce|expired|signature|steward/i.test(message)) reply.code(400);
+      throw error;
+    }
   });
 
   fastify.post("/api/spawn-sessions/:sessionId/refund", async (request, reply) => {
@@ -193,7 +204,39 @@ export const spawnSessionRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     const params = request.params as { sessionId: string };
-    return fastify.factoryClient.claimSpawnRefund(params.sessionId);
+    const body = request.body as import("@ic-automaton/shared").FactoryStewardExecutionRequest;
+    if (body?.command === undefined || !("claimSpawnRefund" in body.command) || body.command.claimSpawnRefund.sessionId !== params.sessionId) {
+      reply.code(400);
+      return { ok: false, error: "Refund command session does not match route session" };
+    }
+    try {
+      return await fastify.factoryClient.claimSpawnRefund(body);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Factory steward command rejected";
+      if (/InvalidStewardProof|nonce|expired|signature|steward/i.test(message)) reply.code(400);
+      throw error;
+    }
+  });
+
+  fastify.post("/api/spawn-sessions/:sessionId/steward-command", async (request, reply) => {
+    if (!fastify.factoryClient.isConfigured()) {
+      reply.code(503);
+      return { ok: false, error: "Factory client is not configured" };
+    }
+    const params = request.params as { sessionId: string };
+    const body = request.body as { command: import("@ic-automaton/shared").FactoryStewardCommand };
+    if (body?.command === undefined) {
+      reply.code(400);
+      return { ok: false, error: "Factory steward command is required" };
+    }
+    const commandSessionId = "retrySpawnSession" in body.command
+      ? body.command.retrySpawnSession.sessionId
+      : body.command.claimSpawnRefund.sessionId;
+    if (commandSessionId !== params.sessionId) {
+      reply.code(400);
+      return { ok: false, error: "Steward command session does not match route session" };
+    }
+    return fastify.factoryClient.prepareSpawnStewardCommand(body.command);
   });
 
   fastify.get("/api/spawned-automatons", async (request) => {

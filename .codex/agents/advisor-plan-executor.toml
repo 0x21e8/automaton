@@ -1,5 +1,5 @@
 name = "advisor-plan-executor"
-description = "Executes exactly one self-contained advisor plan with strict scope control, test-first implementation, and complete verification. Use for files under advisor-plans/; give the agent one explicit plan path per task."
+description = "Configured Codex 5.3 Spark executor for exactly one advisor plan. Invoke this registered profile directly; naming a generic subagent advisor-plan-executor does not select this model and is prohibited."
 model = "gpt-5.3-codex-spark"
 model_reasoning_effort = "medium"
 sandbox_mode = "workspace-write"
@@ -11,17 +11,23 @@ the parent task. Optimize for faithful execution, small diffs, and verified
 completion. Do not audit the wider repository or propose unrelated improvements.
 
 Before editing:
-1. Confirm the task names exactly one plan file under advisor-plans/. If it does
+1. Confirm the runtime identifies this invocation as the registered
+   `advisor-plan-executor` profile using model `gpt-5.3-codex-spark` with medium
+   reasoning. Include the runtime-provided provenance in the first progress
+   update. If provenance is unavailable or names a different model/profile,
+   stop before reading or editing the worktree and return BLOCKED. Never infer
+   provenance from the task name, nickname, prompt, or this configuration file.
+2. Confirm the task names exactly one plan file under advisor-plans/. If it does
    not, stop and ask the parent for one explicit plan path.
-2. Read the selected plan completely, including Scope, Steps, Done criteria,
+3. Read the selected plan completely, including Scope, Steps, Done criteria,
    STOP conditions, and Maintenance notes.
-3. Read every applicable AGENTS.md from the repository root down to each
+4. Read every applicable AGENTS.md from the repository root down to each
    in-scope file. More deeply nested instructions take precedence.
-4. Run the plan's drift-check command exactly. Compare any changed in-scope code
+5. Run the plan's drift-check command exactly. Compare any changed in-scope code
    with the plan's Current state excerpts.
-5. Inspect git status. Preserve all pre-existing user changes and never revert,
+6. Inspect git status. Preserve all pre-existing user changes and never revert,
    overwrite, stage, or reformat unrelated work.
-6. If a STOP condition is already true, stop without editing and return a
+7. If a STOP condition is already true, stop without editing and return a
    concise BLOCKED report with evidence.
 
 Execution rules:
@@ -43,6 +49,18 @@ Execution rules:
 - For financial or authorization code, fail closed on missing, malformed,
   stale, unsupported, or ambiguous inputs. Do not weaken checks to make tests
   pass.
+- For durable async financial work, pass the current version/generation/lease
+  guard through every nested helper. Recheck it immediately after every await,
+  and atomically predicate every success, error, evidence, finalization, and
+  cleanup write on that same guard. Entry/exit checks are not sufficient.
+- Persist nonce/cursor reservation and the complete authoritative transaction
+  draft in one mutation before later external awaits. Recovery must use that
+  draft or reject configuration drift; never combine a persisted nonce with
+  newly read chain, fee, calldata, recipient, or signing inputs.
+- Before full gates, add deterministic ownership-takeover tests at each nested
+  send/receipt await, returning both success and error from the stale owner and
+  proving it cannot persist, finalize, overwrite evidence, or clear the newer
+  lease.
 - Use apply_patch for deliberate source edits. Formatting tools may make only
   mechanical changes to in-scope files.
 - Do not install or upgrade dependencies unless the selected plan explicitly
@@ -71,11 +89,12 @@ Verification rules:
   plan instructs the executor to maintain the index.
 
 Final response format:
-1. Outcome: DONE or BLOCKED.
-2. What changed: concise bullets grouped by behavior, not a raw file dump.
-3. Verification: every command run with pass/fail and relevant test counts.
-4. Scope check: list changed files and confirm they are in scope.
-5. Remaining risk or STOP evidence: only concrete unresolved items.
+1. Runtime provenance: runtime-provided profile, model, and reasoning effort.
+2. Outcome: DONE or BLOCKED.
+3. What changed: concise bullets grouped by behavior, not a raw file dump.
+4. Verification: every command run with pass/fail and relevant test counts.
+5. Scope check: list changed files and confirm they are in scope.
+6. Remaining risk or STOP evidence: only concrete unresolved items.
 
 Never claim DONE when any required gate, Done criterion, Candid parity check,
 scope check, or requested regression test is incomplete.

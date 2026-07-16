@@ -18,6 +18,12 @@ use crate::types::{
     SpawnedAutomatonRecord,
 };
 
+#[derive(Clone, Debug, Eq, PartialEq, CandidType, Serialize, Deserialize)]
+pub struct RefundCommandLease {
+    pub generation: u64,
+    pub expires_at_ms: u64,
+}
+
 const STORAGE_SCHEMA_VERSION: u32 = 5;
 const PREVIOUS_STORAGE_SCHEMA_VERSION: u32 = 4;
 const STORAGE_METADATA_MEMORY_ID: u8 = 0;
@@ -76,6 +82,12 @@ pub struct FactoryState {
     pub next_session_nonce: u64,
     pub next_automaton_nonce: u64,
     pub next_release_nonce: Option<u64>,
+    #[serde(default)]
+    pub steward_command_nonces: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub steward_refunds_in_flight: BTreeSet<String>,
+    #[serde(default)]
+    pub steward_refund_leases: BTreeMap<String, RefundCommandLease>,
     pub payment_address: String,
     pub escrow_contract_address: String,
     pub payment_last_scanned_block: Option<u64>,
@@ -128,6 +140,12 @@ struct FactoryStableConfig {
     next_automaton_nonce: u64,
     #[serde(default)]
     next_release_nonce: Option<u64>,
+    #[serde(default)]
+    steward_command_nonces: Option<BTreeMap<String, u64>>,
+    #[serde(default)]
+    steward_refunds_in_flight: Option<BTreeSet<String>>,
+    #[serde(default)]
+    steward_refund_leases: Option<BTreeMap<String, RefundCommandLease>>,
     payment_address: String,
     escrow_contract_address: String,
     payment_last_scanned_block: Option<u64>,
@@ -182,6 +200,9 @@ impl Default for FactoryState {
             next_session_nonce: 0,
             next_automaton_nonce: 0,
             next_release_nonce: None,
+            steward_command_nonces: BTreeMap::new(),
+            steward_refunds_in_flight: BTreeSet::new(),
+            steward_refund_leases: BTreeMap::new(),
             payment_address: "0x1111111111111111111111111111111111111111".to_string(),
             escrow_contract_address: "0x2222222222222222222222222222222222222222".to_string(),
             payment_last_scanned_block: None,
@@ -220,6 +241,9 @@ impl From<&FactoryState> for FactoryStableConfig {
             next_session_nonce: value.next_session_nonce,
             next_automaton_nonce: value.next_automaton_nonce,
             next_release_nonce: value.next_release_nonce,
+            steward_command_nonces: Some(value.steward_command_nonces.clone()),
+            steward_refunds_in_flight: Some(value.steward_refunds_in_flight.clone()),
+            steward_refund_leases: Some(value.steward_refund_leases.clone()),
             payment_address: value.payment_address.clone(),
             escrow_contract_address: value.escrow_contract_address.clone(),
             payment_last_scanned_block: value.payment_last_scanned_block,
@@ -275,6 +299,9 @@ impl FactoryStableConfig {
             next_session_nonce: self.next_session_nonce,
             next_automaton_nonce: self.next_automaton_nonce,
             next_release_nonce: self.next_release_nonce,
+            steward_command_nonces: self.steward_command_nonces.unwrap_or_default(),
+            steward_refunds_in_flight: self.steward_refunds_in_flight.unwrap_or_default(),
+            steward_refund_leases: self.steward_refund_leases.unwrap_or_default(),
             payment_address: self.payment_address,
             escrow_contract_address: self.escrow_contract_address,
             payment_last_scanned_block: self.payment_last_scanned_block,

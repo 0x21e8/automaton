@@ -1,6 +1,9 @@
 import type {
   CreateSpawnSessionRequest,
   CreateSpawnSessionResponse,
+  FactoryStewardCommand,
+  FactoryStewardExecutionRequest,
+  FactoryStewardProofTemplate,
   RepositoryStrategyGetResponse,
   RepositoryStrategyListResponse,
   RepositoryStrategyRecord,
@@ -43,8 +46,9 @@ export interface FactoryAdapter {
     request: CreateSpawnSessionRequest
   ): Promise<CreateSpawnSessionResponse>;
   getSpawnSession(sessionId: string): Promise<SpawnSessionStatusResponse | null>;
-  retrySpawnSession(sessionId: string): Promise<RetrySpawnResponse>;
-  claimSpawnRefund(sessionId: string): Promise<RefundSpawnResponse>;
+  prepareSpawnStewardCommand(command: FactoryStewardCommand): Promise<FactoryStewardProofTemplate>;
+  retrySpawnSession(request: FactoryStewardExecutionRequest): Promise<RetrySpawnResponse>;
+  claimSpawnRefund(request: FactoryStewardExecutionRequest): Promise<RefundSpawnResponse>;
   listSpawnedAutomatons(
     cursor: string | undefined,
     limit: number
@@ -82,6 +86,10 @@ class UnconfiguredFactoryAdapter implements FactoryAdapter {
   }
 
   async claimSpawnRefund(): Promise<RefundSpawnResponse> {
+    throw new Error("Factory adapter is not configured.");
+  }
+
+  async prepareSpawnStewardCommand(): Promise<FactoryStewardProofTemplate> {
     throw new Error("Factory adapter is not configured.");
   }
 
@@ -281,16 +289,20 @@ export class FactoryClient {
     };
   }
 
-  async retrySpawnSession(sessionId: string): Promise<RetrySpawnResponse> {
-    const response = await this.adapter.retrySpawnSession(sessionId);
+  async prepareSpawnStewardCommand(command: FactoryStewardCommand): Promise<FactoryStewardProofTemplate> {
+    return this.adapter.prepareSpawnStewardCommand(command);
+  }
+
+  async retrySpawnSession(request: FactoryStewardExecutionRequest): Promise<RetrySpawnResponse> {
+    const response = await this.adapter.retrySpawnSession(request);
 
     return {
       session: normalizeSession(response.session)
     };
   }
 
-  async claimSpawnRefund(sessionId: string): Promise<RefundSpawnResponse> {
-    return this.adapter.claimSpawnRefund(sessionId);
+  async claimSpawnRefund(request: FactoryStewardExecutionRequest): Promise<RefundSpawnResponse> {
+    return this.adapter.claimSpawnRefund(request);
   }
 
   async listSpawnedAutomatons(
