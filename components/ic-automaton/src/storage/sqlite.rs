@@ -7,14 +7,19 @@ use crate::domain::types::{
     AbiArtifact, AbiArtifactKey, ActiveExposure, AutonomyPolicy, ConversationEntry,
     ConversationLog, DecisionRecord, ExposureReconciliationStatus, GoalRecord, InboxMessage,
     JournalDealClaim, JournalEntry, MemoryFact, OutboxMessage, PendingStrategyDiscoveryJob,
-    PlanRecord, ReflectionMemoryRecord, RuntimeSnapshot, ScheduledJob, SchedulerRuntime,
-    SkillRecord, StrategyDiscoveryCallbackRecord, StrategyQuarantine, StrategyTemplate,
-    StrategyTemplateKey, SurvivalOperationClass, TaskKind, TaskScheduleConfig, TaskScheduleRuntime,
-    ToolCallRecord, TransitionLogRecord, TurnRecord,
+    PendingStrategyExecution, PlanRecord, ReflectionMemoryRecord, RuntimeSnapshot, ScheduledJob,
+    SchedulerRuntime, SkillRecord, StrategyDiscoveryCallbackRecord, StrategyOutcomeStats,
+    StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SurvivalOperationClass, TaskKind,
+    TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, ToolCallRecord,
+    TransitionLogRecord, TurnRecord,
 };
 use crate::features::cycle_topup::TopUpStage;
 #[cfg(target_arch = "wasm32")]
+use ic_rusqlite::rusqlite::params;
+#[cfg(target_arch = "wasm32")]
 use ic_rusqlite::rusqlite::types::ValueRef as SqlValueRef;
+#[cfg(not(target_arch = "wasm32"))]
+use rusqlite::params;
 #[cfg(not(target_arch = "wasm32"))]
 use rusqlite::types::ValueRef as SqlValueRef;
 use serde_json::Value;
@@ -22,7 +27,7 @@ use serde_json::{Map as JsonMap, Number as JsonNumber};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 const MIGRATION_001_BASE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -374,6 +379,19 @@ CREATE TABLE IF NOT EXISTS journal (
 CREATE INDEX IF NOT EXISTS idx_journal_timestamp ON journal(timestamp_ns DESC, id DESC);
 "#;
 
+const MIGRATION_010_PENDING_STRATEGY_EXECUTIONS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS pending_strategy_executions (
+    execution_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    next_check_at_ns INTEGER NOT NULL,
+    created_at_ns INTEGER NOT NULL,
+    updated_at_ns INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_strategy_executions_due
+    ON pending_strategy_executions(state, next_check_at_ns, created_at_ns);
+"#;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
     use super::{
@@ -381,7 +399,7 @@ mod backend {
         MIGRATION_003_REMAINING_SCHEMA, MIGRATION_004_REFLECTION_MEMORY_SCHEMA,
         MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA, MIGRATION_006_GOALS_SCHEMA,
         MIGRATION_007_PLANS_SCHEMA, MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA,
-        MIGRATION_009_JOURNAL_SCHEMA,
+        MIGRATION_009_JOURNAL_SCHEMA, MIGRATION_010_PENDING_STRATEGY_EXECUTIONS_SCHEMA,
     };
     use rusqlite::{params, Connection};
     use std::cell::RefCell;
@@ -444,6 +462,8 @@ mod backend {
             .map_err(|err| err.to_string())?;
         conn.execute_batch(MIGRATION_009_JOURNAL_SCHEMA)
             .map_err(|err| err.to_string())?;
+        conn.execute_batch(MIGRATION_010_PENDING_STRATEGY_EXECUTIONS_SCHEMA)
+            .map_err(|err| err.to_string())?;
         let version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -470,7 +490,7 @@ mod backend {
         MIGRATION_003_REMAINING_SCHEMA, MIGRATION_004_REFLECTION_MEMORY_SCHEMA,
         MIGRATION_005_AUTONOMY_RUNTIME_SCHEMA, MIGRATION_006_GOALS_SCHEMA,
         MIGRATION_007_PLANS_SCHEMA, MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA,
-        MIGRATION_009_JOURNAL_SCHEMA,
+        MIGRATION_009_JOURNAL_SCHEMA, MIGRATION_010_PENDING_STRATEGY_EXECUTIONS_SCHEMA,
     };
 
     pub type SqlResult<T> = Result<T, String>;
@@ -494,6 +514,8 @@ mod backend {
             conn.execute_batch(MIGRATION_008_STRATEGY_DISCOVERY_SCHEMA)
                 .map_err(|err| err.to_string())?;
             conn.execute_batch(MIGRATION_009_JOURNAL_SCHEMA)
+                .map_err(|err| err.to_string())?;
+            conn.execute_batch(MIGRATION_010_PENDING_STRATEGY_EXECUTIONS_SCHEMA)
                 .map_err(|err| err.to_string())?;
             let version: i64 = conn
                 .query_row(
@@ -2985,6 +3007,350 @@ pub fn get_active_exposure(strategy_id: &str) -> Result<Option<ActiveExposure>, 
     })
 }
 
+pub fn insert_pending_strategy_execution(
+    execution: &PendingStrategyExecution,
+) -> Result<PendingStrategyExecution, String> {
+    let payload = row_payload(execution)?;
+    let state = strategy_execution_state_text(&execution.state);
+    backend::with_connection(|conn| {
+        let changed = conn
+            .execute(
+                "INSERT OR IGNORE INTO pending_strategy_executions
+                 (execution_id, state, next_check_at_ns, created_at_ns, updated_at_ns, payload_json)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    execution.execution_id,
+                    state,
+                    execution.next_check_at_ns,
+                    execution.created_at_ns,
+                    execution.updated_at_ns,
+                    payload
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        if changed == 0 {
+            let existing: String = conn
+                .query_row(
+                    "SELECT payload_json FROM pending_strategy_executions WHERE execution_id = ?1",
+                    params![execution.execution_id],
+                    |row| row.get(0),
+                )
+                .map_err(|err| err.to_string())?;
+            let existing = serde_json::from_str::<PendingStrategyExecution>(&existing)
+                .map_err(|err| err.to_string())?;
+            if existing.plan_digest != execution.plan_digest {
+                return Err("pending strategy execution id collision".to_string());
+            }
+            return Ok(existing);
+        }
+        Ok(execution.clone())
+    })
+}
+
+pub fn get_pending_strategy_execution(
+    execution_id: &str,
+) -> Result<Option<PendingStrategyExecution>, String> {
+    backend::with_connection(|conn| {
+        let mut statement = conn
+            .prepare("SELECT payload_json FROM pending_strategy_executions WHERE execution_id = ?1")
+            .map_err(|err| err.to_string())?;
+        let mut rows = statement
+            .query(params![execution_id])
+            .map_err(|err| err.to_string())?;
+        let Some(row) = rows.next().map_err(|err| err.to_string())? else {
+            return Ok(None);
+        };
+        let payload: String = row.get(0).map_err(|err| err.to_string())?;
+        serde_json::from_str(&payload)
+            .map(Some)
+            .map_err(|err| err.to_string())
+    })
+}
+
+pub fn update_pending_strategy_execution(
+    execution: &PendingStrategyExecution,
+) -> Result<(), String> {
+    let payload = row_payload(execution)?;
+    backend::with_connection(|conn| {
+        let changed = conn
+            .execute(
+                "UPDATE pending_strategy_executions SET state = ?2, next_check_at_ns = ?3,
+             updated_at_ns = ?4, payload_json = ?5 WHERE execution_id = ?1",
+                params![
+                    execution.execution_id,
+                    strategy_execution_state_text(&execution.state),
+                    execution.next_check_at_ns,
+                    execution.updated_at_ns,
+                    payload
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        if changed != 1 {
+            return Err("pending strategy execution was not found".to_string());
+        }
+        Ok(())
+    })
+}
+
+/// Persist nonterminal progress only when the durable row still equals the
+/// stale-capable snapshot loaded by the caller. A lost race is a safe no-op.
+///
+/// Strategy execution transition table:
+/// - Pending -> Pending: receipt/submission progress; CAS required; no terminal bookkeeping.
+/// - Pending -> Confirmed: success bookkeeping in the guarded confirmation transaction.
+/// - Pending -> PartialFailure/Reverted/Dropped: failure bookkeeping in the guarded failure transaction.
+/// - Any terminal -> any state: forbidden (duplicate same-terminal calls and competing outcomes no-op).
+///
+/// Confirmed and failure terminals are monotonic, mutually exclusive, and each applies its side effects once.
+pub fn compare_and_update_pending_strategy_execution(
+    expected: &PendingStrategyExecution,
+    desired: &PendingStrategyExecution,
+) -> Result<bool, String> {
+    if expected.execution_id != desired.execution_id
+        || expected.state != crate::domain::types::PendingStrategyExecutionState::Pending
+        || desired.state != crate::domain::types::PendingStrategyExecutionState::Pending
+        || expected.bookkeeping_applied
+        || expected.terminal_bookkeeping_applied
+        || desired.bookkeeping_applied
+        || desired.terminal_bookkeeping_applied
+    {
+        return Ok(false);
+    }
+    let expected_payload = row_payload(expected)?;
+    let desired_payload = row_payload(desired)?;
+    backend::with_connection(|conn| {
+        let changed = conn
+            .execute(
+                "UPDATE pending_strategy_executions SET state = 'pending', next_check_at_ns = ?3,
+             updated_at_ns = ?4, payload_json = ?5
+             WHERE execution_id = ?1 AND state = 'pending' AND payload_json = ?2",
+                params![
+                    desired.execution_id,
+                    expected_payload,
+                    desired.next_check_at_ns,
+                    desired.updated_at_ns,
+                    desired_payload
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(changed == 1)
+    })
+}
+
+pub fn list_due_pending_strategy_executions(
+    now_ns: u64,
+    limit: usize,
+) -> Result<Vec<PendingStrategyExecution>, String> {
+    backend::with_connection(|conn| {
+        let mut statement = conn
+            .prepare(
+                "SELECT payload_json FROM pending_strategy_executions
+             WHERE state = 'pending' AND next_check_at_ns <= ?1
+             ORDER BY next_check_at_ns ASC, created_at_ns ASC LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = statement
+            .query_map(params![now_ns, limit as u64], |row| row.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        rows.map(|row| {
+            let payload = row.map_err(|err| err.to_string())?;
+            serde_json::from_str(&payload).map_err(|err| err.to_string())
+        })
+        .collect()
+    })
+}
+
+pub fn list_confirmed_strategy_executions_page(
+    after: Option<(u64, &str)>,
+    limit: usize,
+) -> Result<Vec<PendingStrategyExecution>, String> {
+    backend::with_connection(|conn| {
+        let query = if after.is_some() {
+            "SELECT payload_json FROM pending_strategy_executions
+             WHERE state = 'confirmed' AND (created_at_ns > ?1 OR (created_at_ns = ?1 AND execution_id > ?2))
+             ORDER BY created_at_ns ASC, execution_id ASC LIMIT ?3"
+        } else {
+            "SELECT payload_json FROM pending_strategy_executions
+             WHERE state = 'confirmed' ORDER BY created_at_ns ASC, execution_id ASC LIMIT ?3"
+        };
+        let mut statement = conn.prepare(query).map_err(|err| err.to_string())?;
+        let mut rows = match after {
+            Some((created_at_ns, execution_id)) => {
+                statement.query(params![created_at_ns, execution_id, limit as u64])
+            }
+            None => statement.query(params![0u64, "", limit as u64]),
+        }
+        .map_err(|err| err.to_string())?;
+        let mut executions = Vec::new();
+        while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+            let payload: String = row.get(0).map_err(|err| err.to_string())?;
+            executions.push(serde_json::from_str(&payload).map_err(|err| err.to_string())?);
+        }
+        Ok(executions)
+    })
+}
+
+fn strategy_execution_state_text(
+    state: &crate::domain::types::PendingStrategyExecutionState,
+) -> &'static str {
+    use crate::domain::types::PendingStrategyExecutionState::*;
+    match state {
+        Pending => "pending",
+        Confirmed => "confirmed",
+        PartialFailure => "partial_failure",
+        Reverted => "reverted",
+        Dropped => "dropped",
+    }
+}
+
+/// Commit receipt confirmation and all success-side bookkeeping in one SQLite transaction.
+pub fn confirm_strategy_execution_atomically(
+    execution: &PendingStrategyExecution,
+    exposure_change: Option<&Option<ActiveExposure>>,
+    outcome_record_key: &str,
+    outcome_stats: &StrategyOutcomeStats,
+    budget_change: Option<(&str, &str)>,
+    strategy_id: &str,
+) -> Result<bool, String> {
+    let execution_payload = row_payload(execution)?;
+    let stats_payload = row_payload(outcome_stats)?;
+    backend::with_connection(|conn| {
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|err| err.to_string())?;
+        let current_payload: String = transaction
+            .query_row(
+                "SELECT payload_json FROM pending_strategy_executions WHERE execution_id = ?1",
+                params![execution.execution_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        let current: PendingStrategyExecution =
+            serde_json::from_str(&current_payload).map_err(|err| err.to_string())?;
+        if current.state != crate::domain::types::PendingStrategyExecutionState::Pending
+            || current.bookkeeping_applied
+            || current.terminal_bookkeeping_applied
+        {
+            return Ok(false);
+        }
+        if let Some(change) = exposure_change {
+            if let Some(exposure) = change {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO active_exposures(strategy_id, protocol, chain_id, updated_at_ns, payload_json)
+                     VALUES(?1, ?2, ?3, ?4, ?5)",
+                    params![exposure.strategy_id, exposure.protocol, exposure.chain_id, exposure.updated_at_ns, row_payload(exposure)?],
+                ).map_err(|err| err.to_string())?;
+            } else {
+                transaction
+                    .execute(
+                        "DELETE FROM active_exposures WHERE strategy_id = ?1",
+                        params![strategy_id],
+                    )
+                    .map_err(|err| err.to_string())?;
+            }
+        }
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO strategy_outcome_stats(key, payload_json) VALUES(?1, ?2)",
+                params![outcome_record_key, stats_payload],
+            )
+            .map_err(|err| err.to_string())?;
+        if let Some((budget_key, budget)) = budget_change {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO strategy_budgets(key, payload_json) VALUES(?1, ?2)",
+                    params![budget_key, budget],
+                )
+                .map_err(|err| err.to_string())?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM strategy_quarantines WHERE strategy_id = ?1",
+                params![strategy_id],
+            )
+            .map_err(|err| err.to_string())?;
+        transaction
+            .execute(
+                "UPDATE pending_strategy_executions SET state = 'confirmed', next_check_at_ns = ?2,
+             updated_at_ns = ?3, payload_json = ?4 WHERE execution_id = ?1",
+                params![
+                    execution.execution_id,
+                    execution.next_check_at_ns,
+                    execution.updated_at_ns,
+                    execution_payload
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        transaction.commit().map_err(|err| err.to_string())?;
+        Ok(true)
+    })
+}
+
+/// Commit a terminal failure and its learner/quarantine bookkeeping exactly once.
+pub fn fail_strategy_execution_atomically(
+    execution: &PendingStrategyExecution,
+    outcome_record_key: &str,
+    outcome_stats: &StrategyOutcomeStats,
+    quarantine: &StrategyQuarantine,
+    activation_change: Option<(&str, &TemplateActivationState)>,
+) -> Result<bool, String> {
+    let execution_payload = row_payload(execution)?;
+    let stats_payload = row_payload(outcome_stats)?;
+    let quarantine_payload = row_payload(quarantine)?;
+    backend::with_connection(|conn| {
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|err| err.to_string())?;
+        let current_payload: String = transaction
+            .query_row(
+                "SELECT payload_json FROM pending_strategy_executions WHERE execution_id = ?1",
+                params![execution.execution_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        let current: PendingStrategyExecution =
+            serde_json::from_str(&current_payload).map_err(|err| err.to_string())?;
+        if current.state != crate::domain::types::PendingStrategyExecutionState::Pending
+            || current.bookkeeping_applied
+            || current.terminal_bookkeeping_applied
+        {
+            return Ok(false);
+        }
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO strategy_outcome_stats(key, payload_json) VALUES(?1, ?2)",
+                params![outcome_record_key, stats_payload],
+            )
+            .map_err(|err| err.to_string())?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO strategy_quarantines(strategy_id, quarantined_at_ns, release_after_ns, payload_json)
+             VALUES(?1, ?2, ?3, ?4)",
+            params![quarantine.strategy_id, quarantine.quarantined_at_ns, quarantine.release_after_ns, quarantine_payload],
+        ).map_err(|err| err.to_string())?;
+        if let Some((activation_key, activation)) = activation_change {
+            transaction.execute(
+                "INSERT OR REPLACE INTO strategy_activations(version_key, payload_json) VALUES(?1, ?2)",
+                params![activation_key, row_payload(activation)?],
+            ).map_err(|err| err.to_string())?;
+        }
+        transaction
+            .execute(
+                "UPDATE pending_strategy_executions SET state = ?2, next_check_at_ns = ?3,
+             updated_at_ns = ?4, payload_json = ?5 WHERE execution_id = ?1",
+                params![
+                    execution.execution_id,
+                    strategy_execution_state_text(&execution.state),
+                    execution.next_check_at_ns,
+                    execution.updated_at_ns,
+                    execution_payload
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+        transaction.commit().map_err(|err| err.to_string())?;
+        Ok(true)
+    })
+}
+
 pub fn upsert_active_exposure(exposure: &ActiveExposure) -> Result<(), String> {
     let payload_json = row_payload(exposure)?;
     backend::with_connection(|conn| {
@@ -4482,5 +4848,85 @@ mod tests {
         let denied_multi = sql_query_read_only("SELECT 1; SELECT 2", 10)
             .expect_err("multi statement must be rejected");
         assert!(denied_multi.contains("single SELECT"));
+    }
+
+    #[test]
+    fn strategy_execution_storage_round_trip_due_order_and_duplicate_idempotency() {
+        use crate::domain::types::{
+            PendingStrategyExecutionCall, PendingStrategyExecutionState, StrategyExecutionCall,
+            StrategyExecutionCallState, StrategyTemplateKey,
+        };
+        close_storage().unwrap();
+        init_storage().unwrap();
+        let make = |id: &str, created_at_ns: u64, next_check_at_ns: u64| PendingStrategyExecution {
+            execution_id: id.to_string(),
+            turn_id: format!("turn-{id}"),
+            key: StrategyTemplateKey {
+                protocol: "p".into(),
+                primitive: "lend".into(),
+                chain_id: 8453,
+                template_id: "t".into(),
+            },
+            action_id: "enter_supply".into(),
+            plan_digest: format!("digest-{id}"),
+            asset_effects: vec![],
+            calls: vec![PendingStrategyExecutionCall {
+                index: 0,
+                call: StrategyExecutionCall {
+                    role: "pool".into(),
+                    to: "0x1111111111111111111111111111111111111111".into(),
+                    value_wei: "0".into(),
+                    data: "0x".into(),
+                },
+                tx_hash: Some("0xabc".into()),
+                state: StrategyExecutionCallState::Submitted,
+                receipt_block_number: None,
+                receipt_block_hash: None,
+                submitted_at_ns: Some(created_at_ns),
+                last_checked_at_ns: None,
+                error: None,
+            }],
+            state: PendingStrategyExecutionState::Pending,
+            created_at_ns,
+            updated_at_ns: created_at_ns,
+            next_check_at_ns,
+            consecutive_rpc_failures: 0,
+            bookkeeping_applied: false,
+            terminal_bookkeeping_applied: false,
+        };
+        let later = make("later", 20, 20);
+        let earlier = make("earlier", 10, 10);
+        assert_eq!(insert_pending_strategy_execution(&later).unwrap(), later);
+        assert_eq!(
+            insert_pending_strategy_execution(&earlier).unwrap(),
+            earlier
+        );
+        assert_eq!(
+            insert_pending_strategy_execution(&earlier).unwrap(),
+            earlier
+        );
+        assert_eq!(
+            get_pending_strategy_execution("earlier").unwrap(),
+            Some(earlier.clone())
+        );
+        let due = list_due_pending_strategy_executions(20, 10).unwrap();
+        assert_eq!(
+            due.iter()
+                .map(|item| item.execution_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["earlier", "later"]
+        );
+        let mut updated = earlier.clone();
+        updated.bookkeeping_applied = true;
+        update_pending_strategy_execution(&updated).unwrap();
+        // Re-running initialization models the post-upgrade migration path on
+        // the same stable SQLite database and must preserve the JSON payload.
+        init_storage().unwrap();
+        assert!(
+            get_pending_strategy_execution("earlier")
+                .unwrap()
+                .unwrap()
+                .bookkeeping_applied
+        );
     }
 }

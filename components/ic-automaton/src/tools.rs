@@ -23,9 +23,11 @@
 use crate::domain::types::{
     AbiTypeSpec, ActiveExposure, AgentState, AutonomyPolicy, CycleTelemetry, ExecutionPlan,
     GoalRecord, GoalStatus, InferenceToolScope, JournalDealClaim, MemoryFact, MemoryFactSort,
+    PendingStrategyExecution, PendingStrategyExecutionCall, PendingStrategyExecutionState,
     PlanRecord, PlanStatus, PlanStep, PlanStepStatus, PostRoomMessageRequest, PromptLayer,
-    RoomContentType, StrategyExecutionIntent, StrategyQuarantine, StrategyTemplateKey,
-    SurvivalOperationClass, ToolCall, ToolCallOutcome, ToolCallRecord, ToolFailureKind,
+    RoomContentType, StrategyExecutionCallState, StrategyExecutionIntent, StrategyQuarantine,
+    StrategyTemplateKey, SurvivalOperationClass, ToolCall, ToolCallOutcome, ToolCallRecord,
+    ToolFailureKind,
 };
 use crate::features::canister_call::canister_call_tool;
 use crate::features::cycle_topup_host::{top_up_status_tool, trigger_top_up_tool};
@@ -1316,6 +1318,7 @@ impl ToolManager {
                 } else {
                     let result = execute_strategy_action_tool(
                         &call.args_json,
+                        turn_id,
                         signer,
                         history.prior_same_turn,
                         history.current_batch,
@@ -3896,6 +3899,7 @@ fn calldata_u256_word(
 /// template's budget-spend counter is updated in stable storage.
 async fn execute_strategy_action_tool(
     args_json: &str,
+    turn_id: &str,
     signer: &dyn SignerPort,
     prior_same_turn_history: &[ToolCallRecord],
     current_batch_history: &[ToolCallRecord],
@@ -3996,38 +4000,51 @@ async fn execute_strategy_action_tool(
         plan.action_id,
         plan.calls.len()
     );
-    let tx_hashes = match crate::features::evm::execute_strategy_plan(&plan, signer).await {
-        Ok(tx_hashes) => tx_hashes,
-        Err(error) => {
-            record_strategy_failure(&plan, &error, now_ns);
-            return Err(error);
-        }
+    let plan_digest = execution_plan_digest(&plan)?;
+    let execution_id = format!("strategy:{}:{}", turn_id, plan_digest);
+    let pending = PendingStrategyExecution {
+        execution_id: execution_id.clone(),
+        turn_id: turn_id.to_string(),
+        key: plan.key.clone(),
+        action_id: plan.action_id.clone(),
+        plan_digest,
+        asset_effects: plan.asset_effects.clone(),
+        calls: plan
+            .calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| PendingStrategyExecutionCall {
+                index: index.try_into().unwrap_or(u32::MAX),
+                call: call.clone(),
+                tx_hash: None,
+                state: StrategyExecutionCallState::Unattempted,
+                receipt_block_number: None,
+                receipt_block_hash: None,
+                submitted_at_ns: None,
+                last_checked_at_ns: None,
+                error: None,
+            })
+            .collect(),
+        state: PendingStrategyExecutionState::Pending,
+        created_at_ns: now_ns,
+        updated_at_ns: now_ns,
+        next_check_at_ns: now_ns,
+        consecutive_rpc_failures: 0,
+        bookkeeping_applied: false,
+        terminal_bookkeeping_applied: false,
     };
-    if let Err(error) = record_strategy_success(&plan, args_json, now_ns) {
-        log!(
-            StrategyToolLogPriority::Error,
-            "strategy_bookkeeping_failed protocol={} template_id={} action_id={} error={}",
-            plan.key.protocol,
-            plan.key.template_id,
-            plan.action_id,
-            error
-        );
-        return Err(format!("strategy execution bookkeeping failed: {error}"));
+    let pending = stable::insert_pending_strategy_execution(pending)?;
+    if pending.bookkeeping_applied {
+        return Err("strategy execution replay already confirmed".to_string());
     }
-    if let Err(error) = record_strategy_budget_spend(&plan) {
-        log!(
-            StrategyToolLogPriority::Error,
-            "strategy_budget_update_failed protocol={} template_id={} action_id={} error={}",
-            plan.key.protocol,
-            plan.key.template_id,
-            plan.action_id,
-            error
-        );
-        record_strategy_failure(&plan, &error, now_ns);
-        return Err(format!(
-            "strategy execution budget bookkeeping failed: {error}"
-        ));
+    if pending.terminal_bookkeeping_applied {
+        return Err("strategy execution replay already reached a terminal failure".to_string());
     }
+    let tx_hashes =
+        match crate::features::evm::execute_strategy_plan(&plan, &execution_id, signer).await {
+            Ok(tx_hashes) => tx_hashes,
+            Err(error) => return Err(error),
+        };
     log!(
         StrategyToolLogPriority::Info,
         "strategy_execute_ok protocol={} template_id={} action_id={} tx_hash_count={}",
@@ -4039,6 +4056,8 @@ async fn execute_strategy_action_tool(
     serde_json::to_string(&serde_json::json!({
         "key": plan.key,
         "action_id": plan.action_id,
+        "execution_id": execution_id,
+        "status": "pending_confirmation",
         "tx_hashes": tx_hashes,
         "asset_effects": plan.asset_effects
     }))
@@ -4625,29 +4644,79 @@ fn record_strategy_failure(plan: &ExecutionPlan, reason: &str, now_ns: u64) {
     let _ = stable::set_strategy_quarantine(quarantine);
 }
 
-fn record_strategy_success(
-    plan: &ExecutionPlan,
-    _args_json: &str,
+pub(crate) fn apply_terminal_strategy_failure(
+    execution: &mut PendingStrategyExecution,
+    kind: crate::domain::types::StrategyOutcomeKind,
+    reason: &str,
     now_ns: u64,
-) -> Result<(), String> {
-    let strategy_id = strategy_id_from_key(&plan.key);
-    if is_enter_or_exit_action(&plan.action_id) {
-        let updated = match plan.action_id.starts_with("exit_") {
-            true => update_exposure_after_exit(&strategy_id, plan, now_ns),
-            false => update_exposure_after_enter(&strategy_id, plan, now_ns),
-        }?;
-        if plan.action_id.starts_with("exit_") {
-            if let Some(exposure) = updated {
-                stable::set_active_exposure(exposure)?;
-            } else {
-                let _ = stable::remove_active_exposure(&strategy_id);
-            }
-        } else if let Some(exposure) = updated {
-            stable::set_active_exposure(exposure)?;
+) -> Result<bool, String> {
+    if execution.bookkeeping_applied || execution.terminal_bookkeeping_applied {
+        return Ok(false);
+    }
+    if execution.state == PendingStrategyExecutionState::Pending {
+        return Err("terminal strategy failure requires a terminal state".to_string());
+    }
+    let strategy_id = strategy_id_from_key(&execution.key);
+    let mut quarantine =
+        stable::strategy_quarantine(&strategy_id).unwrap_or_else(|| StrategyQuarantine {
+            strategy_id: strategy_id.clone(),
+            reason: reason.to_string(),
+            failure_count: 0,
+            quarantined_at_ns: now_ns,
+            release_after_ns: None,
+        });
+    quarantine.failure_count = quarantine.failure_count.saturating_add(1);
+    quarantine.reason = reason.to_string();
+    let policy = current_autonomy_policy(now_ns);
+    if quarantine.failure_count >= policy.escalation_rules.failure_quarantine_threshold {
+        quarantine.release_after_ns = Some(
+            now_ns.saturating_add(
+                stable::autonomy_suppression_config()
+                    .failure_cooldown_secs
+                    .saturating_mul(1_000_000_000),
+            ),
+        );
+    }
+    let mut stats = stable::strategy_outcome_stats(&execution.key).unwrap_or_else(|| {
+        crate::domain::types::StrategyOutcomeStats {
+            key: execution.key.clone(),
+            total_runs: 0,
+            success_runs: 0,
+            deterministic_failures: 0,
+            nondeterministic_failures: 0,
+            deterministic_failure_streak: 0,
+            last_error: None,
+            last_tx_hash: None,
+            last_observed_at_ns: None,
+        }
+    });
+    stats.total_runs = stats.total_runs.saturating_add(1);
+    match kind {
+        crate::domain::types::StrategyOutcomeKind::DeterministicFailure => {
+            stats.deterministic_failures = stats.deterministic_failures.saturating_add(1);
+            stats.deterministic_failure_streak =
+                stats.deterministic_failure_streak.saturating_add(1);
+        }
+        crate::domain::types::StrategyOutcomeKind::NondeterministicFailure => {
+            stats.nondeterministic_failures = stats.nondeterministic_failures.saturating_add(1);
+            stats.deterministic_failure_streak = 0;
+        }
+        crate::domain::types::StrategyOutcomeKind::Success => {
+            return Err("terminal failure cannot use success outcome kind".to_string());
         }
     }
-    let _ = stable::clear_strategy_quarantine(&strategy_id);
-    Ok(())
+    stats.last_error = Some(reason.to_string());
+    stats.last_tx_hash = execution
+        .calls
+        .iter()
+        .rev()
+        .find_map(|call| call.tx_hash.clone());
+    stats.last_observed_at_ns = Some(now_ns);
+    let activation = learner::auto_deactivation_for_stats(&stats, now_ns);
+    execution.terminal_bookkeeping_applied = true;
+    execution.updated_at_ns = now_ns;
+    execution.next_check_at_ns = now_ns;
+    stable::fail_strategy_execution_atomically(execution, &stats, &quarantine, activation.as_ref())
 }
 
 fn update_exposure_after_enter(
@@ -4792,24 +4861,85 @@ fn get_strategy_outcomes_tool(args_json: &str) -> Result<String, String> {
     .map_err(|error| format!("failed to serialize strategy outcomes: {error}"))
 }
 
-/// Accumulate the Wei value of all calls in `plan` against the template's budget counter.
-/// No-ops when the total spend for this execution is zero.
-fn record_strategy_budget_spend(plan: &crate::domain::types::ExecutionPlan) -> Result<(), String> {
-    let spent_total = plan.calls.iter().try_fold(U256::ZERO, |acc, call| {
-        parse_u256_decimal(&call.value_wei)
-            .map(|value| acc.saturating_add(value))
-            .map_err(|error| format!("invalid plan value_wei for budget update: {error}"))
-    })?;
-    if spent_total == U256::ZERO {
-        return Ok(());
+/// Apply all success bookkeeping after receipt confirmation. The storage facade
+/// rejects a replay and commits the evidence flag, exposure, budget, learner
+/// stats, and quarantine clear in one SQLite transaction.
+pub(crate) fn apply_confirmed_strategy_execution(
+    execution: &mut PendingStrategyExecution,
+    now_ns: u64,
+) -> Result<bool, String> {
+    if execution.bookkeeping_applied {
+        return Ok(false);
     }
-
-    let current_spent_raw =
-        stable::strategy_template_budget_spent_wei(&plan.key).unwrap_or_else(|| "0".to_string());
-    let current_spent = parse_u256_decimal(&current_spent_raw)
-        .map_err(|error| format!("invalid stored template budget: {error}"))?;
-    let updated = current_spent.saturating_add(spent_total);
-    stable::set_strategy_template_budget_spent_wei(&plan.key, updated.to_string()).map(|_| ())
+    let plan = ExecutionPlan {
+        key: execution.key.clone(),
+        action_id: execution.action_id.clone(),
+        calls: execution
+            .calls
+            .iter()
+            .map(|call| call.call.clone())
+            .collect(),
+        preconditions: Vec::new(),
+        postconditions: Vec::new(),
+        asset_effects: execution.asset_effects.clone(),
+        risk_checks: Vec::new(),
+    };
+    let strategy_id = strategy_id_from_key(&plan.key);
+    let exposure_change = if is_enter_or_exit_action(&plan.action_id) {
+        Some(if plan.action_id.starts_with("exit_") {
+            update_exposure_after_exit(&strategy_id, &plan, now_ns)?
+        } else {
+            update_exposure_after_enter(&strategy_id, &plan, now_ns)?
+        })
+    } else {
+        None
+    };
+    let mut stats = stable::strategy_outcome_stats(&plan.key).unwrap_or_else(|| {
+        crate::domain::types::StrategyOutcomeStats {
+            key: plan.key.clone(),
+            total_runs: 0,
+            success_runs: 0,
+            deterministic_failures: 0,
+            nondeterministic_failures: 0,
+            deterministic_failure_streak: 0,
+            last_error: None,
+            last_tx_hash: None,
+            last_observed_at_ns: None,
+        }
+    });
+    stats.total_runs = stats.total_runs.saturating_add(1);
+    stats.success_runs = stats.success_runs.saturating_add(1);
+    stats.deterministic_failure_streak = 0;
+    stats.last_error = None;
+    stats.last_tx_hash = execution.calls.last().and_then(|call| call.tx_hash.clone());
+    stats.last_observed_at_ns = Some(now_ns);
+    let spent = plan.calls.iter().try_fold(U256::ZERO, |acc, call| {
+        parse_u256_decimal(&call.value_wei).and_then(|value| {
+            acc.checked_add(value)
+                .ok_or_else(|| "strategy budget overflow".to_string())
+        })
+    })?;
+    let budget = if spent == U256::ZERO {
+        None
+    } else {
+        let current = stable::strategy_template_budget_spent_wei(&plan.key)
+            .unwrap_or_else(|| "0".to_string());
+        let updated = parse_u256_decimal(&current)?
+            .checked_add(spent)
+            .ok_or_else(|| "strategy budget overflow".to_string())?;
+        Some(updated.to_string())
+    };
+    execution.bookkeeping_applied = true;
+    execution.state = PendingStrategyExecutionState::Confirmed;
+    execution.updated_at_ns = now_ns;
+    execution.next_check_at_ns = now_ns;
+    stable::confirm_strategy_execution_atomically(
+        execution,
+        exposure_change.as_ref(),
+        &stats,
+        budget.as_deref(),
+        &strategy_id,
+    )
 }
 
 /// Parse a decimal (non-hex) string into a `U256`.  Rejects empty input and hex strings.
@@ -5537,6 +5667,247 @@ mod tests {
             asset_effects: vec![effect],
             risk_checks: vec![],
         }
+    }
+
+    #[test]
+    fn strategy_execution_confirmed_bookkeeping_is_atomic_and_idempotent() {
+        stable::init_storage();
+        let key = StrategyTemplateKey {
+            protocol: "receipt-test".into(),
+            primitive: "lend".into(),
+            chain_id: 8453,
+            template_id: "atomic-once".into(),
+        };
+        let strategy_id = strategy_id_from_key(&key);
+        let mut execution = PendingStrategyExecution {
+            execution_id: "strategy:turn-atomic:digest".into(),
+            turn_id: "turn-atomic".into(),
+            key: key.clone(),
+            action_id: "enter_supply".into(),
+            plan_digest: "digest".into(),
+            asset_effects: vec![StrategyAssetEffect {
+                chain_id: 8453,
+                asset_address: Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".into()),
+                asset_symbol: "USDC".into(),
+                decimals: 6,
+                amount_raw: "25".into(),
+                direction: StrategyAssetDirection::Debit,
+            }],
+            calls: vec![PendingStrategyExecutionCall {
+                index: 0,
+                call: crate::domain::types::StrategyExecutionCall {
+                    role: "pool".into(),
+                    to: "0x1111111111111111111111111111111111111111".into(),
+                    value_wei: "5".into(),
+                    data: "0x".into(),
+                },
+                tx_hash: Some("0xabc".into()),
+                state: StrategyExecutionCallState::Confirmed,
+                receipt_block_number: Some(10),
+                receipt_block_hash: Some("0xblock".into()),
+                submitted_at_ns: Some(1),
+                last_checked_at_ns: Some(2),
+                error: None,
+            }],
+            state: PendingStrategyExecutionState::Pending,
+            created_at_ns: 1,
+            updated_at_ns: 2,
+            next_check_at_ns: 2,
+            consecutive_rpc_failures: 0,
+            bookkeeping_applied: false,
+            terminal_bookkeeping_applied: false,
+        };
+        stable::insert_pending_strategy_execution(execution.clone()).unwrap();
+        let stale_pending = execution.clone();
+        assert!(apply_confirmed_strategy_execution(&mut execution, 3).unwrap());
+        let persisted = stable::pending_strategy_execution(&execution.execution_id).unwrap();
+        assert!(persisted.bookkeeping_applied);
+        assert_eq!(
+            stable::active_exposure(&strategy_id)
+                .unwrap()
+                .amount_raw
+                .as_deref(),
+            Some("25")
+        );
+        assert_eq!(
+            stable::strategy_template_budget_spent_wei(&key).as_deref(),
+            Some("5")
+        );
+        assert_eq!(
+            stable::strategy_outcome_stats(&key).unwrap().success_runs,
+            1
+        );
+        let mut stale_progress = stale_pending.clone();
+        stale_progress.next_check_at_ns = 99;
+        assert!(!stable::compare_and_update_pending_strategy_execution(
+            &stale_pending,
+            stale_progress,
+        )
+        .unwrap());
+        let mut stale_failure = stale_pending;
+        stale_failure.state = PendingStrategyExecutionState::Reverted;
+        stale_failure.calls[0].state = StrategyExecutionCallState::Reverted;
+        assert!(!apply_terminal_strategy_failure(
+            &mut stale_failure,
+            crate::domain::types::StrategyOutcomeKind::DeterministicFailure,
+            "stale failure after confirmation",
+            100,
+        )
+        .unwrap());
+        let mut replay = persisted;
+        assert!(!apply_confirmed_strategy_execution(&mut replay, 4).unwrap());
+        assert_eq!(
+            stable::active_exposure(&strategy_id)
+                .unwrap()
+                .amount_raw
+                .as_deref(),
+            Some("25")
+        );
+        assert_eq!(
+            stable::strategy_template_budget_spent_wei(&key).as_deref(),
+            Some("5")
+        );
+        assert_eq!(
+            stable::strategy_outcome_stats(&key).unwrap().success_runs,
+            1
+        );
+    }
+
+    #[test]
+    fn strategy_execution_terminal_failure_bookkeeping_is_atomic_classified_and_idempotent() {
+        stable::init_storage();
+        let make = |key: StrategyTemplateKey, id: String| PendingStrategyExecution {
+            execution_id: id.clone(),
+            turn_id: id,
+            key,
+            action_id: "enter_supply".into(),
+            plan_digest: "digest".into(),
+            asset_effects: vec![],
+            calls: vec![PendingStrategyExecutionCall {
+                index: 0,
+                call: crate::domain::types::StrategyExecutionCall {
+                    role: "pool".into(),
+                    to: "0x1111111111111111111111111111111111111111".into(),
+                    value_wei: "0".into(),
+                    data: "0x".into(),
+                },
+                tx_hash: Some("0xabc".into()),
+                state: StrategyExecutionCallState::Reverted,
+                receipt_block_number: Some(1),
+                receipt_block_hash: Some("0xblock".into()),
+                submitted_at_ns: Some(1),
+                last_checked_at_ns: Some(2),
+                error: Some("reverted".into()),
+            }],
+            state: PendingStrategyExecutionState::Reverted,
+            created_at_ns: 1,
+            updated_at_ns: 2,
+            next_check_at_ns: 2,
+            consecutive_rpc_failures: 0,
+            bookkeeping_applied: false,
+            terminal_bookkeeping_applied: false,
+        };
+        let deterministic_key = StrategyTemplateKey {
+            protocol: "failure-atomic".into(),
+            primitive: "lend".into(),
+            chain_id: 8453,
+            template_id: "deterministic".into(),
+        };
+        stable::set_strategy_template_activation(crate::domain::types::TemplateActivationState {
+            key: deterministic_key.clone(),
+            enabled: true,
+            updated_at_ns: 0,
+            reason: None,
+        })
+        .unwrap();
+        for index in 0..3 {
+            let mut execution = make(
+                deterministic_key.clone(),
+                format!("failure-deterministic-{index}"),
+            );
+            let mut durable_predecessor = execution.clone();
+            durable_predecessor.state = PendingStrategyExecutionState::Pending;
+            let stale_pending = durable_predecessor.clone();
+            stable::insert_pending_strategy_execution(durable_predecessor).unwrap();
+            assert!(apply_terminal_strategy_failure(
+                &mut execution,
+                crate::domain::types::StrategyOutcomeKind::DeterministicFailure,
+                "receipt reverted",
+                10 + index
+            )
+            .unwrap());
+            if index == 0 {
+                let mut stale_progress = stale_pending.clone();
+                stale_progress.next_check_at_ns = 999;
+                assert!(!stable::compare_and_update_pending_strategy_execution(
+                    &stale_pending,
+                    stale_progress,
+                )
+                .unwrap());
+                let mut stale_confirm = stale_pending;
+                stale_confirm.calls[0].state = StrategyExecutionCallState::Confirmed;
+                stale_confirm.action_id = "observe".into();
+                assert!(!apply_confirmed_strategy_execution(&mut stale_confirm, 99).unwrap());
+            }
+            stable::init_storage();
+            let mut replay = stable::pending_strategy_execution(&execution.execution_id).unwrap();
+            assert!(!apply_terminal_strategy_failure(
+                &mut replay,
+                crate::domain::types::StrategyOutcomeKind::DeterministicFailure,
+                "receipt reverted",
+                20 + index
+            )
+            .unwrap());
+        }
+        let deterministic = stable::strategy_outcome_stats(&deterministic_key).unwrap();
+        assert_eq!(deterministic.total_runs, 3);
+        assert_eq!(deterministic.deterministic_failures, 3);
+        assert!(
+            !stable::strategy_template_activation(&deterministic_key)
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(
+            stable::strategy_quarantine(&strategy_id_from_key(&deterministic_key))
+                .unwrap()
+                .failure_count,
+            3
+        );
+
+        let dropped_key = StrategyTemplateKey {
+            template_id: "dropped".into(),
+            ..deterministic_key
+        };
+        stable::set_strategy_template_activation(crate::domain::types::TemplateActivationState {
+            key: dropped_key.clone(),
+            enabled: true,
+            updated_at_ns: 0,
+            reason: None,
+        })
+        .unwrap();
+        for index in 0..3 {
+            let mut execution = make(dropped_key.clone(), format!("failure-dropped-{index}"));
+            execution.state = PendingStrategyExecutionState::Dropped;
+            execution.calls[0].state = StrategyExecutionCallState::Dropped;
+            let mut durable_predecessor = execution.clone();
+            durable_predecessor.state = PendingStrategyExecutionState::Pending;
+            stable::insert_pending_strategy_execution(durable_predecessor).unwrap();
+            apply_terminal_strategy_failure(
+                &mut execution,
+                crate::domain::types::StrategyOutcomeKind::NondeterministicFailure,
+                "receipt timeout",
+                30 + index,
+            )
+            .unwrap();
+        }
+        let dropped = stable::strategy_outcome_stats(&dropped_key).unwrap();
+        assert_eq!(dropped.nondeterministic_failures, 3);
+        assert_eq!(dropped.deterministic_failure_streak, 0);
+        assert!(
+            stable::strategy_template_activation(&dropped_key)
+                .unwrap()
+                .enabled
+        );
     }
 
     #[test]
@@ -6908,16 +7279,19 @@ mod tests {
             records[1]
         );
         assert!(records[1].output.contains("\"tx_hashes\""));
+        assert!(records[1]
+            .output
+            .contains("\"status\":\"pending_confirmation\""));
         assert!(
             records[2].success,
             "outcomes should query: {:?}",
             records[2]
         );
-        assert!(records[2].output.contains("\"total_runs\":1"));
+        assert!(records[2].output.contains("\"stats\":null"));
         assert!(records[2].output.contains("\"summary\""));
         assert_eq!(
             stable::strategy_template_budget_spent_wei(&sample_strategy_key()).as_deref(),
-            Some("1")
+            None
         );
     }
 
@@ -7685,14 +8059,24 @@ mod tests {
         assert_eq!(morpho_records.len(), 2);
         assert!(morpho_records[0].success);
         assert!(morpho_records[1].success, "{morpho_records:?}");
-        let exposure = stable::active_exposure(&morpho_strategy_id)
-            .expect("enter execution should persist exposure");
-        assert_eq!(exposure.protocol, sample_morpho_strategy_key().protocol);
-        assert_eq!(exposure.chain_id, sample_morpho_strategy_key().chain_id);
-        assert_eq!(exposure.notional_wei, None);
-        assert_eq!(exposure.amount_raw.as_deref(), Some("1000000"));
-        assert_eq!(exposure.decimals, Some(6));
-        assert!(!exposure.asset_symbol.trim().is_empty());
+        assert!(stable::active_exposure(&morpho_strategy_id).is_none());
+        let output: serde_json::Value = serde_json::from_str(&morpho_records[1].output).unwrap();
+        assert_eq!(
+            output.get("status").and_then(serde_json::Value::as_str),
+            Some("pending_confirmation")
+        );
+        let execution_id = output
+            .get("execution_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let pending = stable::pending_strategy_execution(execution_id).unwrap();
+        assert_eq!(pending.asset_effects[0].amount_raw, "1000000");
+        assert_eq!(
+            pending.calls[0].tx_hash.as_deref(),
+            Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(!pending.bookkeeping_applied);
+        assert!(stable::strategy_outcome_stats(&sample_morpho_strategy_key()).is_none());
     }
 
     #[test]

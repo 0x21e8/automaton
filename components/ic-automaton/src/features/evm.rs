@@ -16,8 +16,9 @@ use crate::domain::cycle_admission::{
 };
 use crate::domain::types::{
     EvmEvent, EvmPollCursor, EvmStewardProof, ExecutionPlan, OperationFailure,
-    OperationFailureKind, OutcallFailure, OutcallFailureKind, RecoveryFailure, RuntimeSnapshot,
-    StewardState, StrategyExecutionCall, StrategyOutcomeEvent, StrategyOutcomeKind,
+    OperationFailureKind, OutcallFailure, OutcallFailureKind, PendingStrategyExecutionState,
+    RecoveryFailure, RuntimeSnapshot, StewardState, StrategyExecutionCall,
+    StrategyExecutionCallState, StrategyOutcomeEvent, StrategyOutcomeKind,
 };
 use crate::storage::stable;
 use crate::timing::current_time_ns;
@@ -481,6 +482,14 @@ pub enum TransactionReceiptStatus {
     Reverted,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StrategyReceiptObservation {
+    pub status: TransactionReceiptStatus,
+    pub block_number: Option<u64>,
+    pub block_hash: Option<String>,
+    pub latest_block: u64,
+}
+
 impl HttpEvmRpcClient {
     /// Construct from the current `RuntimeSnapshot`.  Returns an error if the
     /// primary RPC URL is not configured.
@@ -696,6 +705,59 @@ impl HttpEvmRpcClient {
             Some("0x0") => Ok(TransactionReceiptStatus::Reverted),
             _ => Err("eth_getTransactionReceipt status was invalid".to_string()),
         }
+    }
+
+    pub async fn strategy_receipt_observation(
+        &self,
+        tx_hash: &str,
+    ) -> Result<StrategyReceiptObservation, String> {
+        let response = self
+            .rpc_call(
+                "eth_getTransactionReceipt",
+                json!([tx_hash]),
+                self.control_plane_max_response_bytes(),
+            )
+            .await
+            .map_err(|error| format!("eth_getTransactionReceipt failed: {error}"))?;
+        let receipt = response
+            .get("result")
+            .ok_or_else(|| "eth_getTransactionReceipt result was missing".to_string())?;
+        let latest_block = self.eth_block_number().await?;
+        if receipt.is_null() {
+            return Ok(StrategyReceiptObservation {
+                status: TransactionReceiptStatus::Pending,
+                block_number: None,
+                block_hash: None,
+                latest_block,
+            });
+        }
+        let status = match receipt.get("status").and_then(Value::as_str) {
+            Some("0x1") => TransactionReceiptStatus::Confirmed,
+            Some("0x0") => TransactionReceiptStatus::Reverted,
+            _ => return Err("eth_getTransactionReceipt status was invalid".to_string()),
+        };
+        let block_number = receipt
+            .get("blockNumber")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "eth_getTransactionReceipt blockNumber was missing".to_string())
+            .and_then(|raw| parse_hex_u64(raw, "receipt blockNumber"))?;
+        let block_hash = receipt
+            .get("blockHash")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "eth_getTransactionReceipt blockHash was missing".to_string())?
+            .to_string();
+        if block_number > latest_block {
+            return Err(format!(
+                "receipt block {block_number} is greater than latest head {latest_block}"
+            ));
+        }
+        Ok(StrategyReceiptObservation {
+            status,
+            block_number: Some(block_number),
+            block_hash: Some(block_hash),
+            latest_block,
+        })
     }
 
     /// Fetch the current base gas price in wei.
@@ -1159,6 +1221,12 @@ fn host_rpc_stub_response(body: &[u8]) -> Result<Vec<u8>, String> {
         .get("method")
         .and_then(Value::as_str)
         .ok_or_else(|| "host rpc stub request is missing method".to_string())?;
+
+    // Tests may force a syntactically malformed successful response to drive
+    // decoding failures through the same orchestration path as production.
+    if let Ok(forced_body) = std::env::var(HOST_EVM_RPC_STUB_FORCE_BODY_ENV) {
+        return Ok(forced_body.into_bytes());
+    }
 
     let response = match method {
         "eth_blockNumber" => json!({"jsonrpc":"2.0","id":1,"result":"0x0"}),
@@ -2857,6 +2925,7 @@ pub fn classify_strategy_failure_kind(error: &str) -> StrategyOutcomeKind {
 #[allow(dead_code)]
 pub async fn execute_strategy_plan(
     plan: &ExecutionPlan,
+    execution_id: &str,
     signer: &dyn SignerPort,
 ) -> Result<Vec<String>, String> {
     log!(
@@ -2883,8 +2952,30 @@ pub async fn execute_strategy_plan(
         return Err(error);
     }
 
-    let mut tx_hashes = Vec::with_capacity(plan.calls.len());
+    let mut execution = stable::pending_strategy_execution(execution_id).ok_or_else(|| {
+        "pending strategy execution was not persisted before broadcast".to_string()
+    })?;
+    if execution.calls.len() != plan.calls.len()
+        || execution
+            .calls
+            .iter()
+            .zip(&plan.calls)
+            .any(|(stored, planned)| stored.call != *planned)
+    {
+        return Err("pending strategy execution does not match execution plan".to_string());
+    }
+    if execution.terminal_bookkeeping_applied {
+        return Err("strategy execution already reached a terminal failure".to_string());
+    }
+    let mut tx_hashes = execution
+        .calls
+        .iter()
+        .filter_map(|call| call.tx_hash.clone())
+        .collect::<Vec<_>>();
     for (index, call) in plan.calls.iter().enumerate() {
+        if execution.calls[index].tx_hash.is_some() {
+            continue;
+        }
         log!(
             StrategyExecutionLogPriority::Info,
             "strategy_execute_call_start protocol={} template_id={} action_id={} call_index={} role={} to={} value_wei={}",
@@ -2899,7 +2990,6 @@ pub async fn execute_strategy_plan(
         let args_json = match strategy_call_to_send_eth_args_json(call) {
             Ok(payload) => payload,
             Err(error) => {
-                let outcome = classify_strategy_failure_kind(&error);
                 log!(
                     StrategyExecutionLogPriority::Error,
                     "strategy_execute_call_encode_failed protocol={} template_id={} action_id={} call_index={} error={}",
@@ -2909,16 +2999,26 @@ pub async fn execute_strategy_plan(
                     index,
                     error
                 );
-                persist_strategy_outcome(
-                    plan,
-                    outcome,
-                    tx_hashes.last().cloned(),
-                    Some(error.clone()),
+                execution.calls[index].error = Some(error.clone());
+                execution.calls[index].state = StrategyExecutionCallState::Dropped;
+                execution.updated_at_ns = current_time_ns();
+                execution.state = if tx_hashes.is_empty() {
+                    PendingStrategyExecutionState::Dropped
+                } else {
+                    PendingStrategyExecutionState::PartialFailure
+                };
+                crate::tools::apply_terminal_strategy_failure(
+                    &mut execution,
+                    StrategyOutcomeKind::DeterministicFailure,
+                    &error,
+                    current_time_ns(),
                 )?;
                 return Err(error);
             }
         };
 
+        // The durable execution loaded above is stale-capable across this RPC await.
+        let expected = execution.clone();
         match send_eth_tool(&args_json, signer).await {
             Ok(tx_hash) => {
                 log!(
@@ -2930,10 +3030,33 @@ pub async fn execute_strategy_plan(
                     index,
                     tx_hash
                 );
-                tx_hashes.push(tx_hash);
+                tx_hashes.push(tx_hash.clone());
+                let now_ns = current_time_ns();
+                execution.calls[index].tx_hash = Some(tx_hash);
+                execution.calls[index].state = StrategyExecutionCallState::Submitted;
+                execution.calls[index].submitted_at_ns = Some(now_ns);
+                execution.updated_at_ns = now_ns;
+                execution.next_check_at_ns = now_ns;
+                if !stable::compare_and_update_pending_strategy_execution(
+                    &expected,
+                    execution.clone(),
+                )? {
+                    execution =
+                        stable::pending_strategy_execution(execution_id).ok_or_else(|| {
+                            "strategy execution disappeared after submission".to_string()
+                        })?;
+                    if execution.state != PendingStrategyExecutionState::Pending {
+                        return Err(
+                            "strategy execution reached a terminal state during submission"
+                                .to_string(),
+                        );
+                    }
+                    return Err(
+                        "strategy execution submission lost a durable progress race".to_string()
+                    );
+                }
             }
             Err(error) => {
-                let outcome = classify_strategy_failure_kind(&error);
                 log!(
                     StrategyExecutionLogPriority::Error,
                     "strategy_execute_call_failed protocol={} template_id={} action_id={} call_index={} error={}",
@@ -2943,23 +3066,34 @@ pub async fn execute_strategy_plan(
                     index,
                     error
                 );
-                persist_strategy_outcome(
-                    plan,
-                    outcome,
-                    tx_hashes.last().cloned(),
-                    Some(error.clone()),
+                execution.calls[index].error = Some(error.clone());
+                execution.calls[index].state = StrategyExecutionCallState::Dropped;
+                execution.updated_at_ns = current_time_ns();
+                execution.state = if tx_hashes.is_empty() {
+                    PendingStrategyExecutionState::Dropped
+                } else {
+                    PendingStrategyExecutionState::PartialFailure
+                };
+                let kind = classify_strategy_failure_kind(&error);
+                crate::tools::apply_terminal_strategy_failure(
+                    &mut execution,
+                    kind,
+                    &error,
+                    current_time_ns(),
                 )?;
                 return Err(error);
             }
         }
     }
 
-    persist_strategy_outcome(
-        plan,
-        StrategyOutcomeKind::Success,
-        tx_hashes.last().cloned(),
-        None,
-    )?;
+    execution.state = PendingStrategyExecutionState::Pending;
+    execution.updated_at_ns = current_time_ns();
+    // No await occurred since the last successful CAS; this write is still fenced.
+    let expected = stable::pending_strategy_execution(execution_id)
+        .ok_or_else(|| "strategy execution disappeared before completion".to_string())?;
+    if !stable::compare_and_update_pending_strategy_execution(&expected, execution)? {
+        return Err("strategy execution completion lost a durable progress race".to_string());
+    }
     log!(
         StrategyExecutionLogPriority::Info,
         "strategy_execute_plan_ok protocol={} template_id={} action_id={} tx_hash_count={}",
@@ -4103,6 +4237,45 @@ mod tests {
         }
     }
 
+    fn persist_strategy_execution_fixture(execution_id: &str, plan: &ExecutionPlan) {
+        use crate::domain::types::{
+            PendingStrategyExecution, PendingStrategyExecutionCall, PendingStrategyExecutionState,
+            StrategyExecutionCallState,
+        };
+        stable::insert_pending_strategy_execution(PendingStrategyExecution {
+            execution_id: execution_id.to_string(),
+            turn_id: execution_id.to_string(),
+            key: plan.key.clone(),
+            action_id: plan.action_id.clone(),
+            plan_digest: format!("digest-{execution_id}"),
+            asset_effects: plan.asset_effects.clone(),
+            calls: plan
+                .calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| PendingStrategyExecutionCall {
+                    index: index as u32,
+                    call: call.clone(),
+                    tx_hash: None,
+                    state: StrategyExecutionCallState::Unattempted,
+                    receipt_block_number: None,
+                    receipt_block_hash: None,
+                    submitted_at_ns: None,
+                    last_checked_at_ns: None,
+                    error: None,
+                })
+                .collect(),
+            state: PendingStrategyExecutionState::Pending,
+            created_at_ns: 1,
+            updated_at_ns: 1,
+            next_check_at_ns: 1,
+            consecutive_rpc_failures: 0,
+            bookkeeping_applied: false,
+            terminal_bookkeeping_applied: false,
+        })
+        .unwrap();
+    }
+
     #[test]
     fn send_eth_tool_returns_tx_hash_in_host_mode() {
         stable::init_storage();
@@ -4235,18 +4408,164 @@ mod tests {
         };
 
         let signer = FixedSignatureSigner;
-        let err = block_on_with_spin(execute_strategy_plan(&plan, &signer))
+        persist_strategy_execution_fixture("test-invalid-call", &plan);
+        let err = block_on_with_spin(execute_strategy_plan(&plan, "test-invalid-call", &signer))
             .expect_err("invalid strategy call should fail");
         assert!(
             err.contains("address"),
             "expected address validation error, got {err}"
         );
 
-        let stats = crate::storage::stable::strategy_outcome_stats(&plan.key)
-            .expect("failure evidence should persist");
-        assert_eq!(stats.total_runs, 1);
+        let execution = stable::pending_strategy_execution("test-invalid-call").unwrap();
+        assert_eq!(execution.state, PendingStrategyExecutionState::Dropped);
+        assert!(execution.terminal_bookkeeping_applied);
+        assert!(execution.calls[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("address"));
+        let stats = crate::storage::stable::strategy_outcome_stats(&plan.key).unwrap();
         assert_eq!(stats.deterministic_failures, 1);
         assert_eq!(stats.nondeterministic_failures, 0);
+        let _ = block_on_with_spin(execute_strategy_plan(&plan, "test-invalid-call", &signer));
+        assert_eq!(
+            crate::storage::stable::strategy_outcome_stats(&plan.key)
+                .unwrap()
+                .total_runs,
+            1
+        );
+    }
+
+    struct FailSecondSigner(std::cell::Cell<u32>);
+
+    #[async_trait(?Send)]
+    impl SignerPort for FailSecondSigner {
+        async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+            let call = self.0.get().saturating_add(1);
+            self.0.set(call);
+            if call == 2 {
+                Err("second call signing failed".to_string())
+            } else {
+                Ok(format!("0x{}", "11".repeat(64)))
+            }
+        }
+    }
+
+    struct TimeoutSigner;
+
+    #[async_trait(?Send)]
+    impl SignerPort for TimeoutSigner {
+        async fn sign_message(&self, _message_hash: &str) -> Result<String, String> {
+            Err("rpc timeout while signing".to_string())
+        }
+    }
+
+    #[test]
+    fn strategy_execution_multi_call_persists_order_stops_on_failure_and_replays_without_broadcast()
+    {
+        stable::init_storage();
+        stable::set_evm_rpc_url("https://mainnet.base.org".to_string()).unwrap();
+        stable::set_ecdsa_key_name("dfx_test_key".to_string()).unwrap();
+        stable::set_evm_address(Some(
+            "0x1111111111111111111111111111111111111111".to_string(),
+        ))
+        .unwrap();
+        let call = StrategyExecutionCall {
+            role: "pool".into(),
+            to: "0x2222222222222222222222222222222222222222".into(),
+            value_wei: "0".into(),
+            data: "0x".into(),
+        };
+        let plan = ExecutionPlan {
+            key: crate::domain::types::StrategyTemplateKey {
+                protocol: "multi".into(),
+                primitive: "test".into(),
+                chain_id: 8453,
+                template_id: "ordered".into(),
+            },
+            action_id: "act".into(),
+            calls: vec![call.clone(), call.clone(), call],
+            preconditions: vec![],
+            postconditions: vec![],
+            asset_effects: vec![],
+            risk_checks: vec![],
+        };
+        persist_strategy_execution_fixture("multi-success", &plan);
+        let hashes = block_on_with_spin(execute_strategy_plan(
+            &plan,
+            "multi-success",
+            &FixedSignatureSigner,
+        ))
+        .unwrap();
+        assert_eq!(hashes.len(), 3);
+        let stored = stable::pending_strategy_execution("multi-success").unwrap();
+        assert_eq!(
+            stored
+                .calls
+                .iter()
+                .map(|call| call.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(stored.calls.iter().all(|call| call.tx_hash.is_some()));
+        let replay = block_on_with_spin(execute_strategy_plan(
+            &plan,
+            "multi-success",
+            &FailSecondSigner(std::cell::Cell::new(0)),
+        ))
+        .unwrap();
+        assert_eq!(
+            replay, hashes,
+            "replay must return durable hashes without signing again"
+        );
+
+        persist_strategy_execution_fixture("multi-partial", &plan);
+        let error = block_on_with_spin(execute_strategy_plan(
+            &plan,
+            "multi-partial",
+            &FailSecondSigner(std::cell::Cell::new(0)),
+        ))
+        .unwrap_err();
+        assert!(error.contains("second call signing failed"));
+        let partial = stable::pending_strategy_execution("multi-partial").unwrap();
+        assert_eq!(partial.state, PendingStrategyExecutionState::PartialFailure);
+        assert!(partial.terminal_bookkeeping_applied);
+        assert!(partial.calls[0].tx_hash.is_some());
+        assert!(partial.calls[1].tx_hash.is_none());
+        assert_eq!(partial.calls[1].state, StrategyExecutionCallState::Dropped);
+        assert!(partial.calls[2].tx_hash.is_none());
+        assert_eq!(
+            partial.calls[2].state,
+            StrategyExecutionCallState::Unattempted
+        );
+        assert_eq!(
+            stable::strategy_outcome_stats(&plan.key)
+                .unwrap()
+                .deterministic_failures,
+            1
+        );
+
+        let timeout_plan = ExecutionPlan {
+            key: crate::domain::types::StrategyTemplateKey {
+                template_id: "timeout".into(),
+                ..plan.key.clone()
+            },
+            calls: vec![plan.calls[0].clone()],
+            ..plan.clone()
+        };
+        persist_strategy_execution_fixture("single-timeout", &timeout_plan);
+        let timeout = block_on_with_spin(execute_strategy_plan(
+            &timeout_plan,
+            "single-timeout",
+            &TimeoutSigner,
+        ))
+        .unwrap_err();
+        assert!(timeout.contains("timeout"));
+        let timeout_execution = stable::pending_strategy_execution("single-timeout").unwrap();
+        assert!(timeout_execution.terminal_bookkeeping_applied);
+        let timeout_stats = stable::strategy_outcome_stats(&timeout_plan.key).unwrap();
+        assert_eq!(timeout_stats.nondeterministic_failures, 1);
+        assert_eq!(timeout_stats.deterministic_failures, 0);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

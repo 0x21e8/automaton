@@ -93,6 +93,26 @@ fn maybe_auto_deactivate_on_deterministic_failures(
     .map(|_| ())
 }
 
+pub(crate) fn auto_deactivation_for_stats(
+    stats: &StrategyOutcomeStats,
+    observed_at_ns: u64,
+) -> Option<TemplateActivationState> {
+    if stats.deterministic_failure_streak < AUTO_DEACTIVATE_DETERMINISTIC_STREAK
+        || !stable::strategy_template_activation(&stats.key).is_some_and(|state| state.enabled)
+    {
+        return None;
+    }
+    Some(TemplateActivationState {
+        key: stats.key.clone(),
+        enabled: false,
+        updated_at_ns: observed_at_ns,
+        reason: Some(format!(
+            "auto_deactivated after {} deterministic failures in a row",
+            stats.deterministic_failure_streak
+        )),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

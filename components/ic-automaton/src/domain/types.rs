@@ -1819,6 +1819,68 @@ pub struct ExecutionPlan {
     pub risk_checks: Vec<String>,
 }
 
+/// Receipt lifecycle for one ordered call in a durable strategy execution.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyExecutionCallState {
+    Unattempted,
+    Submitted,
+    Confirmed,
+    Reverted,
+    Dropped,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PendingStrategyExecutionCall {
+    pub index: u32,
+    pub call: StrategyExecutionCall,
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+    pub state: StrategyExecutionCallState,
+    #[serde(default)]
+    pub receipt_block_number: Option<u64>,
+    #[serde(default)]
+    pub receipt_block_hash: Option<String>,
+    #[serde(default)]
+    pub submitted_at_ns: Option<u64>,
+    #[serde(default)]
+    pub last_checked_at_ns: Option<u64>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingStrategyExecutionState {
+    Pending,
+    Confirmed,
+    PartialFailure,
+    Reverted,
+    Dropped,
+}
+
+/// Durable, receipt-backed evidence for a submitted strategy plan.
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PendingStrategyExecution {
+    pub execution_id: String,
+    pub turn_id: String,
+    pub key: StrategyTemplateKey,
+    pub action_id: String,
+    pub plan_digest: String,
+    pub asset_effects: Vec<StrategyAssetEffect>,
+    pub calls: Vec<PendingStrategyExecutionCall>,
+    pub state: PendingStrategyExecutionState,
+    pub created_at_ns: u64,
+    pub updated_at_ns: u64,
+    pub next_check_at_ns: u64,
+    #[serde(default)]
+    pub consecutive_rpc_failures: u32,
+    #[serde(default)]
+    pub bookkeeping_applied: bool,
+    #[serde(default)]
+    pub terminal_bookkeeping_applied: bool,
+}
+
 /// The pipeline stage at which a validation finding was produced.
 #[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]

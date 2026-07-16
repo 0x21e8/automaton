@@ -18,15 +18,15 @@ use crate::domain::types::{
     InferenceProxyCallbackRecord, InferenceProxyStatusView, JobStatus, JournalDealClaim,
     JournalEntry, MemoryFact, MemoryRollup, ObservabilitySnapshot, OpenRouterProxyWorkerConfig,
     OpenRouterReasoningLevel, OutboxMessage, OutboxStats, PendingInferenceProxyJob,
-    PendingStrategyDiscoveryJob, PlanRecord, PromptLayer, PromptLayerView, ProtocolWatchlistEntry,
-    ReflectionMemoryRecord, ReflectionOrigin, RetentionConfig, RetentionMaintenanceRuntime,
-    RoomMessage, RoomPollingState, RuntimeSnapshot, RuntimeView, ScheduledJob, SchedulerLease,
-    SchedulerRuntime, SessionSummary, SkillRecord, SpawnBootstrapView, StewardNonceState,
-    StewardState, StewardStatusView, StorageGrowthMetrics, StoragePressureLevel,
-    StrategyDiscoveryCallbackRecord, StrategyDiscoveryResultPayload, StrategyDiscoveryResultStatus,
-    StrategyDiscoveryStatusView, StrategyDiscoveryWorkerConfig, StrategyKillSwitchState,
-    StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats, StrategyQuarantine,
-    StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
+    PendingStrategyDiscoveryJob, PendingStrategyExecution, PlanRecord, PromptLayer,
+    PromptLayerView, ProtocolWatchlistEntry, ReflectionMemoryRecord, ReflectionOrigin,
+    RetentionConfig, RetentionMaintenanceRuntime, RoomMessage, RoomPollingState, RuntimeSnapshot,
+    RuntimeView, ScheduledJob, SchedulerLease, SchedulerRuntime, SessionSummary, SkillRecord,
+    SpawnBootstrapView, StewardNonceState, StewardState, StewardStatusView, StorageGrowthMetrics,
+    StoragePressureLevel, StrategyDiscoveryCallbackRecord, StrategyDiscoveryResultPayload,
+    StrategyDiscoveryResultStatus, StrategyDiscoveryStatusView, StrategyDiscoveryWorkerConfig,
+    StrategyKillSwitchState, StrategyOutcomeEvent, StrategyOutcomeKind, StrategyOutcomeStats,
+    StrategyQuarantine, StrategyTemplate, StrategyTemplateKey, SubmitInferenceResultArgs,
     SubmitStrategyDiscoveryResultArgs, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
     TaskScheduleConfig, TaskScheduleRuntime, TemplateActivationState, TemplateRevocationState,
     ToolCallRecord, TransitionLogRecord, TurnRecord, TurnWindowSummary, WalletBalanceSnapshot,
@@ -1684,6 +1684,86 @@ pub fn set_autonomy_policy(policy: AutonomyPolicy) -> Result<AutonomyPolicy, Str
 
 pub fn active_exposure(strategy_id: &str) -> Option<ActiveExposure> {
     sqlite::get_active_exposure(strategy_id).ok().flatten()
+}
+
+pub fn insert_pending_strategy_execution(
+    execution: PendingStrategyExecution,
+) -> Result<PendingStrategyExecution, String> {
+    if execution.execution_id.trim().is_empty() || execution.plan_digest.trim().is_empty() {
+        return Err("pending strategy execution identity cannot be empty".to_string());
+    }
+    validate_strategy_template_key(&execution.key)?;
+    sqlite::insert_pending_strategy_execution(&execution)
+}
+
+pub fn pending_strategy_execution(execution_id: &str) -> Option<PendingStrategyExecution> {
+    sqlite::get_pending_strategy_execution(execution_id)
+        .ok()
+        .flatten()
+}
+
+pub fn update_pending_strategy_execution(
+    execution: PendingStrategyExecution,
+) -> Result<PendingStrategyExecution, String> {
+    sqlite::update_pending_strategy_execution(&execution)?;
+    Ok(execution)
+}
+
+pub fn compare_and_update_pending_strategy_execution(
+    expected: &PendingStrategyExecution,
+    desired: PendingStrategyExecution,
+) -> Result<bool, String> {
+    sqlite::compare_and_update_pending_strategy_execution(expected, &desired)
+}
+
+pub fn list_due_pending_strategy_executions(
+    now_ns: u64,
+    limit: usize,
+) -> Vec<PendingStrategyExecution> {
+    sqlite::list_due_pending_strategy_executions(now_ns, limit).unwrap_or_default()
+}
+
+pub fn list_confirmed_strategy_executions_page(
+    after: Option<(u64, &str)>,
+    limit: usize,
+) -> Result<Vec<PendingStrategyExecution>, String> {
+    sqlite::list_confirmed_strategy_executions_page(after, limit)
+}
+
+pub fn confirm_strategy_execution_atomically(
+    execution: &PendingStrategyExecution,
+    exposure_change: Option<&Option<ActiveExposure>>,
+    outcome_stats: &StrategyOutcomeStats,
+    budget: Option<&str>,
+    strategy_id: &str,
+) -> Result<bool, String> {
+    let outcome_key = strategy_outcome_stats_record_key(&execution.key);
+    let budget_key = strategy_budget_record_key(&execution.key);
+    sqlite::confirm_strategy_execution_atomically(
+        execution,
+        exposure_change,
+        &outcome_key,
+        outcome_stats,
+        budget.map(|value| (budget_key.as_str(), value)),
+        strategy_id,
+    )
+}
+
+pub fn fail_strategy_execution_atomically(
+    execution: &PendingStrategyExecution,
+    outcome_stats: &StrategyOutcomeStats,
+    quarantine: &StrategyQuarantine,
+    activation: Option<&TemplateActivationState>,
+) -> Result<bool, String> {
+    let outcome_key = strategy_outcome_stats_record_key(&execution.key);
+    let activation_key = template_state_record_key("activation", &execution.key);
+    sqlite::fail_strategy_execution_atomically(
+        execution,
+        &outcome_key,
+        outcome_stats,
+        quarantine,
+        activation.map(|value| (activation_key.as_str(), value)),
+    )
 }
 
 pub fn set_active_exposure(exposure: ActiveExposure) -> Result<ActiveExposure, String> {

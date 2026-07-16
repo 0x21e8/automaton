@@ -116,21 +116,96 @@ fn exposure_drifted(existing: &ActiveExposure, observed: &ObservedExposure) -> b
 }
 
 fn collect_observed_exposures() -> Result<Vec<ObservedExposure>, String> {
-    let turns = stable::list_turns(RECENT_TURN_SCAN_LIMIT);
     let mut observed_by_strategy_id: BTreeMap<String, ObservedExposure> = BTreeMap::new();
 
-    // SQLite returns newest-first. Replay oldest-first so each successful
-    // execution is folded exactly once into a deterministic reconstructed state.
-    for turn in turns.into_iter().rev() {
-        let tool_calls = stable::get_tools_for_turn(&turn.id);
-        for tool_call in tool_calls {
-            if !tool_call.success || tool_call.tool != "execute_strategy_action" {
+    // Receipt-backed executions are the only authoritative source. Historical
+    // successful tool calls predate receipt tracking and are intentionally not
+    // reinterpreted as confirmed chain outcomes.
+    const PAGE_SIZE: usize = 250;
+    let mut cursor: Option<(u64, String)> = None;
+    loop {
+        let page = stable::list_confirmed_strategy_executions_page(
+            cursor.as_ref().map(|(created, id)| (*created, id.as_str())),
+            PAGE_SIZE,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+        for execution in &page {
+            if !execution.bookkeeping_applied {
                 continue;
             }
-            let Some(observation) = observed_exposure_from_tool_call(&turn, &tool_call)? else {
+            let is_open = execution.action_id.starts_with("enter_");
+            let is_close = execution.action_id.starts_with("exit_");
+            if !is_open && !is_close {
+                continue;
+            }
+            let direction = if is_open {
+                crate::domain::types::StrategyAssetDirection::Debit
+            } else {
+                crate::domain::types::StrategyAssetDirection::Credit
+            };
+            let relevant = execution
+                .asset_effects
+                .iter()
+                .filter(|effect| effect.direction == direction)
+                .collect::<Vec<_>>();
+            let Some(first) = relevant.first() else {
                 continue;
             };
-            fold_observed_exposure(&mut observed_by_strategy_id, observation)?;
+            let identity = (
+                first.chain_id,
+                first
+                    .asset_address
+                    .as_ref()
+                    .map(|value| value.to_ascii_lowercase()),
+                first.decimals,
+            );
+            if relevant.iter().any(|effect| {
+                (
+                    effect.chain_id,
+                    effect
+                        .asset_address
+                        .as_ref()
+                        .map(|value| value.to_ascii_lowercase()),
+                    effect.decimals,
+                ) != identity
+            }) {
+                return Err("confirmed strategy effects contain multiple asset groups".to_string());
+            }
+            let amount =
+                relevant
+                    .iter()
+                    .try_fold(alloy_primitives::U256::ZERO, |sum, effect| {
+                        let value = alloy_primitives::U256::from_str(&effect.amount_raw)
+                            .map_err(|error| format!("invalid confirmed effect amount: {error}"))?;
+                        sum.checked_add(value)
+                            .ok_or_else(|| "confirmed effect amount overflow".to_string())
+                    })?;
+            fold_observed_exposure(
+                &mut observed_by_strategy_id,
+                ObservedExposure {
+                    strategy_id: strategy_id_from_key(&execution.key),
+                    protocol: execution.key.protocol.clone(),
+                    chain_id: execution.key.chain_id,
+                    asset_symbol: first.asset_symbol.clone(),
+                    notional_wei: if first.asset_address.is_none() && first.decimals == 18 {
+                        amount.try_into().ok()
+                    } else {
+                        None
+                    },
+                    asset_address: first.asset_address.clone(),
+                    decimals: Some(first.decimals),
+                    amount_raw: Some(amount.to_string()),
+                    updated_at_ns: execution.updated_at_ns,
+                    is_open,
+                },
+            )?;
+        }
+        let last = page.last().expect("non-empty receipt page");
+        cursor = Some((last.created_at_ns, last.execution_id.clone()));
+        if page.len() < PAGE_SIZE {
+            break;
         }
     }
 
@@ -381,44 +456,59 @@ mod tests {
     }
 
     fn append_execution(turn_id: &str, created_at_ns: u64, action_id: &str, amount: &str) {
-        let turn = TurnRecord {
-            id: turn_id.to_string(),
-            created_at_ns,
-            finished_at_ns: Some(created_at_ns + 1),
-            duration_ms: Some(1),
-            state_from: AgentState::Inferring,
-            state_to: AgentState::ExecutingActions,
-            source_events: 1,
-            tool_call_count: 1,
-            input_summary: action_id.to_string(),
-            inner_dialogue: None,
-            inference_round_count: 1,
-            continuation_stop_reason: Default::default(),
-            error: None,
+        use crate::domain::types::{
+            PendingStrategyExecution, PendingStrategyExecutionCall, PendingStrategyExecutionState,
+            StrategyAssetDirection, StrategyAssetEffect, StrategyExecutionCall,
+            StrategyExecutionCallState,
         };
-        let mut tool_call = sample_tool_call();
-        tool_call.turn_id = turn_id.to_string();
-        let mut args: Value = serde_json::from_str(&tool_call.args_json).unwrap();
-        args["action_id"] = Value::String(action_id.to_string());
-        tool_call.args_json = args.to_string();
-        let direction = if action_id.starts_with("enter_") {
-            "Debit"
-        } else {
-            "Credit"
-        };
-        tool_call.output = serde_json::json!({
-            "tx_hashes": [format!("0x{created_at_ns:x}")],
-            "asset_effects": [{
-                "chain_id": 8453,
-                "asset_address": Value::Null,
-                "asset_symbol": "ETH",
-                "decimals": 18,
-                "amount_raw": amount,
-                "direction": direction,
+        stable::insert_pending_strategy_execution(PendingStrategyExecution {
+            execution_id: format!("strategy:{turn_id}:digest"),
+            turn_id: turn_id.to_string(),
+            key: StrategyTemplateKey {
+                protocol: "morpho-v1".into(),
+                primitive: "supply".into(),
+                chain_id: 8453,
+                template_id: "morpho-enter-supply".into(),
+            },
+            action_id: action_id.to_string(),
+            plan_digest: format!("digest-{turn_id}"),
+            asset_effects: vec![StrategyAssetEffect {
+                chain_id: 8453,
+                asset_address: None,
+                asset_symbol: "ETH".into(),
+                decimals: 18,
+                amount_raw: amount.into(),
+                direction: if action_id.starts_with("enter_") {
+                    StrategyAssetDirection::Debit
+                } else {
+                    StrategyAssetDirection::Credit
+                },
             }],
+            calls: vec![PendingStrategyExecutionCall {
+                index: 0,
+                call: StrategyExecutionCall {
+                    role: "pool".into(),
+                    to: "0x1111111111111111111111111111111111111111".into(),
+                    value_wei: "0".into(),
+                    data: "0x".into(),
+                },
+                tx_hash: Some(format!("0x{created_at_ns:x}")),
+                state: StrategyExecutionCallState::Confirmed,
+                receipt_block_number: Some(1),
+                receipt_block_hash: Some("0xblock".into()),
+                submitted_at_ns: Some(created_at_ns),
+                last_checked_at_ns: Some(created_at_ns),
+                error: None,
+            }],
+            state: PendingStrategyExecutionState::Confirmed,
+            created_at_ns,
+            updated_at_ns: created_at_ns,
+            next_check_at_ns: created_at_ns,
+            consecutive_rpc_failures: 0,
+            bookkeeping_applied: true,
+            terminal_bookkeeping_applied: false,
         })
-        .to_string();
-        stable::append_turn_record(&turn, &[tool_call]);
+        .unwrap();
     }
 
     #[test]
@@ -443,6 +533,11 @@ mod tests {
         };
         let tool_call = sample_tool_call();
         stable::append_turn_record(&turn, std::slice::from_ref(&tool_call));
+
+        let legacy = reconcile_active_exposures_from_recent_executions(1_500)
+            .expect("legacy tool success should be ignored");
+        assert_eq!(legacy.recreated_exposures, 0);
+        append_execution("turn-confirmed", 1_600, "enter_supply", "50000000000000000");
 
         assert_eq!(
             stable::active_exposure("morpho-v1:supply:8453:morpho-enter-supply"),
@@ -508,5 +603,30 @@ mod tests {
         assert!(stable::active_exposure("morpho-v1:supply:8453:morpho-enter-supply").is_none());
         let closed_replay = reconcile_active_exposures_from_recent_executions(17_000).unwrap();
         assert_eq!(closed_replay.closed_exposures, 0);
+    }
+
+    #[test]
+    fn exposure_reconciliation_pages_past_boundary_and_applies_newer_exit() {
+        let _ = sqlite::close_storage();
+        stable::init_storage();
+        for index in 0..=250u64 {
+            append_execution(
+                &format!("page-enter-{index:04}"),
+                20_000 + index,
+                "enter_supply",
+                "1",
+            );
+        }
+        append_execution("page-exit-after-boundary", 21_000, "exit_supply", "250");
+        let status = reconcile_active_exposures_from_recent_executions(22_000).unwrap();
+        assert_eq!(status.recreated_exposures, 1);
+        assert_eq!(
+            stable::active_exposure("morpho-v1:supply:8453:morpho-enter-supply")
+                .unwrap()
+                .amount_raw
+                .as_deref(),
+            Some("1"),
+            "the exit on the page after the first boundary must be folded"
+        );
     }
 }

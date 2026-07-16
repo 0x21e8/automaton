@@ -35,10 +35,10 @@ use crate::domain::mortality::{canonical_runway_seconds, policy_for_tier};
 use crate::domain::recovery_policy::decide_recovery_action;
 use crate::domain::types::{
     EvmEvent, InboxMessageSource, JobStatus, MemoryFact, MemoryFactSort, OperationFailure,
-    OperationFailureKind, RecoveryContext, RecoveryFailure, RecoveryOperation,
-    RecoveryPolicyAction, ResponseLimitAdjustment, ResponseLimitPolicy, RuntimeSnapshot,
-    ScheduledJob, SurvivalOperationClass, SurvivalTier, TaskKind, TaskLane,
-    TemplateActivationState, TemplateStatus,
+    OperationFailureKind, PendingStrategyExecutionState, RecoveryContext, RecoveryFailure,
+    RecoveryOperation, RecoveryPolicyAction, ResponseLimitAdjustment, ResponseLimitPolicy,
+    RuntimeSnapshot, ScheduledJob, StrategyExecutionCallState, SurvivalOperationClass,
+    SurvivalTier, TaskKind, TaskLane, TemplateActivationState, TemplateStatus,
 };
 use crate::features::cycle_topup::{
     TopUpStage, TOPUP_MIN_OPERATIONAL_CYCLES, TOPUP_MIN_USDC_AVAILABLE_RAW,
@@ -48,7 +48,8 @@ use crate::features::cycle_topup_host::{
 };
 use crate::features::evm::{
     classify_evm_failure, decode_message_queued_payload, fetch_peer_min_prices,
-    fetch_transaction_receipt_status, fetch_wallet_balance_sync_read, TransactionReceiptStatus,
+    fetch_transaction_receipt_status, fetch_wallet_balance_sync_read, HttpEvmRpcClient,
+    StrategyReceiptObservation, TransactionReceiptStatus,
 };
 use crate::features::factory_room::{FactoryPeer, FactoryRoomClient, ReproductionSessionState};
 use crate::features::inference::classify_inference_failure;
@@ -108,6 +109,11 @@ const TOPUP_FAILED_RECOVERY_BACKOFF_SECS: u64 = 120;
 
 /// Maximum number of strategy templates iterated per `Reconcile` job.
 const STRATEGY_RECONCILE_MAX_TEMPLATES: usize = 200;
+const PENDING_STRATEGY_EXECUTION_SCAN_LIMIT: usize = 20;
+/// A transaction with no receipt for one hour is considered dropped.
+const STRATEGY_EXECUTION_RECEIPT_TIMEOUT_NS: u64 = 60 * 60 * 1_000_000_000;
+const STRATEGY_EXECUTION_RECHECK_NS: u64 = 15 * 1_000_000_000;
+const STRATEGY_EXECUTION_MAX_BACKOFF_NS: u64 = 5 * 60 * 1_000_000_000;
 
 /// Templates older than this window (14 days) are disabled by the reconciler.
 const STRATEGY_TEMPLATE_FRESHNESS_WINDOW_SECS: u64 = 14 * 24 * 60 * 60;
@@ -390,6 +396,7 @@ fn strategy_discovery_autonomy_summary() -> String {
 }
 
 async fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
+    reconcile_pending_strategy_executions(now_ns).await?;
     let templates = crate::strategy::registry::list_all_templates(STRATEGY_RECONCILE_MAX_TEMPLATES);
     if templates.is_empty() {
         log!(
@@ -513,6 +520,181 @@ async fn run_reconcile_job(now_ns: u64) -> Result<(), String> {
         );
     }
 
+    Ok(())
+}
+
+async fn reconcile_pending_strategy_executions(now_ns: u64) -> Result<(), String> {
+    let pending =
+        stable::list_due_pending_strategy_executions(now_ns, PENDING_STRATEGY_EXECUTION_SCAN_LIMIT);
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let snapshot = stable::runtime_snapshot();
+    let rpc = HttpEvmRpcClient::from_snapshot(&snapshot);
+    let required_depth = snapshot.evm_cursor.confirmation_depth.max(1);
+    for mut execution in pending {
+        // `expected` is the stale-capable snapshot loaded before receipt RPC awaits.
+        let expected = execution.clone();
+        expire_unattempted_strategy_calls(&mut execution, now_ns);
+        let mut transport_error = None;
+        for call in execution.calls.iter_mut() {
+            if call.state == StrategyExecutionCallState::Unattempted {
+                continue;
+            }
+            if call.state != StrategyExecutionCallState::Submitted {
+                continue;
+            }
+            let Some(tx_hash) = call.tx_hash.as_deref() else {
+                continue;
+            };
+            let observation = match rpc.as_ref() {
+                Ok(rpc) => rpc.strategy_receipt_observation(tx_hash).await,
+                Err(error) => Err(error.clone()),
+            };
+            match observation {
+                Ok(observation) => {
+                    apply_strategy_receipt_observation(
+                        call,
+                        observation,
+                        now_ns,
+                        execution.created_at_ns,
+                        required_depth,
+                    )?;
+                }
+                Err(error) => {
+                    call.last_checked_at_ns = Some(now_ns);
+                    call.error = Some(error.clone());
+                    transport_error = Some(error);
+                    break;
+                }
+            }
+        }
+        execution.updated_at_ns = now_ns;
+        if let Some(error) = transport_error {
+            execution.consecutive_rpc_failures =
+                execution.consecutive_rpc_failures.saturating_add(1);
+            let backoff = strategy_execution_rpc_backoff_ns(execution.consecutive_rpc_failures);
+            execution.next_check_at_ns = now_ns.saturating_add(backoff);
+            let _ = stable::compare_and_update_pending_strategy_execution(&expected, execution)?;
+            log!(
+                SchedulerLogPriority::Error,
+                "strategy receipt reconciliation backed off: {error}"
+            );
+            continue;
+        }
+        execution.consecutive_rpc_failures = 0;
+        let confirmed = execution
+            .calls
+            .iter()
+            .filter(|call| call.state == StrategyExecutionCallState::Confirmed)
+            .count();
+        let reverted = execution
+            .calls
+            .iter()
+            .any(|call| call.state == StrategyExecutionCallState::Reverted);
+        let dropped = execution
+            .calls
+            .iter()
+            .any(|call| call.state == StrategyExecutionCallState::Dropped);
+        if reverted || dropped {
+            execution.state = if confirmed > 0 {
+                PendingStrategyExecutionState::PartialFailure
+            } else if reverted {
+                PendingStrategyExecutionState::Reverted
+            } else {
+                PendingStrategyExecutionState::Dropped
+            };
+            execution.next_check_at_ns = now_ns;
+            let reason = if reverted {
+                "strategy transaction reverted"
+            } else {
+                "strategy transaction dropped"
+            };
+            let kind = if reverted {
+                crate::domain::types::StrategyOutcomeKind::DeterministicFailure
+            } else {
+                crate::domain::types::StrategyOutcomeKind::NondeterministicFailure
+            };
+            crate::tools::apply_terminal_strategy_failure(&mut execution, kind, reason, now_ns)?;
+        } else if confirmed == execution.calls.len() && !execution.calls.is_empty() {
+            crate::tools::apply_confirmed_strategy_execution(&mut execution, now_ns)?;
+        } else {
+            execution.state = PendingStrategyExecutionState::Pending;
+            execution.next_check_at_ns = now_ns.saturating_add(STRATEGY_EXECUTION_RECHECK_NS);
+            let _ = stable::compare_and_update_pending_strategy_execution(&expected, execution)?;
+        }
+    }
+    Ok(())
+}
+
+fn expire_unattempted_strategy_calls(
+    execution: &mut crate::domain::types::PendingStrategyExecution,
+    now_ns: u64,
+) {
+    if now_ns.saturating_sub(execution.created_at_ns) < STRATEGY_EXECUTION_RECEIPT_TIMEOUT_NS {
+        return;
+    }
+    for call in &mut execution.calls {
+        if call.state == StrategyExecutionCallState::Unattempted
+            || (call.state == StrategyExecutionCallState::Submitted && call.tx_hash.is_none())
+        {
+            call.state = StrategyExecutionCallState::Dropped;
+            call.last_checked_at_ns = Some(now_ns);
+            call.error = Some("unattempted call recovery timeout exceeded".to_string());
+        }
+    }
+}
+
+fn strategy_execution_rpc_backoff_ns(consecutive_failures: u32) -> u64 {
+    let shift = consecutive_failures.min(8);
+    STRATEGY_EXECUTION_RECHECK_NS
+        .saturating_mul(1u64 << shift)
+        .min(STRATEGY_EXECUTION_MAX_BACKOFF_NS)
+}
+
+fn apply_strategy_receipt_observation(
+    call: &mut crate::domain::types::PendingStrategyExecutionCall,
+    observation: StrategyReceiptObservation,
+    now_ns: u64,
+    execution_created_at_ns: u64,
+    required_depth: u64,
+) -> Result<(), String> {
+    call.last_checked_at_ns = Some(now_ns);
+    call.receipt_block_number = observation.block_number;
+    call.receipt_block_hash = observation.block_hash;
+    call.error = None;
+    match observation.status {
+        TransactionReceiptStatus::Pending => {
+            let submitted = call.submitted_at_ns.unwrap_or(execution_created_at_ns);
+            if now_ns.saturating_sub(submitted) >= STRATEGY_EXECUTION_RECEIPT_TIMEOUT_NS {
+                call.state = StrategyExecutionCallState::Dropped;
+                call.error = Some("receipt timeout exceeded".to_string());
+            }
+        }
+        TransactionReceiptStatus::Reverted => {
+            call.state = StrategyExecutionCallState::Reverted;
+            call.error = Some("transaction receipt status was 0x0".to_string());
+        }
+        TransactionReceiptStatus::Confirmed => {
+            let receipt_block = observation
+                .block_number
+                .ok_or_else(|| "confirmed strategy receipt missing block number".to_string())?;
+            if receipt_block > observation.latest_block {
+                return Err(format!(
+                    "receipt block {receipt_block} is greater than latest head {}",
+                    observation.latest_block
+                ));
+            }
+            let confirmations = observation
+                .latest_block
+                .checked_sub(receipt_block)
+                .and_then(|distance| distance.checked_add(1))
+                .ok_or_else(|| "strategy receipt confirmation arithmetic overflow".to_string())?;
+            if confirmations >= required_depth.max(1) {
+                call.state = StrategyExecutionCallState::Confirmed;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2068,6 +2250,254 @@ mod tests {
             .count()
     }
 
+    fn strategy_execution_test_call(
+        submitted_at_ns: u64,
+    ) -> crate::domain::types::PendingStrategyExecutionCall {
+        crate::domain::types::PendingStrategyExecutionCall {
+            index: 0,
+            call: crate::domain::types::StrategyExecutionCall {
+                role: "pool".into(),
+                to: "0x1111111111111111111111111111111111111111".into(),
+                value_wei: "0".into(),
+                data: "0x".into(),
+            },
+            tx_hash: Some("0xabc".into()),
+            state: StrategyExecutionCallState::Submitted,
+            receipt_block_number: None,
+            receipt_block_hash: None,
+            submitted_at_ns: Some(submitted_at_ns),
+            last_checked_at_ns: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn strategy_execution_receipt_state_matrix_enforces_depth_revert_timeout_and_head_order() {
+        assert_eq!(strategy_execution_rpc_backoff_ns(1), 30 * 1_000_000_000);
+        assert_eq!(
+            strategy_execution_rpc_backoff_ns(100),
+            STRATEGY_EXECUTION_MAX_BACKOFF_NS
+        );
+        let mut call = strategy_execution_test_call(100);
+        apply_strategy_receipt_observation(
+            &mut call,
+            StrategyReceiptObservation {
+                status: TransactionReceiptStatus::Pending,
+                block_number: None,
+                block_hash: None,
+                latest_block: 20,
+            },
+            200,
+            100,
+            3,
+        )
+        .unwrap();
+        assert_eq!(call.state, StrategyExecutionCallState::Submitted);
+
+        apply_strategy_receipt_observation(
+            &mut call,
+            StrategyReceiptObservation {
+                status: TransactionReceiptStatus::Confirmed,
+                block_number: Some(19),
+                block_hash: Some("0xblock".into()),
+                latest_block: 20,
+            },
+            201,
+            100,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            call.state,
+            StrategyExecutionCallState::Submitted,
+            "two confirmations are below depth three"
+        );
+        apply_strategy_receipt_observation(
+            &mut call,
+            StrategyReceiptObservation {
+                status: TransactionReceiptStatus::Confirmed,
+                block_number: Some(18),
+                block_hash: Some("0xblock".into()),
+                latest_block: 20,
+            },
+            202,
+            100,
+            3,
+        )
+        .unwrap();
+        assert_eq!(call.state, StrategyExecutionCallState::Confirmed);
+
+        let mut reverted = strategy_execution_test_call(100);
+        apply_strategy_receipt_observation(
+            &mut reverted,
+            StrategyReceiptObservation {
+                status: TransactionReceiptStatus::Reverted,
+                block_number: Some(20),
+                block_hash: Some("0xblock".into()),
+                latest_block: 20,
+            },
+            202,
+            100,
+            3,
+        )
+        .unwrap();
+        assert_eq!(reverted.state, StrategyExecutionCallState::Reverted);
+
+        let mut dropped = strategy_execution_test_call(100);
+        apply_strategy_receipt_observation(
+            &mut dropped,
+            StrategyReceiptObservation {
+                status: TransactionReceiptStatus::Pending,
+                block_number: None,
+                block_hash: None,
+                latest_block: 20,
+            },
+            100 + STRATEGY_EXECUTION_RECEIPT_TIMEOUT_NS,
+            100,
+            3,
+        )
+        .unwrap();
+        assert_eq!(dropped.state, StrategyExecutionCallState::Dropped);
+
+        let mut future = strategy_execution_test_call(100);
+        let error = apply_strategy_receipt_observation(
+            &mut future,
+            StrategyReceiptObservation {
+                status: TransactionReceiptStatus::Confirmed,
+                block_number: Some(21),
+                block_hash: Some("0xblock".into()),
+                latest_block: 20,
+            },
+            202,
+            100,
+            3,
+        )
+        .unwrap_err();
+        assert!(error.contains("greater than latest head"));
+
+        let mut reloaded = crate::domain::types::PendingStrategyExecution {
+            execution_id: "crash-before-broadcast".into(),
+            turn_id: "turn".into(),
+            key: StrategyTemplateKey {
+                protocol: "p".into(),
+                primitive: "q".into(),
+                chain_id: 8453,
+                template_id: "t".into(),
+            },
+            action_id: "enter_supply".into(),
+            plan_digest: "digest".into(),
+            asset_effects: vec![],
+            calls: vec![crate::domain::types::PendingStrategyExecutionCall {
+                state: StrategyExecutionCallState::Unattempted,
+                tx_hash: None,
+                ..strategy_execution_test_call(100)
+            }],
+            state: PendingStrategyExecutionState::Pending,
+            created_at_ns: 100,
+            updated_at_ns: 100,
+            next_check_at_ns: 100,
+            consecutive_rpc_failures: 0,
+            bookkeeping_applied: false,
+            terminal_bookkeeping_applied: false,
+        };
+        expire_unattempted_strategy_calls(
+            &mut reloaded,
+            100 + STRATEGY_EXECUTION_RECEIPT_TIMEOUT_NS - 1,
+        );
+        assert_eq!(
+            reloaded.calls[0].state,
+            StrategyExecutionCallState::Unattempted
+        );
+        expire_unattempted_strategy_calls(
+            &mut reloaded,
+            100 + STRATEGY_EXECUTION_RECEIPT_TIMEOUT_NS,
+        );
+        assert_eq!(reloaded.calls[0].state, StrategyExecutionCallState::Dropped);
+        reloaded.calls[0].state = StrategyExecutionCallState::Submitted;
+        reloaded.calls[0].tx_hash = None;
+        expire_unattempted_strategy_calls(
+            &mut reloaded,
+            100 + STRATEGY_EXECUTION_RECEIPT_TIMEOUT_NS,
+        );
+        assert_eq!(reloaded.calls[0].state, StrategyExecutionCallState::Dropped);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn strategy_receipt_reconciliation_persists_malformed_and_transport_backoff_end_to_end() {
+        fn pending(id: &str, now_ns: u64) -> crate::domain::types::PendingStrategyExecution {
+            crate::domain::types::PendingStrategyExecution {
+                execution_id: id.into(),
+                turn_id: format!("turn-{id}"),
+                key: StrategyTemplateKey {
+                    protocol: "receipt-e2e".into(),
+                    primitive: "lend".into(),
+                    chain_id: 8453,
+                    template_id: id.into(),
+                },
+                action_id: "enter_supply".into(),
+                plan_digest: format!("digest-{id}"),
+                asset_effects: vec![],
+                calls: vec![strategy_execution_test_call(now_ns)],
+                state: PendingStrategyExecutionState::Pending,
+                created_at_ns: now_ns,
+                updated_at_ns: now_ns,
+                next_check_at_ns: now_ns,
+                consecutive_rpc_failures: 0,
+                bookkeeping_applied: false,
+                terminal_bookkeeping_applied: false,
+            }
+        }
+
+        stable::init_storage();
+        let malformed_id = "receipt-malformed-json-e2e";
+        let now_ns = 91_000_000_000;
+        stable::insert_pending_strategy_execution(pending(malformed_id, now_ns)).unwrap();
+        with_host_stub_env(
+            &[("IC_AUTOMATON_EVM_RPC_STUB_FORCE_BODY", Some("{malformed"))],
+            || block_on_with_spin(reconcile_pending_strategy_executions(now_ns)).unwrap(),
+        );
+        let first = stable::pending_strategy_execution(malformed_id).unwrap();
+        assert_eq!(first.consecutive_rpc_failures, 1);
+        assert_eq!(first.calls[0].last_checked_at_ns, Some(now_ns));
+        assert!(first.calls[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("parse eth_getTransactionReceipt response JSON"));
+        assert_eq!(
+            first.next_check_at_ns,
+            now_ns + strategy_execution_rpc_backoff_ns(1)
+        );
+        let retry_ns = first.next_check_at_ns;
+        with_host_stub_env(
+            &[("IC_AUTOMATON_EVM_RPC_STUB_FORCE_BODY", Some("{malformed"))],
+            || block_on_with_spin(reconcile_pending_strategy_executions(retry_ns)).unwrap(),
+        );
+        let second = stable::pending_strategy_execution(malformed_id).unwrap();
+        assert_eq!(second.consecutive_rpc_failures, 2);
+        assert_eq!(second.calls[0].last_checked_at_ns, Some(retry_ns));
+        assert_eq!(
+            second.next_check_at_ns,
+            retry_ns + strategy_execution_rpc_backoff_ns(2)
+        );
+
+        let transport_id = "receipt-transport-e2e";
+        stable::insert_pending_strategy_execution(pending(transport_id, now_ns)).unwrap();
+        with_host_stub_env(
+            &[
+                ("IC_AUTOMATON_EVM_RPC_STUB_FORCE_STATUS", Some("503")),
+                ("IC_AUTOMATON_EVM_RPC_STUB_FORCE_BODY", Some("unavailable")),
+            ],
+            || block_on_with_spin(reconcile_pending_strategy_executions(now_ns)).unwrap(),
+        );
+        let transport = stable::pending_strategy_execution(transport_id).unwrap();
+        assert_eq!(transport.consecutive_rpc_failures, 1);
+        assert_eq!(transport.calls[0].last_checked_at_ns, Some(now_ns));
+        assert!(transport.calls[0].error.as_deref().unwrap().contains("503"));
+        assert!(transport.next_check_at_ns <= now_ns + STRATEGY_EXECUTION_MAX_BACKOFF_NS);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn with_host_stub_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
         crate::test_support::with_locked_host_env(vars, f);
@@ -3393,51 +3823,54 @@ mod tests {
         }
 
         let strategy_id = "morpho-v1:supply:8453:morpho-enter-supply".to_string();
-        let turn = crate::domain::types::TurnRecord {
-            id: "turn-enter".to_string(),
-            created_at_ns: 1_000,
-            finished_at_ns: Some(1_001),
-            duration_ms: Some(1),
-            state_from: crate::domain::types::AgentState::Inferring,
-            state_to: crate::domain::types::AgentState::ExecutingActions,
-            source_events: 1,
-            tool_call_count: 1,
-            input_summary: "enter supply".to_string(),
-            inner_dialogue: None,
-            inference_round_count: 1,
-            continuation_stop_reason: Default::default(),
-            error: None,
+        use crate::domain::types::{
+            PendingStrategyExecution, PendingStrategyExecutionCall, StrategyAssetDirection,
+            StrategyAssetEffect, StrategyExecutionCall,
         };
-        let tool_call = crate::domain::types::ToolCallRecord {
-            turn_id: turn.id.clone(),
-            tool: "execute_strategy_action".to_string(),
-            args_json: json!({
-                "key": {
-                    "protocol": "morpho-v1",
-                    "primitive": "supply",
-                    "chain_id": 8453,
-                    "template_id": "morpho-enter-supply"
+        stable::insert_pending_strategy_execution(PendingStrategyExecution {
+            execution_id: "strategy:turn-enter:digest".into(),
+            turn_id: "turn-enter".into(),
+            key: StrategyTemplateKey {
+                protocol: "morpho-v1".into(),
+                primitive: "supply".into(),
+                chain_id: 8453,
+                template_id: "morpho-enter-supply".into(),
+            },
+            action_id: "enter_supply".into(),
+            plan_digest: "digest".into(),
+            asset_effects: vec![StrategyAssetEffect {
+                chain_id: 8453,
+                asset_address: None,
+                asset_symbol: "USDC".into(),
+                decimals: 18,
+                amount_raw: "50000000000000000".into(),
+                direction: StrategyAssetDirection::Debit,
+            }],
+            calls: vec![PendingStrategyExecutionCall {
+                index: 0,
+                call: StrategyExecutionCall {
+                    role: "pool".into(),
+                    to: "0x1111111111111111111111111111111111111111".into(),
+                    value_wei: "0".into(),
+                    data: "0x".into(),
                 },
-                "action_id": "enter_supply",
-                "typed_params": {
-                    "calls": [{
-                        "value_wei": "50000000000000000",
-                        "args": {
-                            "marketParams": {
-                                "collateralToken": "USDC"
-                            }
-                        }
-                    }]
-                }
-            })
-            .to_string(),
-            output: r#"{"tx_hashes":["0xabc"]}"#.to_string(),
-            success: true,
-            outcome: Default::default(),
-            error: None,
-            failure_kind: None,
-        };
-        stable::append_turn_record(&turn, &[tool_call]);
+                tx_hash: Some("0xabc".into()),
+                state: StrategyExecutionCallState::Confirmed,
+                receipt_block_number: Some(1),
+                receipt_block_hash: Some("0xblock".into()),
+                submitted_at_ns: Some(1_000),
+                last_checked_at_ns: Some(1_000),
+                error: None,
+            }],
+            state: PendingStrategyExecutionState::Confirmed,
+            created_at_ns: 1_000,
+            updated_at_ns: 1_000,
+            next_check_at_ns: 1_000,
+            consecutive_rpc_failures: 0,
+            bookkeeping_applied: true,
+            terminal_bookkeeping_applied: false,
+        })
+        .unwrap();
         assert!(
             stable::active_exposure(&strategy_id).is_none(),
             "test setup should start without local exposure"
