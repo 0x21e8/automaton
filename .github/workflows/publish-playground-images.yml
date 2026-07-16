@@ -86,9 +86,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          base_dir="${XDG_CONFIG_HOME:-$HOME}"
+          foundry_dir="${FOUNDRY_DIR:-"$base_dir/.foundry"}"
+          foundry_bin_dir="$foundry_dir/bin"
           curl -L https://foundry.paradigm.xyz | bash
-          "$HOME/.foundry/bin/foundryup"
-          echo "$HOME/.foundry/bin" >> "$GITHUB_PATH"
+          "$foundry_bin_dir/foundryup"
+          echo "$foundry_bin_dir" >> "$GITHUB_PATH"
 
       - name: Install Wasm tooling
         shell: bash

@@ -96,20 +96,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: playground-vps
+    env:
+      TAILSCALE_AUTHKEY: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY }}
 
     steps:
       - name: Install Tailscale
-        if: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY != '' }}
+        if: ${{ env.TAILSCALE_AUTHKEY != '' }}
         shell: bash
         run: |
           set -euo pipefail
           curl -fsSL https://tailscale.com/install.sh | sh
 
       - name: Join Tailnet
-        if: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY != '' }}
+        if: ${{ env.TAILSCALE_AUTHKEY != '' }}
         shell: bash
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.PLAYGROUND_TAILSCALE_AUTHKEY }}
         run: |
           set -euo pipefail
           sudo tailscale up \
@@ -159,7 +159,7 @@ jobs:
             "set -euo pipefail; . '${remote_env}'; repo_root=\${PLAYGROUND_VPS_REPO_ROOT:-${repo_root}}; if [ -n \"\${PLAYGROUND_ENV_FILE:-}\" ] && [ -f \"\${PLAYGROUND_ENV_FILE}\" ]; then . \"\${PLAYGROUND_ENV_FILE}\"; fi; cd \"\${repo_root}\"; npm run playground:spawn-payment-e2e; rm -f '${remote_env}'"
 
       - name: Leave Tailnet
-        if: ${{ always() && secrets.PLAYGROUND_TAILSCALE_AUTHKEY != '' }}
+        if: ${{ always() && env.TAILSCALE_AUTHKEY != '' }}
         shell: bash
         run: |
           set -euo pipefail
